@@ -4,7 +4,7 @@
 //! none of it can be, once it touches macroquad's window/input globals.
 
 use macroquad::prelude::*;
-use viewer::{color_for, load_sequence, synthetic_frame, synthetic_tiles, Camera, FrameSequence};
+use viewer::{color_for, load_sequence, synthetic_frame, synthetic_tiles, Camera, FrameSequence, Timeline};
 
 const ZOOM_STEP: f32 = 1.1;
 const PLAY_INTERVAL_SECS: f32 = 0.25; // ~4 frames/sec auto-play
@@ -99,14 +99,28 @@ async fn main() {
     let mut last_mouse: Vec2 = mouse_position().into();
     let mut playing = false;
     let mut play_accum = 0.0;
+    let mut dragging_timeline = false;
 
     loop {
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let mouse: Vec2 = mouse_position().into();
+        let timeline = Timeline::for_screen(screen_width(), screen_height());
+
+        // Which a drag does depends on where it started: grabbing the
+        // scrub bar seeks, anywhere else pans the camera, same as a video
+        // player's scrubber taking priority over the content behind it.
+        if is_mouse_button_pressed(MouseButton::Left) {
+            dragging_timeline = timeline.contains(mouse);
+        }
 
         if is_mouse_button_down(MouseButton::Left) {
-            let delta = mouse - last_mouse;
-            camera.offset -= delta / camera.pixels_per_tile();
+            if dragging_timeline {
+                sequence.goto(timeline.index_for_x(mouse.x, sequence.len()));
+                playing = false;
+            } else {
+                let delta = mouse - last_mouse;
+                camera.offset -= delta / camera.pixels_per_tile();
+            }
         }
         last_mouse = mouse;
 
@@ -199,7 +213,7 @@ async fn main() {
         );
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump",
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  drag the bar below to scrub",
                 if playing { "pause" } else { "play" }
             ),
             10.0,
@@ -207,6 +221,19 @@ async fn main() {
             20.0,
             WHITE,
         );
+
+        // Track, filled up to the current frame, a tick per frame when
+        // there are few enough to read, and a playhead on top.
+        draw_line(timeline.left, timeline.y, timeline.left + timeline.width, timeline.y, 4.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        let playhead_x = timeline.x_for_index(sequence.index(), sequence.len());
+        draw_line(timeline.left, timeline.y, playhead_x, timeline.y, 4.0, Color::new(1.0, 1.0, 1.0, 0.8));
+        if sequence.len() <= 100 {
+            for i in 0..sequence.len() {
+                let x = timeline.x_for_index(i, sequence.len());
+                draw_line(x, timeline.y - 4.0, x, timeline.y + 4.0, 2.0, Color::new(1.0, 1.0, 1.0, 0.4));
+            }
+        }
+        draw_circle(playhead_x, timeline.y, 7.0, WHITE);
 
         next_frame().await;
     }

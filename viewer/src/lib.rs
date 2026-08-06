@@ -60,6 +60,52 @@ impl Camera {
     }
 }
 
+/// A horizontal scrub bar, centered near the bottom of the window, mapping
+/// between screen-x and frame index. Geometry and hit-testing only -- drawing
+/// and input polling stay in main.rs, same split as Camera.
+#[derive(Clone, Copy)]
+pub struct Timeline {
+    pub left: f32,
+    pub width: f32,
+    pub y: f32,
+}
+
+impl Timeline {
+    /// Vertical distance from the bar within which a click/drag counts as
+    /// grabbing it, rather than falling through to camera pan.
+    pub const HIT_HEIGHT: f32 = 14.0;
+
+    pub fn for_screen(screen_width: f32, screen_height: f32) -> Self {
+        let width = screen_width * 0.6;
+        Timeline { left: (screen_width - width) / 2.0, width, y: screen_height - 40.0 }
+    }
+
+    /// Where a frame index sits along the bar.
+    pub fn x_for_index(&self, index: usize, frame_count: usize) -> f32 {
+        if frame_count <= 1 {
+            return self.left;
+        }
+        self.left + self.width * (index as f32 / (frame_count - 1) as f32)
+    }
+
+    /// The nearest frame index to an x position, clamped to the bar's ends
+    /// rather than requiring the point land exactly on it.
+    pub fn index_for_x(&self, x: f32, frame_count: usize) -> usize {
+        if frame_count <= 1 {
+            return 0;
+        }
+        let t = ((x - self.left) / self.width).clamp(0.0, 1.0);
+        (t * (frame_count - 1) as f32).round() as usize
+    }
+
+    /// Whether a point (typically the mouse) is close enough to the bar,
+    /// horizontally within its ends and vertically within `HIT_HEIGHT`, to
+    /// count as interacting with it rather than the view behind it.
+    pub fn contains(&self, point: Vec2) -> bool {
+        point.x >= self.left && point.x <= self.left + self.width && (point.y - self.y).abs() <= Self::HIT_HEIGHT
+    }
+}
+
 /// Deterministic name -> color, so a given entity type is always the same
 /// color across runs with nothing to curate as new Factorio types show up.
 pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
@@ -293,6 +339,38 @@ mod tests {
         assert!(tiles.iter().all(|t| t.n == "concrete"));
         assert_eq!((tiles[0].x, tiles[0].y), (0, 0));
         assert_eq!((tiles[3].x, tiles[3].y), (0, 1));
+    }
+
+    #[test]
+    fn timeline_index_and_x_are_inverses() {
+        let timeline = Timeline::for_screen(1000.0, 600.0);
+        for index in [0, 3, 7, 12] {
+            let x = timeline.x_for_index(index, 13);
+            assert_eq!(timeline.index_for_x(x, 13), index, "index {index}");
+        }
+    }
+
+    #[test]
+    fn timeline_index_for_x_clamps_beyond_the_bar_ends() {
+        let timeline = Timeline::for_screen(1000.0, 600.0);
+        assert_eq!(timeline.index_for_x(timeline.left - 500.0, 10), 0);
+        assert_eq!(timeline.index_for_x(timeline.left + timeline.width + 500.0, 10), 9);
+    }
+
+    #[test]
+    fn timeline_with_a_single_frame_never_divides_by_zero() {
+        let timeline = Timeline::for_screen(1000.0, 600.0);
+        assert_eq!(timeline.index_for_x(timeline.left + 999.0, 1), 0);
+        assert_eq!(timeline.x_for_index(0, 1), timeline.left);
+    }
+
+    #[test]
+    fn timeline_contains_checks_both_axes() {
+        let timeline = Timeline::for_screen(1000.0, 600.0);
+        let mid = Vec2::new(timeline.left + timeline.width / 2.0, timeline.y);
+        assert!(timeline.contains(mid));
+        assert!(!timeline.contains(Vec2::new(timeline.left - 50.0, timeline.y)), "left of the bar");
+        assert!(!timeline.contains(Vec2::new(mid.x, timeline.y - 200.0)), "far above the bar");
     }
 
     #[test]
