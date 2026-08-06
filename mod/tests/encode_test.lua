@@ -42,6 +42,17 @@ check("encode_entity: direction absent (nil) is omitted",
   encode.encode_entity({ name = "stone-furnace", position = { x = 1, y = 2 } }),
   '{"n":"stone-furnace","x":1.0,"y":2.0}')
 
+check("encode_entity: 1x1 footprint is omitted",
+  encode.encode_entity({ name = "inserter", position = { x = 0, y = 0 }, tile_width = 1, tile_height = 1 }),
+  '{"n":"inserter","x":0.0,"y":0.0}')
+
+check("encode_entity: multi-tile footprint is included",
+  encode.encode_entity({
+    name = "assembling-machine-1", position = { x = 5, y = 5 }, direction = 0,
+    tile_width = 3, tile_height = 3,
+  }),
+  '{"n":"assembling-machine-1","x":5.0,"y":5.0,"w":3,"h":3}')
+
 -- encode_tile ----------------------------------------------------------------
 
 check("encode_tile: positive coordinates",
@@ -61,6 +72,14 @@ check("encode_event: entity add with id and direction",
 check("encode_event: entity add with direction zero omits d",
   encode.encode_event("+", "e", 1234, "stone-furnace", 1, 2, 0, 8842),
   '{"t":1234,"op":"+","k":"e","n":"stone-furnace","x":1.0,"y":2.0,"id":8842}')
+
+check("encode_event: entity add with multi-tile footprint",
+  encode.encode_event("+", "e", 1234, "assembling-machine-1", 5, 5, 0, 8842, 3, 3),
+  '{"t":1234,"op":"+","k":"e","n":"assembling-machine-1","x":5.0,"y":5.0,"w":3,"h":3,"id":8842}')
+
+check("encode_event: entity add with 1x1 footprint omits w/h",
+  encode.encode_event("+", "e", 1234, "inserter", 1, 2, 0, 8842, 1, 1),
+  '{"t":1234,"op":"+","k":"e","n":"inserter","x":1.0,"y":2.0,"id":8842}')
 
 check("encode_event: entity remove with id is the short form",
   encode.encode_event("-", "e", 1250, nil, nil, nil, nil, 8842),

@@ -139,7 +139,7 @@ fn stage_mods(staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
 /// The usual layout is `<root>/bin/x64/factorio`, but macOS app bundles put the
 /// binary in `Contents/MacOS`, so walk up looking for a real `data` directory
 /// rather than assuming a fixed depth.
-fn install_data_dir(exe: &Path) -> Option<PathBuf> {
+pub fn install_data_dir(exe: &Path) -> Option<PathBuf> {
     let mut dir = exe.parent();
     for _ in 0..4 {
         let current = dir?;

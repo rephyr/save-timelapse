@@ -2,7 +2,7 @@
 //! so it's unit testable: `main.rs` is thin glue over this.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use macroquad::color::Color;
 use macroquad::math::Vec2;
@@ -36,11 +36,18 @@ impl Camera {
     /// are almost never near world origin, so an empty/degenerate input
     /// falls back to a sane default rather than opening on empty space.
     pub fn fit_frames(frames: &[Frame], screen_width: f32, screen_height: f32) -> Camera {
+        // Each entity contributes its two footprint corners, not just its
+        // center point -- for a small cluster of large buildings, ignoring
+        // footprint here would zoom in as if they were 1x1, and a real
+        // multi-tile entity would then render bigger than the whole window.
         let mut points = frames.iter().flat_map(|f| {
-            f.entities
-                .iter()
-                .map(|e| Vec2::new(e.x, e.y))
-                .chain(f.tiles.iter().map(|t| Vec2::new(t.x as f32, t.y as f32)))
+            let entity_corners = f.entities.iter().flat_map(|e| {
+                let half = Vec2::new(e.w as f32, e.h as f32) / 2.0;
+                let center = Vec2::new(e.x, e.y);
+                [center - half, center + half]
+            });
+            let tile_points = f.tiles.iter().map(|t| Vec2::new(t.x as f32, t.y as f32));
+            entity_corners.chain(tile_points)
         });
         let Some(first) = points.next() else {
             return Camera { offset: Vec2::ZERO, zoom: 1.0 };
@@ -58,6 +65,29 @@ impl Camera {
             * 0.9;
         Camera { offset: center, zoom: zoom.clamp(0.01, 50.0) }
     }
+}
+
+/// The on-screen size of an entity's footprint, in pixels. Most entities are
+/// 1x1, but assemblers, furnaces and the like span several tiles -- sizing
+/// every entity to a fixed 1-tile square (the pre-footprint behavior) is why
+/// multi-tile buildings used to render undersized and visually disconnected
+/// from whatever was actually touching them.
+pub fn entity_footprint_size(pixels_per_tile: f32, w: u32, h: u32) -> Vec2 {
+    Vec2::new((w as f32 * pixels_per_tile).max(1.0), (h as f32 * pixels_per_tile).max(1.0))
+}
+
+/// Vanilla/Space-Age icons follow a predictable path under the Factorio
+/// install's data directory, keyed by prototype name -- verified against
+/// Wube's own base-game source (e.g. `__base__/graphics/icons/stone-furnace.png`
+/// resolves to `<data_dir>/base/graphics/icons/stone-furnace.png`). There's no
+/// runtime API a mod could use to export the exact path (checked before
+/// building this), and no reliable convention for third-party mod icons --
+/// a lookup miss just means falling back to a colored shape, never an error.
+pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
+    ["base", "space-age"]
+        .iter()
+        .map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png")))
+        .collect()
 }
 
 /// A horizontal scrub bar, centered near the bottom of the window, mapping
@@ -157,6 +187,8 @@ pub fn synthetic_frame(count: usize) -> Frame {
                 x: ix as f32 * spacing,
                 y: iy as f32 * spacing,
                 d: 0,
+                w: 1,
+                h: 1,
             }
         })
         .collect();
@@ -278,8 +310,8 @@ mod tests {
             surface: "nauvis".to_string(),
             count: 2,
             entities: vec![
-                Entity { n: "a".to_string(), x: 0.0, y: 0.0, d: 0 },
-                Entity { n: "b".to_string(), x: 10.0, y: 10.0, d: 0 },
+                Entity { n: "a".to_string(), x: 0.0, y: 0.0, d: 0, w: 1, h: 1 },
+                Entity { n: "b".to_string(), x: 10.0, y: 10.0, d: 0, w: 1, h: 1 },
             ],
             tiles: Vec::new(),
         };
@@ -294,7 +326,7 @@ mod tests {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 1,
-            entities: vec![Entity { n: "a".to_string(), x: 3.0, y: 3.0, d: 0 }],
+            entities: vec![Entity { n: "a".to_string(), x: 3.0, y: 3.0, d: 0, w: 1, h: 1 }],
             tiles: Vec::new(),
         };
         let camera = Camera::fit_frames(std::slice::from_ref(&frame), 800.0, 600.0);
@@ -339,6 +371,30 @@ mod tests {
         assert!(tiles.iter().all(|t| t.n == "concrete"));
         assert_eq!((tiles[0].x, tiles[0].y), (0, 0));
         assert_eq!((tiles[3].x, tiles[3].y), (0, 1));
+    }
+
+    #[test]
+    fn entity_footprint_size_scales_by_tile_count() {
+        assert_eq!(entity_footprint_size(32.0, 1, 1), Vec2::new(32.0, 32.0));
+        assert_eq!(entity_footprint_size(32.0, 3, 2), Vec2::new(96.0, 64.0));
+    }
+
+    #[test]
+    fn entity_footprint_size_never_collapses_to_zero_at_tiny_zoom() {
+        let size = entity_footprint_size(0.001, 1, 1);
+        assert!(size.x >= 1.0 && size.y >= 1.0);
+    }
+
+    #[test]
+    fn icon_candidates_checks_base_then_space_age() {
+        let candidates = icon_candidates(Path::new("/data"), "stone-furnace");
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/data/base/graphics/icons/stone-furnace.png"),
+                PathBuf::from("/data/space-age/graphics/icons/stone-furnace.png"),
+            ]
+        );
     }
 
     #[test]

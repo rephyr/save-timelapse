@@ -22,6 +22,18 @@ pub struct Entity {
     pub y: f32,
     #[serde(default)]
     pub d: u8,
+    /// Tile footprint. Absent in frames captured before footprint export
+    /// existed, and omitted by the encoder for the common 1x1 case, so both
+    /// default to 1 rather than 0 (plain `#[serde(default)]` would give 0,
+    /// which would draw as invisible instead of the single tile it always was).
+    #[serde(default = "one")]
+    pub w: u32,
+    #[serde(default = "one")]
+    pub h: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 /// Unlike entities, tiles are corner positioned and integer aligned: a tile
@@ -85,5 +97,17 @@ mod tests {
 
         let with: Entity = serde_json::from_str(r#"{"n":"pipe","x":1.0,"y":2.0,"d":4}"#).unwrap();
         assert_eq!(with.d, 4);
+    }
+
+    /// w/h default to 1, not 0 (0 would draw as invisible instead of the
+    /// single tile every entity always occupied before footprint export).
+    #[test]
+    fn entity_footprint_defaults_to_one_by_one_when_absent_and_decodes_when_present() {
+        let without: Entity = serde_json::from_str(r#"{"n":"inserter","x":1.0,"y":2.0}"#).unwrap();
+        assert_eq!((without.w, without.h), (1, 1));
+
+        let with: Entity =
+            serde_json::from_str(r#"{"n":"assembling-machine-1","x":1.0,"y":2.0,"w":3,"h":3}"#).unwrap();
+        assert_eq!((with.w, with.h), (3, 3));
     }
 }

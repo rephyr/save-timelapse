@@ -208,7 +208,7 @@ local function flush_capture()
   end
 end
 
-local function log_event(op, kind, name, x, y, direction, id)
+local function log_event(op, kind, name, x, y, direction, id, w, h)
   if not capture_checked_rollover then
     ensure_capture_segment()
     capture_checked_rollover = true
@@ -217,7 +217,7 @@ local function log_event(op, kind, name, x, y, direction, id)
 
   capture_pending_count = capture_pending_count + 1
   capture_pending[capture_pending_count] =
-    encode.encode_event(op, kind, game.tick, name, x, y, direction, id) .. "\n"
+    encode.encode_event(op, kind, game.tick, name, x, y, direction, id, w, h) .. "\n"
 
   if capture_pending_count >= CAPTURE_FLUSH_EVERY then
     flush_capture()
@@ -229,7 +229,8 @@ local function log_entity(op, entity)
     return
   end
   local pos = entity.position
-  log_event(op, "e", op == "+" and entity.name or nil, pos.x, pos.y, entity.direction, entity.unit_number)
+  log_event(op, "e", op == "+" and entity.name or nil, pos.x, pos.y,
+    entity.direction, entity.unit_number, entity.tile_width, entity.tile_height)
 end
 
 local function log_tile_change(op, event)

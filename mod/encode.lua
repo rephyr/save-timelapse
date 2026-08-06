@@ -47,6 +47,12 @@ function M.encode_entity(entity)
   if facing and facing ~= 0 then
     fields = fields .. ',"d":' .. facing
   end
+  -- Most entities are 1x1, so this omits w/h the same way d is omitted at 0
+  -- -- otherwise every belt and pole would carry two redundant fields.
+  local w, h = entity.tile_width, entity.tile_height
+  if w and h and (w ~= 1 or h ~= 1) then
+    fields = fields .. string.format(',"w":%d,"h":%d', w, h)
+  end
   return fields .. "}"
 end
 
@@ -61,7 +67,9 @@ end
 --- preferred when available: just tick/op/kind/id, nothing else needed.
 --- Otherwise x/y locate whatever currently occupies that position -- the
 --- only option for tiles, which have no identity beyond their position.
-function M.encode_event(op, kind, tick, name, x, y, direction, id)
+--- `w`/`h` (entity footprint, add events only) follow the same omit-at-1x1
+--- convention as encode_entity.
+function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h)
   if op == "-" and id then
     return string.format('{"t":%d,"op":"-","k":%s,"id":%d}', tick, M.quote(kind), id)
   end
@@ -78,6 +86,9 @@ function M.encode_event(op, kind, tick, name, x, y, direction, id)
   if op == "+" and kind == "e" then
     if direction and direction ~= 0 then
       fields = fields .. ',"d":' .. direction
+    end
+    if w and h and (w ~= 1 or h ~= 1) then
+      fields = fields .. string.format(',"w":%d,"h":%d', w, h)
     end
     if id then
       fields = fields .. ',"id":' .. id
