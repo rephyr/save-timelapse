@@ -187,3 +187,29 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordering_key_sorts_numerically_not_lexicographically() {
+        let mut saves = vec![
+            PathBuf::from("base2.zip"),
+            PathBuf::from("base10.zip"),
+            PathBuf::from("base1.zip"),
+        ];
+        saves.sort_by_key(|p| ordering_key(p));
+        assert_eq!(
+            saves,
+            vec![PathBuf::from("base1.zip"), PathBuf::from("base2.zip"), PathBuf::from("base10.zip")]
+        );
+    }
+
+    #[test]
+    fn ordering_key_falls_back_to_name_when_no_digits_are_present() {
+        let mut saves = vec![PathBuf::from("zzz.zip"), PathBuf::from("aaa.zip")];
+        saves.sort_by_key(|p| ordering_key(p));
+        assert_eq!(saves, vec![PathBuf::from("aaa.zip"), PathBuf::from("zzz.zip")]);
+    }
+}

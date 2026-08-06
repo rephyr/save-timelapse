@@ -570,6 +570,7 @@ dependencies = [
  "macroquad",
  "save-timelapse",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
