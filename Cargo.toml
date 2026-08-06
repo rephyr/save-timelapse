@@ -1,3 +1,6 @@
+[workspace]
+members = ["viewer"]
+
 [package]
 name = "save-timelapse"
 version = "0.1.0"

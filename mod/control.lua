@@ -34,6 +34,21 @@ local function excluded_types()
   return list
 end
 
+-- Natural terrain (grass, water, sand, dirt, ...) vastly outnumbers placed
+-- floor types, so this is an include list rather than an exclude list, the
+-- opposite of EXCLUDED_TYPES above. Verified against base/prototypes/tile/tiles.lua.
+local PLACED_FLOOR_TILES = {
+  "stone-path", "concrete",
+  "hazard-concrete-left", "hazard-concrete-right",
+  "refined-concrete", "refined-hazard-concrete-left", "refined-hazard-concrete-right",
+  "landfill",
+  -- Space Age colored refined-concrete variants
+  "red-refined-concrete", "green-refined-concrete", "blue-refined-concrete",
+  "orange-refined-concrete", "yellow-refined-concrete", "pink-refined-concrete",
+  "purple-refined-concrete", "black-refined-concrete", "brown-refined-concrete",
+  "cyan-refined-concrete", "acid-refined-concrete",
+}
+
 local function quote(text)
   return '"' .. text:gsub('[\\"]', '\\%0') .. '"'
 end
@@ -49,7 +64,13 @@ local function encode_entity(entity)
   return fields .. "}"
 end
 
---- Write one surface to its own file. Returns how many entities were written.
+--- Tiles are corner positioned and integer aligned, unlike entities.
+local function encode_tile(tile)
+  local pos = tile.position
+  return string.format('{"n":%s,"x":%d,"y":%d}', quote(tile.name), pos.x, pos.y)
+end
+
+--- Write one surface to its own file. Returns entity and tile counts written.
 local function export_surface(surface, tick)
   local path = string.format("%sframe_%d_%s.json", EXPORT_DIR, tick, surface.name)
 
@@ -80,8 +101,29 @@ local function export_surface(surface, tick)
     helpers.write_file(path, table.concat(pending), true)
   end
 
-  helpers.write_file(path, string.format('],"count":%d}', written), true)
-  return written
+  helpers.write_file(path, string.format('],"count":%d,"tiles":[', written), true)
+
+  pending, pending_count = {}, 0
+  local tiles_written = 0
+
+  for _, tile in pairs(surface.find_tiles_filtered({ name = PLACED_FLOOR_TILES })) do
+    pending_count = pending_count + 1
+    tiles_written = tiles_written + 1
+    pending[pending_count] = (tiles_written > 1 and "," or "") .. encode_tile(tile)
+
+    if pending_count >= FLUSH_EVERY then
+      helpers.write_file(path, table.concat(pending), true)
+      pending, pending_count = {}, 0
+    end
+  end
+
+  if pending_count > 0 then
+    helpers.write_file(path, table.concat(pending), true)
+  end
+
+  helpers.write_file(path, string.format('],"tile_count":%d}', tiles_written), true)
+
+  return written, tiles_written
 end
 
 --- A surface is worth exporting if it is nauvis or the player built on it.
@@ -96,33 +138,35 @@ local function is_inhabited(surface)
 end
 
 local function export_all(tick)
-  local names, total = {}, 0
+  local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do
     if is_inhabited(surface) then
-      total = total + export_surface(surface, tick)
+      local entities, tiles = export_surface(surface, tick)
+      total = total + entities
+      tile_total = tile_total + tiles
       names[#names + 1] = quote(surface.name)
     end
   end
 
   helpers.write_file(
     string.format("%sframe_%d_manifest.json", EXPORT_DIR, tick),
-    string.format('{"tick":%d,"entities":%d,"surfaces":[%s]}',
-      tick, total, table.concat(names, ",")),
+    string.format('{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s]}',
+      tick, total, tile_total, table.concat(names, ",")),
     false)
 
-  return total, #names
+  return total, tile_total, #names
 end
 
 commands.add_command("timelapse-export",
   "Export this save's entities for timelapse rendering.",
   function(event)
-    local total, surfaces = export_all(game.tick)
+    local total, tiles, surfaces = export_all(game.tick)
     local player = event.player_index and game.get_player(event.player_index)
     if player then
       player.print(string.format(
-        "[save-timelapse] exported %d entities from %d surface(s) to script-output/%s",
-        total, surfaces, EXPORT_DIR))
+        "[save-timelapse] exported %d entities and %d tiles from %d surface(s) to script-output/%s",
+        total, tiles, surfaces, EXPORT_DIR))
     end
   end)
 

@@ -2,4 +2,5 @@
 //! integration tests can all share the same code.
 
 pub mod export;
+pub mod frame;
 pub mod settings_dat;
