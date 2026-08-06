@@ -52,6 +52,35 @@ cargo build --release
 cargo test
 ```
 
+## Developing without Factorio
+
+The whole project can be built, tested and run on a machine with no Factorio
+installed. `cargo test` needs nothing beyond the toolchain.
+
+A `fake-factorio` binary implements enough of Factorio's command line to
+exercise the exporter end to end. It decodes the staged `mod-settings.dat` and
+emits a frame only when the export trigger is genuinely set, so it catches
+staging bugs rather than papering over them.
+
+To drive the real CLI with it, put it where the executable is expected:
+
+```
+mkdir -p /tmp/fake/factorio/bin/x64 /tmp/fake/factorio/data /tmp/fake/saves
+cp target/debug/fake-factorio /tmp/fake/factorio/bin/x64/factorio
+for n in 1 2 3 10 20; do echo save > /tmp/fake/saves/base$n.zip; done
+
+FAKE_FACTORIO_FRAME=tests/fixtures/frames/frame_0003.json \
+cargo run --bin save-timelapse -- \
+    --saves /tmp/fake/saves \
+    --mods  /tmp/fake/mods \
+    --factorio /tmp/fake/factorio/bin/x64/factorio \
+    --out /tmp/fake/out
+```
+
+`tests/fixtures/frames/` holds five real frames, from 240 to 22,971 entities
+across 58 entity types, for building the renderer against realistic data.
+See [tests/fixtures/README.md](tests/fixtures/README.md).
+
 ## Design
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

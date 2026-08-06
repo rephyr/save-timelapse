@@ -134,8 +134,23 @@ fn stage_mods(staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
     Ok(mods)
 }
 
+/// Locate the install's `data` directory from the executable path.
+///
+/// The usual layout is `<root>/bin/x64/factorio`, but macOS app bundles put the
+/// binary in `Contents/MacOS`, so walk up looking for a real `data` directory
+/// rather than assuming a fixed depth.
 fn install_data_dir(exe: &Path) -> Option<PathBuf> {
-    // bin/x64/factorio.exe -> install root
+    let mut dir = exe.parent();
+    for _ in 0..4 {
+        let current = dir?;
+        let candidate = current.join("data");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        dir = current.parent();
+    }
+    // Nothing found: fall back to the conventional depth so the error surfaces
+    // from Factorio itself, which reports it better than we can.
     exe.parent()?.parent()?.parent().map(|root| root.join("data"))
 }
 
