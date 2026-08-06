@@ -97,6 +97,31 @@ check("encode_event: tile remove is always position keyed",
   encode.encode_event("-", "t", 1310, nil, 10, 20, nil, nil),
   '{"t":1310,"op":"-","k":"t","x":10,"y":20}')
 
+-- Surface. Anything located by position needs one, or replay cannot tell two
+-- planets apart: positions repeat across surfaces.
+
+check("encode_event: entity add carries its surface",
+  encode.encode_event("+", "e", 1234, "transport-belt", 10.5, 20.5, 4, 8842, nil, nil, "vulcanus"),
+  '{"t":1234,"op":"+","k":"e","s":"vulcanus","n":"transport-belt","x":10.5,"y":20.5,"d":4,"id":8842}')
+
+check("encode_event: position-keyed entity remove carries its surface",
+  encode.encode_event("-", "e", 1250, nil, 10.5, 20.5, nil, nil, nil, nil, "vulcanus"),
+  '{"t":1250,"op":"-","k":"e","s":"vulcanus","x":10.5,"y":20.5}')
+
+check("encode_event: tile add carries its surface",
+  encode.encode_event("+", "t", 1300, "concrete", 10, 20, nil, nil, nil, nil, "fulgora"),
+  '{"t":1300,"op":"+","k":"t","s":"fulgora","n":"concrete","x":10,"y":20}')
+
+check("encode_event: tile remove carries its surface",
+  encode.encode_event("-", "t", 1310, nil, 10, 20, nil, nil, nil, nil, "fulgora"),
+  '{"t":1310,"op":"-","k":"t","s":"fulgora","x":10,"y":20}')
+
+-- unit_number is unique across the whole game, not per surface, so an
+-- id-keyed removal stays the short form with no surface to carry.
+check("encode_event: id-keyed remove omits surface even when one is given",
+  encode.encode_event("-", "e", 1250, nil, nil, nil, nil, 8842, nil, nil, "vulcanus"),
+  '{"t":1250,"op":"-","k":"e","id":8842}')
+
 -- next_capture_segment ---------------------------------------------------------
 
 check("next_capture_segment: normal forward play keeps the segment",

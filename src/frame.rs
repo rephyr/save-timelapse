@@ -1,7 +1,7 @@
 //! The exported frame format written by the mod (see mod/control.lua) and
 //! consumed by the viewer. Kept in the lib so both can share it.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct Frame {
@@ -15,20 +15,22 @@ pub struct Frame {
     pub tiles: Vec<Tile>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Writing mirrors the mod's omissions rather than emitting every field, so
+/// a replayed frame is the same shape and size as an exported one.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct Entity {
     pub n: String,
     pub x: f32,
     pub y: f32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default_direction")]
     pub d: u8,
     /// Tile footprint. Absent in frames captured before footprint export
     /// existed, and omitted by the encoder for the common 1x1 case, so both
     /// default to 1 rather than 0 (plain `#[serde(default)]` would give 0,
     /// which would draw as invisible instead of the single tile it always was).
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_single_tile")]
     pub w: u32,
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_single_tile")]
     pub h: u32,
 }
 
@@ -36,13 +38,47 @@ fn one() -> u32 {
     1
 }
 
+fn is_default_direction(d: &u8) -> bool {
+    *d == 0
+}
+
+fn is_single_tile(n: &u32) -> bool {
+    *n == 1
+}
+
 /// Unlike entities, tiles are corner positioned and integer aligned: a tile
 /// named at (x,y) occupies world space [x,x+1) x [y,y+1).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct Tile {
     pub n: String,
     pub x: i32,
     pub y: i32,
+}
+
+/// Serialisable view of a frame, carrying the `count`/`tile_count` totals the
+/// format documents. Separate from `Frame` because those totals are derived:
+/// making them fields would let them drift from the arrays they describe.
+#[derive(Debug, Serialize)]
+pub struct FrameOut<'a> {
+    pub tick: u64,
+    pub surface: &'a str,
+    pub entities: &'a [Entity],
+    pub count: usize,
+    pub tiles: &'a [Tile],
+    pub tile_count: usize,
+}
+
+impl Frame {
+    pub fn as_out(&self) -> FrameOut<'_> {
+        FrameOut {
+            tick: self.tick,
+            surface: &self.surface,
+            entities: &self.entities,
+            count: self.entities.len(),
+            tiles: &self.tiles,
+            tile_count: self.tiles.len(),
+        }
+    }
 }
 
 #[cfg(test)]

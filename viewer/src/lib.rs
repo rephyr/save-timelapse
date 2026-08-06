@@ -1,6 +1,7 @@
 //! Everything that doesn't touch macroquad's window/input globals, split out
 //! so it's unit testable: `main.rs` is thin glue over this.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,320 @@ use macroquad::math::Vec2;
 use save_timelapse::frame::{Entity, Frame, Tile};
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
+
+/// Dense index into [`TypeRegistry`]. A real base has tens of distinct
+/// prototype names against hundreds of thousands of entities, so the name is
+/// worth storing once and referring to by number everywhere else.
+pub type TypeId = u16;
+
+/// Interns entity/tile prototype names, and resolves each one's color once.
+///
+/// The pre-registry renderer called `color_for` (an FNV hash over the name)
+/// and `sprites.get(&e.n)` (a SipHash over the name) for every entity on
+/// every rendered frame. Both are pure functions of the name, and there are
+/// only ~58 distinct names in the real fixtures, so both collapse into an
+/// array index once names are interned.
+#[derive(Default)]
+pub struct TypeRegistry {
+    names: Vec<String>,
+    ids: HashMap<String, TypeId>,
+    entity_colors: Vec<Color>,
+    tile_colors: Vec<Color>,
+}
+
+impl TypeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Both color variants are precomputed rather than one per registered
+    /// kind: a name is realistically either an entity or a tile type, but
+    /// nothing in the format guarantees it, and two `Color`s per *type* is
+    /// negligible next to one hash per *entity per frame*.
+    pub fn intern(&mut self, name: &str) -> TypeId {
+        if let Some(&id) = self.ids.get(name) {
+            return id;
+        }
+        let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
+        self.names.push(name.to_string());
+        self.entity_colors.push(color_for(name, 0.55, 0.85));
+        self.tile_colors.push(color_for(name, 0.35, 0.5));
+        self.ids.insert(name.to_string(), id);
+        id
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn name(&self, id: TypeId) -> &str {
+        &self.names[id as usize]
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn entity_color(&self, id: TypeId) -> Color {
+        self.entity_colors[id as usize]
+    }
+
+    pub fn tile_color(&self, id: TypeId) -> Color {
+        self.tile_colors[id as usize]
+    }
+}
+
+/// A contiguous span of one type within a [`RenderFrame`]'s entity or tile
+/// array. Draws iterate runs rather than individual items, so the texture is
+/// bound once per type instead of being re-decided per entity -- which is
+/// what keeps macroquad from breaking the batch. See [`DrawCallCounter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub type_id: TypeId,
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Run {
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
+}
+
+/// An entity stripped to what drawing actually reads. The name is gone (the
+/// enclosing [`Run`] carries it), so this is 12 bytes against roughly 80 for
+/// a `frame::Entity` -- 48 for the struct plus a heap allocation for a name
+/// that was one of a few dozen repeated strings.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderEntity {
+    pub x: f32,
+    pub y: f32,
+    /// Tile footprint, saturated into a byte: the format allows u32, but
+    /// Factorio's largest prototypes are far under 255 tiles across.
+    pub w: u8,
+    pub h: u8,
+    /// Unused by the current flat-sprite drawing, kept because it costs
+    /// nothing here (it lands in existing padding) and rotation-aware
+    /// sprites would otherwise need a reload to recover it.
+    pub d: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RenderTile {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A frame in the layout the renderer wants: items grouped into contiguous
+/// per-type runs, names interned away, dense and copyable.
+pub struct RenderFrame {
+    pub tick: u64,
+    pub count: usize,
+    pub entities: Vec<RenderEntity>,
+    pub entity_runs: Vec<Run>,
+    pub tiles: Vec<RenderTile>,
+    pub tile_runs: Vec<Run>,
+}
+
+/// Group `items` by type into contiguous runs, by counting sort.
+///
+/// Counting sort rather than `sort_by_key` because this is O(n) with one
+/// pass to count and one to scatter, needs no comparisons, and avoids the
+/// temporary `Vec<(TypeId, T)>` that sorting in place would require -- which
+/// at megabase entity counts is the difference between a brief allocation
+/// spike and none.
+fn group_by_type<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
+    let mut counts = vec![0u32; type_count + 1];
+    for &id in ids {
+        counts[id as usize + 1] += 1;
+    }
+    for i in 1..counts.len() {
+        counts[i] += counts[i - 1];
+    }
+
+    let runs: Vec<Run> = (0..type_count)
+        .filter(|&t| counts[t + 1] > counts[t])
+        .map(|t| Run { type_id: t as TypeId, start: counts[t], end: counts[t + 1] })
+        .collect();
+
+    let mut cursors = counts;
+    let mut grouped = vec![T::default(); items.len()];
+    for (&id, &item) in ids.iter().zip(items) {
+        let slot = &mut cursors[id as usize];
+        grouped[*slot as usize] = item;
+        *slot += 1;
+    }
+
+    (grouped, runs)
+}
+
+impl RenderFrame {
+    /// Consumes the parsed frame: keeping both representations alive would
+    /// defeat the point, since the `frame::Frame` is the expensive one.
+    pub fn from_frame(frame: Frame, registry: &mut TypeRegistry) -> RenderFrame {
+        let entity_ids: Vec<TypeId> = frame.entities.iter().map(|e| registry.intern(&e.n)).collect();
+        let entities: Vec<RenderEntity> = frame
+            .entities
+            .iter()
+            .map(|e| RenderEntity {
+                x: e.x,
+                y: e.y,
+                w: e.w.clamp(1, u8::MAX as u32) as u8,
+                h: e.h.clamp(1, u8::MAX as u32) as u8,
+                d: e.d,
+            })
+            .collect();
+
+        let tile_ids: Vec<TypeId> = frame.tiles.iter().map(|t| registry.intern(&t.n)).collect();
+        let tiles: Vec<RenderTile> = frame.tiles.iter().map(|t| RenderTile { x: t.x, y: t.y }).collect();
+
+        let type_count = registry.len();
+        let (entities, entity_runs) = group_by_type(&entity_ids, &entities, type_count);
+        let (tiles, tile_runs) = group_by_type(&tile_ids, &tiles, type_count);
+
+        RenderFrame { tick: frame.tick, count: frame.count, entities, entity_runs, tiles, tile_runs }
+    }
+}
+
+/// Mirrors macroquad 0.4's batching rule so the viewer can report the draw
+/// calls it actually costs.
+///
+/// `quad_gl.rs::geometry` merges new geometry only into the *immediately
+/// preceding* draw call, and starts a fresh one when the bound texture
+/// differs or the index buffer would overflow. macroquad's own
+/// `telemetry::drawcalls` can't be used for a running count: `track_drawcall`
+/// allocates a 128x128 render texture per call, so counting thousands of them
+/// would cost more than the thing being measured.
+pub struct DrawCallCounter {
+    max_indices: usize,
+    current: Option<TypeId>,
+    started: bool,
+    indices: usize,
+    pub calls: usize,
+    pub quads: usize,
+}
+
+impl DrawCallCounter {
+    pub const INDICES_PER_QUAD: usize = 6;
+
+    pub fn new(max_indices: usize) -> Self {
+        DrawCallCounter {
+            max_indices,
+            current: None,
+            started: false,
+            indices: 0,
+            calls: 0,
+            quads: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current = None;
+        self.started = false;
+        self.indices = 0;
+        self.calls = 0;
+        self.quads = 0;
+    }
+
+    /// Record one quad bound to `texture` (`None` for an untextured rect,
+    /// which macroquad treats as its own distinct texture state).
+    pub fn quad(&mut self, texture: Option<TypeId>) {
+        let would_overflow = self.indices + Self::INDICES_PER_QUAD > self.max_indices;
+        if !self.started || self.current != texture || would_overflow {
+            self.calls += 1;
+            self.indices = 0;
+            self.current = texture;
+            self.started = true;
+        }
+        self.indices += Self::INDICES_PER_QUAD;
+        self.quads += 1;
+    }
+
+    /// Record `n` consecutive quads sharing one texture -- the batched case,
+    /// without looping per quad.
+    pub fn quads(&mut self, texture: Option<TypeId>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.quad(texture);
+        let remaining = n - 1;
+        let per_call = self.max_indices / Self::INDICES_PER_QUAD;
+        let room = per_call - self.indices / Self::INDICES_PER_QUAD;
+        let after_fill = remaining.saturating_sub(room);
+        self.calls += after_fill.div_ceil(per_call);
+        self.indices = if after_fill == 0 {
+            self.indices + remaining * Self::INDICES_PER_QUAD
+        } else {
+            let tail = after_fill % per_call;
+            let quads_in_last = if tail == 0 { per_call } else { tail };
+            quads_in_last * Self::INDICES_PER_QUAD
+        };
+        self.quads += remaining;
+    }
+}
+
+/// Progress through the startup load, for the on-screen bar.
+///
+/// Loading is blocking work in front of a window that is already open, so
+/// without this the viewer shows an empty frame for as long as it takes to
+/// parse every frame file and load every sprite -- which on a real save set
+/// is many seconds with no indication anything is happening.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadProgress {
+    pub phase: &'static str,
+    pub detail: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl LoadProgress {
+    pub fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Geometry for the loading bar. Split from drawing for the same reason as
+/// [`Timeline`]: this part is testable, macroquad calls are not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProgressBar {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl ProgressBar {
+    pub const HEIGHT: f32 = 18.0;
+
+    pub fn centered(screen_width: f32, screen_height: f32) -> Self {
+        let width = (screen_width * 0.5).max(1.0);
+        ProgressBar {
+            left: (screen_width - width) / 2.0,
+            top: screen_height / 2.0 - Self::HEIGHT / 2.0,
+            width,
+            height: Self::HEIGHT,
+        }
+    }
+
+    pub fn filled_width(&self, progress: &LoadProgress) -> f32 {
+        self.width * progress.fraction()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Camera {
@@ -35,7 +350,7 @@ impl Camera {
     /// through a growing base doesn't jump-recenter every step. Real bases
     /// are almost never near world origin, so an empty/degenerate input
     /// falls back to a sane default rather than opening on empty space.
-    pub fn fit_frames(frames: &[Frame], screen_width: f32, screen_height: f32) -> Camera {
+    pub fn fit_frames(frames: &[RenderFrame], screen_width: f32, screen_height: f32) -> Camera {
         // Each entity contributes its two footprint corners, not just its
         // center point -- for a small cluster of large buildings, ignoring
         // footprint here would zoom in as if they were 1x1, and a real
@@ -88,6 +403,10 @@ pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
         .iter()
         .map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png")))
         .collect()
+}
+
+pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
+    icon_candidates(data_dir, name).into_iter().find(|candidate| candidate.exists())
 }
 
 /// A horizontal scrub bar, centered near the bottom of the window, mapping
@@ -212,23 +531,23 @@ pub fn synthetic_tiles(count: usize) -> Vec<Tile> {
 /// construction from zero frames is rejected rather than leaving every
 /// accessor to guard against it.
 pub struct FrameSequence {
-    frames: Vec<Frame>,
+    frames: Vec<RenderFrame>,
     index: usize,
 }
 
 impl FrameSequence {
-    pub fn new(frames: Vec<Frame>) -> Option<Self> {
+    pub fn new(frames: Vec<RenderFrame>) -> Option<Self> {
         if frames.is_empty() {
             return None;
         }
         Some(Self { frames, index: 0 })
     }
 
-    pub fn current(&self) -> &Frame {
+    pub fn current(&self) -> &RenderFrame {
         &self.frames[self.index]
     }
 
-    pub fn frames(&self) -> &[Frame] {
+    pub fn frames(&self) -> &[RenderFrame] {
         &self.frames
     }
 
@@ -261,37 +580,106 @@ impl FrameSequence {
 /// A directory of `frame_*.json` (sorted by filename -- matches the CLI's
 /// own zero-padded `frame_NNNN.json` output, so plain lexicographic sort is
 /// enough) or a single frame file.
-pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
-    let paths: Vec<std::path::PathBuf> = if path.is_dir() {
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(path)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().and_then(|e| e.to_str()) == Some("json")
-                    && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("frame_"))
-            })
-            .collect();
-        entries.sort();
-        entries
-    } else {
-        vec![path.to_path_buf()]
-    };
+fn frame_is_candidate(path: &Path) -> bool {
+    // Extension first. Live capture writes a `frame_<tick>_<surface>.json.done`
+    // marker beside each finished snapshot, and its *stem* is
+    // `frame_<tick>_<surface>.json` -- which passes every check below, so
+    // without this the viewer treats every marker as a frame and warns about
+    // failing to parse an empty file.
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        return false
+    }
 
-    paths
-        .into_iter()
-        .map(|p| {
-            let text = std::fs::read_to_string(&p)?;
-            serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        })
-        .collect()
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+    if !stem.starts_with("frame_") {
+        return false
+    }
+
+    let rest = &stem[6..];
+    let mut parts = rest.splitn(2, '_');
+    let tick_part = parts.next().unwrap_or("");
+    let surface_part = parts.next().unwrap_or("");
+
+    if surface_part == "manifest" {
+        return false
+    }
+
+    tick_part.parse::<u64>().is_ok()
+}
+
+/// The frame files a path refers to, in order. Enumerating separately from
+/// parsing is what lets the caller show a bar with a real total instead of an
+/// indeterminate spinner.
+pub fn frame_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| frame_is_candidate(p))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// Parse one frame file, or warn and yield `None`. A snapshot being written
+/// incrementally by the mod is a half-file until it is finished, so an
+/// unparseable frame is an expected transient rather than an error.
+pub fn load_frame(path: &Path) -> Option<Frame> {
+    if !path.exists() {
+        return None;
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("warning: skipping unreadable frame {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(frame) => Some(frame),
+        Err(e) => {
+            eprintln!("warning: skipping invalid frame {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
+    let frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
+
+    if frames.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no valid frame files found"));
+    }
+
+    Ok(frames)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile;
 
-    fn sample_frame(tick: u64) -> Frame {
-        Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() }
+    fn sample_frame(tick: u64) -> RenderFrame {
+        render(Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles: Vec::new(),
+        })
+    }
+
+    fn render(frame: Frame) -> RenderFrame {
+        RenderFrame::from_frame(frame, &mut TypeRegistry::new())
+    }
+
+    fn entity(n: &str, x: f32, y: f32) -> Entity {
+        Entity { n: n.to_string(), x, y, d: 0, w: 1, h: 1 }
     }
 
     #[test]
@@ -305,30 +693,54 @@ mod tests {
 
     #[test]
     fn fit_frames_centers_on_the_bounding_box() {
-        let frame = Frame {
+        let frame = render(Frame {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 2,
-            entities: vec![
-                Entity { n: "a".to_string(), x: 0.0, y: 0.0, d: 0, w: 1, h: 1 },
-                Entity { n: "b".to_string(), x: 10.0, y: 10.0, d: 0, w: 1, h: 1 },
-            ],
+            entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
             tiles: Vec::new(),
-        };
+        });
         let camera = Camera::fit_frames(std::slice::from_ref(&frame), 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::new(5.0, 5.0));
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
     }
 
     #[test]
+    fn icon_path_prefers_the_first_existing_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_icon_dir = dir.path().join("base").join("graphics/icons");
+        let space_age_icon_dir = dir.path().join("space-age").join("graphics/icons");
+        std::fs::create_dir_all(&base_icon_dir).unwrap();
+        std::fs::create_dir_all(&space_age_icon_dir).unwrap();
+        std::fs::write(base_icon_dir.join("stone-furnace.png"), b"icon").unwrap();
+        std::fs::write(space_age_icon_dir.join("stone-furnace.png"), b"other").unwrap();
+
+        let path = icon_path(dir.path(), "stone-furnace").unwrap();
+        assert_eq!(path, base_icon_dir.join("stone-furnace.png"));
+    }
+
+    #[test]
+    fn load_sequence_skips_invalid_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("frame_0000.json");
+        let invalid = dir.path().join("frame_0001.json");
+        std::fs::write(&valid, r#"{"tick":0,"surface":"nauvis","entities":[],"count":0,"tiles":[],"tile_count":0}"#).unwrap();
+        std::fs::write(&invalid, "{\"unfinished\":true").unwrap();
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 0);
+    }
+
+    #[test]
     fn fit_frames_handles_a_single_point_without_dividing_by_zero() {
-        let frame = Frame {
+        let frame = render(Frame {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 1,
-            entities: vec![Entity { n: "a".to_string(), x: 3.0, y: 3.0, d: 0, w: 1, h: 1 }],
+            entities: vec![entity("a", 3.0, 3.0)],
             tiles: Vec::new(),
-        };
+        });
         let camera = Camera::fit_frames(std::slice::from_ref(&frame), 800.0, 600.0);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
     }
@@ -468,5 +880,234 @@ mod tests {
         assert_eq!(frames.len(), 5);
         let ticks: Vec<u64> = frames.iter().map(|f| f.tick).collect();
         assert!(ticks.windows(2).all(|w| w[0] < w[1]), "expected strictly increasing ticks, got {ticks:?}");
+    }
+
+    /// Live capture writes these beside every finished snapshot. Their stem
+    /// ends in `.json`, so they look exactly like a frame to a stem-only
+    /// check -- and being empty, each one would produce a parse warning.
+    #[test]
+    fn done_markers_and_event_logs_are_not_mistaken_for_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("frame_22630009_nauvis.json");
+        std::fs::write(&frame, r#"{"tick":22630009,"surface":"nauvis","entities":[],"count":0}"#).unwrap();
+        std::fs::write(dir.path().join("frame_22630009_nauvis.json.done"), "").unwrap();
+        std::fs::write(dir.path().join("frame_22630009_manifest.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("events_22630009.jsonl"), "").unwrap();
+
+        assert_eq!(frame_paths(dir.path()).unwrap(), vec![frame]);
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 22630009);
+    }
+
+    #[test]
+    fn registry_interns_repeated_names_to_one_id() {
+        let mut registry = TypeRegistry::new();
+        let belt = registry.intern("transport-belt");
+        let pipe = registry.intern("pipe");
+        assert_eq!(registry.intern("transport-belt"), belt);
+        assert_ne!(belt, pipe);
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.name(belt), "transport-belt");
+    }
+
+    /// The registry has to agree with the function it replaces, or interning
+    /// would silently recolor every entity in the viewer.
+    #[test]
+    fn registry_colors_match_the_underlying_hash() {
+        let mut registry = TypeRegistry::new();
+        let id = registry.intern("assembling-machine-1");
+        let entity = color_for("assembling-machine-1", 0.55, 0.85);
+        let tile = color_for("assembling-machine-1", 0.35, 0.5);
+        assert_eq!(
+            (registry.entity_color(id).r, registry.entity_color(id).g, registry.entity_color(id).b),
+            (entity.r, entity.g, entity.b)
+        );
+        assert_eq!(
+            (registry.tile_color(id).r, registry.tile_color(id).g, registry.tile_color(id).b),
+            (tile.r, tile.g, tile.b)
+        );
+    }
+
+    #[test]
+    fn render_frame_groups_entities_into_contiguous_runs_per_type() {
+        let mut registry = TypeRegistry::new();
+        let frame = Frame {
+            tick: 7,
+            surface: "nauvis".to_string(),
+            count: 5,
+            // Deliberately interleaved, the order a real export produces.
+            entities: vec![
+                entity("belt", 0.0, 0.0),
+                entity("pipe", 1.0, 0.0),
+                entity("belt", 2.0, 0.0),
+                entity("pole", 3.0, 0.0),
+                entity("pipe", 4.0, 0.0),
+            ],
+            tiles: Vec::new(),
+        };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+
+        assert_eq!(rendered.entities.len(), 5);
+        assert_eq!(rendered.entity_runs.len(), 3, "one run per distinct type");
+        assert_eq!(rendered.entity_runs.iter().map(Run::len).sum::<usize>(), 5);
+
+        // Runs must tile the array end to end with no gap or overlap.
+        let mut cursor = 0;
+        for run in &rendered.entity_runs {
+            assert_eq!(run.start as usize, cursor, "runs must be contiguous");
+            cursor = run.end as usize;
+        }
+        assert_eq!(cursor, 5);
+
+        // Every item inside a run really is that type: the belts sit
+        // together, and they kept their positions through the regrouping.
+        let belt = registry.intern("belt");
+        let belt_run = rendered.entity_runs.iter().find(|r| r.type_id == belt).unwrap();
+        let xs: Vec<f32> = rendered.entities[belt_run.range()].iter().map(|e| e.x).collect();
+        assert_eq!(xs, vec![0.0, 2.0]);
+    }
+
+    #[test]
+    fn render_frame_groups_tiles_and_preserves_coordinates() {
+        let mut registry = TypeRegistry::new();
+        let frame = Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles: vec![
+                Tile { n: "concrete".to_string(), x: -5, y: 1 },
+                Tile { n: "stone-path".to_string(), x: 2, y: 2 },
+                Tile { n: "concrete".to_string(), x: -6, y: 3 },
+            ],
+        };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+        assert_eq!(rendered.tile_runs.len(), 2);
+
+        let concrete = registry.intern("concrete");
+        let run = rendered.tile_runs.iter().find(|r| r.type_id == concrete).unwrap();
+        let mut coords: Vec<(i32, i32)> = rendered.tiles[run.range()].iter().map(|t| (t.x, t.y)).collect();
+        coords.sort();
+        assert_eq!(coords, vec![(-6, 3), (-5, 1)]);
+    }
+
+    #[test]
+    fn render_frame_saturates_oversized_footprints_into_a_byte() {
+        let mut registry = TypeRegistry::new();
+        let frame = Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 1,
+            entities: vec![Entity { n: "huge".to_string(), x: 0.0, y: 0.0, d: 0, w: 100_000, h: 0 }],
+            tiles: Vec::new(),
+        };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+        assert_eq!(rendered.entities[0].w, u8::MAX);
+        assert_eq!(rendered.entities[0].h, 1, "a zero footprint must not become invisible");
+    }
+
+    /// The whole point of grouping: one texture switch per type instead of
+    /// one per entity. macroquad only merges into the immediately preceding
+    /// draw call, so interleaved types cost a draw call each.
+    #[test]
+    fn grouping_collapses_draw_calls_against_interleaved_order() {
+        let types: Vec<TypeId> = (0..600).map(|i| (i % 3) as TypeId).collect();
+        let huge_buffer = usize::MAX / 2;
+
+        let mut interleaved = DrawCallCounter::new(huge_buffer);
+        for &t in &types {
+            interleaved.quad(Some(t));
+        }
+        assert_eq!(interleaved.calls, 600, "every switch starts a new draw call");
+
+        let mut grouped = DrawCallCounter::new(huge_buffer);
+        let mut sorted = types.clone();
+        sorted.sort();
+        for &t in &sorted {
+            grouped.quad(Some(t));
+        }
+        assert_eq!(grouped.calls, 3, "one per distinct type");
+    }
+
+    /// Untextured rects are their own texture state, so interleaving shapes
+    /// and sprites breaks the batch exactly like two different sprites do.
+    #[test]
+    fn untextured_quads_break_the_batch_like_a_texture_change() {
+        let mut counter = DrawCallCounter::new(usize::MAX / 2);
+        counter.quad(Some(0));
+        counter.quad(None);
+        counter.quad(Some(0));
+        assert_eq!(counter.calls, 3);
+    }
+
+    /// Even perfectly grouped, macroquad's index buffer caps a draw call at
+    /// `max_indices / 6` quads -- the ceiling that made raising the capacity
+    /// worth doing alongside the sorting.
+    #[test]
+    fn a_full_index_buffer_splits_one_texture_across_draw_calls() {
+        let max_indices = 5000; // macroquad's default
+        let per_call = max_indices / DrawCallCounter::INDICES_PER_QUAD; // 833
+        let mut counter = DrawCallCounter::new(max_indices);
+        for _ in 0..per_call * 2 {
+            counter.quad(Some(0));
+        }
+        assert_eq!(counter.calls, 2);
+
+        counter.quad(Some(0));
+        assert_eq!(counter.calls, 3, "one past a full buffer starts another call");
+    }
+
+    /// The bulk helper is only useful if it counts identically to the
+    /// per-quad path it replaces, across buffer boundaries.
+    #[test]
+    fn bulk_quads_match_counting_one_at_a_time() {
+        for n in [0usize, 1, 5, 832, 833, 834, 1666, 1667, 5000] {
+            let mut one_by_one = DrawCallCounter::new(5000);
+            for _ in 0..n {
+                one_by_one.quad(Some(1));
+            }
+            let mut bulk = DrawCallCounter::new(5000);
+            bulk.quads(Some(1), n);
+            assert_eq!(bulk.calls, one_by_one.calls, "calls for n={n}");
+            assert_eq!(bulk.quads, one_by_one.quads, "quads for n={n}");
+        }
+    }
+
+    #[test]
+    fn bulk_quads_then_a_switch_still_counts_the_switch() {
+        let mut counter = DrawCallCounter::new(5000);
+        counter.quads(Some(1), 10);
+        counter.quads(Some(2), 10);
+        counter.quads(Some(1), 10);
+        assert_eq!(counter.calls, 3);
+        assert_eq!(counter.quads, 30);
+    }
+
+    #[test]
+    fn load_progress_fraction_is_bounded_and_safe_at_zero_total() {
+        let at = |done, total| LoadProgress {
+            phase: "frames",
+            detail: String::new(),
+            done,
+            total,
+        }
+        .fraction();
+        assert_eq!(at(0, 0), 0.0, "an empty job must not divide by zero");
+        assert_eq!(at(0, 4), 0.0);
+        assert_eq!(at(2, 4), 0.5);
+        assert_eq!(at(4, 4), 1.0);
+        assert_eq!(at(9, 4), 1.0, "overshoot clamps rather than overflowing the bar");
+    }
+
+    #[test]
+    fn progress_bar_is_centered_and_fills_proportionally() {
+        let bar = ProgressBar::centered(1000.0, 600.0);
+        assert_eq!(bar.left + bar.width / 2.0, 500.0);
+        assert_eq!(bar.top + bar.height / 2.0, 300.0);
+
+        let half = LoadProgress { phase: "frames", detail: String::new(), done: 1, total: 2 };
+        assert_eq!(bar.filled_width(&half), bar.width / 2.0);
     }
 }

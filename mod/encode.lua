@@ -69,7 +69,14 @@ end
 --- only option for tiles, which have no identity beyond their position.
 --- `w`/`h` (entity footprint, add events only) follow the same omit-at-1x1
 --- convention as encode_entity.
-function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h)
+---
+--- `surface` (`"s"`) is what lets replay route an event to the right world.
+--- Without it, a Space Age save's planets and platforms all collapse into one
+--- coordinate space, since positions only repeat across surfaces. It is
+--- emitted on anything located by position, and omitted when `id` alone
+--- identifies the target: unit_number is unique across the whole game, not
+--- per surface, so a removal keyed by id needs no surface to find it.
+function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h, surface)
   if op == "-" and id then
     return string.format('{"t":%d,"op":"-","k":%s,"id":%d}', tick, M.quote(kind), id)
   end
@@ -77,6 +84,9 @@ function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h)
   local coord_fmt = kind == "t" and '"x":%d,"y":%d' or '"x":%.1f,"y":%.1f'
   local fields = string.format('{"t":%d,"op":%s,"k":%s,', tick, M.quote(op), M.quote(kind))
 
+  if surface then
+    fields = fields .. '"s":' .. M.quote(surface) .. ","
+  end
   if name then
     fields = fields .. '"n":' .. M.quote(name) .. ","
   end
