@@ -1,0 +1,11 @@
+{
+  "name": "save-timelapse",
+  "version": "0.1.0",
+  "title": "Save Timelapse",
+  "author": "Emilia Sipola",
+  "contact": "",
+  "homepage": "",
+  "factorio_version": "2.0",
+  "description": "Turn the save files you already have into a timelapse of your factory. No need to have had a mod installed while you played - point the tool at your saves folder and it reconstructs the growth of your base.",
+  "dependencies": ["base >= 2.0.0"]
+}
