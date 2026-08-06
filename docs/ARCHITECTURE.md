@@ -88,15 +88,27 @@ from `factorio.exe --version`.
       "tick": 22630009,
       "surface": "nauvis",
       "entities": [ {"n": "transport-belt", "x": -80.5, "y": 28.5, "d": 4} ],
-      "count": 517934
+      "count": 517934,
+      "tiles": [ {"n": "concrete", "x": -80, "y": 28} ],
+      "tile_count": 812004
     }
 
 Keys are shortened because entity count dominates file size. `d` is omitted
 when direction is zero. Coordinates are fixed to one decimal, matching
 Factorio's half-tile entity alignment.
 
+`tiles` covers placed floor (concrete, stone path, hazard/refined concrete
+variants, landfill) — a short, stable include list, the opposite of entity
+filtering's exclude list, since natural terrain vastly outnumbers placed
+floor types. Tile positions are integers: a tile named at `(x, y)` occupies
+world space `[x, x+1) x [y, y+1)`, corner rather than center anchored like
+entities. `tiles` is absent from frames captured before tile export existed;
+readers should treat a missing `tiles`/`tile_count` as empty rather than
+requiring it.
+
 A surface is exported when it is nauvis or contains at least one entity owned
-by the player force. A manifest listing exported surfaces accompanies each set.
+by the player force. A manifest listing exported surfaces accompanies each set,
+and now also reports the tile total alongside the entity total.
 
 ## Entity filtering
 

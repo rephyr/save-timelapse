@@ -1,10 +1,15 @@
--- Both settings are startup scope deliberately.
+-- The first two settings are startup scope deliberately.
 --
 -- Factorio stores runtime-global setting values inside each save file, and a
 -- loaded save restores its own stored values in preference to mod-settings.dat.
 -- An external tool therefore cannot set a runtime-global flag for an existing
 -- save. Startup values are read from mod-settings.dat regardless of the save,
 -- which is what makes unattended export possible.
+--
+-- Live capture is the opposite case: it's the player choosing to record
+-- during an active session, not the CLI forcing a flag on an existing save,
+-- so it belongs as an ordinary runtime setting -- changeable live from the
+-- in-game settings menu, the normal reason runtime settings exist.
 
 data:extend({
   {
@@ -22,5 +27,12 @@ data:extend({
     setting_type = "startup",
     default_value = false,
     order = "b",
+  },
+  {
+    type = "bool-setting",
+    name = "save-timelapse-live-capture",
+    setting_type = "runtime-global",
+    default_value = false,
+    order = "c",
   },
 })

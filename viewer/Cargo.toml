@@ -1,0 +1,13 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Milestone 1 spike: pan/zoom viewer for a single save-timelapse frame"
+
+[dependencies]
+save-timelapse = { path = ".." }
+macroquad = "0.4"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
