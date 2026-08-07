@@ -6,6 +6,7 @@ pub mod export;
 pub mod frame;
 pub mod locate;
 pub mod names;
+pub mod player_log;
 pub mod replay;
 pub mod settings_dat;
 pub mod wire;

@@ -66,6 +66,7 @@ fn config_for(root: &Path) -> ExportConfig {
         user_mods: user_mods(root),
         mod_source: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod"),
         include_resources: false,
+        capture_terrain: false,
     }
 }
 

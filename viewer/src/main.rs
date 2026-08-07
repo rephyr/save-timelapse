@@ -12,9 +12,9 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    entity_footprint_size, icon_path, icon_source_rect, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, ProgressBar, RenderFrame,
-    Timeline, TypeRegistry, LOD_CELL_TILES,
+    color_for, entity_footprint_size, icon_path, icon_source_rect, synthetic_frame, synthetic_tiles,
+    use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, PlayerTrack, ProgressBar,
+    RenderFrame, Timeline, TypeRegistry, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -345,6 +345,18 @@ async fn main() {
     let mut registry = TypeRegistry::new();
     let loaded = load_frames(&args, &mut registry).await;
 
+    // Absent entirely (an older capture, or nobody was connected during
+    // capture) is normal, not an error -- no markers drawn, nothing else
+    // affected.
+    let players = args
+        .path
+        .as_deref()
+        .map(|p| std::path::Path::new(p).join("players.jsonl"))
+        .filter(|p| p.exists())
+        .and_then(|p| save_timelapse::player_log::read_jsonl(&p).ok())
+        .unwrap_or_default();
+    let player_track = PlayerTrack::new(players);
+
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
         Some(dir) => println!("factorio data: {}", dir.display()),
@@ -658,6 +670,18 @@ async fn main() {
             }
         }
         draw_circle(playhead_x, timeline.y, 7.0, WHITE);
+
+        // Where the player(s) were as of the currently displayed tick, on
+        // whichever world/surface is active -- looked up fresh each draw
+        // rather than cached on the frame, since it's a cheap scan over a
+        // tiny sample count (see PlayerTrack).
+        for (name, x, y) in player_track.positions_at(world_name, sequence.current().tick) {
+            let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
+            let color = color_for(name, 0.7, 0.95);
+            draw_circle(screen.x, screen.y, 9.0, Color::new(0.0, 0.0, 0.0, 0.6));
+            draw_circle(screen.x, screen.y, 6.0, color);
+            draw_text(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
+        }
 
         next_frame().await;
     }

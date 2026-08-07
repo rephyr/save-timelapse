@@ -19,6 +19,11 @@ local encode = require("encode")
 
 local EXPORT_DIR = "save-timelapse/"
 local FLUSH_EVERY = 2000
+--- How far past the entities/placed-floor bounding box to also capture
+--- natural terrain, so the factory reads as sitting on real ground rather
+--- than stopping at a hard edge. Roughly a chunk; not exposed as a setting
+--- since nothing has asked for this to be tunable yet.
+local TERRAIN_MARGIN_TILES = 32
 
 --- Set at load when the CLI's startup flag is on, and acted on by the single
 --- on_tick handler at the bottom of this file rather than by registering one
@@ -27,13 +32,22 @@ local FLUSH_EVERY = 2000
 --- wanting on_tick would do.
 local headless_scan_pending = false
 
+--- Trees and cliffs are excluded here, on top of `encode.EXCLUDED_TYPES`'s
+--- always-excluded set, when terrain capture is off -- one setting
+--- controlling all of it (them plus the natural-ground tile pass further
+--- down) rather than scatter entities always showing regardless of the
+--- toggle someone just turned off because of its cost.
 local function excluded_types()
-  if settings.startup["save-timelapse-include-resources"].value then
-    return encode.EXCLUDED_TYPES
-  end
-  local list = { "resource" }
+  local list = {}
   for _, t in pairs(encode.EXCLUDED_TYPES) do
     list[#list + 1] = t
+  end
+  if not settings.startup["save-timelapse-include-resources"].value then
+    list[#list + 1] = "resource"
+  end
+  if not settings.startup["save-timelapse-capture-terrain"].value then
+    list[#list + 1] = "tree"
+    list[#list + 1] = "cliff"
   end
   return list
 end
@@ -63,6 +77,11 @@ local function export_surface(surface, tick, session_id)
   local checksum = encode.checksum_init()
   checksum = checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
 
+  -- Grown as entities and placed floor below are scanned, so the terrain
+  -- pass after them knows what area to cover without a separate scan of
+  -- the whole surface just to learn its extent.
+  local bbox = encode.new_bbox()
+
   local pending, pending_count, written = {}, 0, 0
 
   for _, entity in pairs(surface.find_entities_filtered({
@@ -73,6 +92,7 @@ local function export_surface(surface, tick, session_id)
       pending_count = pending_count + 1
       written = written + 1
       pending[pending_count] = encode.frame_entity_record(dict, entity)
+      encode.grow_bbox(bbox, entity.position.x, entity.position.y)
 
       -- Each write_file call is a separate file append, so flushing per entity
       -- would make export time track syscalls rather than entity count.
@@ -96,6 +116,7 @@ local function export_surface(surface, tick, session_id)
     pending_count = pending_count + 1
     tiles_written = tiles_written + 1
     pending[pending_count] = encode.frame_tile_record(dict, tile)
+    encode.grow_bbox(bbox, tile.position.x, tile.position.y)
 
     if pending_count >= FLUSH_EVERY then
       checksum = checksummed_write(path, table.concat(pending), true, checksum)
@@ -105,6 +126,37 @@ local function export_surface(surface, tick, session_id)
 
   if pending_count > 0 then
     checksum = checksummed_write(path, table.concat(pending), true, checksum)
+  end
+
+  -- Natural terrain (grass, water, sand, ...) covers every generated tile,
+  -- not just where the player built, so it is capped to a margin around
+  -- the factory rather than the whole surface -- otherwise it would dwarf
+  -- everything else exported here. Off by default (see settings.lua): it
+  -- roughly 5x'd export size and time in testing, so opting in is a real
+  -- decision, not a free improvement. `nil` when nothing was seen above
+  -- (an untouched surface has no factory to show context around) also
+  -- skips it, same as the setting being off.
+  local terrain_area = settings.startup["save-timelapse-capture-terrain"].value
+    and encode.expand_bbox(bbox, TERRAIN_MARGIN_TILES)
+  if terrain_area then
+    for _, tile in pairs(surface.find_tiles_filtered({
+      area = terrain_area,
+      name = encode.PLACED_FLOOR_TILES,
+      invert = true,
+    })) do
+      pending_count = pending_count + 1
+      tiles_written = tiles_written + 1
+      pending[pending_count] = encode.frame_tile_record(dict, tile)
+
+      if pending_count >= FLUSH_EVERY then
+        checksum = checksummed_write(path, table.concat(pending), true, checksum)
+        pending, pending_count = {}, 0
+      end
+    end
+
+    if pending_count > 0 then
+      checksum = checksummed_write(path, table.concat(pending), true, checksum)
+    end
   end
 
   -- Not itself folded into the checksum: nothing needs a checksum of the
@@ -132,12 +184,75 @@ local function periodic_manifest_path(tick)
   return string.format("%sframe_%d_manifest.json", EXPORT_DIR, tick)
 end
 
+-- ---------------------------------------------------------------------------
+-- Player position tracking
+--
+-- A separate, deliberately simple newline-delimited JSON log (not the
+-- binary formats above): a sample happens at most once every several
+-- seconds by design, nowhere near the per-tick construction volume that
+-- actually justified going binary for frames and events, so there is
+-- nothing here for a text format's formatting/parsing cost to be a problem
+-- for. The same shape is both what this mod writes and what the viewer
+-- reads (see src/player_log.rs) -- save-timelapse.exe just relocates the
+-- file into its output directory, no conversion step.
+
+--- Untagged for /timelapse-export and headless scan, tagged by session_id
+--- for live capture, exactly like `baseline_manifest_path`.
+local function player_log_path(session_id)
+  if not session_id then
+    return EXPORT_DIR .. "players.jsonl"
+  end
+  return EXPORT_DIR .. encode.player_log_name(session_id)
+end
+
+--- Periodic, for live capture: only players actually connected right now.
+--- Wrapped in `pcall` per player, the same defensive style as
+--- `compute_session_id`/`is_inhabited`: a player with no valid position
+--- right now (e.g. true spectator state) is skipped rather than raising.
+local function sample_connected_players(tick, session_id)
+  local players = {}
+  for _, player in pairs(game.connected_players) do
+    local ok, name, surface, x, y = pcall(function()
+      return player.name, player.surface.name, player.position.x, player.position.y
+    end)
+    if ok then
+      players[#players + 1] = { name = name, surface = surface, x = x, y = y }
+    end
+  end
+  if #players > 0 then
+    helpers.write_file(player_log_path(session_id), encode.player_log_line(tick, players), true)
+  end
+end
+
+--- One-shot, for /timelapse-export, headless scan, and the baseline: reads
+--- every player who has ever played this save via `game.players`, not
+--- `game.connected_players`, which would just be empty in headless mode
+--- (nobody is technically "connected" to run a benchmark). A player whose
+--- character does not currently exist (never spawned, or dead) is skipped.
+local function sample_all_players(tick, session_id)
+  local players = {}
+  for _, player in pairs(game.players) do
+    local ok, name, surface, x, y = pcall(function()
+      return player.name, player.character.surface.name, player.character.position.x, player.character.position.y
+    end)
+    if ok then
+      players[#players + 1] = { name = name, surface = surface, x = x, y = y }
+    end
+  end
+  if #players > 0 then
+    helpers.write_file(player_log_path(session_id), encode.player_log_line(tick, players), true)
+  end
+end
+
 --- Every surface, synchronously, in whatever tick this is called from. Used
 --- for /timelapse-export, headless scan, and the once-per-save baseline,
 --- three callers wanting the exact same "everything, right now" export,
 --- differing only in what manifest path names the result and, for the
---- baseline, in tagging its output with the playthrough's session_id.
+--- baseline, in tagging its output with the playthrough's session_id. Also
+--- where all three record where the player(s) were, one line, alongside
+--- the entities and tiles.
 local function export_all_to(tick, manifest_path, session_id)
+  sample_all_players(tick, session_id)
   local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do
@@ -773,6 +888,11 @@ local function sync_subscriptions()
       capture_checked_rollover = true
       request_baseline(event.tick)
       flush_capture()
+      -- After request_baseline, which guarantees storage.timelapse_capture
+      -- exists (see ensure_capture_segment): session_id may still be nil
+      -- for a save whose capture state predates it, and player_log_path
+      -- already falls back to the untagged name for that case.
+      sample_connected_players(event.tick, storage.timelapse_capture.session_id)
     end)
   end
 

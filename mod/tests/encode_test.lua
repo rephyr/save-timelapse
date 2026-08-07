@@ -235,6 +235,38 @@ do
   check("checksum_update: splitting the input across calls gives the same result", hash, 5863208)
 end
 
+-- terrain capture bounding box -------------------------------------------------
+
+check("new_bbox: starts with nothing seen", encode.new_bbox().min_x, nil)
+
+do
+  local bbox = encode.new_bbox()
+  encode.grow_bbox(bbox, 10, 20)
+  encode.grow_bbox(bbox, -5, 30)
+  encode.grow_bbox(bbox, 7, -2)
+  check("grow_bbox: min_x tracks the smallest x seen", bbox.min_x, -5)
+  check("grow_bbox: max_x tracks the largest x seen", bbox.max_x, 10)
+  check("grow_bbox: min_y tracks the smallest y seen", bbox.min_y, -2)
+  check("grow_bbox: max_y tracks the largest y seen", bbox.max_y, 30)
+end
+
+check("expand_bbox: nil for a box that never saw a position",
+  encode.expand_bbox(encode.new_bbox(), 32), nil)
+
+do
+  local bbox = encode.new_bbox()
+  encode.grow_bbox(bbox, 10, 20)
+  encode.grow_bbox(bbox, -5, 30)
+  -- Compared field by field rather than the returned table as a whole:
+  -- Lua's == on tables is identity, not structural, so two freshly built
+  -- tables with identical contents are never equal.
+  local area = encode.expand_bbox(bbox, 4)
+  check("expand_bbox: left_top x is min_x minus the margin", area[1][1], -9)
+  check("expand_bbox: left_top y is min_y minus the margin", area[1][2], 16)
+  check("expand_bbox: right_bottom x is max_x plus the margin", area[2][1], 14)
+  check("expand_bbox: right_bottom y is max_y plus the margin", area[2][2], 34)
+end
+
 -- per-playthrough file naming ----------------------------------------------------
 
 check("baseline_manifest_name: session id as zero padded 8 digit hex",
@@ -248,6 +280,32 @@ check("baseline_manifest_name: a small session id still gets full width padding"
 check("capture_segment_name: session id and tick side by side",
   encode.capture_segment_name(0x1a2b3c, 22760790),
   "events_001a2b3c_22760790.stev")
+
+check("player_log_name: session id as zero padded 8 digit hex",
+  encode.player_log_name(0x1a2b3c),
+  "players_001a2b3c.jsonl")
+
+-- player position log ----------------------------------------------------
+
+check("player_log_line: one player, tick and fields in order",
+  encode.player_log_line(100, { { name = "Alice", surface = "nauvis", x = 10.5, y = -3.2 } }),
+  '{"tick":100,"players":[{"name":"Alice","surface":"nauvis","x":10.5,"y":-3.2}]}\n')
+
+check("player_log_line: multiple players are comma separated",
+  encode.player_log_line(1, {
+    { name = "Alice", surface = "nauvis", x = 1, y = 2 },
+    { name = "Bob", surface = "vulcanus", x = 3, y = 4 },
+  }),
+  '{"tick":1,"players":[{"name":"Alice","surface":"nauvis","x":1,"y":2},' ..
+    '{"name":"Bob","surface":"vulcanus","x":3,"y":4}]}\n')
+
+-- The empty case itself is never actually written: control.lua's callers
+-- skip the write_file call entirely when nobody was sampled. Still worth
+-- pinning here as a value, since something downstream could start calling
+-- this with an empty list directly.
+check("player_log_line: an empty player list is an empty JSON array",
+  encode.player_log_line(1, {}),
+  '{"tick":1,"players":[]}\n')
 
 -- list sanity ------------------------------------------------------------------
 
@@ -265,7 +323,11 @@ end
 
 local excluded = assert_no_duplicates(encode.EXCLUDED_TYPES, "EXCLUDED_TYPES")
 check("EXCLUDED_TYPES: contains character", excluded["character"], true)
-check("EXCLUDED_TYPES: contains tree", excluded["tree"], true)
+-- Rendered as ground context now (see control.lua's terrain capture), not
+-- excluded like other terrain scatter.
+check("EXCLUDED_TYPES: does not contain tree", excluded["tree"], nil)
+check("EXCLUDED_TYPES: does not contain cliff", excluded["cliff"], nil)
+check("EXCLUDED_TYPES: still contains the generic decorative scatter type", excluded["simple-entity"], true)
 -- Enemies are wildlife, not factory, and their deaths would otherwise flood
 -- live capture with removals unrelated to construction. Regression: a real
 -- capture showed ~6% of exported entities were biters/spitters/spawners

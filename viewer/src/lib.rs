@@ -48,8 +48,9 @@ impl TypeRegistry {
         }
         let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
         self.names.push(name.to_string());
-        self.entity_colors.push(color_for(name, 0.55, 0.85));
-        self.tile_colors.push(color_for(name, 0.35, 0.5));
+        let color = known_color(name);
+        self.entity_colors.push(color.unwrap_or_else(|| color_for(name, 0.55, 0.85)));
+        self.tile_colors.push(color.unwrap_or_else(|| color_for(name, 0.35, 0.5)));
         self.ids.insert(name.to_string(), id);
         id
     }
@@ -585,6 +586,77 @@ impl Timeline {
     }
 }
 
+/// A curated color for terrain and terrain-scatter names, approximating how
+/// they actually look in Factorio, checked before falling back to
+/// `color_for`'s hash. Best-effort and pattern-matched against the real
+/// names a live capture actually produced (see the terrain-capture work in
+/// mod/control.lua), not an exhaustive prototype list -- Factorio and Space
+/// Age have dozens of terrain names across four planets, and hashing is a
+/// perfectly good fallback for whatever this doesn't recognize. Without
+/// this, ordinary factory infrastructure (concrete, a hazard floor) got the
+/// same rainbow-hash treatment as everything else, which is exactly backward
+/// for the handful of names a player sees constantly and has strong
+/// expectations for the color of.
+fn known_color(name: &str) -> Option<Color> {
+    let rgb = |r: u8, g: u8, b: u8| Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+
+    // Natural terrain.
+    if name == "water" || name.starts_with("water-") {
+        return Some(rgb(29, 78, 130));
+    }
+    if name == "deepwater" || name.starts_with("deepwater-") {
+        return Some(rgb(16, 52, 92));
+    }
+    if name.starts_with("grass") {
+        return Some(rgb(76, 104, 46));
+    }
+    if name.starts_with("dirt") || name == "dry-dirt" {
+        return Some(rgb(107, 84, 60));
+    }
+    if name.starts_with("sand") {
+        return Some(rgb(184, 165, 116));
+    }
+    if name.starts_with("red-desert") {
+        return Some(rgb(140, 92, 68));
+    }
+    if name == "out-of-map" {
+        return Some(rgb(8, 8, 8));
+    }
+
+    // Placed infrastructure common enough to have a strong expected color.
+    if name.starts_with("refined-hazard-concrete") || name.starts_with("hazard-concrete") {
+        return Some(rgb(196, 160, 40));
+    }
+    if name == "concrete" || name == "refined-concrete" {
+        // Dark enough that entities sitting on it (colored via the bright
+        // hash palette below) stay readable against it -- a mid grey was
+        // too close in brightness to blend into rather than contrast with.
+        return Some(rgb(58, 58, 60));
+    }
+    if name == "stone-path" {
+        return Some(rgb(146, 126, 104));
+    }
+    if name == "landfill" {
+        return Some(rgb(107, 84, 60));
+    }
+
+    // Terrain scatter: cliffs read as bare rock; live trees green, with
+    // "dead"/"dry" variants (including desert trees) a dead-wood brown
+    // rather than green, since that's the biggest visual distinction
+    // between tree variants, not the specific species.
+    if name == "cliff" {
+        return Some(rgb(96, 92, 88));
+    }
+    if name.starts_with("dead-") || name.starts_with("dry-") {
+        return Some(rgb(107, 92, 66));
+    }
+    if name.starts_with("tree") {
+        return Some(rgb(53, 89, 42));
+    }
+
+    None
+}
+
 /// Deterministic name -> color, so a given entity type is always the same
 /// color across runs with nothing to curate as new Factorio types show up.
 pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
@@ -910,6 +982,42 @@ pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
     surfaces
 }
 
+/// Where every tracked player was, looked up as of whatever tick is
+/// currently displayed. Built once at load time from
+/// `player_log::read_jsonl`'s flat sample list; a plain linear scan per
+/// lookup is plenty since sample counts are tiny (at most one per ~10
+/// seconds of real play per player) next to entity/tile counts, so there's
+/// no reason to reach for a binary search or an incremental cursor here.
+pub struct PlayerTrack {
+    /// Sorted by tick, ascending, once at construction rather than on every
+    /// lookup.
+    samples: Vec<save_timelapse::player_log::PlayerSample>,
+}
+
+impl PlayerTrack {
+    pub fn new(mut samples: Vec<save_timelapse::player_log::PlayerSample>) -> Self {
+        samples.sort_by_key(|s| s.tick);
+        PlayerTrack { samples }
+    }
+
+    /// Each tracked player's latest known position at or before `tick`,
+    /// filtered to whichever surface they were last seen on -- the same
+    /// nearest-preceding "step function" semantics `World` already uses to
+    /// reconstruct entity state from events. A player not yet sampled by
+    /// `tick`, or last seen on a different surface, isn't returned: they
+    /// either aren't there yet or are currently elsewhere.
+    pub fn positions_at(&self, surface: &str, tick: u64) -> Vec<(&str, f32, f32)> {
+        let mut latest: HashMap<&str, &save_timelapse::player_log::PlayerSample> = HashMap::new();
+        for sample in &self.samples {
+            if sample.tick > tick {
+                break;
+            }
+            latest.insert(&sample.name, sample);
+        }
+        latest.into_values().filter(|s| s.surface == surface).map(|s| (s.name.as_str(), s.x, s.y)).collect()
+    }
+}
+
 pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
     let mut frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
 
@@ -1021,6 +1129,30 @@ mod tests {
         let camera = Camera::fit_frames(&[], 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::ZERO);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
+    }
+
+    /// Every one of these is a real name a live capture actually produced
+    /// (see the terrain-capture work in mod/control.lua); pinning that
+    /// they resolve to a curated color, not the hash fallback, is what
+    /// guards against a substring check silently stopping matching one of
+    /// them after some future edit.
+    #[test]
+    fn known_color_recognizes_real_captured_terrain_names() {
+        for name in [
+            "water", "deepwater", "grass-1", "grass-4", "dirt-3", "dry-dirt", "sand-2", "red-desert-1",
+            "out-of-map", "concrete", "refined-concrete", "hazard-concrete-left",
+            "refined-hazard-concrete-right", "stone-path", "landfill", "cliff", "tree-01", "tree-09-brown",
+            "dead-tree-desert", "dry-hairy-tree",
+        ] {
+            assert!(known_color(name).is_some(), "{name} should have a curated color");
+        }
+    }
+
+    #[test]
+    fn known_color_falls_back_to_none_for_ordinary_factory_entities() {
+        for name in ["transport-belt", "assembling-machine-1", "electric-furnace"] {
+            assert!(known_color(name).is_none(), "{name} should use the hash fallback, not a curated color");
+        }
     }
 
     #[test]
@@ -1313,6 +1445,52 @@ mod tests {
         let vulcanus = grouped.iter().find(|(name, _)| name == "vulcanus").unwrap();
         assert_eq!(vulcanus.1.len(), 1);
         assert_eq!(vulcanus.1[0].tick, 600);
+    }
+
+    fn player_sample(tick: u64, name: &str, surface: &str, x: f32, y: f32) -> save_timelapse::player_log::PlayerSample {
+        save_timelapse::player_log::PlayerSample { tick, name: name.to_string(), surface: surface.to_string(), x, y }
+    }
+
+    #[test]
+    fn player_track_finds_no_one_before_the_first_sample() {
+        let track = PlayerTrack::new(vec![player_sample(100, "Alice", "nauvis", 1.0, 2.0)]);
+        assert!(track.positions_at("nauvis", 50).is_empty());
+    }
+
+    #[test]
+    fn player_track_returns_the_exact_match_at_that_tick() {
+        let track = PlayerTrack::new(vec![player_sample(100, "Alice", "nauvis", 1.0, 2.0)]);
+        assert_eq!(track.positions_at("nauvis", 100), vec![("Alice", 1.0, 2.0)]);
+    }
+
+    #[test]
+    fn player_track_uses_the_latest_sample_at_or_before_the_tick_not_a_later_one() {
+        let track = PlayerTrack::new(vec![
+            player_sample(100, "Alice", "nauvis", 1.0, 2.0),
+            player_sample(200, "Alice", "nauvis", 9.0, 9.0),
+        ]);
+        assert_eq!(track.positions_at("nauvis", 150), vec![("Alice", 1.0, 2.0)], "150 is before the 200 sample");
+    }
+
+    #[test]
+    fn player_track_only_shows_a_player_on_their_last_known_surface() {
+        let track = PlayerTrack::new(vec![
+            player_sample(100, "Alice", "nauvis", 1.0, 2.0),
+            player_sample(200, "Alice", "vulcanus", 3.0, 4.0),
+        ]);
+        assert!(track.positions_at("nauvis", 250).is_empty(), "Alice last seen on vulcanus by tick 250");
+        assert_eq!(track.positions_at("vulcanus", 250), vec![("Alice", 3.0, 4.0)]);
+    }
+
+    #[test]
+    fn player_track_tracks_multiple_players_independently() {
+        let track = PlayerTrack::new(vec![
+            player_sample(100, "Alice", "nauvis", 1.0, 2.0),
+            player_sample(100, "Bob", "nauvis", 5.0, 6.0),
+        ]);
+        let mut positions = track.positions_at("nauvis", 100);
+        positions.sort_by_key(|(name, ..)| *name);
+        assert_eq!(positions, vec![("Alice", 1.0, 2.0), ("Bob", 5.0, 6.0)]);
     }
 
     /// Live capture writes these beside every finished snapshot. Their stem

@@ -262,6 +262,15 @@ impl World {
                     None => false,
                 }
             }
+            // Known gap, not fixed here: removing landfill fires this the
+            // same as any other tile removal, but `tiles` is a flat
+            // position -> name map with no idea what was there before the
+            // removed tile, e.g. the water a baseline captured underneath
+            // it (now that natural terrain is captured -- see
+            // mod/control.lua's terrain pass). The position just goes
+            // empty instead of reverting to water. A real fix needs a
+            // two-layer model (natural base + placed overlay), which is
+            // more than this single removal event can express on its own.
             Event::RemoveTile { x, y } => {
                 self.target(surface).is_some_and(|s| s.tiles.remove(&(*x, *y)).is_some())
             }

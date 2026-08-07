@@ -34,9 +34,8 @@ For ongoing factories, enable live capture once and the mod records only increme
 ---
 
 ## Screenshots
-
-![Tool overview](assets/toolOverview.PNG)
 - Overview of the current state of the tool
+![Tool overview](assets/save-timelapse-overview.PNG)
 
 - Timeline scrubbing
 - Zoomed sprite rendering
@@ -57,6 +56,12 @@ The application:
 3. Exports each selected save
 4. Reconstructs the world
 5. Opens the interactive viewer
+
+It also asks whether to include natural terrain (grass, water, trees,
+cliffs) around the base. Worth it for how much more it looks like a real
+place, but it's a real cost, not a free improvement: roughly 5x more export
+time and file size in testing, so it's an explicit yes/no each run rather
+than always on.
 
 No changes are made to your real installation or mod folder.
 
@@ -85,6 +90,12 @@ the timelapse from.
 > Upgrading from an older version? Run `/timelapse-reset-capture` once
 > in-game so your current playthrough starts a freshly tagged capture.
 
+Terrain works differently here, since save-timelapse.exe only reads a
+baseline after the mod already took it, not before: enable the
+`save-timelapse-capture-terrain` **startup** setting (off by default, same
+reasoning as above) before your baseline is taken if you want it included
+in a live capture.
+
 ---
 
 ## Viewer
@@ -94,9 +105,10 @@ Current features:
 - Pan
 - Zoom
 - Timeline scrubbing
-- Play / Pause
+- Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
 - Home / End navigation
 - Surface switching
+- Player position marker
 - Sprite rendering
 - Flat-color LOD rendering
 - Parallel loading

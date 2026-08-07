@@ -111,6 +111,32 @@ fn find_surface<'a>(input: &str, surfaces: &'a [String]) -> Option<&'a str> {
     surfaces.iter().find(|s| s.eq_ignore_ascii_case(input)).map(String::as_str)
 }
 
+/// `None` for anything that isn't a recognized yes/no word, including empty
+/// input: whether a blank answer means "yes" or "no" is the caller's
+/// business (`ask_yes_no` treats it as "use the default"), not something
+/// this pure parser should decide on its own.
+fn parse_yes_no(input: &str) -> Option<bool> {
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn ask_yes_no(question: &str, default: bool) -> io::Result<bool> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    loop {
+        let input = prompt(&format!("{question} [{hint}]:"))?;
+        if input.trim().is_empty() {
+            return Ok(default);
+        }
+        match parse_yes_no(&input) {
+            Some(answer) => return Ok(answer),
+            None => println!("Please answer y or n.\n"),
+        }
+    }
+}
+
 fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
     loop {
         let input = prompt(&format!(
@@ -327,6 +353,15 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
+    // A straight copy, not a re-parse: the mod's raw log and what the
+    // viewer reads are the exact same shape by design (see
+    // src/player_log.rs), so there's nothing to convert. Absent entirely
+    // is normal, not an error -- e.g. nobody was connected during capture.
+    let players_log = capture.join(format!("players_{:08x}.jsonl", chosen.session_id));
+    if players_log.exists() {
+        std::fs::copy(&players_log, out.join("players.jsonl"))?;
+    }
+
     let options = Options { interval: INTERVAL, max_frames: MAX_FRAMES };
     let mut written = 0usize;
     let mut error: Option<io::Error> = None;
@@ -424,6 +459,12 @@ fn run_from_saves() -> io::Result<PathBuf> {
             .join(", ")
     );
 
+    let capture_terrain = ask_yes_no(
+        "Include natural terrain (grass, water, trees, cliffs) around the base? This can \
+         significantly increase export size and time (roughly 5x in testing)",
+        false,
+    )?;
+
     let out = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
@@ -438,6 +479,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
         user_mods,
         mod_source: mod_source_dir()?,
         include_resources: false,
+        capture_terrain,
     };
 
     let mut done = 0usize;
@@ -452,6 +494,15 @@ fn run_from_saves() -> io::Result<PathBuf> {
                 let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
+                // Appended, not overwritten: each save contributes its own
+                // one-shot sample (its own real game.tick), so a multi-save
+                // playthrough builds up one line per save in the shared
+                // output file, the same as a live capture's many samples.
+                if let Some(log) = &outcome.players_log {
+                    let mut combined =
+                        std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
+                    combined.write_all(&std::fs::read(log)?)?;
+                }
                 let kib = target.metadata().map(|m| m.len()).unwrap_or(0) / 1024;
                 println!("ok, {kib} KiB in {:.1}s", outcome.seconds);
                 done += 1;
@@ -527,6 +578,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_yes_no_accepts_short_and_long_forms_case_insensitively() {
+        assert_eq!(parse_yes_no("y"), Some(true));
+        assert_eq!(parse_yes_no("Yes"), Some(true));
+        assert_eq!(parse_yes_no("n"), Some(false));
+        assert_eq!(parse_yes_no("NO"), Some(false));
+    }
+
+    #[test]
+    fn parse_yes_no_rejects_anything_else_including_empty() {
+        assert_eq!(parse_yes_no(""), None);
+        assert_eq!(parse_yes_no("sure"), None);
+        assert_eq!(parse_yes_no("maybe"), None);
+    }
 
     #[test]
     fn describe_age_just_now_for_under_a_minute() {

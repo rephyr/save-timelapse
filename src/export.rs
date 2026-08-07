@@ -13,6 +13,7 @@ use crate::settings_dat::{self, Version};
 pub const MOD_NAME: &str = "save-timelapse";
 const TRIGGER_SETTING: &str = "save-timelapse-headless-scan";
 const RESOURCES_SETTING: &str = "save-timelapse-include-resources";
+const TERRAIN_SETTING: &str = "save-timelapse-capture-terrain";
 
 pub struct ExportConfig {
     pub factorio: PathBuf,
@@ -20,6 +21,10 @@ pub struct ExportConfig {
     /// Directory holding this mod's Lua, staged in place of any installed copy.
     pub mod_source: PathBuf,
     pub include_resources: bool,
+    /// Natural terrain (grass, water, trees, cliffs, ...) around the base,
+    /// not just what the player built. Roughly 5x'd export size and time in
+    /// testing, so this is a real opt-in rather than something to default on.
+    pub capture_terrain: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +32,9 @@ pub struct ExportOutcome {
     /// Exported surface files, largest first.
     pub frames: Vec<PathBuf>,
     pub seconds: f64,
+    /// The mod's one-shot player-position sample, if it found anyone with a
+    /// valid position to record (see mod/control.lua's `sample_all_players`).
+    pub players_log: Option<PathBuf>,
 }
 
 /// Read the version from the executable rather than assuming one.
@@ -127,6 +135,7 @@ fn stage_mods(staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
         &[
             ("startup", TRIGGER_SETTING, true),
             ("startup", RESOURCES_SETTING, config.include_resources),
+            ("startup", TERRAIN_SETTING, config.capture_terrain),
         ],
         factorio_version(&config.factorio).unwrap_or([2, 0, 0, 0]),
     )?;
@@ -213,5 +222,7 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
         ));
     }
 
-    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64() })
+    let players_log = Some(written_to.join("players.jsonl")).filter(|p| p.exists());
+
+    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log })
 }

@@ -29,6 +29,19 @@ data:extend({
     order = "b",
   },
   {
+    -- Natural terrain covers every generated tile around the base, not
+    -- just where the player built, so this roughly 5x'd a real ~38MB/30s
+    -- export to ~200MB/161s in testing. Off by default so enabling live
+    -- capture doesn't silently sign up for a much longer baseline freeze;
+    -- save-timelapse.exe's from-saves flow asks about this each run
+    -- instead of assuming this setting.
+    type = "bool-setting",
+    name = "save-timelapse-capture-terrain",
+    setting_type = "startup",
+    default_value = false,
+    order = "b2",
+  },
+  {
     type = "bool-setting",
     name = "save-timelapse-live-capture",
     setting_type = "runtime-global",

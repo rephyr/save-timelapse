@@ -27,9 +27,11 @@ M.EXCLUDED_TYPES = {
   -- filtering them would risk excluding a real player entity by name-sniffing
   -- instead of type.
   "unit", "unit-spawner",
-  -- terrain scatter
-  "tree", "simple-entity", "simple-entity-with-force", "simple-entity-with-owner",
-  "cliff",
+  -- generic decorative/rock scatter, kept out for now: unlike trees and
+  -- cliffs (rendered as ground context, see control.lua's terrain capture),
+  -- this catch-all covers whatever else Space Age uses it for, which is
+  -- harder to predict without the game's prototype data on hand.
+  "simple-entity", "simple-entity-with-force", "simple-entity-with-owner",
   -- transient visual effects
   "particle-source", "projectile", "explosion", "fire", "smoke",
   "smoke-with-trigger", "stream", "sticker", "beam",
@@ -51,6 +53,48 @@ M.PLACED_FLOOR_TILES = {
   "purple-refined-concrete", "black-refined-concrete", "brown-refined-concrete",
   "cyan-refined-concrete", "acid-refined-concrete",
 }
+
+-- ---------------------------------------------------------------------------
+-- Terrain capture bounding box
+--
+-- Natural terrain (grass, water, sand, ...) covers every generated tile on
+-- a surface, not just where the player built, so capturing all of it would
+-- dwarf everything else this mod exports. Instead, control.lua captures a
+-- margin of ground around wherever entities and placed floor actually are,
+-- tracked here as a running box grown one position at a time while those
+-- are scanned, needing no second pass over the surface just to learn its
+-- extent.
+
+--- `nil` fields mean "nothing seen yet" -- an untouched surface has no
+--- factory to show context around, distinct from a box that happens to be
+--- a single point.
+function M.new_bbox()
+  return { min_x = nil, min_y = nil, max_x = nil, max_y = nil }
+end
+
+--- Mutates `bbox` in place (a plain table, not a value like the checksum
+--- above) and returns it, so a caller can chain `grow_bbox(grow_bbox(...))`
+--- if that reads better at a given call site.
+function M.grow_bbox(bbox, x, y)
+  if not bbox.min_x or x < bbox.min_x then bbox.min_x = x end
+  if not bbox.max_x or x > bbox.max_x then bbox.max_x = x end
+  if not bbox.min_y or y < bbox.min_y then bbox.min_y = y end
+  if not bbox.max_y or y > bbox.max_y then bbox.max_y = y end
+  return bbox
+end
+
+--- `nil` if `bbox` never saw a position. Otherwise a Factorio BoundingBox
+--- (the shape `LuaSurface.find_tiles_filtered`'s `area` argument expects)
+--- padded by `margin` tiles on every side.
+function M.expand_bbox(bbox, margin)
+  if not bbox.min_x then
+    return nil
+  end
+  return {
+    { bbox.min_x - margin, bbox.min_y - margin },
+    { bbox.max_x + margin, bbox.max_y + margin },
+  }
+end
 
 M.FRAME_MAGIC = "STF1"
 M.EVENT_MAGIC = "STE1"
@@ -337,6 +381,34 @@ end
 
 function M.capture_segment_name(session_id, start_tick)
   return string.format("events_%08x_%d.stev", session_id, start_tick)
+end
+
+function M.player_log_name(session_id)
+  return string.format("players_%08x.jsonl", session_id)
+end
+
+-- ---------------------------------------------------------------------------
+-- Player position log
+--
+-- Deliberately plain newline-delimited JSON, not a tagged binary format
+-- like the frame/event formats above: a position sample happens at most
+-- once every several seconds by design (see control.lua), nowhere near
+-- the per-tick construction volume that actually justified paying for a
+-- binary format there. The same shape is both what the mod writes and
+-- what the viewer reads directly (src/player_log.rs), so
+-- save-timelapse.exe only ever relocates this file, never rewrites it.
+
+--- One line: `{"tick":T,"players":[{"name":...,"surface":...,"x":...,"y":...}]}`.
+--- `players` is a list of `{name=, surface=, x=, y=}` tables, already
+--- resolved by the caller (control.lua has two: periodic sampling during
+--- live capture, and a one-shot sample alongside every full export).
+function M.player_log_line(tick, players)
+  local entries = {}
+  for i, p in pairs(players) do
+    entries[i] = string.format('{"name":%s,"surface":%s,"x":%s,"y":%s}',
+      M.quote(p.name), M.quote(p.surface), tostring(p.x), tostring(p.y))
+  end
+  return string.format('{"tick":%d,"players":[%s]}\n', tick, table.concat(entries, ","))
 end
 
 return M
