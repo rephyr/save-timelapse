@@ -35,9 +35,9 @@ For ongoing factories, enable live capture once and the mod records only increme
 
 ## Screenshots
 
-> **TODO:** Add screenshots and GIFs 
+![Tool overview](assets/toolOverview.PNG)
+- Overview of the current state of the tool
 
-- Overview of a megabase
 - Timeline scrubbing
 - Zoomed sprite rendering
 - Live capture
