@@ -10,7 +10,8 @@ use save_timelapse::locate::{factorio_user_dir, locate_factorio};
 #[derive(Parser)]
 #[command(name = "save-timelapse", version, about)]
 struct Args {
-    /// Folder of .zip saves to export. Defaults to Factorio's saves folder.
+    /// Folder of .zip saves to export, or a single .zip. Defaults to
+    /// Factorio's saves folder.
     #[arg(long)]
     saves: Option<PathBuf>,
 
@@ -34,6 +35,11 @@ struct Args {
     /// multiplies frame size without showing factory growth.
     #[arg(long)]
     include_resources: bool,
+
+    /// Export only saves whose filename contains this text, case insensitive.
+    /// A saves folder usually holds several unrelated worlds.
+    #[arg(long)]
+    match_name: Option<String>,
 
     /// Export only the first N saves.
     #[arg(long)]
@@ -72,22 +78,39 @@ fn run(args: Args) -> std::io::Result<()> {
     println!("mods     {}", user_mods.display());
     println!("saves    {}", saves_dir.display());
 
-    let mut saves: Vec<PathBuf> = std::fs::read_dir(&saves_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
-        .collect();
+    // A saves folder usually holds several unrelated worlds, so accept a
+    // single .zip directly rather than making the user isolate one first.
+    let mut saves: Vec<PathBuf> = if saves_dir.is_file() {
+        vec![saves_dir.clone()]
+    } else {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&saves_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
+            .collect();
+        found.sort_by_key(|path| ordering_key(path));
+        found
+    };
 
-    saves.sort_by_key(|path| ordering_key(path));
+    if let Some(pattern) = args.match_name.as_deref() {
+        let needle = pattern.to_lowercase();
+        saves.retain(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.to_lowercase().contains(&needle))
+        });
+    }
     if let Some(n) = args.limit {
         saves.truncate(n);
     }
 
     if saves.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "no .zip saves in {}",
-            saves_dir.display()
-        )));
+        return Err(std::io::Error::other(match args.match_name.as_deref() {
+            Some(pattern) => {
+                format!("no saves in {} match {pattern:?}", saves_dir.display())
+            }
+            None => format!("no .zip saves in {}", saves_dir.display()),
+        }));
     }
     println!("{} save(s) to export\n", saves.len());
 
@@ -110,7 +133,7 @@ fn run(args: Args) -> std::io::Result<()> {
         let staged = workspace.join(format!("stage_{index}"));
         match export::export_save(save, &staged, &config) {
             Ok(outcome) => {
-                let target = args.out.join(format!("frame_{index:04}.json"));
+                let target = args.out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target)
                     .or_else(|_| std::fs::copy(primary, &target).map(drop))?;

@@ -15,11 +15,11 @@ Use these to build and test the renderer. They are real placements, so belt
 runs, rail curves and mixed entity densities all look like a genuine factory
 rather than synthetic noise.
 
-    frame_0000.json     240 entities     11 KiB
-    frame_0001.json     589 entities     26 KiB
-    frame_0002.json   3,043 entities    150 KiB
-    frame_0003.json  10,234 entities    511 KiB
-    frame_0004.json  22,971 entities  1,139 KiB
+    frame_0000.stfr     240 entities    3.7 KiB
+    frame_0001.stfr     589 entities    8.6 KiB
+    frame_0002.stfr   3,043 entities     42 KiB
+    frame_0003.stfr  10,234 entities    141 KiB
+    frame_0004.stfr  22,971 entities    315 KiB
 
 ## real-mod-settings.dat
 
@@ -53,7 +53,7 @@ instead of assuming it did.
 Two knobs:
 
 - `FAKE_FACTORIO_FRAME=<path>` emits that file as the frame instead of the
-  built in one. Point it at `frames/frame_0003.json` for realistic volume.
+  built in one. Point it at `frames/frame_0003.stfr` for realistic volume.
 - A save named `*-silent.zip` makes it exit cleanly having written nothing,
   reproducing the failure where the game runs fine but the mod never fires.
 

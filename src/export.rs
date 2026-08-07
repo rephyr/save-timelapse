@@ -197,7 +197,7 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
         .map(|item| item.path())
         .filter(|path| {
             path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-                name.starts_with("frame_") && name.ends_with(".json") && !name.contains("manifest")
+                name.starts_with("frame_") && name.ends_with(".stfr") && !name.contains("manifest")
             })
         })
         .collect();

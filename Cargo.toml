@@ -22,6 +22,11 @@ path = "src/main.rs"
 name = "fake-factorio"
 path = "src/bin/fake_factorio.rs"
 
+# Rebuilds a timelapse from a live-capture baseline plus its event log.
+[[bin]]
+name = "save-timelapse-replay"
+path = "src/bin/replay.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
