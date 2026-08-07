@@ -39,8 +39,16 @@ local function excluded_types()
 end
 
 --- Write one surface to its own file. Returns entity and tile counts written.
-local function export_surface(surface, tick)
-  local path = string.format("%sframe_%d_%s.stfr", EXPORT_DIR, tick, surface.name)
+---
+--- `session_id`, when given, tags the path so a baseline written into the
+--- shared, persistent script-output folder can't collide with another
+--- playthrough's (see encode.baseline_manifest_name's comment for why).
+--- `/timelapse-export` and the headless scan call this with no session id:
+--- both run against a private, per-run script-output folder that nothing
+--- else ever writes into, so there is nothing for them to collide with.
+local function export_surface(surface, tick, session_id)
+  local tag = session_id and string.format("%08x_", session_id) or ""
+  local path = string.format("%sframe_%s%d_%s.stfr", EXPORT_DIR, tag, tick, surface.name)
   local dict = encode.new_dictionary()
 
   helpers.write_file(path, encode.frame_header(tick, surface.name), false)
@@ -113,13 +121,14 @@ end
 --- Every surface, synchronously, in whatever tick this is called from. Used
 --- for /timelapse-export, headless scan, and the once-per-save baseline,
 --- three callers wanting the exact same "everything, right now" export,
---- differing only in what manifest path names the result.
-local function export_all_to(tick, manifest_path)
+--- differing only in what manifest path names the result and, for the
+--- baseline, in tagging its output with the playthrough's session_id.
+local function export_all_to(tick, manifest_path, session_id)
   local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do
     if is_inhabited(surface) then
-      local entities, tiles = export_surface(surface, tick)
+      local entities, tiles = export_surface(surface, tick, session_id)
       total = total + entities
       tile_total = tile_total + tiles
       names[#names + 1] = encode.quote(surface.name)
@@ -180,9 +189,22 @@ local SNAPSHOT_FLUSH_EVERY = 128
 --- Written once, after the baseline snapshot finishes, naming the tick and
 --- surfaces it covers. This is the handshake with the Rust side: it is the
 --- last file written, so its presence means the baseline is complete, and it
---- says which `frame_<tick>_<surface>.stfr` files make up that baseline.
---- Everything after the baseline is reconstructed by replaying the event log.
-local BASELINE_MANIFEST = EXPORT_DIR .. "baseline.json"
+--- says which `frame_<session_id>_<tick>_<surface>.stfr` files make up that
+--- baseline. Everything after the baseline is reconstructed by replaying the
+--- event log. Tagged by session_id (see compute_session_id below) so each
+--- playthrough gets its own manifest instead of overwriting another one's.
+---
+--- A save whose capture state predates session_id existing has it as `nil`
+--- (see ensure_capture_segment below, which only ever sets it while creating
+--- fresh state): this keeps such a save on the untagged name it was already
+--- using rather than erroring, until /timelapse-reset-capture clears its
+--- state and lets it start over with a real one.
+local function baseline_manifest_path(session_id)
+  if not session_id then
+    return EXPORT_DIR .. "baseline.json"
+  end
+  return EXPORT_DIR .. encode.baseline_manifest_name(session_id)
+end
 
 local capture_pending, capture_pending_count = {}, 0
 local capture_path = nil
@@ -232,8 +254,31 @@ local function is_placed_floor(tile_name)
   return placed_floor_set[tile_name]
 end
 
-local function capture_segment_path(start_tick)
-  return string.format("%sevents_%d.stev", EXPORT_DIR, start_tick)
+--- See baseline_manifest_path above for why a nil session_id (a save whose
+--- capture state predates this feature) falls back to the untagged name
+--- instead of erroring.
+local function capture_segment_path(session_id, start_tick)
+  if not session_id then
+    return string.format("%sevents_%d.stev", EXPORT_DIR, start_tick)
+  end
+  return EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
+end
+
+--- A playthrough's identity, for tagging files written into the shared,
+--- persistent script-output folder (see encode.baseline_manifest_name's
+--- comment). The map's terrain seed is deterministic across save/reload of
+--- one playthrough, differs across different ones with overwhelming
+--- probability, and needs no new in-game UI to collect, unlike a save name,
+--- which mods have no API access to at all. Wrapped in pcall and falling
+--- back to 0 the same defensive way is_inhabited does: that only degrades
+--- to today's single shared bucket in the unlikely event nauvis or its
+--- map_gen_settings are unavailable, never a crash.
+local function compute_session_id()
+  local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
+  if ok and seed then
+    return seed
+  end
+  return 0
 end
 
 --- A player can load an older save than one already recorded past, which an
@@ -261,7 +306,12 @@ local function ensure_capture_segment()
   local state = storage.timelapse_capture
 
   if not state then
-    state = { segment_start_tick = game.tick, last_tick = game.tick, segment_initialized = false }
+    state = {
+      segment_start_tick = game.tick,
+      last_tick = game.tick,
+      segment_initialized = false,
+      session_id = compute_session_id(),
+    }
     storage.timelapse_capture = state
   else
     local next_start = encode.next_capture_segment(state.last_tick, game.tick, state.segment_start_tick)
@@ -272,7 +322,7 @@ local function ensure_capture_segment()
     end
   end
 
-  capture_path = capture_segment_path(state.segment_start_tick)
+  capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()
@@ -517,7 +567,8 @@ local function perform_baseline(tick)
     return
   end
 
-  local total, tiles, surfaces = export_all_to(tick, BASELINE_MANIFEST)
+  local total, tiles, surfaces =
+    export_all_to(tick, baseline_manifest_path(capture.session_id), capture.session_id)
   capture.baseline_tick = tick
 
   game.print(string.format(

@@ -282,4 +282,24 @@ function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)
   return current_segment_start -- keep appending to the existing segment
 end
 
+-- ---------------------------------------------------------------------------
+-- Per-playthrough file naming
+--
+-- game.tick restarts from 0 for every save, and script-output/save-timelapse/
+-- is one folder shared by every save that ever turns capture on, so a raw
+-- tick number cannot tell two playthroughs apart. session_id (the world's
+-- map generation seed; see control.lua) is stable across save/reload of one
+-- playthrough and differs across different ones, so every filename this mod
+-- writes into that shared folder carries it.
+
+--- Pure: plain values in and out, so these are testable the same way as
+--- next_capture_segment above, with no save/load cycle to trigger them.
+function M.baseline_manifest_name(session_id)
+  return string.format("baseline_%08x.json", session_id)
+end
+
+function M.capture_segment_name(session_id, start_tick)
+  return string.format("events_%08x_%d.stev", session_id, start_tick)
+end
+
 return M

@@ -10,6 +10,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use save_timelapse::export;
 use save_timelapse::frame;
@@ -127,6 +128,66 @@ fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
     }
 }
 
+/// A coarse "how long ago" label for a session's `last_modified`, good
+/// enough to help someone recognise their own playthrough in a list without
+/// a mod-side save name to show instead (Factorio gives mods no way to read
+/// one).
+fn describe_age(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if secs < 3600 {
+        let minutes = secs / 60;
+        return format!("{minutes} minute{} ago", if minutes == 1 { "" } else { "s" });
+    }
+    if secs < 86400 {
+        let hours = secs / 3600;
+        return format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" });
+    }
+    let days = secs / 86400;
+    format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+}
+
+/// 1-based `input` as an index into a list of `count` items. `None` for
+/// anything out of range or not a number, so the caller reprompts on a miss
+/// rather than silently guessing which playthrough was meant.
+fn parse_session_index(input: &str, count: usize) -> Option<usize> {
+    let one_based: usize = input.trim().parse().ok()?;
+    let index = one_based.checked_sub(1)?;
+    (index < count).then_some(index)
+}
+
+/// Only reached when more than one playthrough has live capture data
+/// waiting: combining them would jump between different bases in one
+/// timelapse, exactly what tagging playthroughs by session is meant to
+/// prevent, so this always picks exactly one rather than offering "all"
+/// the way `ask_surface_choice` and the from-saves flow's selection do.
+fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
+    println!("\nFound {} captured playthrough(s):", sessions.len());
+    let now = SystemTime::now();
+    for (i, session) in sessions.iter().enumerate() {
+        let age = now.duration_since(session.last_modified).unwrap_or_default();
+        println!(
+            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} -- {}",
+            i + 1,
+            session.baseline.tick,
+            session.baseline.entities,
+            session.baseline.tiles,
+            session.baseline.surfaces.join(", "),
+            describe_age(age)
+        );
+    }
+    loop {
+        let input =
+            prompt("\nWhich playthrough do you want to update the timelapse for? Enter a number:")?;
+        if let Some(index) = parse_session_index(&input, sessions.len()) {
+            return Ok(index);
+        }
+        println!("Please enter a number between 1 and {}.\n", sessions.len());
+    }
+}
+
 /// Saves are usually numbered, so order by that number rather than
 /// lexicographically, which would place "base10" before "base2".
 fn ordering_key(path: &Path) -> (u64, String) {
@@ -174,15 +235,20 @@ fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// The Lua mod's source, needed to stage a headless export. Tried next to
-/// this program first (how it travels once distributed), falling back to
-/// the current folder (how it's found running from the project source via
-/// `cargo run`).
+/// this program first (how it travels once distributed), then the project
+/// root baked in at compile time (how it's found running the built exe
+/// straight out of target/release, regardless of the working directory),
+/// then the current folder as a last resort.
 fn mod_source_dir() -> io::Result<PathBuf> {
     let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
     if let Some(dir) = &exe_sibling {
         if dir.is_dir() {
             return Ok(dir.clone());
         }
+    }
+    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod");
+    if manifest_candidate.is_dir() {
+        return Ok(manifest_candidate);
     }
     let cwd_candidate = PathBuf::from("mod");
     if cwd_candidate.is_dir() {
@@ -216,7 +282,12 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let user_dir = locate_factorio_user_dir_interactive()?;
 
     let capture = user_dir.join("script-output").join("save-timelapse");
-    if !capture.join(replay::BASELINE_MANIFEST).exists() {
+    // A missing capture folder (nothing has ever been captured) and one that
+    // exists but names no finished baseline are the same "not started yet"
+    // state from here, so a read_dir failure is folded into the empty case
+    // rather than surfaced as a raw IO error.
+    let sessions = replay::discover_sessions(&capture).unwrap_or_default();
+    if sessions.is_empty() {
         return Err(io::Error::other(format!(
             "No live capture found at {}.\n\n\
              In Factorio, turn on the \"save-timelapse-live-capture\" setting (Settings > Mod \
@@ -225,7 +296,18 @@ fn run_live_capture() -> io::Result<PathBuf> {
         )));
     }
 
-    let mut replay_state = replay::load_baseline(&capture)?;
+    // Different playthroughs are tagged separately precisely so they never
+    // get combined into one timelapse; only ask which one when there is
+    // more than one to choose from, so the common single-playthrough case
+    // stays exactly as simple as it always was.
+    let chosen = if sessions.len() == 1 {
+        sessions.into_iter().next().expect("checked non-empty above")
+    } else {
+        let index = ask_session_choice(&sessions)?;
+        sessions.into_iter().nth(index).expect("ask_session_choice returned a valid index")
+    };
+
+    let mut replay_state = replay::load_baseline(&chosen.baseline_path)?;
     println!(
         "\nbaseline tick {} ({} entities, {} tiles)",
         replay_state.baseline.tick,
@@ -252,7 +334,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let emitted = match &chosen_surface {
         None => {
             println!("rendering every surface, one frame per {INTERVAL} tick(s)\n");
-            replay::run(&mut replay_state, &capture, &options, |world, tick| {
+            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
@@ -269,7 +351,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         }
         Some(name) => {
             println!("rendering surface {name}, one frame per {INTERVAL} tick(s)\n");
-            replay::run(&mut replay_state, &capture, &options, |world, tick| {
+            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
@@ -445,6 +527,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_age_just_now_for_under_a_minute() {
+        assert_eq!(describe_age(Duration::from_secs(30)), "just now");
+    }
+
+    #[test]
+    fn describe_age_minutes() {
+        assert_eq!(describe_age(Duration::from_secs(60)), "1 minute ago");
+        assert_eq!(describe_age(Duration::from_secs(60 * 5)), "5 minutes ago");
+    }
+
+    #[test]
+    fn describe_age_hours() {
+        assert_eq!(describe_age(Duration::from_secs(3600)), "1 hour ago");
+        assert_eq!(describe_age(Duration::from_secs(3600 * 3)), "3 hours ago");
+    }
+
+    #[test]
+    fn describe_age_days() {
+        assert_eq!(describe_age(Duration::from_secs(86400)), "1 day ago");
+        assert_eq!(describe_age(Duration::from_secs(86400 * 2)), "2 days ago");
+    }
+
+    #[test]
+    fn parse_session_index_accepts_a_one_based_number_in_range() {
+        assert_eq!(parse_session_index("1", 3), Some(0));
+        assert_eq!(parse_session_index("3", 3), Some(2));
+    }
+
+    #[test]
+    fn parse_session_index_rejects_zero_out_of_range_and_non_numeric() {
+        assert_eq!(parse_session_index("0", 3), None);
+        assert_eq!(parse_session_index("4", 3), None);
+        assert_eq!(parse_session_index("nope", 3), None);
+        assert_eq!(parse_session_index("", 3), None);
+    }
 
     #[test]
     fn ordering_key_sorts_numerically_not_lexicographically() {
