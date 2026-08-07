@@ -49,11 +49,17 @@ pub enum Event {
         h: u32,
         id: Option<u64>,
     },
-    /// Removal keyed by `unit_number`, which is unique across the whole game,
-    /// so it carries no surface and no position.
-    RemoveEntityById { id: u64 },
-    /// Removal of an entity with no `unit_number`, located by position.
-    RemoveEntityAt { x: f32, y: f32 },
+    /// Removal of an entity. `id` (`unit_number`) is a fast, unambiguous
+    /// match when replay's world state has it registered -- true for
+    /// anything built after capture began, since its `AddEntity` carried the
+    /// same id. `pos` is what actually resolves an entity that already
+    /// existed when the baseline was taken: a snapshot records no ids, so an
+    /// entity from the baseline has none registered no matter what id
+    /// Factorio reports it removed by, and id-only lookup would silently
+    /// never find it. At least one of the two is always present; both are,
+    /// in every log written after this event started carrying position --
+    /// `pos: None` only happens on a log line written before that.
+    RemoveEntity { id: Option<u64>, pos: Option<(f32, f32)> },
     AddTile { name: String, x: i32, y: i32 },
     RemoveTile { x: i32, y: i32 },
 }
@@ -61,8 +67,7 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoggedEvent {
     pub tick: u64,
-    /// Absent on `RemoveEntityById`, and on logs written before events
-    /// carried a surface at all.
+    /// Absent on logs written before events carried a surface at all.
     pub surface: Option<String>,
     pub event: Event,
 }
@@ -83,10 +88,14 @@ impl Event {
                 h: raw.h.unwrap_or(1).max(1),
                 id: raw.id,
             }),
-            (false, true) => match raw.id {
-                Some(id) => Some(Event::RemoveEntityById { id }),
-                None => Some(Event::RemoveEntityAt { x: raw.x? as f32, y: raw.y? as f32 }),
-            },
+            (false, true) => {
+                let pos = match (raw.x, raw.y) {
+                    (Some(x), Some(y)) => Some((x as f32, y as f32)),
+                    _ => None,
+                };
+                // Neither present means the line names nothing to remove.
+                (raw.id.is_some() || pos.is_some()).then_some(Event::RemoveEntity { id: raw.id, pos })
+            }
             (true, false) => Some(Event::AddTile {
                 name: raw.n?,
                 x: raw.x? as i32,
@@ -182,17 +191,38 @@ mod tests {
         }
     }
 
+    /// The pre-fix wire format: id with no position, still written by any
+    /// log captured before the mod started sending both. Must still parse,
+    /// even though replay can only resolve it for an entity whose id it
+    /// already has registered (see world.rs) -- the bug this event shape
+    /// caused for baseline-original entities can't be fixed retroactively
+    /// for data that never recorded a position to fall back to.
     #[test]
-    fn removal_by_id_carries_no_surface_or_position() {
+    fn a_pre_fix_id_only_removal_still_parses() {
         let logged = parse_line(r#"{"t":7,"op":"-","k":"e","id":99}"#).unwrap();
         assert_eq!(logged.surface, None);
-        assert_eq!(logged.event, Event::RemoveEntityById { id: 99 });
+        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: None });
     }
 
     #[test]
-    fn removal_without_an_id_falls_back_to_position() {
+    fn removal_without_an_id_is_position_only() {
         let logged = parse_line(r#"{"t":7,"op":"-","k":"e","s":"nauvis","x":-3.5,"y":4.5}"#).unwrap();
-        assert_eq!(logged.event, Event::RemoveEntityAt { x: -3.5, y: 4.5 });
+        assert_eq!(logged.event, Event::RemoveEntity { id: None, pos: Some((-3.5, 4.5)) });
+    }
+
+    /// The current wire format: both together. This is what actually fixes
+    /// removal of an entity that already existed when the baseline was
+    /// taken -- id alone can't find it (a snapshot records no ids), so
+    /// position has to ride along rather than being dropped as redundant.
+    #[test]
+    fn removal_with_both_id_and_position_carries_both() {
+        let logged = parse_line(r#"{"t":7,"op":"-","k":"e","s":"nauvis","x":-3.5,"y":4.5,"id":99}"#).unwrap();
+        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: Some((-3.5, 4.5)) });
+    }
+
+    #[test]
+    fn a_removal_naming_neither_id_nor_position_does_not_parse() {
+        assert!(parse_line(r#"{"t":7,"op":"-","k":"e","s":"nauvis"}"#).is_none());
     }
 
     #[test]
@@ -236,7 +266,7 @@ mod tests {
         let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
         assert_eq!(events.len(), 2, "the unparseable middle line is skipped");
         assert_eq!(events[0].tick, 100);
-        assert_eq!(events[1].event, Event::RemoveEntityById { id: 5 });
+        assert_eq!(events[1].event, Event::RemoveEntity { id: Some(5), pos: None });
     }
 
     #[test]

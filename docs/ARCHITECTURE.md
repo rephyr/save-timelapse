@@ -117,7 +117,14 @@ excluded types are never returned across the API boundary.
 
 Excluded by default: characters, corpses, particles, projectiles, trees, rocks,
 cliffs, fish, fire, smoke, explosions, ghosts, dropped items, combat robots,
-streams, stickers and beams.
+streams, stickers and beams. Also excluded: biters, spitters and their
+spawners (`unit`, `unit-spawner`) -- wildlife rather than factory, and without
+this a live-capture log fills with combat-death removals indistinguishable
+from the player mining something. Confirmed against a real capture, where
+these types were ~6% of exported entities. Worm turrets are left in: they
+share Factorio's `turret` type with player-built turrets, and filtering them
+out would mean matching by name instead of type, which risks catching a real
+player entity by pattern rather than excluding by what it actually is.
 
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
@@ -143,53 +150,125 @@ reassembles any moment by replaying that log over the baseline.
 `baseline.json` is written last, so its existence means the baseline finished.
 It is the handshake: replay reads it to learn which frame files to seed from.
 
-The baseline is taken once per save, not periodically. `baseline_tick` lives
-in `storage`, so it travels inside the save file — a save that has been
-baselined knows it. It is recorded only on *completion*, so a game saved and
-reloaded midway simply starts over rather than leaving a truncated baseline
-that replay would trust. Abandoned partial files are orphans no manifest
-names, so they are ignored rather than harmful.
+The baseline is taken once per save, not periodically, and **synchronously**
+in a single tick — the game visibly freezes for its duration (measured on a
+~375k entity base: tens of seconds). That trade is deliberate: a repeating
+snapshot would need to avoid a stall on every run, but a baseline runs at most
+once per save, so a one-time freeze beats a background cost smeared across
+the next several minutes of play that a save or quit could interrupt and
+force to restart. Factorio can only save or quit between ticks, never
+mid-tick, so the export cannot itself be caught half-written by normal
+play — only a killed process could, and that just retries on next load (see
+below).
+
+`baseline_tick` lives in `storage`, so it travels inside the save file — a
+save that has been baselined knows it. It is recorded only on *completion*,
+so a game saved and reloaded midway simply starts over rather than leaving a
+truncated baseline that replay would trust.
+
+That same persistence is a trap if the *output* is deleted rather than the
+save: `storage` survives independently of `script-output`, and the mod has
+no way to notice the mismatch. Checked against Factorio's own
+`runtime-api.json`: `LuaHelpers` exposes `write_file` and `remove_path` and
+nothing else, no read and no directory listing, so a mod genuinely cannot
+ask "is the file I wrote still there." Deleting `script-output/save-timelapse`
+by hand leaves `baseline_tick` set, `ensure_baseline` keeps returning early,
+and nothing gets rewritten — the reported symptom was live capture producing
+an `events_*.jsonl` (which doesn't check `baseline_tick` at all) with no
+baseline files alongside it. `/timelapse-reset-capture` is the manual
+equivalent of the detection the mod cannot do automatically: it clears
+`storage.timelapse_capture` outright, so the next check retakes the baseline
+and starts a fresh event segment.
 
 Snapshotting periodically instead would be pure duplication of what the log
 already says: at roughly 50 bytes per entity, a megabase snapshot every ten
-seconds writes gigabytes an hour.
+seconds writes gigabytes an hour. A separate `save-timelapse-snapshot-seconds`
+runtime setting does exactly that anyway, independent of live capture, for
+exercising the export path during real play — but for a *repeating* export
+the freeze that's fine to accept once is not fine to accept every interval,
+so that path stays incremental (see below) rather than sharing the baseline's
+synchronous one.
 
 ### Event format
 
 One JSON object per line. `op` is `+`/`-`, `k` is `e`/`t`.
 
     {"t":1234,"op":"+","k":"e","s":"nauvis","n":"transport-belt","x":10.5,"y":20.5,"d":4,"id":8842}
-    {"t":1250,"op":"-","k":"e","id":8842}
+    {"t":1250,"op":"-","k":"e","s":"nauvis","x":10.5,"y":20.5,"id":8842}
 
 `d`/`w`/`h` are omitted at their defaults, as in the frame format. `s` is the
 surface, and without it a Space Age save's planets collapse into one
-coordinate space, since positions repeat across surfaces. It is omitted on
-removals keyed by `id`: `unit_number` is unique across the whole game rather
-than per surface, so the id alone locates the target.
+coordinate space, since positions repeat across surfaces.
+
+A removal always carries position, even when `id` is present too. It used to
+carry id alone whenever one was available — `{"t":1250,"op":"-","k":"e","id":8842}`,
+nothing else — on the reasoning that `unit_number` is unique game-wide and
+unambiguously locates the target. That reasoning had a hole: an entity that
+already existed when the baseline was taken has no id in replay's world
+state (a snapshot records no `unit_number`s), but Factorio still reports its
+*real* id — the one it was assigned whenever it was originally built — when
+that entity is later mined or destroyed. Replay had never registered that id
+anywhere, so the removal resolved nowhere and silently no-opped. The entity
+never disappeared from the replayed timeline. `id` is kept alongside position
+now as a fast-path hint rather than the only key: replay tries it first, and
+falls back to position when the id isn't one it recognizes (see "World state"
+below).
 
 ### Why replay is forgiving
 
-The baseline is written across many ticks and so is not an atomic picture of
-one instant — something built while it runs may or may not appear, depending
-on whether its surface had already been flushed. Events are logged throughout
-that window too, so replay can see an add for something already present, or a
-remove for something it never saw.
+The baseline runs inside one tick, but that is not quite the same as being
+atomic with respect to every other event handler Factorio invokes during that
+same tick — a robot completing construction or a biter dying to a turret in
+the exact tick the baseline runs could in principle be logged as an event
+while also already reflected (or not) in what the baseline read. This window
+is now a single tick wide rather than the multi-minute one an incremental
+baseline would leave open, so in practice it is vanishingly rare, but replay
+does not depend on it never happening: an add for something already present,
+or a remove for something it never saw, are both no-ops rather than errors.
 
-Both are no-ops rather than errors. That turns an unavoidable smear into a
-non-problem, instead of something the mod would have to freeze the game to
-prevent. `save-timelapse-replay` reports the no-op count: a trickle is normal,
+That costs nothing and removes an entire class of edge case for free, so it
+stays even though the baseline it was originally built to cover no longer
+smears. `save-timelapse-replay` reports the no-op count: a trickle is normal,
 but a large fraction means the log and baseline came from different
 playthroughs.
 
 Events are applied in whole-tick batches, so a frame is never cut halfway
 through a tick — a blueprint landing 400 entities appears whole or not at all.
 
+### Timer handlers share one on_nth_tick per interval
+
+Factorio keeps a single handler per `on_nth_tick` interval; registering a
+second one for the same interval silently replaces the first rather than
+erroring. The capture flush runs every 600 ticks (10 real seconds), and the
+independent `save-timelapse-snapshot-seconds` test setting is also given in
+seconds, so a value of 10 there collides with it by coincidence, not by doing
+anything unusual. `control.lua` collects every interval a setting wants into
+one table and chains handlers that share an interval, rather than each
+feature calling `on_nth_tick` for itself — see `sync_subscriptions` and
+`set_interval_handlers`.
+
+`on_tick` itself is not part of that scheme: the mod registers exactly one
+`on_tick` handler, unconditionally, which drives both the headless-scan export
+and the periodic test-snapshot's incremental stepper (`snapshot_step`) off two
+field checks. There is nothing to collide with, since nothing else in the mod
+wants `on_tick`.
+
+`snapshot_start`/`snapshot_step` (the incremental, multi-tick exporter) now
+has exactly one caller: the periodic `save-timelapse-snapshot-seconds` test
+setting. The baseline used to share it, but runs synchronously instead (see
+"Live capture and replay" above) — a single-tick export via `export_all_to`,
+the same function `/timelapse-export` and headless scan use.
+
 ### World state
 
 Entities live in a slab with free-list reuse, indexed by position and by
-`unit_number`. Baseline entities have no `unit_number` (snapshots don't record
-one), so they can only be removed by position, which is why the mod always
-emits the position form when no id is available.
+`unit_number`. Baseline entities are loaded with no `unit_number` (a snapshot
+records none), so they are never reachable by id no matter what id Factorio
+later reports removing them by — only position resolves them. Replay's
+removal handling reflects this: try `id` first (an O(1) hit for anything
+built after capture began, since its add event registered the same id),
+then fall back to position, which is what makes a baseline-original entity's
+removal work at all.
 
 Position keys are scaled by **ten**, not two. Half-tile alignment covers most
 entities but not all: `frame_0000.json` holds a

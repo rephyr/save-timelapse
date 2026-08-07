@@ -96,6 +96,7 @@ fn main() {
     );
 
     let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut lod_totals = (0usize, 0usize); // (items, chunk cells)
     for path in viewer::frame_paths(Path::new(path)).unwrap_or_default() {
         let Some(frame) = viewer::load_frame(&path) else { continue };
 
@@ -125,6 +126,7 @@ fn main() {
         let after_default = calls(&grouped_order, DEFAULT_INDEX_CAPACITY);
         let after_raised = calls(&grouped_order, RAISED_INDEX_CAPACITY);
         let grouped = grouped_bytes(&rendered);
+        let lod_cells = rendered.tile_lod.len() + rendered.entity_lod.len();
 
         println!(
             "{items:>8}  {types:>7}  {runs:>6}  {before:>12}  {after_default:>12}  \
@@ -139,6 +141,8 @@ fn main() {
         totals.3 += after_raised;
         totals.4 += parsed;
         totals.5 += grouped;
+        lod_totals.0 += items;
+        lod_totals.1 += lod_cells;
     }
 
     if totals.0 == 0 {
@@ -157,5 +161,11 @@ fn main() {
         totals.4 / 1024,
         totals.5 / 1024,
         totals.4 as f64 / totals.5.max(1) as f64
+    );
+    println!(
+        "  chunk LOD (extreme zoom-out) : {} items -> {} chunk cells ({:.0}x fewer quads submitted per frame)",
+        lod_totals.0,
+        lod_totals.1,
+        lod_totals.0 as f64 / lod_totals.1.max(1) as f64
     );
 }

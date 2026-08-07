@@ -20,6 +20,13 @@ local encode = require("encode")
 local EXPORT_DIR = "save-timelapse/"
 local FLUSH_EVERY = 2000
 
+--- Set at load when the CLI's startup flag is on, and acted on by the single
+--- on_tick handler at the bottom of this file rather than by registering one
+--- here. Factorio keeps one handler per event, so a second registration would
+--- silently replace this one -- which is exactly what an incremental snapshot
+--- wanting on_tick would do.
+local headless_scan_pending = false
+
 local function excluded_types()
   if settings.startup["save-timelapse-include-resources"].value then
     return encode.EXCLUDED_TYPES
@@ -98,7 +105,18 @@ local function is_inhabited(surface)
   return ok and found ~= nil and #found > 0
 end
 
-local function export_all(tick)
+--- Shared by the synchronous export below and the periodic test-snapshot
+--- timer: both describe "everything exported at this tick" in the same shape,
+--- so both write it through one function rather than two copies drifting.
+local function periodic_manifest_path(tick)
+  return string.format("%sframe_%d_manifest.json", EXPORT_DIR, tick)
+end
+
+--- Every surface, synchronously, in whatever tick this is called from. Used
+--- for /timelapse-export, headless scan, and the once-per-save baseline --
+--- three callers wanting the exact same "everything, right now" export,
+--- differing only in what manifest path names the result.
+local function export_all_to(tick, manifest_path)
   local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do
@@ -111,12 +129,16 @@ local function export_all(tick)
   end
 
   helpers.write_file(
-    string.format("%sframe_%d_manifest.json", EXPORT_DIR, tick),
+    manifest_path,
     string.format('{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s]}',
       tick, total, tile_total, table.concat(names, ",")),
     false)
 
   return total, tile_total, #names
+end
+
+local function export_all(tick)
+  return export_all_to(tick, periodic_manifest_path(tick))
 end
 
 commands.add_command("timelapse-export",
@@ -132,13 +154,12 @@ commands.add_command("timelapse-export",
   end)
 
 -- Unattended path. The CLI enables the startup flag, loads the save under
--- --benchmark, and we export on the first tick then unsubscribe so the run
--- reaches its tick limit and exits.
+-- --benchmark, and we export on the first tick so the run reaches its tick
+-- limit and exits. Only the flag is set here; the export itself happens in
+-- the shared on_tick handler at the bottom of this file, which is defined
+-- after everything it calls.
 if settings.startup["save-timelapse-headless-scan"].value then
-  script.on_event(defines.events.on_tick, function(event)
-    export_all(event.tick)
-    script.on_event(defines.events.on_tick, nil)
-  end)
+  headless_scan_pending = true
 end
 
 -- ---------------------------------------------------------------------------
@@ -146,7 +167,17 @@ end
 
 local CAPTURE_FLUSH_EVERY = 200
 local CAPTURE_FLUSH_TICKS = 600 -- ~10 real seconds, bounds data loss even when idle
-local SNAPSHOT_BATCH_SIZE = 1000 -- work items processed per tick while exporting
+--- Work items encoded per tick while the periodic test-snapshot runs, and how
+--- many encoded strings accumulate before a file append. Deliberately small:
+--- the point of spreading that export over ticks is that no single tick
+--- stalls, and a big batch gives that back. The baseline does not use this --
+--- see export_all_to -- since it runs at most once per save and a one-time
+--- freeze was judged worth it there to avoid a background cost smeared across
+--- several minutes of play. Separate from FLUSH_EVERY, which serves every
+--- synchronous export path (`/timelapse-export`, headless scan, baseline)
+--- where syscall count, not smoothness, is the cost.
+local SNAPSHOT_BATCH_SIZE = 64
+local SNAPSHOT_FLUSH_EVERY = 128
 
 --- Written once, after the baseline snapshot finishes, naming the tick and
 --- surfaces it covers. This is the handshake with the Rust side: it is the
@@ -237,25 +268,105 @@ local function snapshot_begin_surface(state, surface)
     string.format('{"tick":%d,"surface":%s,"entities":[', state.tick, encode.quote(surface.name)), false)
 end
 
---- Runs when the baseline finishes: writes the manifest that tells the Rust
---- side the baseline is complete and what it covers, then hands back the
---- tick so the caller can record that this save now has one.
+--- Runs when a snapshot finishes: writes its manifest. Written last, so its
+--- presence is what tells a reader the snapshot is whole rather than still
+--- in progress. Only the periodic test-snapshot timer goes through this path
+--- now -- the baseline runs synchronously via export_all_to below -- so the
+--- manifest is always the periodic shape.
 local function snapshot_finish(s)
   local quoted = {}
   for i, name in pairs(s.surface_names) do
     quoted[i] = encode.quote(name)
   end
 
-  helpers.write_file(BASELINE_MANIFEST, string.format(
+  helpers.write_file(periodic_manifest_path(s.tick), string.format(
     '{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s]}',
     s.tick, s.total_entities, s.total_tiles, table.concat(quoted, ",")), false)
+end
 
-  if s.on_complete then
-    s.on_complete(s.tick)
+--- One tick's worth of export. Driven by the shared on_tick handler rather
+--- than by a handler this function registers itself: Factorio keeps a single
+--- handler per event, so registering one here would silently displace the
+--- headless-scan export.
+local function snapshot_step()
+  local s = snapshot_state
+  if not s then
+    return
+  end
+
+  if not s.phase then
+    local surface = game.surfaces[s.surface_names[s.surface_index]]
+    if not surface then
+      snapshot_state = nil
+      return
+    end
+    snapshot_begin_surface(s, surface)
+  end
+
+  local surface = game.surfaces[s.surface_name]
+  if not surface then
+    snapshot_state = nil
+    return
+  end
+
+  if s.phase == "entities" then
+    local end_index = math.min(s.entity_index + SNAPSHOT_BATCH_SIZE - 1, #s.entities)
+    for i = s.entity_index, end_index do
+      local entity = s.entities[i]
+      if entity.valid then
+        s.written = s.written + 1
+        s.pending_count = s.pending_count + 1
+        s.pending[s.pending_count] = (s.written > 1 and "," or "") .. encode.encode_entity(entity)
+        if s.pending_count >= SNAPSHOT_FLUSH_EVERY then
+          snapshot_flush(s)
+        end
+      end
+    end
+    s.entity_index = end_index + 1
+    if s.entity_index > #s.entities then
+      snapshot_flush(s)
+      helpers.write_file(s.path, string.format('],"count":%d,"tiles":[', s.written), true)
+      s.phase = "tiles"
+      s.tiles = surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })
+      s.tile_index = 1
+    end
+    return
+  end
+
+  if s.phase == "tiles" then
+    local end_index = math.min(s.tile_index + SNAPSHOT_BATCH_SIZE - 1, #s.tiles)
+    for i = s.tile_index, end_index do
+      local tile = s.tiles[i]
+      s.tiles_written = s.tiles_written + 1
+      s.pending_count = s.pending_count + 1
+      s.pending[s.pending_count] = (s.tiles_written > 1 and "," or "") .. encode.encode_tile(tile)
+      if s.pending_count >= SNAPSHOT_FLUSH_EVERY then
+        snapshot_flush(s)
+      end
+    end
+    s.tile_index = end_index + 1
+    if s.tile_index > #s.tiles then
+      snapshot_flush(s)
+      helpers.write_file(s.path, string.format('],"tile_count":%d}', s.tiles_written), true)
+      s.total_entities = s.total_entities + s.written
+      s.total_tiles = s.total_tiles + s.tiles_written
+      s.phase = nil
+      s.surface_index = s.surface_index + 1
+      if s.surface_index > #s.surface_names then
+        snapshot_finish(s)
+        snapshot_state = nil
+      end
+    end
   end
 end
 
-local function snapshot_start(tick, on_complete)
+--- Start an incremental, multi-tick export. The only caller left is the
+--- periodic test-snapshot timer: the baseline used to share this (see
+--- export_all_to for why it no longer does) and a stray old reference here
+--- would be the kind of thing that quietly drifts back out of sync, so this
+--- stays a single-purpose function rather than a generic one two callers
+--- have to agree on.
+local function snapshot_start(tick)
   if snapshot_state then
     return
   end
@@ -277,7 +388,6 @@ local function snapshot_start(tick, on_complete)
     path = nil,
     surface_name = nil,
     phase = nil,
-    on_complete = on_complete,
   }
 
   for _, surface in pairs(game.surfaces) do
@@ -291,81 +401,6 @@ local function snapshot_start(tick, on_complete)
   end
 
   snapshot_state = state
-  script.on_event(defines.events.on_tick, function(event)
-    if not snapshot_state then
-      script.on_event(defines.events.on_tick, nil)
-      return
-    end
-
-    local s = snapshot_state
-    if not s.phase then
-      local surface = game.surfaces[s.surface_names[s.surface_index]]
-      if not surface then
-        snapshot_state = nil
-        script.on_event(defines.events.on_tick, nil)
-        return
-      end
-      snapshot_begin_surface(s, surface)
-    end
-
-    local surface = game.surfaces[s.surface_name]
-    if not surface then
-      snapshot_state = nil
-      script.on_event(defines.events.on_tick, nil)
-      return
-    end
-
-    if s.phase == "entities" then
-      local end_index = math.min(s.entity_index + SNAPSHOT_BATCH_SIZE - 1, #s.entities)
-      for i = s.entity_index, end_index do
-        local entity = s.entities[i]
-        if entity.valid then
-          s.written = s.written + 1
-          s.pending_count = s.pending_count + 1
-          s.pending[s.pending_count] = (s.written > 1 and "," or "") .. encode.encode_entity(entity)
-          if s.pending_count >= FLUSH_EVERY then
-            snapshot_flush(s)
-          end
-        end
-      end
-      s.entity_index = end_index + 1
-      if s.entity_index > #s.entities then
-        snapshot_flush(s)
-        helpers.write_file(s.path, string.format('],"count":%d,"tiles":[', s.written), true)
-        s.phase = "tiles"
-        s.tiles = surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })
-        s.tile_index = 1
-      end
-    end
-
-    if s.phase == "tiles" then
-      local end_index = math.min(s.tile_index + SNAPSHOT_BATCH_SIZE - 1, #s.tiles)
-      for i = s.tile_index, end_index do
-        local tile = s.tiles[i]
-        s.tiles_written = s.tiles_written + 1
-        s.pending_count = s.pending_count + 1
-        s.pending[s.pending_count] = (s.tiles_written > 1 and "," or "") .. encode.encode_tile(tile)
-        if s.pending_count >= FLUSH_EVERY then
-          snapshot_flush(s)
-        end
-      end
-      s.tile_index = end_index + 1
-      if s.tile_index > #s.tiles then
-        snapshot_flush(s)
-        helpers.write_file(s.path, string.format('],"tile_count":%d}', s.tiles_written), true)
-        s.total_entities = s.total_entities + s.written
-        s.total_tiles = s.total_tiles + s.tiles_written
-        s.phase = nil
-        s.surface_index = s.surface_index + 1
-        if s.surface_index > #s.surface_names then
-          snapshot_finish(s)
-          snapshot_state = nil
-          script.on_event(defines.events.on_tick, nil)
-          return
-        end
-      end
-    end
-  end)
 end
 
 --- Take the baseline once per save, then never again: everything after it is
@@ -374,28 +409,66 @@ end
 --- every 10 seconds was writing gigabytes an hour to say what the log
 --- already said.
 ---
---- `baseline_tick` is recorded in `storage`, so it travels inside the save:
---- a save that has been baselined knows it, and a fresh one does not. It is
---- set only on *completion*, so a game saved and reloaded midway through the
---- export simply starts over rather than leaving the Rust side with a
---- truncated baseline it believes is whole. The abandoned partial files are
---- orphans that no manifest names, so they are ignored rather than harmful.
+--- Runs synchronously in a single tick via export_all_to, unlike the
+--- incremental snapshot_start/snapshot_step the periodic test-snapshot
+--- setting uses. That incremental machinery exists specifically to avoid a
+--- visible freeze on every run -- the right trade for something that repeats.
+--- A baseline runs at most once per save, so the trade flips: a freeze
+--- proportional to base size (measured on a ~375k entity base: tens of
+--- seconds), once, beats a background cost smeared across the next several
+--- minutes of play that a save or quit can interrupt and force to restart.
+--- Factorio can only save or quit between ticks, never mid-tick, so a
+--- single-tick export cannot itself be caught half-written by normal play --
+--- only a killed process could, and `baseline_tick` is set below only after
+--- the write succeeds, so even that just retries on next load rather than
+--- trusting a partial file.
 ---
---- Events are logged during the export too. The snapshot is spread over many
---- ticks and so is not atomic: something built while it runs may or may not
---- land in the baseline depending on whether its surface was already written.
---- Replay absorbs that by applying adds idempotently and tolerating removes
---- of things it never saw, which makes the smear harmless rather than
---- something the mod has to prevent.
+--- `baseline_tick` is recorded in `storage`, so it travels inside the save:
+--- a save that has been baselined knows it, and a fresh one does not.
 local function ensure_baseline(tick)
   ensure_capture_segment()
-  if storage.timelapse_capture.baseline_tick or snapshot_state then
+  local capture = storage.timelapse_capture
+  if capture.baseline_tick then
     return
   end
-  snapshot_start(tick, function(completed_tick)
-    storage.timelapse_capture.baseline_tick = completed_tick
-  end)
+  export_all_to(tick, BASELINE_MANIFEST)
+  capture.baseline_tick = tick
 end
+
+--- The mod cannot detect that script-output/save-timelapse has been wiped
+--- and retake the baseline on its own: `LuaHelpers` (checked against
+--- Factorio's own runtime-api.json) exposes `write_file` and `remove_path`
+--- and nothing else -- no read, no exists check, no directory listing. A
+--- mod genuinely cannot tell whether a file it wrote is still there.
+--- `baseline_tick` therefore has to be trusted as the source of truth for
+--- "has this save already been baselined," which is correct for its actual
+--- purpose (never repeat a multi-second export unnecessarily) but leaves no
+--- automatic recovery if the output files are deleted out from under it.
+---
+--- This command is the manual equivalent of automatic detection: run it
+--- after clearing script-output (or whenever a corrupted/incomplete capture
+--- needs to be abandoned) and the next check retakes the baseline and starts
+--- a fresh event segment, exactly as if this save had never been captured.
+commands.add_command("timelapse-reset-capture",
+  "Clear live-capture state so the baseline is retaken and a fresh event " ..
+  "log starts. Use after deleting files from script-output/save-timelapse " ..
+  "-- the mod cannot see that on its own, since Factorio gives it no way " ..
+  "to read back what it already wrote.",
+  function(event)
+    storage.timelapse_capture = nil
+    capture_checked_rollover = false
+    local player = event.player_index and game.get_player(event.player_index)
+
+    if settings.global["save-timelapse-live-capture"].value then
+      ensure_baseline(game.tick)
+      if player then
+        player.print("[save-timelapse] capture state cleared, baseline retaken")
+      end
+    elseif player then
+      player.print(
+        "[save-timelapse] capture state cleared; enable save-timelapse-live-capture to start a new baseline")
+    end
+  end)
 
 local function flush_capture()
   if capture_pending_count > 0 then
@@ -461,31 +534,102 @@ local CAPTURE_HANDLERS = {
   [defines.events.on_robot_mined_tile] = function(e) log_tile_change("-", e) end,
 }
 
---- Handlers are only subscribed while capture is on -- not registered but
---- checking a flag on every call -- so there's zero hook cost when it's off.
-local function sync_capture_subscriptions()
-  local on = settings.global["save-timelapse-live-capture"].value
+-- ---------------------------------------------------------------------------
+-- Timers
+--
+-- Factorio keeps one handler per on_nth_tick interval, so a second feature
+-- registering the same interval silently replaces the first rather than
+-- erroring. CAPTURE_FLUSH_TICKS is 600 (10 real seconds), and the periodic
+-- test-snapshot setting below is also given in seconds, so a user picking 10
+-- there hits that interval by coincidence, not by doing anything unusual.
+-- Anything wanting a periodic callback is therefore collected into one table
+-- keyed by interval and chained, rather than each feature calling
+-- `script.on_nth_tick` for itself.
 
-  for event_id, handler in pairs(CAPTURE_HANDLERS) do
-    script.on_event(event_id, on and handler or nil)
+--- Intervals currently subscribed, so a resync can release the ones no
+--- longer wanted. Reset by on_load along with the rest of Lua state, which
+--- is correct: a fresh state holds no subscriptions to release.
+local active_intervals = {}
+
+local function set_interval_handlers(by_interval)
+  for interval in pairs(active_intervals) do
+    if not by_interval[interval] then
+      script.on_nth_tick(interval, nil)
+    end
   end
 
-  -- Also where an interrupted baseline gets retried: `on_load` cannot write
-  -- storage or start one, so the first flush after a reload is what notices
-  -- `baseline_tick` is still unset and restarts the export.
-  script.on_nth_tick(CAPTURE_FLUSH_TICKS, on and function(event)
-    capture_checked_rollover = true
-    ensure_baseline(event.tick)
-    flush_capture()
-  end or nil)
+  active_intervals = {}
+  for interval, handler in pairs(by_interval) do
+    script.on_nth_tick(interval, handler)
+    active_intervals[interval] = true
+  end
 end
 
-script.on_init(sync_capture_subscriptions)
-script.on_load(sync_capture_subscriptions)
+--- Handlers are only subscribed while their setting is on -- not registered
+--- but checking a flag on every call -- so there's zero hook cost when off.
+local function sync_subscriptions()
+  local capture_on = settings.global["save-timelapse-live-capture"].value
+
+  for event_id, handler in pairs(CAPTURE_HANDLERS) do
+    script.on_event(event_id, capture_on and handler or nil)
+  end
+
+  local by_interval = {}
+  local function want(interval, handler)
+    local existing = by_interval[interval]
+    by_interval[interval] = existing
+      and function(event) existing(event); handler(event) end
+      or handler
+  end
+
+  if capture_on then
+    -- Also where an interrupted baseline gets retried: `on_load` cannot
+    -- write storage or start one, so the first flush after a reload is what
+    -- notices `baseline_tick` is still unset and restarts the export.
+    want(CAPTURE_FLUSH_TICKS, function(event)
+      capture_checked_rollover = true
+      ensure_baseline(event.tick)
+      flush_capture()
+    end)
+  end
+
+  -- A snapshot on a timer, independent of live capture, for exercising the
+  -- export path during real play without the freeze a synchronous export
+  -- would repeat every interval -- unlike the baseline, this one runs over
+  -- and over, so avoiding a stall on every run is worth the extra ticks it
+  -- takes to finish each one.
+  local test_seconds = settings.global["save-timelapse-snapshot-seconds"].value
+  if test_seconds > 0 then
+    want(test_seconds * 60, function(event)
+      snapshot_start(event.tick)
+    end)
+  end
+
+  set_interval_handlers(by_interval)
+end
+
+--- The one on_tick subscription in the whole mod, so nothing here can
+--- collide with another feature wanting on_tick the way two on_nth_tick
+--- features could collide above.
+local function on_tick(event)
+  if headless_scan_pending then
+    export_all(event.tick)
+    headless_scan_pending = false
+  end
+  if snapshot_state then
+    snapshot_step()
+  end
+end
+script.on_event(defines.events.on_tick, on_tick)
+
+script.on_init(sync_subscriptions)
+script.on_load(sync_subscriptions)
 script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
-  if event.setting == "save-timelapse-live-capture" then
-    sync_capture_subscriptions()
-    if settings.global["save-timelapse-live-capture"].value then
+  if event.setting == "save-timelapse-live-capture"
+    or event.setting == "save-timelapse-snapshot-seconds" then
+    sync_subscriptions()
+    if event.setting == "save-timelapse-live-capture"
+      and settings.global["save-timelapse-live-capture"].value then
       capture_checked_rollover = true
       -- Turning capture on is the one moment we can baseline immediately
       -- rather than waiting up to CAPTURE_FLUSH_TICKS for the first flush.

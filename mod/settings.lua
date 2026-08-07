@@ -35,4 +35,23 @@ data:extend({
     default_value = false,
     order = "c",
   },
+  {
+    -- Snapshot the whole surface on a timer, for testing the export path
+    -- during real play independent of live capture. 0 disables it.
+    --
+    -- Spread over many ticks the same way the live-capture baseline is
+    -- (SNAPSHOT_BATCH_SIZE work items per tick in control.lua), so this does
+    -- not stall the game the way one giant single-tick export would. The
+    -- cost is elapsed time instead: on a large base a snapshot can still be
+    -- running when the next one is due, in which case the timer's tick is
+    -- silently skipped rather than overlapping it. Small intervals are only
+    -- meaningful on small saves for that reason.
+    type = "int-setting",
+    name = "save-timelapse-snapshot-seconds",
+    setting_type = "runtime-global",
+    default_value = 0,
+    minimum_value = 0,
+    maximum_value = 3600,
+    order = "d",
+  },
 })

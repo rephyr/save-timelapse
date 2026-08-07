@@ -81,11 +81,18 @@ check("encode_event: entity add with 1x1 footprint omits w/h",
   encode.encode_event("+", "e", 1234, "inserter", 1, 2, 0, 8842, 1, 1),
   '{"t":1234,"op":"+","k":"e","n":"inserter","x":1.0,"y":2.0,"id":8842}')
 
-check("encode_event: entity remove with id is the short form",
-  encode.encode_event("-", "e", 1250, nil, nil, nil, nil, 8842),
-  '{"t":1250,"op":"-","k":"e","id":8842}')
+-- Position is always sent on removal, even when id is available too: an
+-- entity that already existed when the baseline was taken carries its real
+-- (pre-existing) unit_number when Factorio reports it removed, but replay's
+-- world state never learned that number from a snapshot, which records no
+-- ids. Sending id alone, as this once did, made every such removal an
+-- unresolvable no-op. See mod/control.lua's ensure_baseline for the other
+-- half of this.
+check("encode_event: entity remove with id still carries position",
+  encode.encode_event("-", "e", 1250, nil, 10.5, 20.5, nil, 8842),
+  '{"t":1250,"op":"-","k":"e","x":10.5,"y":20.5,"id":8842}')
 
-check("encode_event: entity remove without id falls back to position",
+check("encode_event: entity remove without id is position keyed",
   encode.encode_event("-", "e", 1250, nil, 10.5, 20.5, nil, nil),
   '{"t":1250,"op":"-","k":"e","x":10.5,"y":20.5}')
 
@@ -116,11 +123,9 @@ check("encode_event: tile remove carries its surface",
   encode.encode_event("-", "t", 1310, nil, 10, 20, nil, nil, nil, nil, "fulgora"),
   '{"t":1310,"op":"-","k":"t","s":"fulgora","x":10,"y":20}')
 
--- unit_number is unique across the whole game, not per surface, so an
--- id-keyed removal stays the short form with no surface to carry.
-check("encode_event: id-keyed remove omits surface even when one is given",
-  encode.encode_event("-", "e", 1250, nil, nil, nil, nil, 8842, nil, nil, "vulcanus"),
-  '{"t":1250,"op":"-","k":"e","id":8842}')
+check("encode_event: entity remove carries both surface and id alongside position",
+  encode.encode_event("-", "e", 1250, nil, 10.5, 20.5, nil, 8842, nil, nil, "vulcanus"),
+  '{"t":1250,"op":"-","k":"e","s":"vulcanus","x":10.5,"y":20.5,"id":8842}')
 
 -- next_capture_segment ---------------------------------------------------------
 
@@ -153,6 +158,12 @@ end
 local excluded = assert_no_duplicates(encode.EXCLUDED_TYPES, "EXCLUDED_TYPES")
 check("EXCLUDED_TYPES: contains character", excluded["character"], true)
 check("EXCLUDED_TYPES: contains tree", excluded["tree"], true)
+-- Enemies are wildlife, not factory, and their deaths would otherwise flood
+-- live capture with removals unrelated to construction. Regression: a real
+-- capture showed ~6% of exported entities were biters/spitters/spawners
+-- before these were added.
+check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true)
+check("EXCLUDED_TYPES: contains unit-spawner", excluded["unit-spawner"], true)
 
 local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILES")
 check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)

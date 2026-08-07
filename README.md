@@ -39,6 +39,9 @@ Useful flags:
 | `--mods <path>` | Mods folder if it is not auto-detected |
 | `--limit <n>` | Export only the first N saves, for a quick check |
 | `--include-resources` | Include ore tiles. Every tile is a separate entity, so this multiplies frame size. |
+| `--match-name <text>` | Export only saves whose filename contains this text, case insensitive |
+
+`--saves` also accepts a single `.zip` directly, not just a folder.
 
 Inside the game, `/timelapse-export` writes a single frame for the current save
 to `script-output/save-timelapse/`.
@@ -49,8 +52,10 @@ The other way to build a timelapse, and the smoother one: instead of one frame
 per save, you get one frame per however often you like.
 
 Enable the runtime setting `save-timelapse-live-capture`. The mod takes **one**
-full snapshot of the save, then logs nothing but placements and removals as you
-play. When you're done, replay the log over that baseline:
+full snapshot of the save — the game freezes for its duration, proportional to
+base size (tens of seconds on a large base) — then logs nothing but
+placements and removals as you play. When you're done, replay the log over
+that baseline:
 
 ```
 save-timelapse-replay --capture "%APPDATA%/Factorio/script-output/save-timelapse" --out frames
@@ -70,6 +75,20 @@ never repeats — and a game saved partway through the export just retakes it on
 the next load. Unlike the snapshot flow this only covers play from the moment
 you turn it on, since Factorio keeps no placement history to recover
 retroactively.
+
+If you delete files from `script-output/save-timelapse`, the mod has no way
+to notice: Factorio only lets it write files, never read or list them back.
+It will keep assuming the baseline it already took is still there. Run
+`/timelapse-reset-capture` to clear that assumption and retake the baseline
+immediately, along with starting a fresh event log.
+
+A separate runtime setting, `save-timelapse-snapshot-seconds`, takes a full
+snapshot on a repeating timer instead — independent of live capture, for
+exercising the export path during real play. 0 disables it (the default).
+Unlike the baseline, this one runs incrementally across many ticks rather
+than freezing the game, since paying that cost on every repeat (rather than
+once) isn't worth it; a snapshot can still be running when the next one comes
+due, in which case that tick is silently skipped.
 
 The viewer ignores incomplete or malformed frame files while loading, so a
 snapshot still being written won't crash it.

@@ -10,6 +10,13 @@ local M = {}
 M.EXCLUDED_TYPES = {
   -- actors and their remains
   "character", "corpse", "combat-robot", "fish",
+  -- enemies: wildlife rather than factory, and their deaths in combat would
+  -- otherwise flood live capture with removal events unrelated to
+  -- construction. Worm turrets are left in: they share the "turret" type
+  -- with player turrets, and are stationary and comparatively few, so
+  -- filtering them would risk excluding a real player entity by name-sniffing
+  -- instead of type.
+  "unit", "unit-spawner",
   -- terrain scatter
   "tree", "simple-entity", "simple-entity-with-force", "simple-entity-with-owner",
   "cliff",
@@ -63,24 +70,27 @@ function M.encode_tile(tile)
 end
 
 --- One live-capture log line. `op` is "+" (add) or "-" (remove); `kind` is
---- "e" (entity) or "t" (tile). On remove, `id` (an entity's unit_number) is
---- preferred when available: just tick/op/kind/id, nothing else needed.
---- Otherwise x/y locate whatever currently occupies that position -- the
---- only option for tiles, which have no identity beyond their position.
+--- "e" (entity) or "t" (tile). Position always locates the target -- the
+--- only option for tiles, which have no identity beyond their position, and
+--- necessary for entities too, not just a fallback: an entity that already
+--- existed when the baseline was taken carries its real unit_number when
+--- Factorio later reports it mined or destroyed (that number was assigned
+--- whenever the entity was originally built, long before capture started),
+--- but a snapshot records no ids, so replay's world state never learned that
+--- number belongs to that entity. Sending id alone on removal, as this once
+--- did, made every such removal an unresolvable no-op -- the entity would
+--- never disappear from the replayed timeline. `id` now rides alongside
+--- position as a fast, unambiguous match for whatever replay does have an id
+--- for (anything built after capture began), with position as what actually
+--- makes a baseline-original entity's removal work at all.
+---
 --- `w`/`h` (entity footprint, add events only) follow the same omit-at-1x1
 --- convention as encode_entity.
 ---
 --- `surface` (`"s"`) is what lets replay route an event to the right world.
 --- Without it, a Space Age save's planets and platforms all collapse into one
---- coordinate space, since positions only repeat across surfaces. It is
---- emitted on anything located by position, and omitted when `id` alone
---- identifies the target: unit_number is unique across the whole game, not
---- per surface, so a removal keyed by id needs no surface to find it.
+--- coordinate space, since positions only repeat across surfaces.
 function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h, surface)
-  if op == "-" and id then
-    return string.format('{"t":%d,"op":"-","k":%s,"id":%d}', tick, M.quote(kind), id)
-  end
-
   local coord_fmt = kind == "t" and '"x":%d,"y":%d' or '"x":%.1f,"y":%.1f'
   local fields = string.format('{"t":%d,"op":%s,"k":%s,', tick, M.quote(op), M.quote(kind))
 
@@ -100,9 +110,9 @@ function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h, surface
     if w and h and (w ~= 1 or h ~= 1) then
       fields = fields .. string.format(',"w":%d,"h":%d', w, h)
     end
-    if id then
-      fields = fields .. ',"id":' .. id
-    end
+  end
+  if kind == "e" and id then
+    fields = fields .. ',"id":' .. id
   end
 
   return fields .. "}"

@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use macroquad::color::Color;
-use macroquad::math::Vec2;
+use macroquad::math::{Rect, Vec2};
 use save_timelapse::frame::{Entity, Frame, Tile};
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
@@ -126,6 +126,60 @@ pub struct RenderTile {
     pub y: i32,
 }
 
+/// Granularity of the level-of-detail pass below: an `LOD_CELL_TILES`^2
+/// square of the world collapses to one flat-colored quad, showing whichever
+/// type is most common in it and discarding the rest.
+///
+/// Independent of Factorio's own 32-tile chunk size, despite starting out
+/// equal to it -- that was borrowed as a convenient existing grid, not
+/// because rendering needs to align with it. 32 turned out too coarse:
+/// aggregating 1,024 tiles into one dominant-type color loses so much that a
+/// paved area with belts and machines running through it just reads as a
+/// solid gray block. Smaller cells keep more structure recognizable, at the
+/// cost of more (but still vastly fewer than full-detail) quads submitted --
+/// halved again from 8 to 4 once 8 measured with FPS to spare.
+pub const LOD_CELL_TILES: i32 = 4;
+
+/// Below this on-screen tile size (in pixels), draw chunk-aggregated
+/// [`LodCell`]s instead of individual items. At this scale a 1x1 entity
+/// spans a fraction of a pixel anyway, so individual items are already
+/// imperceptible -- the only question is whether the CPU still pays to
+/// transform and submit each one. Comfortably below `SPRITE_MIN_PIXELS`, so
+/// sprites are never in play once LOD is.
+///
+/// A *tile's* pixel size, not a *chunk's*: a chunk is 32 tiles across, so
+/// gating on the chunk's on-screen size instead would only trigger LOD 32x
+/// later than intended -- a real base at the zoom level that motivated this
+/// (0.32 px/tile, individual tiles long since imperceptible) measured 3.27M
+/// quads submitted and 7 fps with that version of the check, because a
+/// 10px chunk still looked "big enough" even though every tile inside it was
+/// a third of a pixel.
+pub const LOD_MAX_TILE_PIXELS: f32 = 2.0;
+
+pub fn use_chunk_lod(pixels_per_tile: f32) -> bool {
+    pixels_per_tile <= LOD_MAX_TILE_PIXELS
+}
+
+/// One `LOD_CELL_TILES`-square chunk of the world, drawn as a single
+/// flat-colored quad. Only ever produced for the level-of-detail pass --
+/// full-detail rendering uses [`RenderEntity`]/[`RenderTile`] instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LodCell {
+    pub cx: i32,
+    pub cy: i32,
+}
+
+impl LodCell {
+    /// World-space top-left corner of this chunk.
+    pub fn world_origin(&self) -> Vec2 {
+        Vec2::new((self.cx * LOD_CELL_TILES) as f32, (self.cy * LOD_CELL_TILES) as f32)
+    }
+}
+
+fn chunk_of(x: i32, y: i32) -> (i32, i32) {
+    (x.div_euclid(LOD_CELL_TILES), y.div_euclid(LOD_CELL_TILES))
+}
+
 /// A frame in the layout the renderer wants: items grouped into contiguous
 /// per-type runs, names interned away, dense and copyable.
 pub struct RenderFrame {
@@ -135,6 +189,14 @@ pub struct RenderFrame {
     pub entity_runs: Vec<Run>,
     pub tiles: Vec<RenderTile>,
     pub tile_runs: Vec<Run>,
+    /// Chunk-level level of detail, precomputed once at load rather than
+    /// per rendered frame: at millions of tiles, even a cheap per-item
+    /// binning pass is too slow to redo 60 times a second, but paid once
+    /// while parsing it's the same order of cost as parsing itself.
+    pub tile_lod: Vec<LodCell>,
+    pub tile_lod_runs: Vec<Run>,
+    pub entity_lod: Vec<LodCell>,
+    pub entity_lod_runs: Vec<Run>,
 }
 
 /// Group `items` by type into contiguous runs, by counting sort.
@@ -169,6 +231,36 @@ fn group_by_type<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usi
     (grouped, runs)
 }
 
+/// Aggregate items into one dominant type per `LOD_CELL_TILES`-square chunk,
+/// for the level-of-detail pass. `chunk_coords[i]` is the chunk containing
+/// `ids[i]`/the item at the same index in whatever array these came from.
+///
+/// A per-chunk `Vec<(TypeId, count)>` rather than a `type_count`-sized array
+/// per chunk: a chunk of floor tiles is realistically one or two types, and
+/// a real base can have thousands of occupied chunks, so a dense per-chunk
+/// array (tens of entries, nearly all zero) would waste far more than the
+/// linear scan through a handful of real entries costs.
+fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
+    let mut counts: HashMap<(i32, i32), Vec<(TypeId, u32)>> = HashMap::new();
+    for (&coord, &id) in chunk_coords.iter().zip(ids) {
+        let entry = counts.entry(coord).or_default();
+        match entry.iter_mut().find(|(t, _)| *t == id) {
+            Some((_, count)) => *count += 1,
+            None => entry.push((id, 1)),
+        }
+    }
+
+    let mut cell_ids = Vec::with_capacity(counts.len());
+    let mut cells = Vec::with_capacity(counts.len());
+    for ((cx, cy), type_counts) in counts {
+        let dominant = type_counts.into_iter().max_by_key(|&(_, count)| count).map(|(t, _)| t).unwrap_or(0);
+        cell_ids.push(dominant);
+        cells.push(LodCell { cx, cy });
+    }
+
+    group_by_type(&cell_ids, &cells, type_count)
+}
+
 impl RenderFrame {
     /// Consumes the parsed frame: keeping both representations alive would
     /// defeat the point, since the `frame::Frame` is the expensive one.
@@ -190,10 +282,31 @@ impl RenderFrame {
         let tiles: Vec<RenderTile> = frame.tiles.iter().map(|t| RenderTile { x: t.x, y: t.y }).collect();
 
         let type_count = registry.len();
+
+        // Computed from the pre-grouped ids/positions, so this doesn't need
+        // the full-detail grouping to have happened first.
+        let entity_chunks: Vec<(i32, i32)> =
+            entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
+        let (entity_lod, entity_lod_runs) = build_chunk_lod(&entity_ids, &entity_chunks, type_count);
+
+        let tile_chunks: Vec<(i32, i32)> = tiles.iter().map(|t| chunk_of(t.x, t.y)).collect();
+        let (tile_lod, tile_lod_runs) = build_chunk_lod(&tile_ids, &tile_chunks, type_count);
+
         let (entities, entity_runs) = group_by_type(&entity_ids, &entities, type_count);
         let (tiles, tile_runs) = group_by_type(&tile_ids, &tiles, type_count);
 
-        RenderFrame { tick: frame.tick, count: frame.count, entities, entity_runs, tiles, tile_runs }
+        RenderFrame {
+            tick: frame.tick,
+            count: frame.count,
+            entities,
+            entity_runs,
+            tiles,
+            tile_runs,
+            tile_lod,
+            tile_lod_runs,
+            entity_lod,
+            entity_lod_runs,
+        }
     }
 }
 
@@ -407,6 +520,21 @@ pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
 
 pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
     icon_candidates(data_dir, name).into_iter().find(|candidate| candidate.exists())
+}
+
+/// Vanilla and Space Age icon files are a horizontal mipmap strip, not a
+/// single image: the primary icon at full size, then progressively smaller
+/// copies laid out to its right, all sharing the strip's height (verified
+/// against real files -- e.g. 64+32+16+8=120 wide, 64 tall). Drawing the
+/// whole file stretched into one entity's box renders all of them squashed
+/// together, which is what "sprites have 4 sprites in them" was.
+///
+/// The primary icon is always the leftmost square, sized to the image's
+/// height. A single-icon file with no strip (width == height) falls out of
+/// the same rule as a no-op crop, so callers don't need to special-case it.
+pub fn icon_source_rect(width: f32, height: f32) -> Rect {
+    let size = width.min(height);
+    Rect::new(0.0, 0.0, size, size)
 }
 
 /// A horizontal scrub bar, centered near the bottom of the window, mapping
@@ -649,13 +777,38 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
     }
 }
 
+/// Order a loaded sequence by in-game tick, keeping one surface per tick.
+///
+/// Filenames cannot be trusted for ordering. The CLI writes zero-padded
+/// `frame_0000.json` in save order, where lexicographic sort happens to work,
+/// but the mod writes `frame_<tick>_<surface>.json` with a raw unpadded tick
+/// -- so sorting names puts tick 1200 and 12600 before 600. The parsed `tick`
+/// is the one thing both schemes carry.
+///
+/// When several surfaces were exported at the same tick, the busiest wins:
+/// showing them in sequence would make the camera jump between planets.
+pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: impl Fn(&T) -> usize) {
+    frames.sort_by(|a, b| tick(a).cmp(&tick(b)).then(count(b).cmp(&count(a))));
+
+    let mut seen = None;
+    frames.retain(|frame| {
+        let keep = seen != Some(tick(frame));
+        seen = Some(tick(frame));
+        keep
+    });
+}
+
 pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
-    let frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
+    let mut frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
 
     if frames.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "no valid frame files found"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no valid frame files found in {}", path.display()),
+        ));
     }
 
+    order_by_tick(&mut frames, |f| f.tick, |f| f.entities.len());
     Ok(frames)
 }
 
@@ -809,6 +962,20 @@ mod tests {
         );
     }
 
+    /// Real vanilla/Space Age icon files measured directly: 64+32+16+8=120
+    /// wide, 64 tall. The bug this guards against is drawing that whole
+    /// strip stretched into one entity's box instead of cropping to the
+    /// first (primary) icon.
+    #[test]
+    fn icon_source_rect_crops_a_real_mipmap_strip_to_the_primary_icon() {
+        assert_eq!(icon_source_rect(120.0, 64.0), Rect::new(0.0, 0.0, 64.0, 64.0));
+    }
+
+    #[test]
+    fn icon_source_rect_is_a_no_op_for_a_single_square_icon() {
+        assert_eq!(icon_source_rect(64.0, 64.0), Rect::new(0.0, 0.0, 64.0, 64.0));
+    }
+
     #[test]
     fn timeline_index_and_x_are_inverses() {
         let timeline = Timeline::for_screen(1000.0, 600.0);
@@ -880,6 +1047,49 @@ mod tests {
         assert_eq!(frames.len(), 5);
         let ticks: Vec<u64> = frames.iter().map(|f| f.tick).collect();
         assert!(ticks.windows(2).all(|w| w[0] < w[1]), "expected strictly increasing ticks, got {ticks:?}");
+    }
+
+    /// The shape a snapshot timer produces: tick-named files whose
+    /// lexicographic order is wrong, plus manifests that are not frames.
+    #[test]
+    fn load_sequence_orders_mod_written_snapshots_by_tick_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        for tick in [600u64, 1200, 12600, 216000] {
+            std::fs::write(
+                dir.path().join(format!("frame_{tick}_nauvis.json")),
+                format!(r#"{{"tick":{tick},"surface":"nauvis","entities":[],"count":0}}"#),
+            )
+            .unwrap();
+            // Written beside every snapshot; must not be read as a frame.
+            std::fs::write(
+                dir.path().join(format!("frame_{tick}_manifest.json")),
+                format!(r#"{{"tick":{tick},"entities":0,"tiles":0,"surfaces":["nauvis"]}}"#),
+            )
+            .unwrap();
+        }
+
+        let frames = load_sequence(dir.path()).expect("manifests must not break loading");
+        assert_eq!(
+            frames.iter().map(|f| f.tick).collect::<Vec<_>>(),
+            vec![600, 1200, 12600, 216000],
+            "sorted by filename this would be 1200, 12600, 216000, 600"
+        );
+    }
+
+    #[test]
+    fn load_sequence_keeps_only_the_busiest_surface_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        for (surface, count) in [("nauvis", 900u64), ("vulcanus", 12)] {
+            std::fs::write(
+                dir.path().join(format!("frame_600_{surface}.json")),
+                format!(r#"{{"tick":600,"surface":"{surface}","entities":[],"count":{count}}}"#),
+            )
+            .unwrap();
+        }
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1, "one frame per tick, or the camera jumps between planets");
+        assert_eq!(frames[0].surface, "nauvis");
     }
 
     /// Live capture writes these beside every finished snapshot. Their stem
@@ -1006,6 +1216,80 @@ mod tests {
         let rendered = RenderFrame::from_frame(frame, &mut registry);
         assert_eq!(rendered.entities[0].w, u8::MAX);
         assert_eq!(rendered.entities[0].h, 1, "a zero footprint must not become invisible");
+    }
+
+    #[test]
+    fn use_chunk_lod_switches_on_below_the_pixel_threshold() {
+        assert!(!use_chunk_lod(5.0), "5px tiles are still individually visible");
+        assert!(use_chunk_lod(0.5), "0.5px tiles are already sub-pixel");
+    }
+
+    /// Regression: gating on the *chunk's* on-screen size (chunk being 32
+    /// tiles) instead of the tile's meant LOD only engaged 32x further out
+    /// than intended. 0.32 px/tile is a real measurement from a base that
+    /// stayed in full detail (3.27M quads, 7 fps) under that version.
+    #[test]
+    fn use_chunk_lod_engages_well_before_a_tile_is_sub_pixel() {
+        assert!(use_chunk_lod(0.32));
+    }
+
+    #[test]
+    fn chunk_lod_aggregates_a_dense_area_into_one_cell_per_chunk() {
+        let mut registry = TypeRegistry::new();
+        // A strip of concrete spanning one chunk plus one tile into the
+        // next, so this must produce exactly two cells, not one per tile.
+        // The spill must stay under one cell's width or this would land in
+        // three-plus chunks instead of two, regardless of LOD_CELL_TILES.
+        let tiles: Vec<Tile> =
+            (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".to_string(), x, y: 0 }).collect();
+        let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+
+        assert_eq!(rendered.tile_lod.len(), 2, "one cell per occupied chunk, not per tile");
+        let mut coords: Vec<(i32, i32)> = rendered.tile_lod.iter().map(|c| (c.cx, c.cy)).collect();
+        coords.sort();
+        assert_eq!(coords, vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn chunk_lod_picks_the_dominant_type_when_a_chunk_has_several() {
+        let mut registry = TypeRegistry::new();
+        let mut tiles = vec![Tile { n: "concrete".to_string(), x: 0, y: 0 }; 5];
+        tiles.push(Tile { n: "stone-path".to_string(), x: 1, y: 0 });
+        let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+
+        assert_eq!(rendered.tile_lod.len(), 1, "still one chunk");
+        let concrete = registry.intern("concrete");
+        assert_eq!(rendered.tile_lod_runs[0].type_id, concrete, "5 concrete outnumbers 1 stone-path");
+    }
+
+    #[test]
+    fn chunk_lod_covers_entities_too_keyed_by_their_floored_position() {
+        let mut registry = TypeRegistry::new();
+        let frame = Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 2,
+            // -0.5 floors to -1, landing in the chunk to the left of origin
+            // -- exercises div_euclid rather than plain integer division,
+            // which would incorrectly floor a negative toward zero. The
+            // second entity sits in the last column of chunk (0,0).
+            entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],
+            tiles: Vec::new(),
+        };
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+
+        assert_eq!(rendered.entity_lod.len(), 2);
+        let mut coords: Vec<(i32, i32)> = rendered.entity_lod.iter().map(|c| (c.cx, c.cy)).collect();
+        coords.sort();
+        assert_eq!(coords, vec![(-1, -1), (0, 0)]);
+    }
+
+    #[test]
+    fn lod_cell_world_origin_is_the_chunks_top_left_corner() {
+        let cell = LodCell { cx: -2, cy: 3 };
+        assert_eq!(cell.world_origin(), Vec2::new((-2 * LOD_CELL_TILES) as f32, (3 * LOD_CELL_TILES) as f32));
     }
 
     /// The whole point of grouping: one texture switch per type instead of

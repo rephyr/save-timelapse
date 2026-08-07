@@ -235,14 +235,25 @@ impl World {
                     None => false,
                 }
             }
-            // An id-keyed removal names no surface, so it has to be looked
-            // for everywhere. unit_number is unique game-wide, so at most one
-            // surface can hold it.
-            Event::RemoveEntityById { id } => {
-                self.surfaces.values_mut().any(|s| s.remove_by_id(*id))
-            }
-            Event::RemoveEntityAt { x, y } => {
-                self.target(surface).is_some_and(|s| s.remove_at(*x, *y))
+            // Id first: unit_number is unique game-wide (so this searches
+            // every surface, not just `surface`) and resolves in O(1) for
+            // anything replay already has registered -- which is anything
+            // built after capture began, since its AddEntity carried the
+            // same id. Position is the fallback, and the only thing that
+            // can resolve an entity that already existed when the baseline
+            // was taken: a snapshot records no ids, so no id lookup can ever
+            // find a baseline-original entity no matter what id Factorio
+            // reports it removed by.
+            Event::RemoveEntity { id, pos } => {
+                if let Some(id) = id {
+                    if self.surfaces.values_mut().any(|s| s.remove_by_id(*id)) {
+                        return true;
+                    }
+                }
+                match pos {
+                    Some((x, y)) => self.target(surface).is_some_and(|s| s.remove_at(*x, *y)),
+                    None => false,
+                }
             }
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
@@ -319,6 +330,16 @@ mod tests {
         Event::AddEntity { name: name.to_string(), x, y, d: 0, w: 1, h: 1, id }
     }
 
+    /// The pre-fix wire shape: id with no position. Still what a log written
+    /// before this event started carrying position looks like.
+    fn remove_by_id(id: u64) -> Event {
+        Event::RemoveEntity { id: Some(id), pos: None }
+    }
+
+    fn remove_at(x: f32, y: f32) -> Event {
+        Event::RemoveEntity { id: None, pos: Some((x, y)) }
+    }
+
     /// Regression: keying positions by half-tile merged these two real
     /// entities into one and lost five of `frame_0000.json`'s 240.
     #[test]
@@ -334,7 +355,7 @@ mod tests {
         assert_eq!(world.entity_count(), 2);
 
         // ...and each is individually addressable.
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntityAt { x: 326.9, y: -843.0 }));
+        assert!(world.apply(Some("nauvis"), &remove_at(326.9, -843.0)));
         assert_eq!(world.entity_count(), 1);
         assert_eq!(world.to_frame("nauvis", 0).entities[0].n, "logistic-train-stop");
     }
@@ -374,7 +395,7 @@ mod tests {
         assert!(world.apply(Some("nauvis"), &add("pipe", 1.5, 2.5, Some(7))));
         assert_eq!(world.entity_count(), 1);
 
-        assert!(world.apply(None, &Event::RemoveEntityById { id: 7 }));
+        assert!(world.apply(None, &remove_by_id(7)));
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -383,8 +404,31 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(vec![entity("pipe", -3.5, 4.5)], Vec::new()));
 
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntityAt { x: -3.5, y: 4.5 }));
+        assert!(world.apply(Some("nauvis"), &remove_at(-3.5, 4.5)));
         assert_eq!(world.entity_count(), 0);
+    }
+
+    /// The bug this fixes: an entity from the baseline carries no id in
+    /// replay's world state, but Factorio still reports its *real*
+    /// unit_number (assigned whenever it was originally built) when it's
+    /// later mined. The removal event therefore carries an id lookup can
+    /// never resolve, alongside the position that can. Before the fix, the
+    /// mod sent id alone whenever one was available and this removal was a
+    /// silent no-op forever -- the entity never disappeared from the
+    /// replayed timeline.
+    #[test]
+    fn removing_a_baseline_entity_by_an_id_replay_never_registered_falls_back_to_position() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("pipe", -3.5, 4.5)], Vec::new()));
+
+        // A real unit_number Factorio assigned long before capture started,
+        // so replay's by_id map was never told about it.
+        let unrecognized_id = 999_999;
+        assert!(world.apply(
+            Some("nauvis"),
+            &Event::RemoveEntity { id: Some(unrecognized_id), pos: Some((-3.5, 4.5)) }
+        ));
+        assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
     /// The baseline is written over many ticks while events are logged, so an
@@ -401,7 +445,7 @@ mod tests {
         assert_eq!(frame.entities[0].n, "transport-belt", "the later add wins");
 
         // ...and it is now reachable by the id the add carried.
-        assert!(world.apply(None, &Event::RemoveEntityById { id: 9 }));
+        assert!(world.apply(None, &remove_by_id(9)));
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -412,8 +456,8 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(vec![entity("pipe", 1.5, 2.5)], Vec::new()));
 
-        assert!(!world.apply(None, &Event::RemoveEntityById { id: 404 }));
-        assert!(!world.apply(Some("nauvis"), &Event::RemoveEntityAt { x: 99.5, y: 99.5 }));
+        assert!(!world.apply(None, &remove_by_id(404)));
+        assert!(!world.apply(Some("nauvis"), &remove_at(99.5, 99.5)));
         assert!(!world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 }));
         assert_eq!(world.entity_count(), 1, "the real entity is untouched");
     }
@@ -449,7 +493,7 @@ mod tests {
         });
 
         assert_eq!(world.entity_count(), 2);
-        world.apply(Some("vulcanus"), &Event::RemoveEntityAt { x: 1.5, y: 2.5 });
+        world.apply(Some("vulcanus"), &remove_at(1.5, 2.5));
 
         assert_eq!(world.surface("nauvis").unwrap().entity_count(), 1);
         assert_eq!(world.surface("vulcanus").unwrap().entity_count(), 0);
@@ -473,7 +517,7 @@ mod tests {
 
         for i in 0..100 {
             world.apply(Some("nauvis"), &add("pipe", i as f32 + 0.5, 0.5, Some(i)));
-            world.apply(None, &Event::RemoveEntityById { id: i });
+            world.apply(None, &remove_by_id(i));
         }
         assert_eq!(world.entity_count(), 0);
         assert_eq!(world.surface("nauvis").unwrap().slots.len(), 1, "one slot, reused 100 times");

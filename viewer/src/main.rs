@@ -12,8 +12,9 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    entity_footprint_size, icon_path, load_frame, synthetic_frame, synthetic_tiles, Camera,
-    DrawCallCounter, FrameSequence, LoadProgress, ProgressBar, RenderFrame, Timeline, TypeRegistry,
+    entity_footprint_size, icon_path, icon_source_rect, load_frame, synthetic_frame, synthetic_tiles,
+    use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, ProgressBar, RenderFrame,
+    Timeline, TypeRegistry, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -187,10 +188,26 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
         }
         progress.done = paths.len();
         redraw_progress(&progress, &mut last, true).await;
+
+        // Ordered after loading, not before: the mod's `frame_<tick>_<surface>`
+        // names sort wrong lexicographically, and picking one surface per tick
+        // needs the parsed entity counts. Done on RenderFrames rather than
+        // Frames so the two representations are never both in memory.
+        viewer::order_by_tick(&mut frames, |f| f.tick, |f| f.count);
     }
 
     println!("{} frame(s) loaded, {} distinct type(s)", frames.len(), registry.len());
     FrameSequence::new(frames).expect("no valid frames found")
+}
+
+/// A loaded icon plus the region of it that's the actual icon. Vanilla and
+/// Space Age icon files are a mipmap strip -- the full-size icon followed by
+/// progressively smaller copies -- not a single image, so drawing the whole
+/// texture stretched into an entity's box renders every copy squashed
+/// together. `icon_rect` crops to just the first (primary) one.
+struct Sprite {
+    texture: Texture2D,
+    icon_rect: Rect,
 }
 
 /// Sprites indexed by `TypeId`, so drawing never hashes a name.
@@ -199,11 +216,8 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
 /// mean every icon resolves, since this only covers vanilla/Space-Age
 /// naming, not arbitrary mods. Missing icons just mean that type keeps
 /// using its colored shape -- never an error.
-async fn load_sprites(
-    data_dir: Option<&std::path::Path>,
-    registry: &TypeRegistry,
-) -> Vec<Option<Texture2D>> {
-    let mut sprites: Vec<Option<Texture2D>> = vec![None; registry.len()];
+async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistry) -> Vec<Option<Sprite>> {
+    let mut sprites: Vec<Option<Sprite>> = (0..registry.len()).map(|_| None).collect();
     let Some(data_dir) = data_dir else {
         return sprites;
     };
@@ -223,7 +237,8 @@ async fn load_sprites(
 
         if let Some(path) = icon_path(data_dir, name).and_then(|p| p.to_str().map(str::to_owned)) {
             if let Ok(texture) = load_texture(&path).await {
-                sprites[id] = Some(texture);
+                let icon_rect = icon_source_rect(texture.width(), texture.height());
+                sprites[id] = Some(Sprite { texture, icon_rect });
             }
         }
     }
@@ -236,15 +251,19 @@ async fn load_sprites(
 // ---------------------------------------------------------------------------
 // Drawing
 
-fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Texture2D>) {
+fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Sprite>) {
     let top_left = center - size / 2.0;
     match sprite {
-        Some(texture) => draw_texture_ex(
-            texture,
+        Some(sprite) => draw_texture_ex(
+            &sprite.texture,
             top_left.x,
             top_left.y,
             WHITE,
-            DrawTextureParams { dest_size: Some(size), ..Default::default() },
+            DrawTextureParams {
+                dest_size: Some(size),
+                source: Some(sprite.icon_rect),
+                ..Default::default()
+            },
         ),
         None => draw_rectangle(top_left.x, top_left.y, size.x, size.y, color),
     }
@@ -252,17 +271,28 @@ fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Texture2D
 
 /// Tiles are corner positioned, unlike entities, so `screen` here is the
 /// tile's top-left corner rather than its center.
-fn draw_tile(screen: Vec2, size: f32, color: Color, sprite: Option<&Texture2D>) {
+fn draw_tile(screen: Vec2, size: f32, color: Color, sprite: Option<&Sprite>) {
     match sprite {
-        Some(texture) => draw_texture_ex(
-            texture,
+        Some(sprite) => draw_texture_ex(
+            &sprite.texture,
             screen.x,
             screen.y,
             WHITE,
-            DrawTextureParams { dest_size: Some(Vec2::splat(size)), ..Default::default() },
+            DrawTextureParams {
+                dest_size: Some(Vec2::splat(size)),
+                source: Some(sprite.icon_rect),
+                ..Default::default()
+            },
         ),
         None => draw_rectangle(screen.x, screen.y, size, size, color),
     }
+}
+
+/// One level-of-detail cell: always a flat rect, never a sprite -- a chunk
+/// aggregates several types into "whichever is dominant," so no single icon
+/// would be honest about what's actually there.
+fn draw_lod_cell(screen: Vec2, size: f32, color: Color) {
+    draw_rectangle(screen.x, screen.y, size, size, color);
 }
 
 /// World-space view rectangle, so culling is a pair of comparisons per item
@@ -296,6 +326,7 @@ async fn main() {
     let mut play_accum = 0.0;
     let mut dragging_timeline = false;
     let mut sprites_enabled = true;
+    let mut lod_enabled = true;
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
 
     loop {
@@ -354,6 +385,12 @@ async fn main() {
         if is_key_pressed(KeyCode::S) {
             sprites_enabled = !sprites_enabled;
         }
+        // LOD off is the A/B for what per-item CPU cost costs at extreme
+        // zoom-out: forces full-detail rendering even below the chunk
+        // threshold, so the difference is directly comparable.
+        if is_key_pressed(KeyCode::L) {
+            lod_enabled = !lod_enabled;
+        }
         if playing {
             play_accum += get_frame_time();
             if play_accum >= PLAY_INTERVAL_SECS {
@@ -370,54 +407,107 @@ async fn main() {
 
         let pixels_per_tile = camera.pixels_per_tile();
         let use_sprites = sprites_enabled && pixels_per_tile > SPRITE_MIN_PIXELS;
+        let use_lod = lod_enabled && use_chunk_lod(pixels_per_tile);
         let frame = sequence.current();
         let (view_min, view_max) = view_bounds(&camera, screen_center);
         counter.reset();
 
-        // Floor first, so buildings drawn afterward sit on top of it.
-        //
-        // Iterating runs rather than raw items is what keeps the batch
-        // intact: the sprite and color are decided once per type, so
-        // macroquad sees a long stretch of quads sharing one texture
-        // instead of a texture change per item.
-        let tile_size = pixels_per_tile.max(1.0);
-        for run in &frame.tile_runs {
-            let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
-            let color = registry.tile_color(run.type_id);
-            let mut drawn = 0;
-            for tile in &frame.tiles[run.range()] {
-                // A tile at (x,y) covers [x,x+1) x [y,y+1).
-                let (x, y) = (tile.x as f32, tile.y as f32);
-                if x + 1.0 < view_min.x || x > view_max.x || y + 1.0 < view_min.y || y > view_max.y {
-                    continue;
+        if use_lod {
+            // Below LOD_MAX_TILE_PIXELS a full-detail tile or entity is
+            // already sub-pixel, so nothing is lost by collapsing a whole
+            // LOD_CELL_TILES-square chunk to one quad -- and everything is
+            // gained: a chunk grid over the same world area this base
+            // actually spans is thousands of quads, not millions, which is
+            // the difference between paying a per-item CPU cost 3.4 million
+            // times a frame and paying it a few thousand times.
+            //
+            // Precomputed once at load (`RenderFrame::from_frame`), not
+            // here: binning millions of items into chunks is itself too
+            // slow to redo every rendered frame, which is exactly the cost
+            // this path exists to avoid.
+            let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
+            for run in &frame.tile_lod_runs {
+                let color = registry.tile_color(run.type_id);
+                let mut drawn = 0;
+                for cell in &frame.tile_lod[run.range()] {
+                    let origin = cell.world_origin();
+                    if origin.x + (LOD_CELL_TILES as f32) < view_min.x
+                        || origin.x > view_max.x
+                        || origin.y + (LOD_CELL_TILES as f32) < view_min.y
+                        || origin.y > view_max.y
+                    {
+                        continue;
+                    }
+                    let screen = camera.world_to_screen(origin, screen_center);
+                    draw_lod_cell(screen, chunk_px, color);
+                    drawn += 1;
                 }
-                let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
-                draw_tile(screen, tile_size, color, sprite);
-                drawn += 1;
+                counter.quads(None, drawn);
             }
-            counter.quads(sprite.map(|_| run.type_id), drawn);
-        }
+            for run in &frame.entity_lod_runs {
+                let color = registry.entity_color(run.type_id);
+                let mut drawn = 0;
+                for cell in &frame.entity_lod[run.range()] {
+                    let origin = cell.world_origin();
+                    if origin.x + (LOD_CELL_TILES as f32) < view_min.x
+                        || origin.x > view_max.x
+                        || origin.y + (LOD_CELL_TILES as f32) < view_min.y
+                        || origin.y > view_max.y
+                    {
+                        continue;
+                    }
+                    let screen = camera.world_to_screen(origin, screen_center);
+                    draw_lod_cell(screen, chunk_px, color);
+                    drawn += 1;
+                }
+                counter.quads(None, drawn);
+            }
+        } else {
+            // Floor first, so buildings drawn afterward sit on top of it.
+            //
+            // Iterating runs rather than raw items is what keeps the batch
+            // intact: the sprite and color are decided once per type, so
+            // macroquad sees a long stretch of quads sharing one texture
+            // instead of a texture change per item.
+            let tile_size = pixels_per_tile.max(1.0);
+            for run in &frame.tile_runs {
+                let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
+                let color = registry.tile_color(run.type_id);
+                let mut drawn = 0;
+                for tile in &frame.tiles[run.range()] {
+                    // A tile at (x,y) covers [x,x+1) x [y,y+1).
+                    let (x, y) = (tile.x as f32, tile.y as f32);
+                    if x + 1.0 < view_min.x || x > view_max.x || y + 1.0 < view_min.y || y > view_max.y {
+                        continue;
+                    }
+                    let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
+                    draw_tile(screen, tile_size, color, sprite);
+                    drawn += 1;
+                }
+                counter.quads(sprite.map(|_| run.type_id), drawn);
+            }
 
-        for run in &frame.entity_runs {
-            let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
-            let color = registry.entity_color(run.type_id);
-            let mut drawn = 0;
-            for entity in &frame.entities[run.range()] {
-                let half_w = entity.w as f32 / 2.0;
-                let half_h = entity.h as f32 / 2.0;
-                if entity.x + half_w < view_min.x
-                    || entity.x - half_w > view_max.x
-                    || entity.y + half_h < view_min.y
-                    || entity.y - half_h > view_max.y
-                {
-                    continue;
+            for run in &frame.entity_runs {
+                let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
+                let color = registry.entity_color(run.type_id);
+                let mut drawn = 0;
+                for entity in &frame.entities[run.range()] {
+                    let half_w = entity.w as f32 / 2.0;
+                    let half_h = entity.h as f32 / 2.0;
+                    if entity.x + half_w < view_min.x
+                        || entity.x - half_w > view_max.x
+                        || entity.y + half_h < view_min.y
+                        || entity.y - half_h > view_max.y
+                    {
+                        continue;
+                    }
+                    let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
+                    let size = entity_footprint_size(pixels_per_tile, entity.w as u32, entity.h as u32);
+                    draw_entity(screen, size, color, sprite);
+                    drawn += 1;
                 }
-                let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                let size = entity_footprint_size(pixels_per_tile, entity.w as u32, entity.h as u32);
-                draw_entity(screen, size, color, sprite);
-                drawn += 1;
+                counter.quads(sprite.map(|_| run.type_id), drawn);
             }
-            counter.quads(sprite.map(|_| run.type_id), drawn);
         }
 
         let total_items = frame.entities.len() + frame.tiles.len();
@@ -440,16 +530,29 @@ async fn main() {
         // The profiling readout: draw calls against quads actually submitted,
         // and how much culling threw away. Counts this viewer's own geometry
         // only -- macroquad's text rendering adds a few calls of its own.
-        draw_text(
-            &format!(
-                "{} draw calls  |  {} quads drawn of {} ({} culled)  |  {} runs  |  sprites {}",
-                counter.calls,
+        //
+        // "of {total} ({culled})" only makes sense against full-detail item
+        // counts, so it's specific to that branch -- in LOD mode `quads` is
+        // chunk cells, not items, and comparing it to a millions-large item
+        // count would misleadingly read as "everything culled."
+        let detail_text = if use_lod {
+            format!(
+                "{} chunk cells drawn  |  {} runs  |  LOD on ({total_items} items collapsed)",
+                counter.quads,
+                frame.entity_lod_runs.len() + frame.tile_lod_runs.len(),
+            )
+        } else {
+            format!(
+                "{} quads drawn of {} ({} culled)  |  {} runs  |  sprites {}  |  LOD off",
                 counter.quads,
                 total_items,
                 total_items.saturating_sub(counter.quads),
                 frame.entity_runs.len() + frame.tile_runs.len(),
                 if use_sprites { "on" } else { "off" },
-            ),
+            )
+        };
+        draw_text(
+            &format!("{} draw calls  |  {detail_text}", counter.calls),
             10.0,
             42.0,
             20.0,
@@ -457,7 +560,7 @@ async fn main() {
         );
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  s toggles sprites  |  drag the bar below to scrub",
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub",
                 if playing { "pause" } else { "play" }
             ),
             10.0,
