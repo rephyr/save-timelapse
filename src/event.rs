@@ -1,6 +1,11 @@
 //! Reading the live capture event log written by mod/control.lua.
 //!
-//! Wire format (`events_<start_tick>.stev`), all integers little endian:
+//! Wire format (`events_<session_id>_<start_tick>.stev`), all integers
+//! little endian. `session_id` is a per-playthrough tag (the map's terrain
+//! seed; see mod/control.lua's `compute_session_id`), needed because
+//! `script-output/save-timelapse/` is one folder shared by every save that
+//! ever turns capture on, and `game.tick` restarts from 0 for each one, so a
+//! raw tick alone cannot tell two playthroughs' segments apart:
 //!
 //! ```text
 //! magic 4 bytes, "STE1", written once when the segment is created
@@ -218,26 +223,39 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
     Ok(EventStream { bytes, pos: 4, names: Vec::new(), surfaces: Vec::new(), current_tick: None })
 }
 
-/// Every `events_<tick>.stev` in a capture directory, ordered by start tick.
+/// Every `events_<session>_<tick>.stev` belonging to `session` in a capture
+/// directory, ordered by start tick.
 ///
 /// Ordered numerically, not lexicographically: segment names carry a raw
-/// game tick with no zero padding, so `events_9000` would otherwise sort
-/// after `events_10000`.
-pub fn log_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+/// game tick with no zero padding, so `events_..._9000` would otherwise sort
+/// after `events_..._10000`.
+pub fn log_paths(dir: &Path, session: u32) -> io::Result<Vec<PathBuf>> {
     let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter_map(|path| Some((segment_start_tick(&path)?, path)))
+        .filter_map(|path| {
+            let (found, tick) = segment_id_and_tick(&path)?;
+            (found == session).then_some((tick, path))
+        })
         .collect();
     segments.sort();
     Ok(segments.into_iter().map(|(_, path)| path).collect())
 }
 
-fn segment_start_tick(path: &Path) -> Option<u64> {
+/// Parses the hex session tag and decimal tick out of
+/// `events_<session>_<tick>.stev`. A bare `events_<tick>.stev` -- every
+/// segment written before playthroughs were tagged -- has no session to
+/// parse and returns `None`, which is what makes such a leftover file
+/// invisible, and therefore harmless, rather than a "bad magic" crash.
+fn segment_id_and_tick(path: &Path) -> Option<(u32, u64)> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {
         return None;
     }
-    path.file_stem().and_then(|s| s.to_str())?.strip_prefix("events_")?.parse().ok()
+    let stem = path.file_stem()?.to_str()?.strip_prefix("events_")?;
+    let (session_hex, tick_str) = stem.split_once('_')?;
+    let session = u32::from_str_radix(session_hex, 16).ok()?;
+    let tick = tick_str.parse().ok()?;
+    Some((session, tick))
 }
 
 #[cfg(test)]
@@ -374,18 +392,55 @@ mod tests {
     #[test]
     fn segments_order_by_tick_not_filename() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["events_10000.stev", "events_9000.stev", "events_100.stev"] {
+        for name in ["events_00000001_10000.stev", "events_00000001_9000.stev", "events_00000001_100.stev"] {
             std::fs::write(dir.path().join(name), MAGIC).unwrap();
         }
         // Files that are not segments must not be picked up.
         std::fs::write(dir.path().join("frame_1_nauvis.stfr"), "").unwrap();
-        std::fs::write(dir.path().join("baseline.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("baseline_00000001.json"), "{}").unwrap();
 
-        let names: Vec<String> = log_paths(dir.path())
+        let names: Vec<String> = log_paths(dir.path(), 1)
             .unwrap()
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["events_100.stev", "events_9000.stev", "events_10000.stev"]);
+        assert_eq!(
+            names,
+            vec!["events_00000001_100.stev", "events_00000001_9000.stev", "events_00000001_10000.stev"]
+        );
+    }
+
+    #[test]
+    fn log_paths_only_returns_the_requested_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_00000001_100.stev"), MAGIC).unwrap();
+        std::fs::write(dir.path().join("events_00000002_200.stev"), MAGIC).unwrap();
+
+        let names: Vec<String> = log_paths(dir.path(), 2)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["events_00000002_200.stev"]);
+    }
+
+    /// A segment written before playthroughs were tagged has no session id
+    /// in its name at all, so it must not be mistaken for a match against
+    /// any particular session -- this is what makes such a leftover file
+    /// inert rather than crashing replay (see the real bug this fixed:
+    /// `events_22630200.stev` from before this feature choked replay of an
+    /// otherwise unrelated, correctly tagged capture).
+    #[test]
+    fn an_untagged_legacy_segment_is_ignored_by_every_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_22630200.stev"), MAGIC).unwrap();
+        std::fs::write(dir.path().join("events_00000001_100.stev"), MAGIC).unwrap();
+
+        let names: Vec<String> = log_paths(dir.path(), 1)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["events_00000001_100.stev"]);
     }
 }

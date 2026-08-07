@@ -215,6 +215,20 @@ check("next_capture_segment: loading an older save starts a new segment at the r
   encode.next_capture_segment(5000, 3000, 100),
   3000)
 
+-- per-playthrough file naming ----------------------------------------------------
+
+check("baseline_manifest_name: session id as zero padded 8 digit hex",
+  encode.baseline_manifest_name(0x1a2b3c),
+  "baseline_001a2b3c.json")
+
+check("baseline_manifest_name: a small session id still gets full width padding",
+  encode.baseline_manifest_name(0),
+  "baseline_00000000.json")
+
+check("capture_segment_name: session id and tick side by side",
+  encode.capture_segment_name(0x1a2b3c, 22760790),
+  "events_001a2b3c_22760790.stev")
+
 -- list sanity ------------------------------------------------------------------
 
 local function assert_no_duplicates(list, label)

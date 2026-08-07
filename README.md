@@ -75,8 +75,15 @@ The mod:
 - performs one initial snapshot
 - records only entity additions/removals afterwards
 - keeps runtime overhead minimal
+- tags every capture with which playthrough it belongs to, so saves from
+  different games never get mixed into one timelapse
 
-Whenever you want to view the replay, simply launch Save Timelapse.
+Whenever you want to view the replay, simply launch Save Timelapse. If more
+than one playthrough has capture data waiting, it asks which one to build
+the timelapse from.
+
+> Upgrading from an older version? Run `/timelapse-reset-capture` once
+> in-game so your current playthrough starts a freshly tagged capture.
 
 ---
 
