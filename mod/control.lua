@@ -302,7 +302,7 @@ end
 -- Live capture
 
 local CAPTURE_FLUSH_EVERY = 200
-local CAPTURE_FLUSH_TICKS = 600 -- ~10 real seconds, bounds data loss even when idle
+local CAPTURE_FLUSH_TICKS = 240 -- ~4 real seconds, bounds data loss even when idle
 --- Work items encoded per tick while the periodic test-snapshot runs, and how
 --- many encoded strings accumulate before a file append. Deliberately small:
 --- the point of spreading that export over ticks is that no single tick
@@ -837,8 +837,8 @@ local CAPTURE_HANDLERS = {
 --
 -- Factorio keeps one handler per on_nth_tick interval, so a second feature
 -- registering the same interval silently replaces the first rather than
--- erroring. CAPTURE_FLUSH_TICKS is 600 (10 real seconds), and the periodic
--- test-snapshot setting below is also given in seconds, so a user picking 10
+-- erroring. CAPTURE_FLUSH_TICKS is 240 (4 real seconds), and the periodic
+-- test-snapshot setting below is also given in seconds, so a user picking 4
 -- there hits that interval by coincidence, not by doing anything unusual.
 -- Anything wanting a periodic callback is therefore collected into one table
 -- keyed by interval and chained, rather than each feature calling
