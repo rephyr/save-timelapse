@@ -55,6 +55,12 @@ M.PLACED_FLOOR_TILES = {
 M.FRAME_MAGIC = "STF1"
 M.EVENT_MAGIC = "STE1"
 
+--- Independent per format, since the frame and event formats change on their
+--- own schedules -- a frame-only tweak has no reason to also bump the event
+--- version, and vice versa.
+M.FRAME_VERSION = 1
+M.EVENT_VERSION = 1
+
 --- JSON string quoting, still needed for the manifest files
 --- (baseline.json, frame_<tick>_manifest.json): those stay JSON since
 --- they're tiny, written once, and useful to read by eye, unlike the bulk
@@ -167,7 +173,7 @@ end
 -- Frame format (frame_<tick>_<surface>.stfr)
 
 function M.frame_header(tick, surface)
-  return M.FRAME_MAGIC .. M.u64le(tick) .. M.str(surface)
+  return M.FRAME_MAGIC .. M.u8(M.FRAME_VERSION) .. M.u64le(tick) .. M.str(surface)
 end
 
 --- One entity, as a "DefineName" chunk (if needed) followed by tag 1 and its
@@ -214,7 +220,7 @@ end
 -- Live capture event format (events_<start_tick>.stev)
 
 function M.event_header()
-  return M.EVENT_MAGIC
+  return M.EVENT_MAGIC .. M.u8(M.EVENT_VERSION)
 end
 
 --- Emitted once per distinct tick that has at least one event, rather than
@@ -280,6 +286,37 @@ function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)
     return resumed_tick -- rolled back: start a fresh segment here
   end
   return current_segment_start -- keep appending to the existing segment
+end
+
+-- ---------------------------------------------------------------------------
+-- Checksums
+--
+-- djb2, a simple multiplicative hash, computed with plain multiply/add/mod
+-- rather than the usual bitwise XOR/shift form: Factorio's Lua 5.2 has no
+-- bit32 library, the same reason u32le/i32le above pack integers by hand
+-- instead of with bitwise ops. Not chosen for cryptographic strength --
+-- it only needs to catch accidental corruption, not resist tampering --
+-- but for being trivial to implement identically on both this side and the
+-- Rust reader's. `control.lua` threads the running hash through every
+-- write for a frame file and appends it as a trailer once the file is
+-- complete; nothing on the event log side uses this, since an append-only
+-- segment that grows for as long as capture stays on has no "finished"
+-- moment to checksum against.
+
+--- Pure: plain values in and out, so these are testable the same way as
+--- next_capture_segment above.
+function M.checksum_init()
+  return 5381
+end
+
+--- `data` is hashed byte by byte and folded into `hash`, wrapping at 2^32
+--- the same way Rust's `u32::wrapping_mul`/`wrapping_add` do, so the two
+--- sides agree on every input without either needing the other's runtime.
+function M.checksum_update(hash, data)
+  for i = 1, #data do
+    hash = (hash * 33 + string.byte(data, i)) % 4294967296
+  end
+  return hash
 end
 
 -- ---------------------------------------------------------------------------

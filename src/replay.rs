@@ -354,7 +354,7 @@ mod tests {
     impl TestLog {
         fn new() -> Self {
             let mut w = ByteWriter::new();
-            w.magic(b"STE1");
+            w.magic(b"STE1").u8(1); // magic, then the event format's current version
             TestLog { w, names: HashMap::new(), surfaces: HashMap::new() }
         }
 

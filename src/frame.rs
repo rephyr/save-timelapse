@@ -5,16 +5,31 @@
 //!
 //! ```text
 //! magic     4 bytes, "STF1"
+//! version   u8, must equal CURRENT_VERSION
 //! tick      u64
 //! surface   string (u16 length, then that many UTF-8 bytes)
 //! entity section, a sequence of:
 //!   tag 0  DefineName    string
 //!   tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
 //! tag 9  EndEntities (no payload), marking the start of the tile section
-//! tile section, a sequence of, running to end of file:
+//! tile section, a sequence of:
 //!   tag 0  DefineName    string
 //!   tag 2  TileRecord    u16 name_id, i32 x, i32 y
+//! checksum  u32, djb2 (see `checksum` below) of every byte before it,
+//!           magic and version included
 //! ```
+//!
+//! The version byte lets a reader tell "this is a format I don't understand"
+//! apart from a generic parse failure, which matters here specifically:
+//! this project has already changed this format more than once, each time
+//! with no way for an older build to say anything clearer than a confusing
+//! parse error about a newer file. The checksum catches a narrower,
+//! different problem the tag-based structure alone can't: silent bit-level
+//! corruption that still happens to decode as plausible-looking records.
+//! Both are new as of this version; a file from before it has neither and
+//! will not parse -- consistent with this project's existing precedent of
+//! clean breaks over carrying old formats forward at this alpha stage (see
+//! the session-tagging change earlier).
 //!
 //! There is no entity or tile count anywhere in the file. `find_entities_filtered`
 //! and `find_tiles_filtered` both return a full array, so a count would be
@@ -49,10 +64,27 @@ use std::sync::Arc;
 use crate::wire::{ByteReader, ByteWriter};
 
 const MAGIC: &[u8; 4] = b"STF1";
+const CURRENT_VERSION: u8 = 1;
+const TRAILER_LEN: usize = 4;
 const TAG_DEFINE_NAME: u8 = 0;
 const TAG_ENTITY: u8 = 1;
 const TAG_TILE: u8 = 2;
 const TAG_END_ENTITIES: u8 = 9;
+
+/// djb2, computed in one pass since `read_binary`/`write_binary` always hold
+/// the whole file in memory already, unlike `mod/encode.lua`'s incremental
+/// version of the same hash, which folds each chunk in as it's streamed to
+/// disk. `u32` wrapping arithmetic here is exactly the Lua side's `% 2^32`.
+/// Chosen for being trivial to implement identically on both sides without
+/// a bitwise primitive (Factorio's Lua 5.2 has none), not for cryptographic
+/// strength -- it only needs to catch accidental corruption.
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 5381;
+    for &b in bytes {
+        hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    hash
+}
 
 #[derive(Debug)]
 pub struct Frame {
@@ -142,7 +174,7 @@ fn round10_back(scaled: i32) -> f32 {
 
 pub fn write_binary(frame: &FrameOut<'_>) -> Vec<u8> {
     let mut w = ByteWriter::new();
-    w.magic(MAGIC).u64(frame.tick).string(frame.surface);
+    w.magic(MAGIC).u8(CURRENT_VERSION).u64(frame.tick).string(frame.surface);
 
     let mut names = NameDict::new();
     for entity in frame.entities {
@@ -168,7 +200,10 @@ pub fn write_binary(frame: &FrameOut<'_>) -> Vec<u8> {
         w.u8(TAG_TILE).u16(name_id).i32(tile.x).i32(tile.y);
     }
 
-    w.into_vec()
+    let mut bytes = w.into_vec();
+    let trailer = checksum(&bytes);
+    bytes.extend_from_slice(&trailer.to_le_bytes());
+    bytes
 }
 
 fn truncated() -> io::Error {
@@ -180,8 +215,28 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
+    // Magic + version + at least an empty trailer: anything shorter cannot
+    // possibly be a complete file, whatever else is wrong with it.
+    if bytes.len() < 4 + 1 + TRAILER_LEN {
+        return Err(truncated());
+    }
+
     let mut r = ByteReader::new(bytes);
     r.magic(MAGIC).ok_or_else(|| invalid("not a frame file (bad magic)"))?;
+    let version = r.u8().ok_or_else(truncated)?;
+    if version != CURRENT_VERSION {
+        return Err(invalid(format!(
+            "unsupported frame format version {version} (this build only understands version {CURRENT_VERSION})"
+        )));
+    }
+
+    let payload_end = bytes.len() - TRAILER_LEN;
+    let expected = u32::from_le_bytes(bytes[payload_end..].try_into().unwrap());
+    let actual = checksum(&bytes[..payload_end]);
+    if actual != expected {
+        return Err(invalid("checksum mismatch (corrupted or truncated frame file)"));
+    }
+
     let tick = r.u64().ok_or_else(truncated)?;
     let surface = r.string().ok_or_else(truncated)?;
 
@@ -211,7 +266,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     }
 
     let mut tiles = Vec::new();
-    while !r.is_empty() {
+    while r.consumed() < payload_end {
         match r.tag().ok_or_else(truncated)? {
             TAG_DEFINE_NAME => names.push(Arc::from(r.string().ok_or_else(truncated)?)),
             TAG_TILE => {
@@ -282,7 +337,10 @@ mod tests {
 
     /// Pins the exact byte layout by hand, so a change to field order,
     /// width, or tag value shows up here rather than only as a round trip
-    /// still agreeing with itself.
+    /// still agreeing with itself. The trailing checksum is verified via
+    /// the same `checksum` function under test elsewhere, rather than a
+    /// hand computed constant that would just be a second copy of the
+    /// algorithm to keep in sync.
     #[test]
     fn a_single_entity_frame_matches_its_documented_byte_layout() {
         let entities = vec![entity("pipe", -80.5, 28.5, 4, 1, 1)];
@@ -292,13 +350,51 @@ mod tests {
         let mut expected = ByteWriter::new();
         expected
             .magic(b"STF1")
+            .u8(1) // version
             .u64(100)
             .string("nauvis")
             .u8(0).string("pipe") // DefineName
             .u8(1).u16(0).i32(-805).i32(285).u8(4).u8(1).u8(1) // EntityRecord
             .u8(9); // EndEntities, no tiles follow
+        let payload = expected.into_vec();
 
-        assert_eq!(bytes, expected.into_vec());
+        assert_eq!(&bytes[..bytes.len() - 4], &payload[..], "payload before the trailer");
+        assert_eq!(
+            &bytes[bytes.len() - 4..],
+            &checksum(&payload).to_le_bytes(),
+            "trailer is the checksum of everything before it"
+        );
+    }
+
+    #[test]
+    fn a_wrong_version_is_a_distinct_error_from_a_parse_failure() {
+        let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let mut bytes = write_binary(&out);
+        bytes[4] = 99; // the version byte, right after the 4 byte magic
+
+        let err = read_binary(&bytes).unwrap_err();
+        assert!(err.to_string().contains("version 99"), "got: {err}");
+    }
+
+    #[test]
+    fn a_corrupted_byte_is_caught_by_the_checksum() {
+        let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let mut bytes = write_binary(&out);
+        let last = bytes.len() - 1 - 4; // a byte inside the payload, not the trailer
+        bytes[last] ^= 0xFF;
+
+        let err = read_binary(&bytes).unwrap_err();
+        assert!(err.to_string().contains("checksum"), "got: {err}");
+    }
+
+    /// The Rust and Lua implementations of this hash must agree, since one
+    /// writes what the other reads. Also checked against the same input in
+    /// mod/tests/encode_test.lua via lupa.
+    #[test]
+    fn checksum_matches_the_lua_side_known_vector() {
+        assert_eq!(checksum(b"ab"), 5863208);
     }
 
     #[test]
@@ -342,6 +438,10 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// Cutting bytes off the end lands inside the trailer here (it's only 4
+    /// bytes), which the checksum catches as a mismatch rather than the
+    /// reader running out of bytes mid tag -- still an error either way,
+    /// just a different `io::ErrorKind` than a cut mid-payload would give.
     #[test]
     fn a_truncated_file_is_an_error_rather_than_a_panic() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
@@ -349,6 +449,17 @@ mod tests {
         let bytes = write_binary(&out);
 
         let err = read_binary(&bytes[..bytes.len() - 3]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum"), "got: {err}");
+    }
+
+    /// Cutting deep enough to remove real payload, not just the trailer,
+    /// still must not panic -- the length guard at the top of `read_binary`
+    /// exists specifically for inputs shorter than a header and trailer
+    /// combined.
+    #[test]
+    fn a_file_shorter_than_a_header_and_trailer_is_truncated_not_a_panic() {
+        let err = read_binary(b"STF1\x01").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 

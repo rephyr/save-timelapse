@@ -8,7 +8,8 @@
 //! raw tick alone cannot tell two playthroughs' segments apart:
 //!
 //! ```text
-//! magic 4 bytes, "STE1", written once when the segment is created
+//! magic   4 bytes, "STE1", written once when the segment is created
+//! version u8, must equal CURRENT_VERSION, written right after the magic
 //!
 //! then a sequence of tagged records:
 //!   tag 0  DefineName     string                    (id implicit, next in order)
@@ -38,6 +39,13 @@
 //! be a partial write if the game was killed. A record that does not fit in
 //! the remaining bytes ends the stream instead of failing it, the same
 //! tolerance the JSON line format used to give a truncated last line.
+//!
+//! Unlike the frame format (see `frame.rs`), a segment has no trailing
+//! checksum: it grows for as long as capture stays on and is simply
+//! abandoned, not closed, when a rollover starts a new one, so there is no
+//! "this segment is finished" moment to checksum against. The version byte
+//! still lets a reader tell "this is a format I don't understand" apart
+//! from a generic parse failure, same as the frame format.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -46,6 +54,7 @@ use std::path::{Path, PathBuf};
 use crate::wire::ByteReader;
 
 const MAGIC: &[u8; 4] = b"STE1";
+const CURRENT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -219,8 +228,23 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
             format!("{}: not an event log (bad magic)", path.display()),
         ));
     }
+    match bytes.get(4) {
+        Some(&v) if v == CURRENT_VERSION => {}
+        Some(&v) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: unsupported event log version {v} (this build only understands version {CURRENT_VERSION})",
+                    path.display()
+                ),
+            ));
+        }
+        None => {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display())))
+        }
+    }
 
-    Ok(EventStream { bytes, pos: 4, names: Vec::new(), surfaces: Vec::new(), current_tick: None })
+    Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None })
 }
 
 /// Every `events_<session>_<tick>.stev` belonging to `session` in a capture
@@ -263,12 +287,12 @@ mod tests {
     use super::*;
     use crate::wire::ByteWriter;
 
-    /// Builds one segment's bytes with the given records, magic included, so
-    /// tests read close to the format description above instead of hiding
-    /// the byte layout behind a builder.
+    /// Builds one segment's bytes with the given records, magic and version
+    /// included, so tests read close to the format description above
+    /// instead of hiding the byte layout behind a builder.
     fn segment(records: impl FnOnce(&mut ByteWriter)) -> Vec<u8> {
         let mut w = ByteWriter::new();
-        w.magic(MAGIC);
+        w.magic(MAGIC).u8(CURRENT_VERSION);
         records(&mut w);
         w.into_vec()
     }
@@ -387,6 +411,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_to(dir.path(), "events_0.stev", b"nope");
         assert!(stream_log(&path).is_err());
+    }
+
+    #[test]
+    fn a_wrong_version_is_a_distinct_error_from_a_parse_failure() {
+        let mut bytes = segment(|w| {
+            w.u8(2).u64(1);
+        });
+        bytes[4] = 99; // the version byte, right after the 4 byte magic
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        // Not unwrap_err(): the Ok type is `impl Iterator`, which doesn't
+        // implement Debug. err() discards it, needing only the Err side to.
+        let err = stream_log(&path).err().unwrap();
+        assert!(err.to_string().contains("version 99"), "got: {err}");
     }
 
     #[test]

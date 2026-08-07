@@ -38,6 +38,15 @@ local function excluded_types()
   return list
 end
 
+--- Pairs a write with folding the same bytes into a running checksum, so
+--- every frame-file writer accumulates one the same way rather than each
+--- repeating the two calls side by side. Returns the updated checksum,
+--- Lua-style, since there is no reference to update in place.
+local function checksummed_write(path, data, append, checksum)
+  helpers.write_file(path, data, append)
+  return encode.checksum_update(checksum, data)
+end
+
 --- Write one surface to its own file. Returns entity and tile counts written.
 ---
 --- `session_id`, when given, tags the path so a baseline written into the
@@ -51,7 +60,8 @@ local function export_surface(surface, tick, session_id)
   local path = string.format("%sframe_%s%d_%s.stfr", EXPORT_DIR, tag, tick, surface.name)
   local dict = encode.new_dictionary()
 
-  helpers.write_file(path, encode.frame_header(tick, surface.name), false)
+  local checksum = encode.checksum_init()
+  checksum = checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
 
   local pending, pending_count, written = {}, 0, 0
 
@@ -67,17 +77,17 @@ local function export_surface(surface, tick, session_id)
       -- Each write_file call is a separate file append, so flushing per entity
       -- would make export time track syscalls rather than entity count.
       if pending_count >= FLUSH_EVERY then
-        helpers.write_file(path, table.concat(pending), true)
+        checksum = checksummed_write(path, table.concat(pending), true, checksum)
         pending, pending_count = {}, 0
       end
     end
   end
 
   if pending_count > 0 then
-    helpers.write_file(path, table.concat(pending), true)
+    checksum = checksummed_write(path, table.concat(pending), true, checksum)
   end
 
-  helpers.write_file(path, encode.frame_end_entities(), true)
+  checksum = checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
   pending, pending_count = {}, 0
   local tiles_written = 0
@@ -88,14 +98,18 @@ local function export_surface(surface, tick, session_id)
     pending[pending_count] = encode.frame_tile_record(dict, tile)
 
     if pending_count >= FLUSH_EVERY then
-      helpers.write_file(path, table.concat(pending), true)
+      checksum = checksummed_write(path, table.concat(pending), true, checksum)
       pending, pending_count = {}, 0
     end
   end
 
   if pending_count > 0 then
-    helpers.write_file(path, table.concat(pending), true)
+    checksum = checksummed_write(path, table.concat(pending), true, checksum)
   end
+
+  -- Not itself folded into the checksum: nothing needs a checksum of the
+  -- checksum, and the reader already knows the trailer's fixed size.
+  helpers.write_file(path, encode.u32le(checksum), true)
 
   return written, tiles_written
 end
@@ -339,7 +353,7 @@ end
 
 local function snapshot_flush(state)
   if state.pending_count > 0 then
-    helpers.write_file(state.path, table.concat(state.pending), true)
+    state.checksum = checksummed_write(state.path, table.concat(state.pending), true, state.checksum)
     state.pending, state.pending_count = {}, 0
   end
 end
@@ -358,7 +372,8 @@ local function snapshot_begin_surface(state, surface)
   state.tile_index = 1
   state.tiles_written = 0
   state.phase = "entities"
-  helpers.write_file(state.path, encode.frame_header(state.tick, surface.name), false)
+  state.checksum = encode.checksum_init()
+  state.checksum = checksummed_write(state.path, encode.frame_header(state.tick, surface.name), false, state.checksum)
 end
 
 --- Runs when a snapshot finishes: writes its manifest. Written last, so its
@@ -418,7 +433,7 @@ local function snapshot_step()
     s.entity_index = end_index + 1
     if s.entity_index > #s.entities then
       snapshot_flush(s)
-      helpers.write_file(s.path, encode.frame_end_entities(), true)
+      s.checksum = checksummed_write(s.path, encode.frame_end_entities(), true, s.checksum)
       s.phase = "tiles"
       s.tiles = surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })
       s.tile_index = 1
@@ -440,6 +455,9 @@ local function snapshot_step()
     s.tile_index = end_index + 1
     if s.tile_index > #s.tiles then
       snapshot_flush(s)
+      -- Not itself folded into the checksum, same as export_surface's
+      -- trailer: nothing needs a checksum of the checksum.
+      helpers.write_file(s.path, encode.u32le(s.checksum), true)
       s.total_entities = s.total_entities + s.written
       s.total_tiles = s.total_tiles + s.tiles_written
       s.phase = nil

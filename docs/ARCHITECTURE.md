@@ -94,15 +94,41 @@ the actual CPU and I/O cost of a big export, not something incidental to it.
 Wire format, all integers little endian:
 
     magic     4 bytes, "STF1"
+    version   u8, must equal the reader's CURRENT_VERSION
     tick      u64
     surface   string (u16 length, then that many UTF-8 bytes)
     entity section, a sequence of:
       tag 0  DefineName    string
       tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
     tag 9  EndEntities (no payload), marking the start of the tile section
-    tile section, a sequence of, running to end of file:
+    tile section, a sequence of:
       tag 0  DefineName    string
       tag 2  TileRecord    u16 name_id, i32 x, i32 y
+    checksum  u32, djb2 of every byte before it (magic and version included)
+
+The version byte lets a reader tell "this is a format I don't understand"
+apart from a generic parse failure -- this project has already changed this
+format more than once, each time with no way for an older build to say
+anything clearer than a confusing parse error about a newer file. The
+checksum catches a narrower, different problem the tag structure alone
+can't: silent bit-level corruption that still happens to decode as
+plausible looking records. `mod/control.lua` accumulates it incrementally
+(`checksummed_write`, next to every `helpers.write_file` call for a given
+frame) as the file is written, since a file can be tens or hundreds of
+megabytes and is never held in memory whole on that side; the Rust reader,
+which does hold the whole file in memory, just hashes the payload in one
+pass and compares. Both formats' hash functions (`encode.checksum_update`
+in Lua, `frame::checksum` in Rust) implement the same djb2 variant using
+only multiply/add/mod, with no bitwise primitive, since Factorio's Lua 5.2
+has neither `string.pack` nor a `bit32` library -- the same constraint
+`u32le`/`i32le` above already work around by hand. A test in each language
+asserts both agree on the same known input.
+
+A file from before this version byte existed has neither it nor the
+trailer and will not parse under the current reader -- consistent with this
+project's precedent of clean breaks over carrying old formats forward at
+this alpha stage (see "Live capture and replay" below, which made the same
+call for session tagging).
 
 `DefineName` writes a prototype name the first time it is used and gives it
 the next sequential id; every later reference is just the two byte id, which
@@ -122,7 +148,8 @@ taken upfront could still be wrong by the time writing finishes, and scanning
 the whole list once just to learn it would reintroduce the very stall the
 incremental exporter exists to avoid. `EndEntities` sidesteps needing a count
 at all: each section is a plain forward stream, and the tile section simply
-runs until the file ends.
+runs until the checksum trailer (the reader knows that trailer is always
+exactly 4 bytes, so it stops the tile loop there rather than at true EOF).
 
 Entity coordinates are stored as position times ten, rounded to the nearest
 integer (the same fixed point scale `world.rs::pos_key` keys positions by on
@@ -271,7 +298,8 @@ append only and grows for as long as capture stays on, so it is a plain
 forward stream of tagged records from the magic to whatever the last flush
 wrote.
 
-    magic 4 bytes, "STE1", written once when the segment is created
+    magic   4 bytes, "STE1", written once when the segment is created
+    version u8, must equal the reader's CURRENT_VERSION
 
     then a sequence of tagged records:
       tag 0  DefineName    string
@@ -293,6 +321,17 @@ since many events (a blueprint landing hundreds of entities) usually share a
 tick; `control.lua` always writes one as the very first record of a fresh
 segment, so a reader never has to handle a data record before any tick is
 known.
+
+The version byte gives a reader the same "format I don't understand" signal
+the frame format's does, but there is deliberately no checksum trailer to
+go with it, unlike that format. A segment is append only and grows for as
+long as capture stays on, and is simply abandoned, not closed, when a
+rollover starts a new one (see `next_capture_segment` above) -- there is no
+"this segment is now finished" moment to checksum against without inventing
+one. `replay::run` already tolerates a segment that fails to open (skip and
+warn rather than aborting the whole replay, added for exactly this kind of
+partial/orphaned file), which covers what a checksum would otherwise be
+protecting against here.
 
 `id` on `AddEntity`/`RemoveEntity` uses `0` to mean "no id" (Factorio's
 `unit_number` is documented to start at 1, and `control.lua` already

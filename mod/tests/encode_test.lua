@@ -73,8 +73,8 @@ end
 
 -- frame format -------------------------------------------------------------------
 
-check("frame_header: magic, tick, surface", encode.frame_header(100, "nauvis"),
-  "STF1" .. encode.u64le(100) .. encode.str("nauvis"))
+check("frame_header: magic, version, tick, surface", encode.frame_header(100, "nauvis"),
+  "STF1" .. bytes(1) .. encode.u64le(100) .. encode.str("nauvis"))
 
 do
   local dict = encode.new_dictionary()
@@ -114,7 +114,7 @@ check("frame_end_entities: tag 9, no payload", encode.frame_end_entities(), byte
 
 -- live capture event format -------------------------------------------------------
 
-check("event_header: just the magic", encode.event_header(), "STE1")
+check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(1))
 check("event_set_tick: tag 2 then the tick", encode.event_set_tick(1234), bytes(2) .. encode.u64le(1234))
 
 do
@@ -214,6 +214,26 @@ check("next_capture_segment: resuming exactly where recording left off keeps the
 check("next_capture_segment: loading an older save starts a new segment at the resumed tick",
   encode.next_capture_segment(5000, 3000, 100),
   3000)
+
+-- checksums ------------------------------------------------------------------
+
+check("checksum_init: the djb2 seed", encode.checksum_init(), 5381)
+
+do
+  local hash = encode.checksum_init()
+  hash = encode.checksum_update(hash, "ab")
+  -- Hand computed: 5381*33+97=177670, then 177670*33+98=5863208. Also
+  -- asserted equal in src/frame.rs's checksum tests, so the two
+  -- implementations are checked against the same known vector.
+  check("checksum_update: byte by byte djb2 over \"ab\"", hash, 5863208)
+end
+
+do
+  local hash = encode.checksum_init()
+  hash = encode.checksum_update(hash, "a")
+  hash = encode.checksum_update(hash, "b")
+  check("checksum_update: splitting the input across calls gives the same result", hash, 5863208)
+end
 
 -- per-playthrough file naming ----------------------------------------------------
 
