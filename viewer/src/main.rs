@@ -150,12 +150,12 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
         redraw_progress(&progress, &mut last, true).await;
         Some(synthetic_frame(n))
     } else if args.path.is_none() {
-        let default = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames/frame_0004.json");
+        let default = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames/frame_0004.stfr");
         println!("no frame given, defaulting to {default}");
         progress.detail = "default fixture".to_string();
         redraw_progress(&progress, &mut last, true).await;
-        let text = std::fs::read_to_string(default).expect("failed to read default fixture");
-        Some(serde_json::from_str(&text).expect("failed to parse frame JSON"))
+        let bytes = std::fs::read(default).expect("failed to read default fixture");
+        Some(save_timelapse::frame::read_binary(&bytes).expect("failed to parse frame"))
     } else {
         None
     };

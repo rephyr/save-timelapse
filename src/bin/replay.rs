@@ -2,9 +2,9 @@
 //!
 //! The other half of the live-capture flow: the mod snapshots a save once and
 //! then logs only placements and removals, and this walks that log forward
-//! over the baseline to produce ordinary frames -- the same
-//! `frame_NNNN.json` the viewer already reads, so nothing downstream needs to
-//! know a timeline came from events rather than from a folder of saves.
+//! over the baseline to produce ordinary frames, the same `frame_NNNN.stfr`
+//! the viewer already reads, so nothing downstream needs to know a timeline
+//! came from events rather than from a folder of saves.
 //!
 //!     save-timelapse-replay --capture "%APPDATA%/Factorio/script-output/save-timelapse" --out frames
 
@@ -75,11 +75,8 @@ fn run(args: Args) -> std::io::Result<()> {
             return;
         }
         let frame = world.to_frame(&target, tick);
-        let path = out.join(format!("frame_{written:04}.json"));
-        if let Err(e) = serde_json::to_vec(&frame.as_out())
-            .map_err(std::io::Error::from)
-            .and_then(|bytes| std::fs::write(&path, bytes))
-        {
+        let path = out.join(format!("frame_{written:04}.stfr"));
+        if let Err(e) = std::fs::write(&path, save_timelapse::frame::write_binary(&frame.as_out())) {
             error = Some(e);
             return;
         }

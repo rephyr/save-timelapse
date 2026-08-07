@@ -8,4 +8,5 @@ pub mod locate;
 pub mod names;
 pub mod replay;
 pub mod settings_dat;
+pub mod wire;
 pub mod world;

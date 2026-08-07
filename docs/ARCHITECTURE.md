@@ -2,7 +2,7 @@
 
 ## Components
 
-    mod/     Lua mod loaded by Factorio. Exports entity data as JSON.
+    mod/     Lua mod loaded by Factorio. Exports entity data in a custom binary format.
     src/     Rust CLI. Drives Factorio, collects exports, renders output.
 
 The two never communicate directly. Factorio's Lua sandbox cannot read files,
@@ -19,7 +19,7 @@ into `script-output`. The CLI reads that directory after the process exits.
     Factorio loads the save, mod exports on first tick, process exits
         |
         v
-    <staged>/script-output/save-timelapse/frame_<tick>_<surface>.json
+    <staged>/script-output/save-timelapse/frame_<tick>_<surface>.stfr
         |
         |  CLI collects, orders by save sequence
         v
@@ -84,31 +84,67 @@ from `factorio.exe --version`.
 
 ## Frame format
 
-    {
-      "tick": 22630009,
-      "surface": "nauvis",
-      "entities": [ {"n": "transport-belt", "x": -80.5, "y": 28.5, "d": 4} ],
-      "count": 517934,
-      "tiles": [ {"n": "concrete", "x": -80, "y": 28} ],
-      "tile_count": 812004
-    }
+Every per-surface export (`frame_<tick>_<surface>.stfr`) is a small custom
+binary format, not JSON. The mod exports during real gameplay (the baseline
+snapshot alone has been measured at tens of seconds of frozen play on a
+~375k-entity base), so this is the one file whose write cost genuinely
+mattered: JSON text formatting and punctuation for every single entity was
+the actual CPU and I/O cost of a big export, not something incidental to it.
 
-Keys are shortened because entity count dominates file size. `d` is omitted
-when direction is zero. Coordinates are fixed to one decimal, matching
-Factorio's half-tile entity alignment.
+Wire format, all integers little endian:
+
+    magic     4 bytes, "STF1"
+    tick      u64
+    surface   string (u16 length, then that many UTF-8 bytes)
+    entity section, a sequence of:
+      tag 0  DefineName    string
+      tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
+    tag 9  EndEntities (no payload), marking the start of the tile section
+    tile section, a sequence of, running to end of file:
+      tag 0  DefineName    string
+      tag 2  TileRecord    u16 name_id, i32 x, i32 y
+
+`DefineName` writes a prototype name the first time it is used and gives it
+the next sequential id; every later reference is just the two byte id, which
+is what lets a base with hundreds of thousands of entities but only a few
+dozen distinct prototype names avoid repeating `"transport-belt"` per entity.
+One dictionary is shared by the entity and tile sections of a file, since a
+name only needs defining once.
+
+There is deliberately no entity or tile count anywhere in this format. Both
+counts would be free to compute upfront for the single tick synchronous
+export path (`find_entities_filtered` already returns a full array), but the
+periodic incremental exporter (`snapshot_step` in control.lua) spreads one
+export across many ticks specifically so no single tick has to do the whole
+thing, with real play still running in between: an entity a batch has not
+reached yet can be mined by the player before its turn comes, so a count
+taken upfront could still be wrong by the time writing finishes, and scanning
+the whole list once just to learn it would reintroduce the very stall the
+incremental exporter exists to avoid. `EndEntities` sidesteps needing a count
+at all: each section is a plain forward stream, and the tile section simply
+runs until the file ends.
+
+Entity coordinates are stored as position times ten, rounded to the nearest
+integer (the same fixed point scale `world.rs::pos_key` keys positions by on
+the Rust side, and exactly the precision entities are aligned to). Tile
+coordinates are already integers, stored as is: a tile named at `(x, y)`
+occupies world space `[x, x+1) x [y, y+1)`, corner rather than center
+anchored like entities. `d`, `w` and `h` are always present now rather than
+omitted at their default (0 direction, 1x1 footprint): once a record is this
+compact, a variable width encoding to skip a default value costs more
+complexity than the bytes it would save.
 
 `tiles` covers placed floor (concrete, stone path, hazard/refined concrete
-variants, landfill) — a short, stable include list, the opposite of entity
+variants, landfill), a short, stable include list, the opposite of entity
 filtering's exclude list, since natural terrain vastly outnumbers placed
-floor types. Tile positions are integers: a tile named at `(x, y)` occupies
-world space `[x, x+1) x [y, y+1)`, corner rather than center anchored like
-entities. `tiles` is absent from frames captured before tile export existed;
-readers should treat a missing `tiles`/`tile_count` as empty rather than
-requiring it.
+floor types.
 
 A surface is exported when it is nauvis or contains at least one entity owned
-by the player force. A manifest listing exported surfaces accompanies each set,
-and now also reports the tile total alongside the entity total.
+by the player force. A manifest listing exported surfaces accompanies each
+set. Unlike the frame body, the manifest (`frame_<tick>_manifest.json`) and
+`baseline.json` stay plain JSON: they hold one record per *surface*, not per
+entity, so they're tiny, written once, and worth keeping human readable for
+debugging the handshake between the mod and the Rust side.
 
 ## Entity filtering
 
@@ -132,7 +168,7 @@ while carrying no information about factory growth.
 
 ## Write batching
 
-Entity JSON is accumulated in a Lua table and flushed to
+Encoded entity records are accumulated in a Lua table and flushed to
 `helpers.write_file` in blocks. Each call is a file append, so one call per
 entity makes export time scale with syscall count rather than entity count.
 
@@ -144,8 +180,8 @@ reassembles any moment by replaying that log over the baseline.
 
     <script-output>/save-timelapse/
         baseline.json                  tick + surfaces the baseline covers
-        frame_<tick>_<surface>.json    the baseline itself, one per surface
-        events_<start_tick>.jsonl      append-only, one segment per timeline
+        frame_<tick>_<surface>.stfr    the baseline itself, one per surface
+        events_<start_tick>.stev       append-only, one segment per timeline
 
 `baseline.json` is written last, so its existence means the baseline finished.
 It is the handshake: replay reads it to learn which frame files to seed from.
@@ -166,15 +202,25 @@ save that has been baselined knows it. It is recorded only on *completion*,
 so a game saved and reloaded midway simply starts over rather than leaving a
 truncated baseline that replay would trust.
 
+Because nothing renders while a tick's Lua is still running, there is no way
+to show a live progress bar for a freeze that happens entirely inside one
+tick. `request_baseline`/`perform_baseline` split the work across two ticks
+purely so a warning can be seen at all: `request_baseline` prints an entity
+count (`LuaSurface::count_entities_filtered`, cheap since it never builds the
+array `export_surface` needs) and sets a flag, then `on_tick` runs
+`perform_baseline` the *next* tick. Printing and freezing in the same tick
+would put the warning and the "finished" message on screen at the same
+moment, after the freeze already ended.
+
 That same persistence is a trap if the *output* is deleted rather than the
 save: `storage` survives independently of `script-output`, and the mod has
 no way to notice the mismatch. Checked against Factorio's own
 `runtime-api.json`: `LuaHelpers` exposes `write_file` and `remove_path` and
 nothing else, no read and no directory listing, so a mod genuinely cannot
 ask "is the file I wrote still there." Deleting `script-output/save-timelapse`
-by hand leaves `baseline_tick` set, `ensure_baseline` keeps returning early,
+by hand leaves `baseline_tick` set, `request_baseline` keeps returning early,
 and nothing gets rewritten — the reported symptom was live capture producing
-an `events_*.jsonl` (which doesn't check `baseline_tick` at all) with no
+an `events_*.stev` (which doesn't check `baseline_tick` at all) with no
 baseline files alongside it. `/timelapse-reset-capture` is the manual
 equivalent of the detection the mod cannot do automatically: it clears
 `storage.timelapse_capture` outright, so the next check retakes the baseline
@@ -191,28 +237,68 @@ synchronous one.
 
 ### Event format
 
-One JSON object per line. `op` is `+`/`-`, `k` is `e`/`t`.
+Also a custom binary format (`events_<start_tick>.stev`), for the same reason
+as the frame format: this is written incrementally, live, as the player
+plays, so the cost of formatting and re-parsing text for every single
+construction event is a cost paid during real gameplay, not just at export
+time.
 
-    {"t":1234,"op":"+","k":"e","s":"nauvis","n":"transport-belt","x":10.5,"y":20.5,"d":4,"id":8842}
-    {"t":1250,"op":"-","k":"e","s":"nauvis","x":10.5,"y":20.5,"id":8842}
+Unlike the frame format there is no upfront count of anything: the log is
+append only and grows for as long as capture stays on, so it is a plain
+forward stream of tagged records from the magic to whatever the last flush
+wrote.
 
-`d`/`w`/`h` are omitted at their defaults, as in the frame format. `s` is the
-surface, and without it a Space Age save's planets collapse into one
-coordinate space, since positions repeat across surfaces.
+    magic 4 bytes, "STE1", written once when the segment is created
 
-A removal always carries position, even when `id` is present too. It used to
-carry id alone whenever one was available — `{"t":1250,"op":"-","k":"e","id":8842}`,
-nothing else — on the reasoning that `unit_number` is unique game-wide and
-unambiguously locates the target. That reasoning had a hole: an entity that
-already existed when the baseline was taken has no id in replay's world
+    then a sequence of tagged records:
+      tag 0  DefineName    string
+      tag 1  DefineSurface string
+      tag 2  SetTick       u64 tick
+      tag 3  AddEntity     u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h,
+                           u64 id, u16 surface_id
+      tag 4  RemoveEntity  i32 x10, i32 y10, u64 id, u16 surface_id
+      tag 5  AddTile       u16 name_id, i32 x, i32 y, u16 surface_id
+      tag 6  RemoveTile    i32 x, i32 y, u16 surface_id
+
+`DefineName`/`DefineSurface` name dictionaries work the same way as the frame
+format's, just as two separate dictionaries sharing the same tagged stream
+(surfaces get their own tag, `1`, since a save has only a handful of planets
+and platforms, not worth spending a `DefineName`-sized dictionary entry
+alongside the much larger set of prototype names). `SetTick` is written once
+per distinct tick that has at least one event, rather than on every record,
+since many events (a blueprint landing hundreds of entities) usually share a
+tick; `control.lua` always writes one as the very first record of a fresh
+segment, so a reader never has to handle a data record before any tick is
+known.
+
+`id` on `AddEntity`/`RemoveEntity` uses `0` to mean "no id" (Factorio's
+`unit_number` is documented to start at 1, and `control.lua` already
+tolerates an entity with none). `RemoveEntity` always carries position, even
+when `id` is present too. The JSON-era format used to send id alone whenever
+one was available, on the reasoning that `unit_number` is unique game-wide
+and unambiguously locates the target. That reasoning had a hole: an entity
+that already existed when the baseline was taken has no id in replay's world
 state (a snapshot records no `unit_number`s), but Factorio still reports its
-*real* id — the one it was assigned whenever it was originally built — when
+*real* id, the one it was assigned whenever it was originally built, when
 that entity is later mined or destroyed. Replay had never registered that id
 anywhere, so the removal resolved nowhere and silently no-opped. The entity
 never disappeared from the replayed timeline. `id` is kept alongside position
 now as a fast-path hint rather than the only key: replay tries it first, and
 falls back to position when the id isn't one it recognizes (see "World state"
-below).
+below). The wire format now makes this structurally impossible to get wrong
+in the old way: there is no shape a `RemoveEntity` record can take that omits
+position, unlike the old JSON line where `id` alone was a valid message.
+
+A segment file can be resumed across a save reload: Factorio re-runs all of
+`control.lua`'s top-level code on every load, which resets the in-memory name
+and surface dictionaries to empty. If play resumes appending to a segment
+file that already has earlier `DefineName`/`DefineSurface` records in it from
+before the reload, this session has no way to read those back (see "That same
+persistence is a trap" above for why not), so it may redefine a
+handful of names it cannot know were already defined. That's harmless, not a
+corruption: the reader always assigns ids purely by encounter order in the
+file, so a name defined twice just gets two ids that both resolve to the same
+string, at the cost of a few dozen redundant bytes, not a wrong replay.
 
 ### Why replay is forgiving
 
@@ -271,10 +357,11 @@ then fall back to position, which is what makes a baseline-original entity's
 removal work at all.
 
 Position keys are scaled by **ten**, not two. Half-tile alignment covers most
-entities but not all: `frame_0000.json` holds a
+entities but not all: `frame_0000.stfr` holds a
 `logistic-train-stop-lamp-control` at x=326.9 beside its `logistic-train-stop`
 at x=327.0. Keying on half tiles merged them and silently dropped five of that
-frame's 240 entities. One decimal is exactly the precision the mod writes.
+frame's 240 entities. One decimal is exactly the precision positions are
+stored at on the wire (see "Frame format" above).
 
 ## Rendering
 

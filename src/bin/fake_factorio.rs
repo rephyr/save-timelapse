@@ -13,7 +13,7 @@
 //! genuinely verifies the settings were written correctly, rather than assuming
 //! it.
 //!
-//! Set `FAKE_FACTORIO_FRAME` to a JSON file to control what gets emitted.
+//! Set `FAKE_FACTORIO_FRAME` to a `.stfr` file to control what gets emitted.
 //!
 //! A save whose name ends in `-silent.zip` makes it exit cleanly having written
 //! nothing, reproducing the failure mode where the game runs fine but the mod
@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use save_timelapse::frame::{self, Entity, FrameOut};
 use save_timelapse::settings_dat::{self, Payload};
 
 const VERSION_BANNER: &str = "Version: 2.0.77 (build 84539, linux64, steam)\n\
@@ -32,12 +33,17 @@ const VERSION_BANNER: &str = "Version: 2.0.77 (build 84539, linux64, steam)\n\
 const TRIGGER: &str = "save-timelapse-headless-scan";
 const RESOURCES: &str = "save-timelapse-include-resources";
 
-/// Minimal frame used when no fixture is supplied.
-const DEFAULT_FRAME: &str = r#"{"tick":216000,"surface":"nauvis","entities":[
-{"n":"transport-belt","x":-4.5,"y":2.5,"d":4},
-{"n":"assembling-machine-1","x":0.5,"y":0.5},
-{"n":"stone-furnace","x":6.5,"y":-1.5},
-{"n":"inserter","x":3.5,"y":0.5,"d":2}],"count":4}"#;
+/// Encoded on demand rather than kept as a byte literal: a `Frame` value is
+/// clearer to read and edit than the bytes its binary encoding would produce.
+fn default_frame_bytes() -> Vec<u8> {
+    let entities = vec![
+        Entity { n: "transport-belt".to_string(), x: -4.5, y: 2.5, d: 4, w: 1, h: 1 },
+        Entity { n: "assembling-machine-1".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 },
+        Entity { n: "stone-furnace".to_string(), x: 6.5, y: -1.5, d: 0, w: 1, h: 1 },
+        Entity { n: "inserter".to_string(), x: 3.5, y: 0.5, d: 2, w: 1, h: 1 },
+    ];
+    frame::write_binary(&FrameOut { tick: 216_000, surface: "nauvis", entities: &entities, tiles: &[] })
+}
 
 fn flag_value(file: &settings_dat::SettingsFile, name: &str) -> bool {
     matches!(
@@ -114,11 +120,11 @@ fn main() -> ExitCode {
     }
 
     let body = match std::env::var("FAKE_FACTORIO_FRAME") {
-        Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        Ok(path) => std::fs::read(&path).unwrap_or_else(|err| {
             eprintln!("fake-factorio: cannot read {path}: {err}");
-            DEFAULT_FRAME.to_string()
+            default_frame_bytes()
         }),
-        Err(_) => DEFAULT_FRAME.to_string(),
+        Err(_) => default_frame_bytes(),
     };
 
     let out_dir = write_data.join("script-output").join("save-timelapse");
@@ -128,7 +134,7 @@ fn main() -> ExitCode {
     }
 
     let tick = 216_000;
-    if let Err(err) = std::fs::write(out_dir.join(format!("frame_{tick}_nauvis.json")), &body) {
+    if let Err(err) = std::fs::write(out_dir.join(format!("frame_{tick}_nauvis.stfr")), &body) {
         eprintln!("fake-factorio: cannot write frame: {err}");
         return ExitCode::FAILURE;
     }

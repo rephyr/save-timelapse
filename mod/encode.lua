@@ -1,7 +1,17 @@
--- save-timelapse: pure JSON-encoding helpers shared by snapshot export
+-- save-timelapse: pure binary-encoding helpers shared by snapshot export
 -- (control.lua) and live event capture. Nothing here touches
 -- game/surface/settings/helpers, so this file loads and runs under a plain
 -- `lua` interpreter with no Factorio present. See tests/encode_test.lua.
+--
+-- Factorio's modding Lua is version 5.2, which has no string.pack/unpack (a
+-- 5.3 feature), so every integer here is packed by hand from string.char and
+-- arithmetic. Lua's `%` and `math.floor` are floor based, which turns out to
+-- produce the correct little endian two's complement bytes for a negative
+-- number with no separate "add 2^32" step first: for example -805 packed as
+-- a 4 byte integer below comes out as DB FC FF FF, matching a real signed
+-- 32 bit two's complement encoding. See the "negative numbers" tests.
+--
+-- See docs/ARCHITECTURE.md for the full wire format this file implements.
 
 local M = {}
 
@@ -42,85 +52,227 @@ M.PLACED_FLOOR_TILES = {
   "cyan-refined-concrete", "acid-refined-concrete",
 }
 
+M.FRAME_MAGIC = "STF1"
+M.EVENT_MAGIC = "STE1"
+
+--- JSON string quoting, still needed for the manifest files
+--- (baseline.json, frame_<tick>_manifest.json): those stay JSON since
+--- they're tiny, written once, and useful to read by eye, unlike the bulk
+--- entity/tile/event data this file otherwise encodes as binary.
 function M.quote(text)
   return '"' .. text:gsub('[\\"]', '\\%0') .. '"'
 end
 
-function M.encode_entity(entity)
+-- ---------------------------------------------------------------------------
+-- Low level byte packing
+
+function M.u8(n)
+  return string.char(n % 256)
+end
+
+function M.u16le(n)
+  local b0 = n % 256
+  n = math.floor(n / 256)
+  local b1 = n % 256
+  return string.char(b0, b1)
+end
+
+--- Also used for signed 32 bit values: bytes are bytes, and Lua's floor
+--- based `%`/`math.floor` produce the right two's complement result for a
+--- negative `n` without any extra handling. See the module comment above.
+function M.u32le(n)
+  local b0 = n % 256
+  n = math.floor(n / 256)
+  local b1 = n % 256
+  n = math.floor(n / 256)
+  local b2 = n % 256
+  n = math.floor(n / 256)
+  local b3 = n % 256
+  return string.char(b0, b1, b2, b3)
+end
+
+M.i32le = M.u32le
+
+function M.u64le(n)
+  local bytes = {}
+  for i = 1, 8 do
+    bytes[i] = n % 256
+    n = math.floor(n / 256)
+  end
+  return string.char(bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8])
+end
+
+--- A u16 length prefix followed by the string's bytes. Prototype and surface
+--- names are always short, so a u16 length leaves plenty of headroom without
+--- spending 4 bytes on every single one.
+function M.str(s)
+  return M.u16le(#s) .. s
+end
+
+--- Position times ten, rounded to the nearest integer: entities are aligned
+--- to a tenth of a tile (see world.rs::pos_key on the Rust side), and this
+--- is the fixed point form that alignment is stored in on the wire.
+--- Round-half-away-from-zero, matching what the old "%.1f" text formatting
+--- produced when read back as a number.
+function M.round10(v)
+  if v >= 0 then
+    return math.floor(v * 10 + 0.5)
+  end
+  return -math.floor(-v * 10 + 0.5)
+end
+
+local function clamp_u8(n)
+  if n > 255 then
+    return 255
+  end
+  return n
+end
+
+-- ---------------------------------------------------------------------------
+-- Name dictionaries
+--
+-- A name is written out in full the first time it is used (a "DefineName"
+-- chunk) and given the next sequential id; every later reference to that
+-- name is just the two byte id. This is what lets a frame or event segment
+-- skip repeating "transport-belt" once per entity. The dictionary is a
+-- plain table so the caller (control.lua) can decide its lifetime: one per
+-- frame file, or one per live-capture segment.
+
+function M.new_dictionary()
+  return { ids = {}, count = 0 }
+end
+
+--- Returns the id for `name` in `dict`, plus a define chunk to prepend if
+--- this is the first time `dict` has seen it, or "" otherwise. Concatenate
+--- the two returned pieces directly onto whatever record follows: the
+--- dictionary is a stream position, not something written separately.
+---
+--- `define_tag` is the tag byte the define chunk uses: 0 (DefineName) for
+--- both the frame format's shared dictionary and the event format's name
+--- dictionary, but 1 (DefineSurface) for the event format's surface
+--- dictionary, since those are two different tags on that stream. The
+--- dictionary itself doesn't know which one it is; the caller does.
+function M.dictionary_id(dict, name, define_tag)
+  local id = dict.ids[name]
+  if id then
+    return id, ""
+  end
+  id = dict.count
+  dict.count = id + 1
+  dict.ids[name] = id
+  return id, M.u8(define_tag) .. M.str(name)
+end
+
+-- ---------------------------------------------------------------------------
+-- Frame format (frame_<tick>_<surface>.stfr)
+
+function M.frame_header(tick, surface)
+  return M.FRAME_MAGIC .. M.u64le(tick) .. M.str(surface)
+end
+
+--- One entity, as a "DefineName" chunk (if needed) followed by tag 1 and its
+--- fixed size record. `direction`/`tile_width`/`tile_height` are always
+--- written now rather than omitted at their default: once a record is this
+--- compact, a variable width encoding to skip a default value costs more
+--- complexity than the bytes it would save.
+function M.frame_entity_record(dict, entity)
+  local id, define = M.dictionary_id(dict, entity.name, 0)
   local pos = entity.position
-  local fields = string.format('{"n":%s,"x":%.1f,"y":%.1f',
-    M.quote(entity.name), pos.x, pos.y)
-  local facing = entity.direction
-  if facing and facing ~= 0 then
-    fields = fields .. ',"d":' .. facing
-  end
-  -- Most entities are 1x1, so this omits w/h the same way d is omitted at 0
-  -- -- otherwise every belt and pole would carry two redundant fields.
-  local w, h = entity.tile_width, entity.tile_height
-  if w and h and (w ~= 1 or h ~= 1) then
-    fields = fields .. string.format(',"w":%d,"h":%d', w, h)
-  end
-  return fields .. "}"
+  local direction = entity.direction or 0
+  local w = clamp_u8(entity.tile_width or 1)
+  local h = clamp_u8(entity.tile_height or 1)
+  return define
+    .. M.u8(1)
+    .. M.u16le(id)
+    .. M.i32le(M.round10(pos.x))
+    .. M.i32le(M.round10(pos.y))
+    .. M.u8(direction)
+    .. M.u8(w)
+    .. M.u8(h)
 end
 
 --- Tiles are corner positioned and integer aligned, unlike entities.
-function M.encode_tile(tile)
+function M.frame_tile_record(dict, tile)
+  local id, define = M.dictionary_id(dict, tile.name, 0)
   local pos = tile.position
-  return string.format('{"n":%s,"x":%d,"y":%d}', M.quote(tile.name), pos.x, pos.y)
+  return define .. M.u8(2) .. M.u16le(id) .. M.i32le(pos.x) .. M.i32le(pos.y)
 end
 
---- One live-capture log line. `op` is "+" (add) or "-" (remove); `kind` is
---- "e" (entity) or "t" (tile). Position always locates the target -- the
---- only option for tiles, which have no identity beyond their position, and
---- necessary for entities too, not just a fallback: an entity that already
---- existed when the baseline was taken carries its real unit_number when
---- Factorio later reports it mined or destroyed (that number was assigned
---- whenever the entity was originally built, long before capture started),
---- but a snapshot records no ids, so replay's world state never learned that
---- number belongs to that entity. Sending id alone on removal, as this once
---- did, made every such removal an unresolvable no-op -- the entity would
---- never disappear from the replayed timeline. `id` now rides alongside
---- position as a fast, unambiguous match for whatever replay does have an id
---- for (anything built after capture began), with position as what actually
---- makes a baseline-original entity's removal work at all.
----
---- `w`/`h` (entity footprint, add events only) follow the same omit-at-1x1
---- convention as encode_entity.
----
---- `surface` (`"s"`) is what lets replay route an event to the right world.
---- Without it, a Space Age save's planets and platforms all collapse into one
---- coordinate space, since positions only repeat across surfaces.
-function M.encode_event(op, kind, tick, name, x, y, direction, id, w, h, surface)
-  local coord_fmt = kind == "t" and '"x":%d,"y":%d' or '"x":%.1f,"y":%.1f'
-  local fields = string.format('{"t":%d,"op":%s,"k":%s,', tick, M.quote(op), M.quote(kind))
+--- Marks the end of the entity section and the start of the tile section.
+--- There is no entity or tile count anywhere in this format: the periodic
+--- incremental exporter writes the entity section across many ticks with
+--- real play still running in between, so it cannot afford to also scan the
+--- whole entity list upfront just to learn a count, and the count could
+--- still be stale by the time writing finished anyway. A tile section needs
+--- no equivalent marker: it is always the last thing in the file, so it
+--- simply runs to the end.
+function M.frame_end_entities()
+  return M.u8(9)
+end
 
-  if surface then
-    fields = fields .. '"s":' .. M.quote(surface) .. ","
-  end
-  if name then
-    fields = fields .. '"n":' .. M.quote(name) .. ","
-  end
+-- ---------------------------------------------------------------------------
+-- Live capture event format (events_<start_tick>.stev)
 
-  fields = fields .. string.format(coord_fmt, x, y)
+function M.event_header()
+  return M.EVENT_MAGIC
+end
 
-  if op == "+" and kind == "e" then
-    if direction and direction ~= 0 then
-      fields = fields .. ',"d":' .. direction
-    end
-    if w and h and (w ~= 1 or h ~= 1) then
-      fields = fields .. string.format(',"w":%d,"h":%d', w, h)
-    end
-  end
-  if kind == "e" and id then
-    fields = fields .. ',"id":' .. id
-  end
+--- Emitted once per distinct tick that has at least one event, rather than
+--- on every record, since many events (a blueprint landing hundreds of
+--- entities) usually share a tick.
+function M.event_set_tick(tick)
+  return M.u8(2) .. M.u64le(tick)
+end
 
-  return fields .. "}"
+--- `id` of nil or 0 means the add carries no unit_number (some entity kinds
+--- have none); `w`/`h` default to 1 and `direction` to 0, the same as the
+--- frame format.
+function M.event_add_entity(names, surfaces, surface, name, x, y, direction, id, w, h)
+  local surface_id, define_surface = M.dictionary_id(surfaces, surface, 1)
+  local name_id, define_name = M.dictionary_id(names, name, 0)
+  return define_surface
+    .. define_name
+    .. M.u8(3)
+    .. M.u16le(name_id)
+    .. M.i32le(M.round10(x))
+    .. M.i32le(M.round10(y))
+    .. M.u8(direction or 0)
+    .. M.u8(clamp_u8(w or 1))
+    .. M.u8(clamp_u8(h or 1))
+    .. M.u64le(id or 0)
+    .. M.u16le(surface_id)
+end
+
+--- Position is always sent, even when `id` is also available: an entity that
+--- already existed when the baseline was taken carries its real
+--- unit_number when Factorio later reports it mined or destroyed, but a
+--- snapshot records no ids, so replay's world state never learned that
+--- number belongs to that entity. `id` alone would make every such removal
+--- an unresolvable no-op; position is what actually finds it.
+function M.event_remove_entity(surfaces, surface, x, y, id)
+  local surface_id, define_surface = M.dictionary_id(surfaces, surface, 1)
+  return define_surface
+    .. M.u8(4)
+    .. M.i32le(M.round10(x))
+    .. M.i32le(M.round10(y))
+    .. M.u64le(id or 0)
+    .. M.u16le(surface_id)
+end
+
+function M.event_add_tile(names, surfaces, surface, name, x, y)
+  local surface_id, define_surface = M.dictionary_id(surfaces, surface, 1)
+  local name_id, define_name = M.dictionary_id(names, name, 0)
+  return define_surface .. define_name .. M.u8(5) .. M.u16le(name_id) .. M.i32le(x) .. M.i32le(y) .. M.u16le(surface_id)
+end
+
+function M.event_remove_tile(surfaces, surface, x, y)
+  local surface_id, define_surface = M.dictionary_id(surfaces, surface, 1)
+  return define_surface .. M.u8(6) .. M.i32le(x) .. M.i32le(y) .. M.u16le(surface_id)
 end
 
 --- Given the tick already recorded up to and the tick play resumed at,
---- decide whether this is a reload of an older save -- something an
---- append-only log can't represent as one timeline -- and if so, what
+--- decide whether this is a reload of an older save, something an
+--- append-only log can't represent as one timeline, and if so, what
 --- segment to start. Pure: plain values in and out, no Factorio state, so
 --- the decision is testable without a save/load cycle to actually trigger.
 function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)

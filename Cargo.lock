@@ -569,7 +569,6 @@ version = "0.1.0"
 dependencies = [
  "macroquad",
  "save-timelapse",
- "serde_json",
  "tempfile",
 ]
 

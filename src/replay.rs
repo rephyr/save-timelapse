@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! baseline.json                  tick + surfaces the baseline covers
-//! frame_<tick>_<surface>.json    one per surface, the baseline itself
-//! events_<start_tick>.jsonl      append-only, one segment per timeline
+//! frame_<tick>_<surface>.stfr    one per surface, the baseline itself
+//! events_<start_tick>.stev       append-only, one segment per timeline
 //! ```
 //!
 //! `baseline.json` is written last, so its presence means the baseline
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::event::{self, LoggedEvent};
-use crate::frame::Frame;
+use crate::frame;
 use crate::world::World;
 
 pub const BASELINE_MANIFEST: &str = "baseline.json";
@@ -51,7 +51,7 @@ impl Baseline {
     }
 
     pub fn frame_path(&self, dir: &Path, surface: &str) -> PathBuf {
-        dir.join(format!("frame_{}_{}.json", self.tick, surface))
+        dir.join(format!("frame_{}_{}.stfr", self.tick, surface))
     }
 }
 
@@ -94,14 +94,14 @@ pub fn load_baseline(dir: &Path) -> io::Result<Replay> {
     let mut world = World::new();
     let mut loaded = 0;
     for path in &paths {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!("warning: baseline surface {} unreadable: {e}", path.display());
                 continue;
             }
         };
-        match serde_json::from_str::<Frame>(&text) {
+        match frame::read_binary(&bytes) {
             Ok(frame) => {
                 world.load_baseline(&frame);
                 loaded += 1;
@@ -188,7 +188,7 @@ where
 /// than allocating a new one per tick.
 fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
     for logged in pending.iter() {
-        if replay.world.apply(logged.surface.as_deref(), &logged.event) {
+        if replay.world.apply(Some(logged.surface.as_str()), &logged.event) {
             replay.applied_events += 1;
         } else {
             replay.no_op_events += 1;
@@ -201,6 +201,8 @@ fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ByteWriter;
+    use std::collections::HashMap;
     use std::fs;
 
     fn capture_dir() -> tempfile::TempDir {
@@ -210,12 +212,83 @@ mod tests {
             r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#,
         )
         .unwrap();
-        fs::write(
-            dir.path().join("frame_100_nauvis.json"),
-            r#"{"tick":100,"surface":"nauvis","entities":[{"n":"pipe","x":0.5,"y":0.5}],"count":1,"tiles":[],"tile_count":0}"#,
-        )
-        .unwrap();
+
+        let entities = vec![frame::Entity { n: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
+        let out = frame::FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[] };
+        fs::write(dir.path().join("frame_100_nauvis.stfr"), frame::write_binary(&out)).unwrap();
+
         dir
+    }
+
+    /// Builds one `events_<tick>.stev` segment's bytes, tracking its name and
+    /// surface dictionaries so a test reads as a sequence of events rather
+    /// than a manual byte layout, the way the real writer builds it while
+    /// logging as play happens.
+    struct TestLog {
+        w: ByteWriter,
+        names: HashMap<String, u16>,
+        surfaces: HashMap<String, u16>,
+    }
+
+    impl TestLog {
+        fn new() -> Self {
+            let mut w = ByteWriter::new();
+            w.magic(b"STE1");
+            TestLog { w, names: HashMap::new(), surfaces: HashMap::new() }
+        }
+
+        fn name_id(&mut self, name: &str) -> u16 {
+            if let Some(&id) = self.names.get(name) {
+                return id;
+            }
+            let id = self.names.len() as u16;
+            self.names.insert(name.to_string(), id);
+            self.w.u8(0).string(name);
+            id
+        }
+
+        fn surface_id(&mut self, surface: &str) -> u16 {
+            if let Some(&id) = self.surfaces.get(surface) {
+                return id;
+            }
+            let id = self.surfaces.len() as u16;
+            self.surfaces.insert(surface.to_string(), id);
+            self.w.u8(1).string(surface);
+            id
+        }
+
+        fn tick(&mut self, tick: u64) -> &mut Self {
+            self.w.u8(2).u64(tick);
+            self
+        }
+
+        /// `id` of 0 means the add carries no unit_number, matching the wire
+        /// sentinel `event.rs` decodes.
+        fn add_entity(&mut self, surface: &str, name: &str, x: f32, y: f32, id: u64) -> &mut Self {
+            let surface_id = self.surface_id(surface);
+            let name_id = self.name_id(name);
+            self.w
+                .u8(3)
+                .u16(name_id)
+                .i32((x * 10.0).round() as i32)
+                .i32((y * 10.0).round() as i32)
+                .u8(0)
+                .u8(1)
+                .u8(1)
+                .u64(id)
+                .u16(surface_id);
+            self
+        }
+
+        fn remove_entity(&mut self, surface: &str, x: f32, y: f32) -> &mut Self {
+            let surface_id = self.surface_id(surface);
+            self.w.u8(4).i32((x * 10.0).round() as i32).i32((y * 10.0).round() as i32).u64(0).u16(surface_id);
+            self
+        }
+
+        fn write(self, dir: &Path, name: &str) {
+            fs::write(dir.join(name), self.w.into_vec()).unwrap();
+        }
     }
 
     #[test]
@@ -247,13 +320,11 @@ mod tests {
     #[test]
     fn replay_applies_events_and_emits_frames_on_the_interval() {
         let dir = capture_dir();
-        fs::write(
-            dir.path().join("events_100.jsonl"),
-            "{\"t\":100,\"op\":\"+\",\"k\":\"e\",\"s\":\"nauvis\",\"n\":\"transport-belt\",\"x\":1.5,\"y\":0.5}\n\
-             {\"t\":160,\"op\":\"+\",\"k\":\"e\",\"s\":\"nauvis\",\"n\":\"transport-belt\",\"x\":2.5,\"y\":0.5}\n\
-             {\"t\":220,\"op\":\"-\",\"k\":\"e\",\"s\":\"nauvis\",\"x\":0.5,\"y\":0.5}\n",
-        )
-        .unwrap();
+        let mut log = TestLog::new();
+        log.tick(100).add_entity("nauvis", "transport-belt", 1.5, 0.5, 0);
+        log.tick(160).add_entity("nauvis", "transport-belt", 2.5, 0.5, 0);
+        log.tick(220).remove_entity("nauvis", 0.5, 0.5);
+        log.write(dir.path(), "events_100.stev");
 
         let mut replay = load_baseline(dir.path()).unwrap();
         let mut seen: Vec<(u64, usize)> = Vec::new();
@@ -266,7 +337,7 @@ mod tests {
         assert_eq!(replay.applied_events, 3);
         assert_eq!(replay.no_op_events, 0);
         // Grows to 2 as belts land, then back to 2 when the pipe is removed
-        // (1 baseline + 2 belts - 1 pipe).
+        // (1 baseline plus 2 belts, minus 1 pipe).
         assert_eq!(seen.last().unwrap().1, 2);
         assert!(seen.len() >= 3, "expected several frames, got {seen:?}");
         assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "ticks must not go backwards");
@@ -277,14 +348,12 @@ mod tests {
     #[test]
     fn events_sharing_a_tick_are_applied_as_one_batch() {
         let dir = capture_dir();
-        let mut log = String::new();
+        let mut log = TestLog::new();
+        log.tick(500);
         for i in 0..50 {
-            log.push_str(&format!(
-                "{{\"t\":500,\"op\":\"+\",\"k\":\"e\",\"s\":\"nauvis\",\"n\":\"pipe\",\"x\":{}.5,\"y\":9.5}}\n",
-                i
-            ));
+            log.add_entity("nauvis", "pipe", i as f32 + 0.5, 9.5, 0);
         }
-        fs::write(dir.path().join("events_100.jsonl"), log).unwrap();
+        log.write(dir.path(), "events_100.stev");
 
         let mut replay = load_baseline(dir.path()).unwrap();
         let mut counts = Vec::new();
@@ -303,11 +372,9 @@ mod tests {
     #[test]
     fn events_before_the_baseline_are_ignored() {
         let dir = capture_dir();
-        fs::write(
-            dir.path().join("events_1.jsonl"),
-            "{\"t\":5,\"op\":\"-\",\"k\":\"e\",\"s\":\"nauvis\",\"x\":0.5,\"y\":0.5}\n",
-        )
-        .unwrap();
+        let mut log = TestLog::new();
+        log.tick(5).remove_entity("nauvis", 0.5, 0.5);
+        log.write(dir.path(), "events_1.stev");
 
         let mut replay = load_baseline(dir.path()).unwrap();
         run(&mut replay, dir.path(), &Options::default(), |_, _| {}).unwrap();
@@ -317,16 +384,13 @@ mod tests {
     #[test]
     fn segments_replay_in_tick_order() {
         let dir = capture_dir();
-        fs::write(
-            dir.path().join("events_9000.jsonl"),
-            "{\"t\":9000,\"op\":\"-\",\"k\":\"e\",\"s\":\"nauvis\",\"x\":1.5,\"y\":0.5}\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("events_200.jsonl"),
-            "{\"t\":200,\"op\":\"+\",\"k\":\"e\",\"s\":\"nauvis\",\"n\":\"pipe\",\"x\":1.5,\"y\":0.5}\n",
-        )
-        .unwrap();
+        let mut later = TestLog::new();
+        later.tick(9000).remove_entity("nauvis", 1.5, 0.5);
+        later.write(dir.path(), "events_9000.stev");
+
+        let mut earlier = TestLog::new();
+        earlier.tick(200).add_entity("nauvis", "pipe", 1.5, 0.5, 0);
+        earlier.write(dir.path(), "events_200.stev");
 
         let mut replay = load_baseline(dir.path()).unwrap();
         run(&mut replay, dir.path(), &Options::default(), |_, _| {}).unwrap();
@@ -339,11 +403,9 @@ mod tests {
     #[test]
     fn max_frames_caps_output() {
         let dir = capture_dir();
-        fs::write(
-            dir.path().join("events_100.jsonl"),
-            "{\"t\":100000,\"op\":\"+\",\"k\":\"e\",\"s\":\"nauvis\",\"n\":\"pipe\",\"x\":5.5,\"y\":5.5}\n",
-        )
-        .unwrap();
+        let mut log = TestLog::new();
+        log.tick(100_000).add_entity("nauvis", "pipe", 5.5, 5.5, 0);
+        log.write(dir.path(), "events_100.stev");
 
         let mut replay = load_baseline(dir.path()).unwrap();
         let options = Options { interval: 1, max_frames: 10 };

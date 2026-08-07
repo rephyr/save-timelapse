@@ -88,10 +88,9 @@ fn exporting_produces_a_frame() {
         .expect("export should produce a frame");
 
     assert_eq!(outcome.frames.len(), 1);
-    let frame: serde_json::Value =
-        serde_json::from_slice(&fs::read(&outcome.frames[0]).unwrap()).unwrap();
-    assert_eq!(frame["surface"], "nauvis");
-    assert_eq!(frame["count"], 4);
+    let frame = save_timelapse::frame::read_binary(&fs::read(&outcome.frames[0]).unwrap()).unwrap();
+    assert_eq!(frame.surface, "nauvis");
+    assert_eq!(frame.count, 4);
 }
 
 #[test]

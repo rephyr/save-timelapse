@@ -26,12 +26,13 @@ use crate::names::{NameId, NameTable};
 /// epsilon.
 ///
 /// Scaled by ten, not two. Half-tile alignment covers most entities but not
-/// all: `tests/fixtures/frames/frame_0000.json` has a
+/// all: `tests/fixtures/frames/frame_0000.stfr` has a
 /// `logistic-train-stop-lamp-control` at x=326.9 sitting beside its
 /// `logistic-train-stop` at x=327.0. Keying on half tiles collapsed the two
-/// onto one slot and silently dropped one of them -- five entities out of
-/// that frame's 240. One decimal is exactly the precision the mod writes
-/// (`%.1f`), so scaling by ten is both lossless and collision-free.
+/// onto one slot and silently dropped one of them, five entities out of
+/// that frame's 240. One decimal is exactly the precision entity positions
+/// are stored at (see `frame.rs`), so scaling by ten is both lossless and
+/// collision free.
 ///
 /// Computed in f64: at Factorio's ±1,000,000 map limit an f32 has too few
 /// mantissa bits left to round the scaled value reliably.
@@ -250,10 +251,8 @@ impl World {
                         return true;
                     }
                 }
-                match pos {
-                    Some((x, y)) => self.target(surface).is_some_and(|s| s.remove_at(*x, *y)),
-                    None => false,
-                }
+                let (x, y) = *pos;
+                self.target(surface).is_some_and(|s| s.remove_at(x, y))
             }
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
@@ -330,18 +329,19 @@ mod tests {
         Event::AddEntity { name: name.to_string(), x, y, d: 0, w: 1, h: 1, id }
     }
 
-    /// The pre-fix wire shape: id with no position. Still what a log written
-    /// before this event started carrying position looks like.
-    fn remove_by_id(id: u64) -> Event {
-        Event::RemoveEntity { id: Some(id), pos: None }
+    /// Position is always present on the wire now, so a "removal by id" test
+    /// helper still needs one, even for the id lookup fast path that never
+    /// reads it.
+    fn remove_by_id(id: u64, x: f32, y: f32) -> Event {
+        Event::RemoveEntity { id: Some(id), pos: (x, y) }
     }
 
     fn remove_at(x: f32, y: f32) -> Event {
-        Event::RemoveEntity { id: None, pos: Some((x, y)) }
+        Event::RemoveEntity { id: None, pos: (x, y) }
     }
 
     /// Regression: keying positions by half-tile merged these two real
-    /// entities into one and lost five of `frame_0000.json`'s 240.
+    /// entities into one and lost five of `frame_0000.stfr`'s 240.
     #[test]
     fn entities_a_tenth_of_a_tile_apart_stay_distinct() {
         let mut world = World::new();
@@ -364,9 +364,9 @@ mod tests {
     /// half-tile bug was caught in the first place.
     #[test]
     fn a_real_exported_frame_loads_without_losing_entities() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames/frame_0000.json");
-        let text = std::fs::read_to_string(path).unwrap();
-        let frame: Frame = serde_json::from_str(&text).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames/frame_0000.stfr");
+        let bytes = std::fs::read(path).unwrap();
+        let frame = crate::frame::read_binary(&bytes).unwrap();
         let expected = frame.entities.len();
 
         let mut world = World::new();
@@ -395,7 +395,7 @@ mod tests {
         assert!(world.apply(Some("nauvis"), &add("pipe", 1.5, 2.5, Some(7))));
         assert_eq!(world.entity_count(), 1);
 
-        assert!(world.apply(None, &remove_by_id(7)));
+        assert!(world.apply(None, &remove_by_id(7, 1.5, 2.5)));
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -426,7 +426,7 @@ mod tests {
         let unrecognized_id = 999_999;
         assert!(world.apply(
             Some("nauvis"),
-            &Event::RemoveEntity { id: Some(unrecognized_id), pos: Some((-3.5, 4.5)) }
+            &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }
         ));
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(frame.entities[0].n, "transport-belt", "the later add wins");
 
         // ...and it is now reachable by the id the add carried.
-        assert!(world.apply(None, &remove_by_id(9)));
+        assert!(world.apply(None, &remove_by_id(9, 1.5, 2.5)));
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -456,7 +456,7 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(vec![entity("pipe", 1.5, 2.5)], Vec::new()));
 
-        assert!(!world.apply(None, &remove_by_id(404)));
+        assert!(!world.apply(None, &remove_by_id(404, 500.0, 500.0)));
         assert!(!world.apply(Some("nauvis"), &remove_at(99.5, 99.5)));
         assert!(!world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 }));
         assert_eq!(world.entity_count(), 1, "the real entity is untouched");
@@ -517,7 +517,7 @@ mod tests {
 
         for i in 0..100 {
             world.apply(Some("nauvis"), &add("pipe", i as f32 + 0.5, 0.5, Some(i)));
-            world.apply(None, &remove_by_id(i));
+            world.apply(None, &remove_by_id(i, i as f32 + 0.5, 0.5));
         }
         assert_eq!(world.entity_count(), 0);
         assert_eq!(world.surface("nauvis").unwrap().slots.len(), 1, "one slot, reused 100 times");

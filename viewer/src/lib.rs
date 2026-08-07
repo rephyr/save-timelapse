@@ -705,16 +705,16 @@ impl FrameSequence {
     }
 }
 
-/// A directory of `frame_*.json` (sorted by filename -- matches the CLI's
-/// own zero-padded `frame_NNNN.json` output, so plain lexicographic sort is
+/// A directory of `frame_*.stfr` (sorted by filename, matching the CLI's own
+/// zero-padded `frame_NNNN.stfr` output, so plain lexicographic sort is
 /// enough) or a single frame file.
 fn frame_is_candidate(path: &Path) -> bool {
-    // Extension first. Live capture writes a `frame_<tick>_<surface>.json.done`
+    // Extension first. Live capture writes a `frame_<tick>_<surface>.stfr.done`
     // marker beside each finished snapshot, and its *stem* is
-    // `frame_<tick>_<surface>.json` -- which passes every check below, so
+    // `frame_<tick>_<surface>.stfr`, which passes every check below, so
     // without this the viewer treats every marker as a frame and warns about
     // failing to parse an empty file.
-    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+    if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
         return false
     }
 
@@ -761,14 +761,14 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
     if !path.exists() {
         return None;
     }
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("warning: skipping unreadable frame {}: {}", path.display(), e);
             return None;
         }
     };
-    match serde_json::from_str(&text) {
+    match save_timelapse::frame::read_binary(&bytes) {
         Ok(frame) => Some(frame),
         Err(e) => {
             eprintln!("warning: skipping invalid frame {}: {}", path.display(), e);
@@ -780,9 +780,9 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
 /// Order a loaded sequence by in-game tick, keeping one surface per tick.
 ///
 /// Filenames cannot be trusted for ordering. The CLI writes zero-padded
-/// `frame_0000.json` in save order, where lexicographic sort happens to work,
-/// but the mod writes `frame_<tick>_<surface>.json` with a raw unpadded tick
-/// -- so sorting names puts tick 1200 and 12600 before 600. The parsed `tick`
+/// `frame_0000.stfr` in save order, where lexicographic sort happens to work,
+/// but the mod writes `frame_<tick>_<surface>.stfr` with a raw unpadded tick,
+/// so sorting names puts tick 1200 and 12600 before 600. The parsed `tick`
 /// is the one thing both schemes carry.
 ///
 /// When several surfaces were exported at the same tick, the busiest wins:
@@ -875,10 +875,16 @@ mod tests {
     #[test]
     fn load_sequence_skips_invalid_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let valid = dir.path().join("frame_0000.json");
-        let invalid = dir.path().join("frame_0001.json");
-        std::fs::write(&valid, r#"{"tick":0,"surface":"nauvis","entities":[],"count":0,"tiles":[],"tile_count":0}"#).unwrap();
-        std::fs::write(&invalid, "{\"unfinished\":true").unwrap();
+        let valid = dir.path().join("frame_0000.stfr");
+        let invalid = dir.path().join("frame_0001.stfr");
+        let bytes = save_timelapse::frame::write_binary(&save_timelapse::frame::FrameOut {
+            tick: 0,
+            surface: "nauvis",
+            entities: &[],
+            tiles: &[],
+        });
+        std::fs::write(&valid, bytes).unwrap();
+        std::fs::write(&invalid, b"not a frame").unwrap();
 
         let frames = load_sequence(dir.path()).unwrap();
         assert_eq!(frames.len(), 1);
@@ -1029,12 +1035,19 @@ mod tests {
         assert_eq!(seq.index(), 2);
     }
 
+    /// Writes a `.stfr` frame with `entity_count` fabricated entities, for
+    /// tests that only care about tick/surface ordering, not real content.
+    fn write_stub_frame(dir: &Path, name: &str, tick: u64, surface: &str, entity_count: usize) {
+        let entities = synthetic_frame(entity_count).entities;
+        let out = save_timelapse::frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
+        std::fs::write(dir.join(name), save_timelapse::frame::write_binary(&out)).unwrap();
+    }
+
     #[test]
     fn load_sequence_sorts_a_directory_regardless_of_iteration_order() {
         let dir = tempfile::tempdir().unwrap();
-        for (name, tick) in [("frame_0002.json", 2u64), ("frame_0000.json", 0), ("frame_0001.json", 1)] {
-            let json = format!(r#"{{"tick":{tick},"surface":"nauvis","entities":[],"count":0}}"#);
-            std::fs::write(dir.path().join(name), json).unwrap();
+        for (name, tick) in [("frame_0002.stfr", 2u64), ("frame_0000.stfr", 0), ("frame_0001.stfr", 1)] {
+            write_stub_frame(dir.path(), name, tick, "nauvis", 0);
         }
         let frames = load_sequence(dir.path()).unwrap();
         assert_eq!(frames.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![0, 1, 2]);
@@ -1055,11 +1068,7 @@ mod tests {
     fn load_sequence_orders_mod_written_snapshots_by_tick_not_filename() {
         let dir = tempfile::tempdir().unwrap();
         for tick in [600u64, 1200, 12600, 216000] {
-            std::fs::write(
-                dir.path().join(format!("frame_{tick}_nauvis.json")),
-                format!(r#"{{"tick":{tick},"surface":"nauvis","entities":[],"count":0}}"#),
-            )
-            .unwrap();
+            write_stub_frame(dir.path(), &format!("frame_{tick}_nauvis.stfr"), tick, "nauvis", 0);
             // Written beside every snapshot; must not be read as a frame.
             std::fs::write(
                 dir.path().join(format!("frame_{tick}_manifest.json")),
@@ -1079,12 +1088,8 @@ mod tests {
     #[test]
     fn load_sequence_keeps_only_the_busiest_surface_per_tick() {
         let dir = tempfile::tempdir().unwrap();
-        for (surface, count) in [("nauvis", 900u64), ("vulcanus", 12)] {
-            std::fs::write(
-                dir.path().join(format!("frame_600_{surface}.json")),
-                format!(r#"{{"tick":600,"surface":"{surface}","entities":[],"count":{count}}}"#),
-            )
-            .unwrap();
+        for (surface, count) in [("nauvis", 900usize), ("vulcanus", 12)] {
+            write_stub_frame(dir.path(), &format!("frame_600_{surface}.stfr"), 600, surface, count);
         }
 
         let frames = load_sequence(dir.path()).unwrap();
@@ -1093,16 +1098,16 @@ mod tests {
     }
 
     /// Live capture writes these beside every finished snapshot. Their stem
-    /// ends in `.json`, so they look exactly like a frame to a stem-only
-    /// check -- and being empty, each one would produce a parse warning.
+    /// ends in `.stfr`, so they look exactly like a frame to a stem-only
+    /// check, and being empty, each one would produce a parse warning.
     #[test]
     fn done_markers_and_event_logs_are_not_mistaken_for_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let frame = dir.path().join("frame_22630009_nauvis.json");
-        std::fs::write(&frame, r#"{"tick":22630009,"surface":"nauvis","entities":[],"count":0}"#).unwrap();
-        std::fs::write(dir.path().join("frame_22630009_nauvis.json.done"), "").unwrap();
+        let frame = dir.path().join("frame_22630009_nauvis.stfr");
+        write_stub_frame(dir.path(), "frame_22630009_nauvis.stfr", 22630009, "nauvis", 0);
+        std::fs::write(dir.path().join("frame_22630009_nauvis.stfr.done"), "").unwrap();
         std::fs::write(dir.path().join("frame_22630009_manifest.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("events_22630009.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("events_22630009.stev"), "").unwrap();
 
         assert_eq!(frame_paths(dir.path()).unwrap(), vec![frame]);
 

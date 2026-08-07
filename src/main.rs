@@ -133,7 +133,7 @@ fn run(args: Args) -> std::io::Result<()> {
         let staged = workspace.join(format!("stage_{index}"));
         match export::export_save(save, &staged, &config) {
             Ok(outcome) => {
-                let target = args.out.join(format!("frame_{index:04}.json"));
+                let target = args.out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target)
                     .or_else(|_| std::fs::copy(primary, &target).map(drop))?;

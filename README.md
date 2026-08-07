@@ -13,9 +13,10 @@ Early. The mod exports; the renderer is not written yet.
 ## How it works
 
 Point the tool at your saves folder. For each save it launches Factorio
-headless, has the mod export every entity to JSON, and collects the results as
-frames. Each export runs against a private throwaway copy of your mods folder,
-so your Factorio installation and settings are never modified.
+headless, has the mod export every entity to a compact binary format, and
+collects the results as frames. Each export runs against a private throwaway
+copy of your mods folder, so your Factorio installation and settings are
+never modified.
 
 ## Requirements
 
@@ -61,7 +62,7 @@ that baseline:
 save-timelapse-replay --capture "%APPDATA%/Factorio/script-output/save-timelapse" --out frames
 ```
 
-That writes ordinary `frame_NNNN.json` files, the same ones the viewer reads,
+That writes ordinary `frame_NNNN.stfr` files, the same ones the viewer reads,
 so nothing downstream needs to know the timeline came from events.
 
 | Flag | Meaning |
@@ -142,7 +143,7 @@ mkdir -p /tmp/fake/factorio/bin/x64 /tmp/fake/factorio/data /tmp/fake/saves
 cp target/debug/fake-factorio /tmp/fake/factorio/bin/x64/factorio
 for n in 1 2 3 10 20; do echo save > /tmp/fake/saves/base$n.zip; done
 
-FAKE_FACTORIO_FRAME=tests/fixtures/frames/frame_0003.json \
+FAKE_FACTORIO_FRAME=tests/fixtures/frames/frame_0003.stfr \
 cargo run --bin save-timelapse -- \
     --saves /tmp/fake/saves \
     --mods  /tmp/fake/mods \
