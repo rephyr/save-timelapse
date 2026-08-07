@@ -12,7 +12,7 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    entity_footprint_size, icon_path, icon_source_rect, load_frame, synthetic_frame, synthetic_tiles,
+    entity_footprint_size, icon_path, icon_source_rect, synthetic_frame, synthetic_tiles,
     use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, ProgressBar, RenderFrame,
     Timeline, TypeRegistry, LOD_CELL_TILES,
 };
@@ -171,22 +171,37 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
         println!("loading {path}");
         let paths =
             viewer::frame_paths(std::path::Path::new(path)).expect("failed to enumerate frames");
+
+        // Reading and parsing each file is independent work, so it happens
+        // across every available core rather than one file at a time -- on a
+        // real megabase capture this is the dominant cost of opening the
+        // viewer. Converting to a RenderFrame needs a single, consistently
+        // numbered TypeRegistry, so that part stays sequential below.
         progress.total = paths.len();
-
-        for (i, p) in paths.iter().enumerate() {
-            progress.done = i;
-            progress.detail =
-                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            redraw_progress(&progress, &mut last, false).await;
-
-            if let Some(mut frame) = load_frame(p) {
-                if let Some(n) = args.synthetic_tile_count {
-                    frame.tiles = synthetic_tiles(n);
-                }
-                frames.push(RenderFrame::from_frame(frame, registry));
+        progress.detail = format!(
+            "{} core(s)",
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        );
+        let load = viewer::ParallelFrameLoad::start(paths);
+        let loaded = loop {
+            progress.done = load.done();
+            redraw_progress(&progress, &mut last, true).await;
+            if let Some(loaded) = load.poll() {
+                break loaded;
             }
+        };
+
+        progress.phase = "converting frames";
+        progress.total = loaded.len();
+        for (i, mut frame) in loaded.into_iter().enumerate() {
+            progress.done = i;
+            redraw_progress(&progress, &mut last, false).await;
+            if let Some(n) = args.synthetic_tile_count {
+                frame.tiles = synthetic_tiles(n);
+            }
+            frames.push(RenderFrame::from_frame(frame, registry));
         }
-        progress.done = paths.len();
+        progress.done = progress.total;
         redraw_progress(&progress, &mut last, true).await;
 
         // Ordered after loading, not before: the mod's `frame_<tick>_<surface>`

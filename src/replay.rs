@@ -213,7 +213,7 @@ mod tests {
         )
         .unwrap();
 
-        let entities = vec![frame::Entity { n: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
+        let entities = vec![frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
         let out = frame::FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[] };
         fs::write(dir.path().join("frame_100_nauvis.stfr"), frame::write_binary(&out)).unwrap();
 

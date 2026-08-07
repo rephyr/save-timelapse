@@ -13,12 +13,24 @@
 use std::path::Path;
 
 use save_timelapse::frame::Frame;
-use viewer::{DrawCallCounter, RenderFrame, TypeId, TypeRegistry};
+use viewer::{DrawCallCounter, ParallelFrameLoad, RenderFrame, TypeId, TypeRegistry};
 
 /// macroquad's defaults (`conf::Conf`): 5,000 indices at 6 per quad.
 const DEFAULT_INDEX_CAPACITY: usize = 5_000;
 /// What the viewer now asks for.
 const RAISED_INDEX_CAPACITY: usize = 4096 * 6;
+
+/// This binary is a one-shot CLI report, not a render loop with a progress
+/// bar to redraw between polls, so there is nothing better to do while
+/// waiting than block until the background load finishes.
+fn block_on_load(load: ParallelFrameLoad) -> Vec<Frame> {
+    loop {
+        if let Some(frames) = load.poll() {
+            return frames;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
 
 fn calls(order: &[Option<TypeId>], max_indices: usize) -> usize {
     let mut counter = DrawCallCounter::new(max_indices);
@@ -81,13 +93,18 @@ fn main() {
         .map(String::as_str)
         .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
 
-    let frames = match viewer::load_sequence(Path::new(path)) {
-        Ok(frames) => frames,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    // Loaded once, in parallel: this used to also call load_sequence just to
+    // fail fast on an empty/invalid directory, then reload and reparse every
+    // file a second time in the loop below for per-frame stats. One parallel
+    // load serves both -- the total count for the summary at the bottom and
+    // the per-frame detail here -- without parsing gigabytes of real capture
+    // data twice.
+    let paths = viewer::frame_paths(Path::new(path)).unwrap_or_default();
+    let frames = block_on_load(ParallelFrameLoad::start(paths));
+    if frames.is_empty() {
+        eprintln!("error: no valid frame files found in {path}");
+        std::process::exit(1);
+    }
 
     println!("draw calls for a fully-visible frame, sprites on (one texture per type)\n");
     println!(
@@ -97,9 +114,8 @@ fn main() {
 
     let mut totals = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let mut lod_totals = (0usize, 0usize); // (items, chunk cells)
-    for path in viewer::frame_paths(Path::new(path)).unwrap_or_default() {
-        let Some(frame) = viewer::load_frame(&path) else { continue };
-
+    let frame_count = frames.len();
+    for frame in frames {
         // Type ids in the order the exporter wrote them -- what the viewer
         // used to iterate, and the batching worst case.
         let mut registry = TypeRegistry::new();
@@ -148,7 +164,7 @@ fn main() {
     if totals.0 == 0 {
         return;
     }
-    println!("\ntotals across {} frames, {} items", frames.len(), totals.0);
+    println!("\ntotals across {frame_count} frames, {} items", totals.0);
     println!("  file order, default capacity : {:>8} draw calls", totals.1);
     println!("  grouped,    default capacity : {:>8} draw calls", totals.2);
     println!(

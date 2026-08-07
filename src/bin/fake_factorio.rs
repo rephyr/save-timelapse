@@ -37,10 +37,10 @@ const RESOURCES: &str = "save-timelapse-include-resources";
 /// clearer to read and edit than the bytes its binary encoding would produce.
 fn default_frame_bytes() -> Vec<u8> {
     let entities = vec![
-        Entity { n: "transport-belt".to_string(), x: -4.5, y: 2.5, d: 4, w: 1, h: 1 },
-        Entity { n: "assembling-machine-1".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 },
-        Entity { n: "stone-furnace".to_string(), x: 6.5, y: -1.5, d: 0, w: 1, h: 1 },
-        Entity { n: "inserter".to_string(), x: 3.5, y: 0.5, d: 2, w: 1, h: 1 },
+        Entity { n: "transport-belt".into(), x: -4.5, y: 2.5, d: 4, w: 1, h: 1 },
+        Entity { n: "assembling-machine-1".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 },
+        Entity { n: "stone-furnace".into(), x: 6.5, y: -1.5, d: 0, w: 1, h: 1 },
+        Entity { n: "inserter".into(), x: 3.5, y: 0.5, d: 2, w: 1, h: 1 },
     ];
     frame::write_binary(&FrameOut { tick: 216_000, surface: "nauvis", entities: &entities, tiles: &[] })
 }

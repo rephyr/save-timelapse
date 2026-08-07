@@ -17,6 +17,7 @@
 //! have to freeze the game to prevent.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::event::Event;
 use crate::frame::{Entity, Frame, Tile};
@@ -281,10 +282,19 @@ impl World {
             };
         };
 
+        // Resolved once per call rather than once per entity/tile: a real
+        // surface has a few dozen distinct names against hundreds of
+        // thousands of entities (or millions of tiles), and replay emits one
+        // frame per interval, so re-allocating the same name string on every
+        // entity of every frame is pure waste `Arc::clone` skips.
+        let names: Vec<Arc<str>> = (0..self.names.len())
+            .map(|id| Arc::from(self.names.name(id as NameId)))
+            .collect();
+
         let entities: Vec<Entity> = surface
             .entities()
             .map(|e| Entity {
-                n: self.names.name(e.name).to_string(),
+                n: Arc::clone(&names[e.name as usize]),
                 x: e.x,
                 y: e.y,
                 d: e.d,
@@ -299,7 +309,7 @@ impl World {
         let mut tiles: Vec<Tile> = surface
             .tiles
             .iter()
-            .map(|(&(x, y), &name)| Tile { n: self.names.name(name).to_string(), x, y })
+            .map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y })
             .collect();
         tiles.sort_by_key(|t| (t.y, t.x));
 
@@ -322,7 +332,7 @@ mod tests {
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
-        Entity { n: n.to_string(), x, y, d: 0, w: 1, h: 1 }
+        Entity { n: n.into(), x, y, d: 0, w: 1, h: 1 }
     }
 
     fn add(name: &str, x: f32, y: f32, id: Option<u64>) -> Event {
@@ -357,7 +367,7 @@ mod tests {
         // ...and each is individually addressable.
         assert!(world.apply(Some("nauvis"), &remove_at(326.9, -843.0)));
         assert_eq!(world.entity_count(), 1);
-        assert_eq!(world.to_frame("nauvis", 0).entities[0].n, "logistic-train-stop");
+        assert_eq!(world.to_frame("nauvis", 0).entities[0].n, "logistic-train-stop".into());
     }
 
     /// The real baseline must survive a round trip intact, which is how the
@@ -380,7 +390,7 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(
             vec![entity("pipe", 1.5, 2.5), entity("transport-belt", 3.5, 4.5)],
-            vec![Tile { n: "concrete".to_string(), x: 0, y: 0 }],
+            vec![Tile { n: "concrete".into(), x: 0, y: 0 }],
         ));
         assert_eq!(world.entity_count(), 2);
         assert_eq!(world.tile_count(), 1);
@@ -442,7 +452,7 @@ mod tests {
         assert_eq!(world.entity_count(), 1, "still one entity on that tile");
 
         let frame = world.to_frame("nauvis", 200);
-        assert_eq!(frame.entities[0].n, "transport-belt", "the later add wins");
+        assert_eq!(frame.entities[0].n, Arc::from("transport-belt"), "the later add wins");
 
         // ...and it is now reachable by the id the add carried.
         assert!(world.apply(None, &remove_by_id(9, 1.5, 2.5)));
@@ -530,9 +540,9 @@ mod tests {
             world.load_baseline(&baseline(
                 vec![entity("pipe", 1.5, 2.5)],
                 vec![
-                    Tile { n: "concrete".to_string(), x: 3, y: 1 },
-                    Tile { n: "concrete".to_string(), x: 0, y: 1 },
-                    Tile { n: "stone-path".to_string(), x: 2, y: 0 },
+                    Tile { n: "concrete".into(), x: 3, y: 1 },
+                    Tile { n: "concrete".into(), x: 0, y: 1 },
+                    Tile { n: "stone-path".into(), x: 2, y: 0 },
                 ],
             ));
             world.to_frame("nauvis", 500)

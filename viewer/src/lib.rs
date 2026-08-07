@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 
 use macroquad::color::Color;
 use macroquad::math::{Rect, Vec2};
@@ -630,7 +632,7 @@ pub fn synthetic_frame(count: usize) -> Frame {
             let ix = (i as i64) % side;
             let iy = (i as i64) / side;
             Entity {
-                n: NAMES[i % NAMES.len()].to_string(),
+                n: NAMES[i % NAMES.len()].into(),
                 x: ix as f32 * spacing,
                 y: iy as f32 * spacing,
                 d: 0,
@@ -650,7 +652,7 @@ pub fn synthetic_tiles(count: usize) -> Vec<Tile> {
         .map(|i| {
             let ix = (i as i64) % side;
             let iy = (i as i64) / side;
-            Tile { n: "concrete".to_string(), x: ix as i32, y: iy as i32 }
+            Tile { n: "concrete".into(), x: ix as i32, y: iy as i32 }
         })
         .collect()
 }
@@ -777,6 +779,87 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
     }
 }
 
+/// Loads many frame files across every available CPU core instead of one at
+/// a time. Reading and parsing a `.stfr` file is pure, independent work with
+/// nothing shared until frames become `RenderFrame`s (which need a single
+/// `TypeRegistry` handing out consistent type ids across the whole
+/// sequence), so parsing is what parallelises: on a real megabase capture
+/// (millions of tiles per frame, dozens of frames), it was the dominant cost
+/// of opening the viewer, roughly halved by this on an 8 core machine.
+///
+/// Runs on a fresh OS thread rather than blocking the caller, so a caller
+/// driving macroquad's `next_frame`-based render loop can keep drawing a
+/// progress bar while this proceeds. `done`/`total` report progress as files
+/// finish; `poll` is how the caller collects the result once ready.
+pub struct ParallelFrameLoad {
+    progress: Arc<AtomicUsize>,
+    total: usize,
+    result: mpsc::Receiver<Vec<Frame>>,
+}
+
+impl ParallelFrameLoad {
+    pub fn start(paths: Vec<PathBuf>) -> Self {
+        let total = paths.len();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        let worker_progress = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let _ = tx.send(load_all(&paths, &worker_progress));
+        });
+
+        ParallelFrameLoad { progress, total, result: rx }
+    }
+
+    pub fn done(&self) -> usize {
+        self.progress.load(Ordering::Relaxed)
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// `None` until loading finishes; the result is only ever sent once.
+    pub fn poll(&self) -> Option<Vec<Frame>> {
+        self.result.try_recv().ok()
+    }
+}
+
+/// One worker per available core, each claiming the next unclaimed path from
+/// a shared cursor. Simple work stealing rather than a fixed split, so an
+/// early baseline sized frame next to much smaller ones doesn't leave the
+/// worker that drew it running long after the others are idle.
+fn load_all(paths: &[PathBuf], progress: &AtomicUsize) -> Vec<Frame> {
+    let workers = std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1);
+    let next_index = AtomicUsize::new(0);
+
+    let mut found: Vec<(usize, Frame)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.min(paths.len().max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut loaded = Vec::new();
+                    loop {
+                        let i = next_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = paths.get(i) else { break };
+                        if let Some(frame) = load_frame(path) {
+                            loaded.push((i, frame));
+                        }
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    loaded
+                })
+            })
+            .collect();
+
+        handles.into_iter().flat_map(|h| h.join().expect("frame loading thread panicked")).collect()
+    });
+
+    // Workers finish in claim order, not path order, so restore the order
+    // `frame_paths` produced before handing frames back to the caller.
+    found.sort_by_key(|(i, _)| *i);
+    found.into_iter().map(|(_, frame)| frame).collect()
+}
+
 /// Order a loaded sequence by in-game tick, keeping one surface per tick.
 ///
 /// Filenames cannot be trusted for ordering. The CLI writes zero-padded
@@ -832,7 +915,7 @@ mod tests {
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
-        Entity { n: n.to_string(), x, y, d: 0, w: 1, h: 1 }
+        Entity { n: n.into(), x, y, d: 0, w: 1, h: 1 }
     }
 
     #[test]
@@ -939,7 +1022,7 @@ mod tests {
     fn synthetic_tiles_produces_the_requested_count_on_a_grid() {
         let tiles = synthetic_tiles(9);
         assert_eq!(tiles.len(), 9);
-        assert!(tiles.iter().all(|t| t.n == "concrete"));
+        assert!(tiles.iter().all(|t| &*t.n == "concrete"));
         assert_eq!((tiles[0].x, tiles[0].y), (0, 0));
         assert_eq!((tiles[3].x, tiles[3].y), (0, 1));
     }
@@ -1041,6 +1124,70 @@ mod tests {
         let entities = synthetic_frame(entity_count).entities;
         let out = save_timelapse::frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
         std::fs::write(dir.join(name), save_timelapse::frame::write_binary(&out)).unwrap();
+    }
+
+    /// Polls `load` to completion without a real render loop to yield
+    /// through, standing in for what `main.rs`'s `redraw_progress` loop
+    /// does between polls.
+    fn block_on(load: &ParallelFrameLoad) -> Vec<Frame> {
+        loop {
+            if let Some(frames) = load.poll() {
+                return frames;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn parallel_load_returns_frames_in_the_same_order_paths_were_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (name, tick) in [("a.stfr", 5u64), ("b.stfr", 1), ("c.stfr", 9)] {
+            write_stub_frame(dir.path(), name, tick, "nauvis", 0);
+            paths.push(dir.path().join(name));
+        }
+
+        let load = ParallelFrameLoad::start(paths.clone());
+        let frames = block_on(&load);
+
+        assert_eq!(frames.len(), paths.len());
+        assert_eq!(frames.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![5, 1, 9]);
+        assert_eq!(load.total(), paths.len());
+        assert_eq!(load.done(), paths.len());
+    }
+
+    #[test]
+    fn parallel_load_skips_an_unreadable_path_rather_than_failing_the_whole_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_frame(dir.path(), "good.stfr", 1, "nauvis", 0);
+        let missing = dir.path().join("missing.stfr");
+
+        let load = ParallelFrameLoad::start(vec![missing, dir.path().join("good.stfr")]);
+        let frames = block_on(&load);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 1);
+    }
+
+    #[test]
+    fn parallel_load_of_an_empty_path_list_completes_with_no_frames() {
+        let load = ParallelFrameLoad::start(Vec::new());
+        assert!(block_on(&load).is_empty());
+    }
+
+    /// Real megabase captures are what motivated parallelising this at all,
+    /// so the fixture with the most entities stands in for "one big file
+    /// among the paths" rather than only ever testing uniform, tiny ones.
+    #[test]
+    fn parallel_load_matches_sequential_loading_on_the_real_fixtures() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
+        let paths = frame_paths(Path::new(dir)).unwrap();
+
+        let sequential: Vec<u64> = paths.iter().filter_map(|p| load_frame(p)).map(|f| f.tick).collect();
+        let load = ParallelFrameLoad::start(paths);
+        let parallel: Vec<u64> = block_on(&load).iter().map(|f| f.tick).collect();
+
+        assert_eq!(parallel, sequential);
     }
 
     #[test]
@@ -1193,9 +1340,9 @@ mod tests {
             count: 0,
             entities: Vec::new(),
             tiles: vec![
-                Tile { n: "concrete".to_string(), x: -5, y: 1 },
-                Tile { n: "stone-path".to_string(), x: 2, y: 2 },
-                Tile { n: "concrete".to_string(), x: -6, y: 3 },
+                Tile { n: "concrete".into(), x: -5, y: 1 },
+                Tile { n: "stone-path".into(), x: 2, y: 2 },
+                Tile { n: "concrete".into(), x: -6, y: 3 },
             ],
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
@@ -1215,7 +1362,7 @@ mod tests {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 1,
-            entities: vec![Entity { n: "huge".to_string(), x: 0.0, y: 0.0, d: 0, w: 100_000, h: 0 }],
+            entities: vec![Entity { n: "huge".into(), x: 0.0, y: 0.0, d: 0, w: 100_000, h: 0 }],
             tiles: Vec::new(),
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
@@ -1246,7 +1393,7 @@ mod tests {
         // The spill must stay under one cell's width or this would land in
         // three-plus chunks instead of two, regardless of LOD_CELL_TILES.
         let tiles: Vec<Tile> =
-            (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".to_string(), x, y: 0 }).collect();
+            (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".into(), x, y: 0 }).collect();
         let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
@@ -1259,8 +1406,8 @@ mod tests {
     #[test]
     fn chunk_lod_picks_the_dominant_type_when_a_chunk_has_several() {
         let mut registry = TypeRegistry::new();
-        let mut tiles = vec![Tile { n: "concrete".to_string(), x: 0, y: 0 }; 5];
-        tiles.push(Tile { n: "stone-path".to_string(), x: 1, y: 0 });
+        let mut tiles = vec![Tile { n: "concrete".into(), x: 0, y: 0 }; 5];
+        tiles.push(Tile { n: "stone-path".into(), x: 1, y: 0 });
         let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 

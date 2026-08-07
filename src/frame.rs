@@ -44,6 +44,7 @@
 //! complexity than the bytes it would save.
 
 use std::io;
+use std::sync::Arc;
 
 use crate::wire::{ByteReader, ByteWriter};
 
@@ -62,9 +63,18 @@ pub struct Frame {
     pub tiles: Vec<Tile>,
 }
 
+/// `n` is `Arc<str>` rather than `String`: a real base has a few dozen
+/// distinct prototype names against hundreds of thousands (or, for tiles on
+/// a fully paved base, millions) of entries, and the wire format already
+/// carries that small deduplicated dictionary (see `read_binary` below), so
+/// resolving a record's name only needs a cheap refcount bump, not a fresh
+/// heap allocation and copy of the same handful of strings repeated per
+/// entity. That distinction showed up directly: on a real ~300k-entity,
+/// 3.1M-tile capture, `String::clone` per record was the dominant cost of
+/// loading a frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
-    pub n: String,
+    pub n: Arc<str>,
     pub x: f32,
     pub y: f32,
     pub d: u8,
@@ -76,7 +86,7 @@ pub struct Entity {
 /// named at (x,y) occupies world space [x,x+1) x [y,y+1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tile {
-    pub n: String,
+    pub n: Arc<str>,
     pub x: i32,
     pub y: i32,
 }
@@ -175,12 +185,16 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     let tick = r.u64().ok_or_else(truncated)?;
     let surface = r.string().ok_or_else(truncated)?;
 
-    let mut names: Vec<String> = Vec::new();
+    // Arc<str>, not String: a name is defined once here but referenced by
+    // every entity/tile that uses it, potentially millions of times on a
+    // real base, and cloning an Arc is a refcount bump rather than a fresh
+    // allocation and copy of the same handful of short strings.
+    let mut names: Vec<Arc<str>> = Vec::new();
 
     let mut entities = Vec::new();
     loop {
         match r.tag().ok_or_else(truncated)? {
-            TAG_DEFINE_NAME => names.push(r.string().ok_or_else(truncated)?),
+            TAG_DEFINE_NAME => names.push(Arc::from(r.string().ok_or_else(truncated)?)),
             TAG_ENTITY => {
                 let name_id = r.u16().ok_or_else(truncated)? as usize;
                 let x = round10_back(r.i32().ok_or_else(truncated)?);
@@ -189,7 +203,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
                 let w = r.u8().ok_or_else(truncated)? as u32;
                 let h = r.u8().ok_or_else(truncated)? as u32;
                 let name = names.get(name_id).ok_or_else(|| invalid("entity references an undefined name id"))?;
-                entities.push(Entity { n: name.clone(), x, y, d, w, h });
+                entities.push(Entity { n: Arc::clone(name), x, y, d, w, h });
             }
             TAG_END_ENTITIES => break,
             other => return Err(invalid(format!("unexpected tag {other} in entity section"))),
@@ -199,13 +213,13 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     let mut tiles = Vec::new();
     while !r.is_empty() {
         match r.tag().ok_or_else(truncated)? {
-            TAG_DEFINE_NAME => names.push(r.string().ok_or_else(truncated)?),
+            TAG_DEFINE_NAME => names.push(Arc::from(r.string().ok_or_else(truncated)?)),
             TAG_TILE => {
                 let name_id = r.u16().ok_or_else(truncated)? as usize;
                 let x = r.i32().ok_or_else(truncated)?;
                 let y = r.i32().ok_or_else(truncated)?;
                 let name = names.get(name_id).ok_or_else(|| invalid("tile references an undefined name id"))?;
-                tiles.push(Tile { n: name.clone(), x, y });
+                tiles.push(Tile { n: Arc::clone(name), x, y });
             }
             other => return Err(invalid(format!("unexpected tag {other} in tile section"))),
         }
@@ -243,7 +257,7 @@ mod tests {
     }
 
     fn entity(n: &str, x: f32, y: f32, d: u8, w: u32, h: u32) -> Entity {
-        Entity { n: n.to_string(), x, y, d, w, h }
+        Entity { n: n.into(), x, y, d, w, h }
     }
 
     #[test]
@@ -253,7 +267,7 @@ mod tests {
             entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3),
             entity("stone-furnace", 1.0, 2.0, 0, 1, 1),
         ];
-        let tiles = vec![Tile { n: "concrete".to_string(), x: -5, y: -12 }, Tile { n: "concrete".to_string(), x: -4, y: -12 }];
+        let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }, Tile { n: "concrete".into(), x: -4, y: -12 }];
         let out = FrameOut { tick: 22630009, surface: "nauvis", entities: &entities, tiles: &tiles };
 
         let bytes = write_binary(&out);
@@ -289,12 +303,12 @@ mod tests {
 
     #[test]
     fn tiles_parse_including_negative_coordinates() {
-        let tiles = vec![Tile { n: "concrete".to_string(), x: -5, y: -12 }];
+        let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
         let out = FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles };
         let frame = read_binary(&write_binary(&out)).unwrap();
 
         assert_eq!(frame.tiles.len(), 1);
-        assert_eq!((frame.tiles[0].n.as_str(), frame.tiles[0].x, frame.tiles[0].y), ("concrete", -5, -12));
+        assert_eq!((frame.tiles[0].n.as_ref(), frame.tiles[0].x, frame.tiles[0].y), ("concrete", -5, -12));
     }
 
     #[test]
@@ -306,12 +320,12 @@ mod tests {
         // entity section's, and this frame has no way to tell two different
         // ids called "landfill" apart from just one.
         let entities = vec![entity("landfill", 0.5, 0.5, 0, 1, 1)];
-        let tiles = vec![Tile { n: "landfill".to_string(), x: 1, y: 1 }];
+        let tiles = vec![Tile { n: "landfill".into(), x: 1, y: 1 }];
         let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &tiles };
 
         let frame = read_binary(&write_binary(&out)).unwrap();
-        assert_eq!(frame.entities[0].n, "landfill");
-        assert_eq!(frame.tiles[0].n, "landfill");
+        assert_eq!(frame.entities[0].n, "landfill".into());
+        assert_eq!(frame.tiles[0].n, "landfill".into());
     }
 
     #[test]
