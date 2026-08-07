@@ -370,6 +370,7 @@ async fn main() {
     let mut last_mouse: Vec2 = mouse_position().into();
     let mut playing = false;
     let mut play_accum = 0.0;
+    let mut play_speed: f32 = 1.0;
     let mut dragging_timeline = false;
     let mut sprites_enabled = true;
     let mut lod_enabled = true;
@@ -434,6 +435,16 @@ async fn main() {
             playing = !playing;
             play_accum = 0.0;
         }
+        // Doubling/halving rather than a linear step: matches how video
+        // players commonly expose speed, and keeps the displayed value a
+        // clean power of two (0.25x, 0.5x, 1x, 2x, 4x, 8x) instead of an
+        // arbitrary decimal.
+        if is_key_pressed(KeyCode::Equal) {
+            play_speed = (play_speed * 2.0).min(8.0);
+        }
+        if is_key_pressed(KeyCode::Minus) {
+            play_speed = (play_speed / 2.0).max(0.25);
+        }
         // Sprites off is the A/B for what texture binding costs: same
         // geometry, one flat-rect batch instead of one batch per type.
         if is_key_pressed(KeyCode::S) {
@@ -446,13 +457,21 @@ async fn main() {
             lod_enabled = !lod_enabled;
         }
         if playing {
-            play_accum += get_frame_time();
-            if play_accum >= PLAY_INTERVAL_SECS {
-                play_accum = 0.0;
+            // A `while`, not `if`: at high speed multipliers more than one
+            // interval's worth can accumulate between two frames (e.g. at
+            // 8x and a 60fps display, ~8 frames advance in the time one
+            // used to), and stepping only once per tick would cap the
+            // visible playback rate at the display's refresh rate instead
+            // of the requested speed.
+            play_accum += get_frame_time() * play_speed;
+            while play_accum >= PLAY_INTERVAL_SECS {
+                play_accum -= PLAY_INTERVAL_SECS;
                 if sequence.index() + 1 < sequence.len() {
                     sequence.step_forward();
                 } else {
                     playing = false;
+                    play_accum = 0.0;
+                    break;
                 }
             }
         }
@@ -618,7 +637,7 @@ async fn main() {
         let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub{tab_hint}",
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({play_speed}x)  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub{tab_hint}",
                 if playing { "pause" } else { "play" }
             ),
             10.0,
