@@ -52,9 +52,10 @@ drawcalls:
 # rest of the user's mods folder: just this mod's own files, loose rather
 # than zipped, overwriting whatever is already installed.
 install-mod:
-	mkdir -p "$(MOD_INSTALL)/tests"
+	mkdir -p "$(MOD_INSTALL)/tests" "$(MOD_INSTALL)/locale/en"
 	cp mod/control.lua mod/encode.lua mod/info.json mod/settings.lua "$(MOD_INSTALL)/"
 	cp mod/tests/encode_test.lua "$(MOD_INSTALL)/tests/"
+	cp mod/locale/en/settings.cfg "$(MOD_INSTALL)/locale/en/"
 	@echo "installed to $(MOD_INSTALL)"
 
 clean:

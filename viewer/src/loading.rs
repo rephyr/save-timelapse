@@ -1,0 +1,501 @@
+//! Discovering, reading, and grouping raw `save_timelapse::frame::Frame`
+//! data from disk (or synthesizing it for load testing) -- everything here
+//! stays at that level, never touching `TypeRegistry`/`RenderFrame`.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+
+use save_timelapse::frame::{Entity, Frame, Tile};
+
+/// Grid of fabricated entities, cycling through a handful of type names, for
+/// load-testing at counts the real fixtures don't reach.
+pub fn synthetic_frame(count: usize) -> Frame {
+    const NAMES: &[&str] = &[
+        "transport-belt",
+        "assembling-machine-1",
+        "electric-pole",
+        "inserter",
+        "pipe",
+        "splitter",
+    ];
+    let side = (count as f32).sqrt().ceil() as i64;
+    let spacing = 2.0;
+    let entities = (0..count)
+        .map(|i| {
+            let ix = (i as i64) % side;
+            let iy = (i as i64) / side;
+            Entity {
+                n: NAMES[i % NAMES.len()].into(),
+                x: ix as f32 * spacing,
+                y: iy as f32 * spacing,
+                d: 0,
+                w: 1,
+                h: 1,
+            }
+        })
+        .collect();
+    Frame { tick: 0, surface: "synthetic".to_string(), count, entities, tiles: Vec::new() }
+}
+
+/// Filled grid of concrete tiles, for load-testing the case a fully-paved
+/// megabase produces: far more tile cells than entities.
+pub fn synthetic_tiles(count: usize) -> Vec<Tile> {
+    let side = (count as f32).sqrt().ceil() as i64;
+    (0..count)
+        .map(|i| {
+            let ix = (i as i64) % side;
+            let iy = (i as i64) / side;
+            Tile { n: "concrete".into(), x: ix as i32, y: iy as i32 }
+        })
+        .collect()
+}
+
+/// A directory of `frame_*.stfr` (sorted by filename, matching the CLI's own
+/// zero-padded `frame_NNNN.stfr` output, so plain lexicographic sort is
+/// enough) or a single frame file.
+fn frame_is_candidate(path: &Path) -> bool {
+    // Extension first. Live capture writes a `frame_<tick>_<surface>.stfr.done`
+    // marker beside each finished snapshot, and its *stem* is
+    // `frame_<tick>_<surface>.stfr`, which passes every check below, so
+    // without this the viewer treats every marker as a frame and warns about
+    // failing to parse an empty file.
+    if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
+        return false
+    }
+
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+    if !stem.starts_with("frame_") {
+        return false
+    }
+
+    let rest = &stem[6..];
+    let mut parts = rest.splitn(2, '_');
+    let tick_part = parts.next().unwrap_or("");
+    let surface_part = parts.next().unwrap_or("");
+
+    if surface_part == "manifest" {
+        return false
+    }
+
+    tick_part.parse::<u64>().is_ok()
+}
+
+/// The frame files a path refers to, in order. Enumerating separately from
+/// parsing is what lets the caller show a bar with a real total instead of an
+/// indeterminate spinner.
+pub fn frame_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| frame_is_candidate(p))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// Parse one frame file, or warn and yield `None`. A snapshot being written
+/// incrementally by the mod is a half-file until it is finished, so an
+/// unparseable frame is an expected transient rather than an error.
+pub fn load_frame(path: &Path) -> Option<Frame> {
+    if !path.exists() {
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("warning: skipping unreadable frame {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    match save_timelapse::frame::read_binary(&bytes) {
+        Ok(frame) => Some(frame),
+        Err(e) => {
+            eprintln!("warning: skipping invalid frame {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// Loads many frame files across every available CPU core instead of one at
+/// a time. Reading and parsing a `.stfr` file is pure, independent work with
+/// nothing shared until frames become `RenderFrame`s (which need a single
+/// `TypeRegistry` handing out consistent type ids across the whole
+/// sequence), so parsing is what parallelises: on a real megabase capture
+/// (millions of tiles per frame, dozens of frames), it was the dominant cost
+/// of opening the viewer, roughly halved by this on an 8 core machine.
+///
+/// Runs on a fresh OS thread rather than blocking the caller, so a caller
+/// driving macroquad's `next_frame`-based render loop can keep drawing a
+/// progress bar while this proceeds. `done`/`total` report progress as files
+/// finish; `poll` is how the caller collects the result once ready.
+pub struct ParallelFrameLoad {
+    progress: Arc<AtomicUsize>,
+    total: usize,
+    result: mpsc::Receiver<Vec<Frame>>,
+}
+
+impl ParallelFrameLoad {
+    pub fn start(paths: Vec<PathBuf>) -> Self {
+        let total = paths.len();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        let worker_progress = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let _ = tx.send(load_all(&paths, &worker_progress));
+        });
+
+        ParallelFrameLoad { progress, total, result: rx }
+    }
+
+    pub fn done(&self) -> usize {
+        self.progress.load(Ordering::Relaxed)
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// `None` until loading finishes; the result is only ever sent once.
+    pub fn poll(&self) -> Option<Vec<Frame>> {
+        self.result.try_recv().ok()
+    }
+}
+
+/// One worker per available core, each claiming the next unclaimed path from
+/// a shared cursor. Simple work stealing rather than a fixed split, so an
+/// early baseline sized frame next to much smaller ones doesn't leave the
+/// worker that drew it running long after the others are idle.
+fn load_all(paths: &[PathBuf], progress: &AtomicUsize) -> Vec<Frame> {
+    let workers = std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1);
+    let next_index = AtomicUsize::new(0);
+
+    let mut found: Vec<(usize, Frame)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.min(paths.len().max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut loaded = Vec::new();
+                    loop {
+                        let i = next_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = paths.get(i) else { break };
+                        if let Some(frame) = load_frame(path) {
+                            loaded.push((i, frame));
+                        }
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
+                    loaded
+                })
+            })
+            .collect();
+
+        handles.into_iter().flat_map(|h| h.join().expect("frame loading thread panicked")).collect()
+    });
+
+    // Workers finish in claim order, not path order, so restore the order
+    // `frame_paths` produced before handing frames back to the caller.
+    found.sort_by_key(|(i, _)| *i);
+    found.into_iter().map(|(_, frame)| frame).collect()
+}
+
+/// Order a loaded sequence by in-game tick, keeping one surface per tick.
+///
+/// Filenames cannot be trusted for ordering. The CLI writes zero-padded
+/// `frame_0000.stfr` in save order, where lexicographic sort happens to work,
+/// but the mod writes `frame_<tick>_<surface>.stfr` with a raw unpadded tick,
+/// so sorting names puts tick 1200 and 12600 before 600. The parsed `tick`
+/// is the one thing both schemes carry.
+///
+/// When several surfaces were exported at the same tick, the busiest wins:
+/// showing them in sequence would make the camera jump between planets.
+pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: impl Fn(&T) -> usize) {
+    frames.sort_by(|a, b| tick(a).cmp(&tick(b)).then(count(b).cmp(&count(a))));
+
+    let mut seen = None;
+    frames.retain(|frame| {
+        let keep = seen != Some(tick(frame));
+        seen = Some(tick(frame));
+        keep
+    });
+}
+
+/// Splits a loaded batch of frames into one timeline per surface, each
+/// ordered and deduplicated by tick exactly like `order_by_tick` already
+/// does for a single sequence -- multiple surfaces sharing a tick (the
+/// mod's raw baseline output, six surfaces all named `frame_<tick>_<surface>`)
+/// is exactly the case that needs separating rather than collapsing.
+///
+/// A `Frame`'s surface comes from its parsed content, not its filename, so
+/// this groups correctly whether the directory is the mod's own multi-surface
+/// output or `save-timelapse-replay --all-surfaces`'s equivalent.
+///
+/// Surfaces are returned busiest-first (by peak entity count), so a caller
+/// that only ever shows the first one gets the same surface loading used to
+/// always pick before there was any way to see the others.
+pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
+    let mut by_surface: HashMap<String, Vec<Frame>> = HashMap::new();
+    for frame in frames {
+        by_surface.entry(frame.surface.clone()).or_default().push(frame);
+    }
+
+    let mut surfaces: Vec<(String, Vec<Frame>)> = by_surface.into_iter().collect();
+    for (_, group) in &mut surfaces {
+        order_by_tick(group, |f| f.tick, |f| f.entities.len());
+    }
+    surfaces.sort_by_key(|(_, group)| {
+        std::cmp::Reverse(group.iter().map(|f| f.entities.len()).max().unwrap_or(0))
+    });
+    surfaces
+}
+
+pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
+    let mut frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
+
+    if frames.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no valid frame files found in {}", path.display()),
+        ));
+    }
+
+    order_by_tick(&mut frames, |f| f.tick, |f| f.entities.len());
+    Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a `.stfr` frame with `entity_count` fabricated entities, for
+    /// tests that only care about tick/surface ordering, not real content.
+    fn write_stub_frame(dir: &Path, name: &str, tick: u64, surface: &str, entity_count: usize) {
+        let entities = synthetic_frame(entity_count).entities;
+        let out = save_timelapse::frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
+        std::fs::write(dir.join(name), save_timelapse::frame::write_binary(&out)).unwrap();
+    }
+
+    /// Polls `load` to completion without a real render loop to yield
+    /// through, standing in for what `main.rs`'s `redraw_progress` loop
+    /// does between polls.
+    fn block_on(load: &ParallelFrameLoad) -> Vec<Frame> {
+        loop {
+            if let Some(frames) = load.poll() {
+                return frames;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn load_sequence_skips_invalid_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("frame_0000.stfr");
+        let invalid = dir.path().join("frame_0001.stfr");
+        let bytes = save_timelapse::frame::write_binary(&save_timelapse::frame::FrameOut {
+            tick: 0,
+            surface: "nauvis",
+            entities: &[],
+            tiles: &[],
+        });
+        std::fs::write(&valid, bytes).unwrap();
+        std::fs::write(&invalid, b"not a frame").unwrap();
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 0);
+    }
+
+    #[test]
+    fn synthetic_frame_produces_the_requested_count_on_a_grid() {
+        let frame = synthetic_frame(9);
+        assert_eq!(frame.entities.len(), 9);
+        assert_eq!(frame.count, 9);
+        assert_eq!((frame.entities[0].x, frame.entities[0].y), (0.0, 0.0));
+        assert_eq!((frame.entities[1].x, frame.entities[1].y), (2.0, 0.0));
+        assert_eq!((frame.entities[3].x, frame.entities[3].y), (0.0, 2.0));
+    }
+
+    #[test]
+    fn synthetic_tiles_produces_the_requested_count_on_a_grid() {
+        let tiles = synthetic_tiles(9);
+        assert_eq!(tiles.len(), 9);
+        assert!(tiles.iter().all(|t| &*t.n == "concrete"));
+        assert_eq!((tiles[0].x, tiles[0].y), (0, 0));
+        assert_eq!((tiles[3].x, tiles[3].y), (0, 1));
+    }
+
+    #[test]
+    fn parallel_load_returns_frames_in_the_same_order_paths_were_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (name, tick) in [("a.stfr", 5u64), ("b.stfr", 1), ("c.stfr", 9)] {
+            write_stub_frame(dir.path(), name, tick, "nauvis", 0);
+            paths.push(dir.path().join(name));
+        }
+
+        let load = ParallelFrameLoad::start(paths.clone());
+        let frames = block_on(&load);
+
+        assert_eq!(frames.len(), paths.len());
+        assert_eq!(frames.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![5, 1, 9]);
+        assert_eq!(load.total(), paths.len());
+        assert_eq!(load.done(), paths.len());
+    }
+
+    #[test]
+    fn parallel_load_skips_an_unreadable_path_rather_than_failing_the_whole_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_frame(dir.path(), "good.stfr", 1, "nauvis", 0);
+        let missing = dir.path().join("missing.stfr");
+
+        let load = ParallelFrameLoad::start(vec![missing, dir.path().join("good.stfr")]);
+        let frames = block_on(&load);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 1);
+    }
+
+    #[test]
+    fn parallel_load_of_an_empty_path_list_completes_with_no_frames() {
+        let load = ParallelFrameLoad::start(Vec::new());
+        assert!(block_on(&load).is_empty());
+    }
+
+    /// Real megabase captures are what motivated parallelising this at all,
+    /// so the fixture with the most entities stands in for "one big file
+    /// among the paths" rather than only ever testing uniform, tiny ones.
+    #[test]
+    fn parallel_load_matches_sequential_loading_on_the_real_fixtures() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
+        let paths = frame_paths(Path::new(dir)).unwrap();
+
+        let sequential: Vec<u64> = paths.iter().filter_map(|p| load_frame(p)).map(|f| f.tick).collect();
+        let load = ParallelFrameLoad::start(paths);
+        let parallel: Vec<u64> = block_on(&load).iter().map(|f| f.tick).collect();
+
+        assert_eq!(parallel, sequential);
+    }
+
+    #[test]
+    fn load_sequence_sorts_a_directory_regardless_of_iteration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tick) in [("frame_0002.stfr", 2u64), ("frame_0000.stfr", 0), ("frame_0001.stfr", 1)] {
+            write_stub_frame(dir.path(), name, tick, "nauvis", 0);
+        }
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn load_sequence_loads_the_real_fixtures_in_order() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
+        let frames = load_sequence(Path::new(dir)).unwrap();
+        assert_eq!(frames.len(), 5);
+        let ticks: Vec<u64> = frames.iter().map(|f| f.tick).collect();
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]), "expected strictly increasing ticks, got {ticks:?}");
+    }
+
+    /// The shape a snapshot timer produces: tick-named files whose
+    /// lexicographic order is wrong, plus manifests that are not frames.
+    #[test]
+    fn load_sequence_orders_mod_written_snapshots_by_tick_not_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        for tick in [600u64, 1200, 12600, 216000] {
+            write_stub_frame(dir.path(), &format!("frame_{tick}_nauvis.stfr"), tick, "nauvis", 0);
+            // Written beside every snapshot; must not be read as a frame.
+            std::fs::write(
+                dir.path().join(format!("frame_{tick}_manifest.json")),
+                format!(r#"{{"tick":{tick},"entities":0,"tiles":0,"surfaces":["nauvis"]}}"#),
+            )
+            .unwrap();
+        }
+
+        let frames = load_sequence(dir.path()).expect("manifests must not break loading");
+        assert_eq!(
+            frames.iter().map(|f| f.tick).collect::<Vec<_>>(),
+            vec![600, 1200, 12600, 216000],
+            "sorted by filename this would be 1200, 12600, 216000, 600"
+        );
+    }
+
+    #[test]
+    fn load_sequence_keeps_only_the_busiest_surface_per_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        for (surface, count) in [("nauvis", 900usize), ("vulcanus", 12)] {
+            write_stub_frame(dir.path(), &format!("frame_600_{surface}.stfr"), 600, surface, count);
+        }
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1, "one frame per tick, or the camera jumps between planets");
+        assert_eq!(frames[0].surface, "nauvis");
+    }
+
+    /// The multi-surface counterpart of the busiest-per-tick test above:
+    /// same six-surfaces-one-tick shape the mod's raw baseline output has,
+    /// but nothing should be discarded, since this is exactly the case that
+    /// motivated switching worlds in the viewer instead of only ever seeing
+    /// the busiest one.
+    #[test]
+    fn group_by_surface_keeps_every_surface_sharing_a_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        for (surface, count) in [("nauvis", 900usize), ("vulcanus", 12), ("fulgora", 40)] {
+            write_stub_frame(dir.path(), &format!("frame_600_{surface}.stfr"), 600, surface, count);
+        }
+
+        let frames: Vec<Frame> = frame_paths(dir.path()).unwrap().iter().filter_map(|p| load_frame(p)).collect();
+        let grouped = group_by_surface(frames);
+
+        let names: Vec<&str> = grouped.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["nauvis", "fulgora", "vulcanus"], "busiest surface first");
+        assert!(grouped.iter().all(|(_, frames)| frames.len() == 1));
+    }
+
+    #[test]
+    fn group_by_surface_orders_and_dedups_each_surfaces_own_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        // nauvis across three ticks, written out of order, plus one
+        // vulcanus tick sharing tick 600 with a busier nauvis frame that
+        // must not swallow it the way single-surface loading would.
+        write_stub_frame(dir.path(), "frame_1200_nauvis.stfr", 1200, "nauvis", 5);
+        write_stub_frame(dir.path(), "frame_0000_nauvis.stfr", 0, "nauvis", 1);
+        write_stub_frame(dir.path(), "frame_0600_nauvis.stfr", 600, "nauvis", 3);
+        write_stub_frame(dir.path(), "frame_0600_vulcanus.stfr", 600, "vulcanus", 2);
+
+        let frames: Vec<Frame> = frame_paths(dir.path()).unwrap().iter().filter_map(|p| load_frame(p)).collect();
+        let grouped = group_by_surface(frames);
+
+        let nauvis = grouped.iter().find(|(name, _)| name == "nauvis").unwrap();
+        assert_eq!(nauvis.1.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![0, 600, 1200]);
+
+        let vulcanus = grouped.iter().find(|(name, _)| name == "vulcanus").unwrap();
+        assert_eq!(vulcanus.1.len(), 1);
+        assert_eq!(vulcanus.1[0].tick, 600);
+    }
+
+    /// Live capture writes these beside every finished snapshot. Their stem
+    /// ends in `.stfr`, so they look exactly like a frame to a stem-only
+    /// check, and being empty, each one would produce a parse warning.
+    #[test]
+    fn done_markers_and_event_logs_are_not_mistaken_for_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("frame_22630009_nauvis.stfr");
+        write_stub_frame(dir.path(), "frame_22630009_nauvis.stfr", 22630009, "nauvis", 0);
+        std::fs::write(dir.path().join("frame_22630009_nauvis.stfr.done"), "").unwrap();
+        std::fs::write(dir.path().join("frame_22630009_manifest.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("events_22630009.stev"), "").unwrap();
+
+        assert_eq!(frame_paths(dir.path()).unwrap(), vec![frame]);
+
+        let frames = load_sequence(dir.path()).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tick, 22630009);
+    }
+}

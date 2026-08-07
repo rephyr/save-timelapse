@@ -139,15 +139,36 @@ The Lua mod requires no build step.
 - [x] Sprite rendering
 - [x] LOD rendering
 
-### Planned
-- [ ] Add screenshots and gifs to README.MD of the working project
-- [ ] Adjustable playback speed
-- [ ] Timeline markers
-- [ ] Video export
-- [ ] Camera keyframes
-- [ ] Automatic camera
-- [ ] Bookmarks
+### v0.2
+
+- [x] Checksums (corrupted frame/event files are detected, not silently misread)
+- [x] Versioning (the binary formats carry a version byte)
+- [x] Adjustable playback speed
+- [x] Better documentation
+- [ ] Add screenshots and gifs to README.md of the working project
+
+Bonus, not originally planned for v0.2 but delivered along the way:
+- [x] Terrain and terrain-scatter rendering (grass, water, trees, cliffs), opt-in given its export cost
+- [x] Player position tracking, shown as a marker in the viewer
+
+Video export moved out of this release — see v1.0.
+
+### v0.5
+
+- [ ] One-click installer
+- [ ] Save detection
 - [ ] Performance improvements
+- [ ] Polish
+
+### v1.0
+
+- [ ] Camera system
+- [ ] Bookmarks
+- [ ] Timeline markers
+- [ ] Statistics
+- [ ] Auto framing
+- [ ] Video export
+- [ ] Better export
 
 ---
 
