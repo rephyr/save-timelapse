@@ -369,12 +369,16 @@ The viewer converts each parsed `Frame` into a `RenderFrame` at load time and
 drops the parsed form. Two things happen in that conversion.
 
 **Names are interned.** A real base has tens of distinct prototype names
-against hundreds of thousands of entities, so `Frame`'s `n: String` is one
-heap allocation per entity for one of ~58 repeated strings. `TypeRegistry`
-maps each name to a `u16` once and resolves its color at the same time.
-Drawing then never hashes a name: the pre-registry loop called `color_for`
-(FNV over the name) and `sprites.get(&e.n)` (SipHash over the name) for every
-entity on every rendered frame.
+against hundreds of thousands of entities (or millions of tiles on a fully
+paved one), so `TypeRegistry` maps each name to a `u16` once and resolves its
+color at the same time. Drawing then never hashes a name: the pre-registry
+loop called `color_for` (FNV over the name) and `sprites.get(&e.n)` (SipHash
+over the name) for every entity on every rendered frame. `Frame`'s `n` field
+is `Arc<str>` rather than `String` for the same reason, one level earlier:
+the wire format's own name dictionary (see `frame.rs`) means resolving a
+record's name during parsing only needs a refcount bump, not a fresh
+allocation and copy of one of those same ~58 repeated strings, which was the
+dominant cost of parsing a real megabase frame before it was changed.
 
 **Items are grouped into per-type runs**, by counting sort, so all entities of
 one type sit contiguously and a `Run` names the span. This is what keeps the
@@ -414,9 +418,29 @@ test.
 Frames are parsed with the window already open, yielding to draw a progress
 bar roughly every 33ms. Without that the viewer shows an empty window for as
 long as parsing takes, which on a real save set is many seconds. The bar
-covers both phases, frame parsing and sprite loading, since sprites are loaded
-once up front rather than on first use — otherwise scrubbing stutters the
-first time a not-yet-seen type appears.
+covers three phases: reading frames, converting them, and loading sprites,
+since sprites are loaded once up front rather than on first use — otherwise
+scrubbing stutters the first time a not-yet-seen type appears.
+
+Reading and parsing each `.stfr` file is independent work with nothing shared
+until conversion (which needs one consistently numbered `TypeRegistry` across
+every frame), so `ParallelFrameLoad` spreads it across every available CPU
+core instead of one file at a time. It runs on its own OS thread rather than
+blocking the caller, so the async render loop can keep polling and drawing
+the progress bar while it proceeds. Measured on a real ~300k-entity,
+3.1M-tile, 55-frame capture: parallel reading plus switching `Entity`/`Tile`
+names from `String` to `Arc<str>` (see "Rendering" above) took total load
+time from 47s to 20s.
+
+**Multiple surfaces load as separate worlds.** `group_by_surface` splits a
+loaded batch by each frame's parsed `surface` field (not its filename) into
+one independently ordered timeline per surface, rather than collapsing to
+whichever is busiest the way a single sequence has to. This is what lets the
+viewer's `tab` key switch between worlds: the mod's raw baseline output
+already writes every surface at one tick, and `save-timelapse-replay
+--all-surfaces` does the same across a whole timelapse. Each world keeps its
+own `Camera`, fitted to its own frames at load time, so switching to another
+world and back doesn't disturb either one's pan/zoom.
 
 ## Concurrency
 

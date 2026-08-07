@@ -881,6 +881,35 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
     });
 }
 
+/// Splits a loaded batch of frames into one timeline per surface, each
+/// ordered and deduplicated by tick exactly like `order_by_tick` already
+/// does for a single sequence -- multiple surfaces sharing a tick (the
+/// mod's raw baseline output, six surfaces all named `frame_<tick>_<surface>`)
+/// is exactly the case that needs separating rather than collapsing.
+///
+/// A `Frame`'s surface comes from its parsed content, not its filename, so
+/// this groups correctly whether the directory is the mod's own multi-surface
+/// output or `save-timelapse-replay --all-surfaces`'s equivalent.
+///
+/// Surfaces are returned busiest-first (by peak entity count), so a caller
+/// that only ever shows the first one gets the same surface loading used to
+/// always pick before there was any way to see the others.
+pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
+    let mut by_surface: HashMap<String, Vec<Frame>> = HashMap::new();
+    for frame in frames {
+        by_surface.entry(frame.surface.clone()).or_default().push(frame);
+    }
+
+    let mut surfaces: Vec<(String, Vec<Frame>)> = by_surface.into_iter().collect();
+    for (_, group) in &mut surfaces {
+        order_by_tick(group, |f| f.tick, |f| f.entities.len());
+    }
+    surfaces.sort_by_key(|(_, group)| {
+        std::cmp::Reverse(group.iter().map(|f| f.entities.len()).max().unwrap_or(0))
+    });
+    surfaces
+}
+
 pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
     let mut frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
 
@@ -1242,6 +1271,48 @@ mod tests {
         let frames = load_sequence(dir.path()).unwrap();
         assert_eq!(frames.len(), 1, "one frame per tick, or the camera jumps between planets");
         assert_eq!(frames[0].surface, "nauvis");
+    }
+
+    /// The multi-surface counterpart of the busiest-per-tick test above:
+    /// same six-surfaces-one-tick shape the mod's raw baseline output has,
+    /// but nothing should be discarded, since this is exactly the case that
+    /// motivated switching worlds in the viewer instead of only ever seeing
+    /// the busiest one.
+    #[test]
+    fn group_by_surface_keeps_every_surface_sharing_a_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        for (surface, count) in [("nauvis", 900usize), ("vulcanus", 12), ("fulgora", 40)] {
+            write_stub_frame(dir.path(), &format!("frame_600_{surface}.stfr"), 600, surface, count);
+        }
+
+        let frames: Vec<Frame> = frame_paths(dir.path()).unwrap().iter().filter_map(|p| load_frame(p)).collect();
+        let grouped = group_by_surface(frames);
+
+        let names: Vec<&str> = grouped.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["nauvis", "fulgora", "vulcanus"], "busiest surface first");
+        assert!(grouped.iter().all(|(_, frames)| frames.len() == 1));
+    }
+
+    #[test]
+    fn group_by_surface_orders_and_dedups_each_surfaces_own_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        // nauvis across three ticks, written out of order, plus one
+        // vulcanus tick sharing tick 600 with a busier nauvis frame that
+        // must not swallow it the way single-surface loading would.
+        write_stub_frame(dir.path(), "frame_1200_nauvis.stfr", 1200, "nauvis", 5);
+        write_stub_frame(dir.path(), "frame_0000_nauvis.stfr", 0, "nauvis", 1);
+        write_stub_frame(dir.path(), "frame_0600_nauvis.stfr", 600, "nauvis", 3);
+        write_stub_frame(dir.path(), "frame_0600_vulcanus.stfr", 600, "vulcanus", 2);
+
+        let frames: Vec<Frame> = frame_paths(dir.path()).unwrap().iter().filter_map(|p| load_frame(p)).collect();
+        let grouped = group_by_surface(frames);
+
+        let nauvis = grouped.iter().find(|(name, _)| name == "nauvis").unwrap();
+        assert_eq!(nauvis.1.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![0, 600, 1200]);
+
+        let vulcanus = grouped.iter().find(|(name, _)| name == "vulcanus").unwrap();
+        assert_eq!(vulcanus.1.len(), 1);
+        assert_eq!(vulcanus.1[0].tick, 600);
     }
 
     /// Live capture writes these beside every finished snapshot. Their stem

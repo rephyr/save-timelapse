@@ -69,6 +69,7 @@ so nothing downstream needs to know the timeline came from events.
 |---|---|
 | `--interval <ticks>` | Ticks between frames. Factorio runs at 60/s, so the default 3600 is one frame per minute of game time. |
 | `--surface <name>` | Which surface to render. Defaults to whichever has the most entities. |
+| `--all-surfaces` | Render every surface instead of just one, so the viewer's `tab` key has more than one world to switch between. |
 | `--max-frames <n>` | Stop after this many frames. |
 
 The baseline is taken once per save and recorded inside the save file, so it
@@ -97,12 +98,17 @@ snapshot still being written won't crash it.
 ## Viewer
 
 ```
-cargo run -p viewer --release -- frames
+cargo run -p viewer --release --bin viewer -- frames
 ```
 
 Drag to pan, scroll to zoom, left/right to step, space to play, home/end to
-jump, `s` to toggle sprites, and drag the bar at the bottom to scrub. A
-progress bar covers loading, which on a large save set takes a while.
+jump, `s` to toggle sprites, and drag the bar at the bottom to scrub. `tab`
+switches between worlds when the directory holds more than one surface (the
+mod's raw baseline output, or `save-timelapse-replay --all-surfaces`) --
+each world keeps its own camera, so switching and switching back doesn't
+lose your place. A progress bar covers loading, which on a large save set
+takes a while, now spread across every CPU core rather than one file at a
+time.
 
 The second HUD line reports draw calls against quads submitted, so a
 regression in batching is visible rather than something you have to profile

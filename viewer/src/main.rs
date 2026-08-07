@@ -137,13 +137,16 @@ async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: boo
 /// since the real risk case (a fully-paved megabase) is tile-heavy in a way
 /// the entity-only stress test doesn't cover. Both stay single-frame --
 /// playback is for real exported sequences, not synthetic stress tests.
-async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence {
+/// One timeline per surface, named, so the caller can switch between them
+/// (tab, in the running viewer) instead of only ever seeing whichever one
+/// happened to be busiest.
+async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence)> {
     let mut last = Instant::now();
     let mut progress =
         LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
 
     // Single-frame paths (synthetic, or the default fixture) share the tail
-    // of this function; only a real directory has a meaningful item count.
+    // of this function; only a real directory can have more than one world.
     let single = if let Some(n) = args.synthetic_entities {
         progress.phase = "building synthetic frame";
         progress.detail = format!("{n} entities");
@@ -160,12 +163,11 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
         None
     };
 
-    let mut frames = Vec::new();
-    if let Some(mut frame) = single {
+    let worlds: Vec<(String, Vec<save_timelapse::frame::Frame>)> = if let Some(mut frame) = single {
         if let Some(n) = args.synthetic_tile_count {
             frame.tiles = synthetic_tiles(n);
         }
-        frames.push(RenderFrame::from_frame(frame, registry));
+        vec![(frame.surface.clone(), vec![frame])]
     } else {
         let path = args.path.as_ref().expect("checked above");
         println!("loading {path}");
@@ -190,29 +192,46 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> FrameSequence 
                 break loaded;
             }
         };
-
-        progress.phase = "converting frames";
-        progress.total = loaded.len();
-        for (i, mut frame) in loaded.into_iter().enumerate() {
-            progress.done = i;
-            redraw_progress(&progress, &mut last, false).await;
-            if let Some(n) = args.synthetic_tile_count {
-                frame.tiles = synthetic_tiles(n);
-            }
-            frames.push(RenderFrame::from_frame(frame, registry));
-        }
         progress.done = progress.total;
         redraw_progress(&progress, &mut last, true).await;
 
-        // Ordered after loading, not before: the mod's `frame_<tick>_<surface>`
-        // names sort wrong lexicographically, and picking one surface per tick
-        // needs the parsed entity counts. Done on RenderFrames rather than
-        // Frames so the two representations are never both in memory.
-        viewer::order_by_tick(&mut frames, |f| f.tick, |f| f.count);
-    }
+        // Grouped before converting, not after: the mod's raw baseline
+        // output writes every surface at the same tick, and grouping is
+        // what keeps all of them (one timeline per surface) instead of
+        // collapsing to whichever was busiest.
+        let mut grouped = viewer::group_by_surface(loaded);
+        if let Some(n) = args.synthetic_tile_count {
+            for (_, frames) in &mut grouped {
+                for frame in frames {
+                    frame.tiles = synthetic_tiles(n);
+                }
+            }
+        }
+        grouped
+    };
 
-    println!("{} frame(s) loaded, {} distinct type(s)", frames.len(), registry.len());
-    FrameSequence::new(frames).expect("no valid frames found")
+    progress.phase = "converting frames";
+    progress.done = 0;
+    progress.total = worlds.iter().map(|(_, frames)| frames.len()).sum();
+    let mut result = Vec::with_capacity(worlds.len());
+    for (name, frames) in worlds {
+        let mut rendered = Vec::with_capacity(frames.len());
+        for frame in frames {
+            rendered.push(RenderFrame::from_frame(frame, registry));
+            progress.done += 1;
+            redraw_progress(&progress, &mut last, false).await;
+        }
+        result.push((name, FrameSequence::new(rendered).expect("no valid frames found")));
+    }
+    redraw_progress(&progress, &mut last, true).await;
+
+    println!(
+        "{} world(s) loaded ({} frame(s) total), {} distinct type(s)",
+        result.len(),
+        result.iter().map(|(_, seq)| seq.len()).sum::<usize>(),
+        registry.len()
+    );
+    result
 }
 
 /// A loaded icon plus the region of it that's the actual icon. Vanilla and
@@ -324,7 +343,7 @@ async fn main() {
     let args = parse_args();
 
     let mut registry = TypeRegistry::new();
-    let mut sequence = load_frames(&args, &mut registry).await;
+    let loaded = load_frames(&args, &mut registry).await;
 
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
@@ -335,7 +354,19 @@ async fn main() {
     let with_sprites = sprites.iter().filter(|s| s.is_some()).count();
     println!("{} of {} entity/tile types have sprites", with_sprites, registry.len());
 
-    let mut camera = Camera::fit_frames(sequence.frames(), screen_width(), screen_height());
+    // One camera per world rather than one shared: panning/zooming vulcanus
+    // and then tabbing to nauvis with vulcanus's view still applied would be
+    // disorienting, and each world's own frames are what its camera was
+    // fitted to in the first place.
+    let mut worlds: Vec<(String, FrameSequence, Camera)> = loaded
+        .into_iter()
+        .map(|(name, sequence)| {
+            let camera = Camera::fit_frames(sequence.frames(), screen_width(), screen_height());
+            (name, sequence, camera)
+        })
+        .collect();
+    let mut current = 0usize;
+
     let mut last_mouse: Vec2 = mouse_position().into();
     let mut playing = false;
     let mut play_accum = 0.0;
@@ -345,6 +376,14 @@ async fn main() {
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
 
     loop {
+        // Captured before the mutable borrow below, which holds `worlds`
+        // borrowed for the rest of the loop body.
+        let world_count = worlds.len();
+        if is_key_pressed(KeyCode::Tab) && world_count > 1 {
+            current = (current + 1) % world_count;
+        }
+        let (world_name, sequence, camera) = &mut worlds[current];
+
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let mouse: Vec2 = mouse_position().into();
         let timeline = Timeline::for_screen(screen_width(), screen_height());
@@ -528,7 +567,10 @@ async fn main() {
         let total_items = frame.entities.len() + frame.tiles.len();
         draw_text(
             &format!(
-                "frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  {} fps  |  {:.1} ms",
+                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  {} fps  |  {:.1} ms",
+                world_name,
+                current + 1,
+                world_count,
                 sequence.index() + 1,
                 sequence.len(),
                 frame.count,
@@ -573,9 +615,10 @@ async fn main() {
             20.0,
             Color::new(0.6, 0.9, 1.0, 1.0),
         );
+        let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub",
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub{tab_hint}",
                 if playing { "pause" } else { "play" }
             ),
             10.0,
