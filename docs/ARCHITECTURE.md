@@ -13,8 +13,8 @@ into `script-output`. The CLI reads that directory after the process exits.
 
     saves/*.zip
         |
-        |  CLI launches: factorio --benchmark <save> --benchmark-ticks 3
-        |                         --config <staged> --mod-directory <staged>
+        |  CLI launches: factorio benchmark <save> benchmark-ticks 3
+        |                         config <staged> mod-directory <staged>
         v
     Factorio loads the save, mod exports on first tick, process exits
         |
@@ -80,7 +80,7 @@ written as `empty_flag=0` followed by a zero length rather than `empty_flag=1`,
 and dictionary insertion order is preserved.
 
 The version header is taken from the source file when one exists, otherwise
-from `factorio.exe --version`.
+from `factorio.exe version`.
 
 ## Frame format
 
@@ -154,7 +154,7 @@ excluded types are never returned across the API boundary.
 Excluded by default: characters, corpses, particles, projectiles, trees, rocks,
 cliffs, fish, fire, smoke, explosions, ghosts, dropped items, combat robots,
 streams, stickers and beams. Also excluded: biters, spitters and their
-spawners (`unit`, `unit-spawner`) -- wildlife rather than factory, and without
+spawners (`unit`, `unit-spawner`)  wildlife rather than factory, and without
 this a live-capture log fills with combat-death removals indistinguishable
 from the player mining something. Confirmed against a real capture, where
 these types were ~6% of exported entities. Worm turrets are left in: they
@@ -388,7 +388,7 @@ preceding* draw call, and starts a new one whenever the bound texture changes
 — costs close to one draw call per entity. Untextured rects count as their own
 texture state, so mixing shapes and sprites breaks the batch the same way.
 
-Measured on `tests/fixtures/frames` with `cargo run -p viewer --bin drawcalls`,
+Measured on `tests/fixtures/frames` with `cargo run -p viewer bin drawcalls`,
 for fully-visible frames:
 
     items    types    export order    grouped    grouped, raised capacity
@@ -438,7 +438,7 @@ one independently ordered timeline per surface, rather than collapsing to
 whichever is busiest the way a single sequence has to. This is what lets the
 viewer's `tab` key switch between worlds: the mod's raw baseline output
 already writes every surface at one tick, and `save-timelapse-replay
---all-surfaces` does the same across a whole timelapse. Each world keeps its
+all-surfaces` does the same across a whole timelapse. Each world keeps its
 own `Camera`, fitted to its own frames at load time, so switching to another
 world and back doesn't disturb either one's pan/zoom.
 

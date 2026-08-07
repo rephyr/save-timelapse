@@ -1,49 +1,130 @@
-//! save-timelapse: build a timelapse from Factorio saves you already have.
+//! save-timelapse: one interactive tool, no flags to learn.
+//!
+//! Asks what you want to do (rebuild from live capture, or build from
+//! existing saves), asks whatever it couldn't auto-detect (Factorio's
+//! folder, which surface, which saves belong to one playthrough), then
+//! opens the viewer on the result automatically.
+//!
+//!     save-timelapse.exe
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use clap::Parser;
 use save_timelapse::export;
+use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
+use save_timelapse::replay::{self, Options};
 
-#[derive(Parser)]
-#[command(name = "save-timelapse", version, about)]
-struct Args {
-    /// Folder of .zip saves to export, or a single .zip. Defaults to
-    /// Factorio's saves folder.
-    #[arg(long)]
-    saves: Option<PathBuf>,
+/// One frame per minute of game time for the live-capture flow: a
+/// reasonable middle ground that isn't trying to be clever about how long
+/// the capture actually is.
+const INTERVAL: u64 = 3600;
+const MAX_FRAMES: usize = 100_000;
 
-    /// Where to collect exported frames.
-    #[arg(long, default_value = "frames")]
-    out: PathBuf,
+enum Mode {
+    LiveCapture,
+    FromSaves,
+}
 
-    /// Path to factorio.exe. Auto-detected when omitted.
-    #[arg(long)]
-    factorio: Option<PathBuf>,
+/// Prints `question`, reads one line, and trims it. An empty `Ok` on EOF
+/// (stdin closed, e.g. `< /dev/null`) would spin the retry loops below
+/// forever with no way to make progress, so that comes back as an error
+/// instead, which unwinds out through the same friendly-failure path as
+/// everything else.
+fn prompt(question: &str) -> io::Result<String> {
+    print!("{question} ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        return Err(io::Error::other("no more input"));
+    }
+    Ok(line.trim().to_string())
+}
 
-    /// Factorio mods folder. Auto-detected when omitted.
-    #[arg(long)]
-    mods: Option<PathBuf>,
+fn ask_mode() -> io::Result<Mode> {
+    loop {
+        let input = prompt(
+            "What would you like to do?\n\
+             \x20 1) Update my timelapse from live capture (recommended if capture is on)\n\
+             \x20 2) Build a timelapse from existing save files\n\
+             Enter 1 or 2:",
+        )?;
+        match input.as_str() {
+            "1" => return Ok(Mode::LiveCapture),
+            "2" => return Ok(Mode::FromSaves),
+            _ => println!("Please enter 1 or 2.\n"),
+        }
+    }
+}
 
-    /// Directory holding this mod's Lua.
-    #[arg(long, default_value = "mod")]
-    mod_source: PathBuf,
+/// Auto-detects Factorio's data folder (saves/mods/script-output), falling
+/// back to asking for it. Validated by checking for a `mods` subfolder
+/// rather than just accepting any path, since a wrong answer here would
+/// otherwise only surface as a confusing failure several steps later.
+fn locate_factorio_user_dir_interactive() -> io::Result<PathBuf> {
+    if let Some(dir) = factorio_user_dir() {
+        if dir.join("mods").is_dir() {
+            return Ok(dir);
+        }
+    }
+    loop {
+        let input = prompt(
+            "Could not find your Factorio folder automatically.\n\
+             Please enter the path to it (the folder containing \"mods\" and \"saves\", \
+             usually %APPDATA%\\Factorio on Windows):",
+        )?;
+        let path = PathBuf::from(&input);
+        if path.join("mods").is_dir() {
+            return Ok(path);
+        }
+        println!("That doesn't look right: no \"mods\" folder inside {}.\n", path.display());
+    }
+}
 
-    /// Include ore tiles. Every tile is a separate entity, so this typically
-    /// multiplies frame size without showing factory growth.
-    #[arg(long)]
-    include_resources: bool,
+/// Same idea for the actual game executable, only needed by the from-saves
+/// flow, which launches it headless.
+fn locate_factorio_exe_interactive() -> io::Result<PathBuf> {
+    if let Some(exe) = locate_factorio() {
+        return Ok(exe);
+    }
+    loop {
+        let input = prompt(
+            "Could not find your Factorio install automatically.\n\
+             Please enter the full path to factorio.exe (usually inside a Steam \
+             library, under Factorio\\bin\\x64\\factorio.exe):",
+        )?;
+        let path = PathBuf::from(&input);
+        if path.is_file() {
+            return Ok(path);
+        }
+        println!("That file doesn't exist: {}\n", path.display());
+    }
+}
 
-    /// Export only saves whose filename contains this text, case insensitive.
-    /// A saves folder usually holds several unrelated worlds.
-    #[arg(long)]
-    match_name: Option<String>,
+/// Empty input is the caller's job to treat as "every surface"; this only
+/// ever gets asked about a genuine name, matched case-insensitively so
+/// "Nauvis" and "nauvis" aren't different answers.
+fn find_surface<'a>(input: &str, surfaces: &'a [String]) -> Option<&'a str> {
+    surfaces.iter().find(|s| s.eq_ignore_ascii_case(input)).map(String::as_str)
+}
 
-    /// Export only the first N saves.
-    #[arg(long)]
-    limit: Option<usize>,
+fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
+    loop {
+        let input = prompt(&format!(
+            "Render every surface (so tab in the viewer can switch between worlds), or just \
+             one?\nSurfaces found: {}\nEnter a name, or press Enter for every surface:",
+            surfaces.join(", ")
+        ))?;
+        if input.is_empty() {
+            return Ok(None);
+        }
+        if let Some(found) = find_surface(&input, surfaces) {
+            return Ok(Some(found.to_string()));
+        }
+        println!("\"{input}\" doesn't match any surface listed above. Try again.\n");
+    }
 }
 
 /// Saves are usually numbered, so order by that number rather than
@@ -54,90 +135,241 @@ fn ordering_key(path: &Path) -> (u64, String) {
     (digits.parse().unwrap_or(0), stem.to_lowercase())
 }
 
-fn run(args: Args) -> std::io::Result<()> {
-    let factorio = args
-        .factorio
-        .or_else(locate_factorio)
-        .ok_or_else(|| std::io::Error::other("cannot find factorio.exe, pass --factorio"))?;
+/// `all` (case-insensitive) selects everything. Otherwise, if every
+/// comma-separated part parses as a number, those are 1-based indices into
+/// `saves` (out-of-range ones are dropped rather than erroring, so a typo'd
+/// extra index doesn't throw away the rest of a valid selection).
+/// Otherwise, a case-insensitive substring filter against each save's
+/// filename, the same matching `--match-name` used to do. Blank input
+/// selects nothing rather than matching every filename via an empty
+/// substring, since the whole point of asking is to make a blank answer
+/// something the caller reprompts on, not a silent "combine everything".
+fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.eq_ignore_ascii_case("all") {
+        return saves.to_vec();
+    }
 
-    let user_mods = args
-        .mods
-        .or_else(|| factorio_user_dir().map(|d| d.join("mods")))
-        .ok_or_else(|| std::io::Error::other("cannot find the mods folder, pass --mods"))?;
-
-    let saves_dir = args
-        .saves
-        .or_else(|| factorio_user_dir().map(|d| d.join("saves")))
-        .ok_or_else(|| std::io::Error::other("cannot find the saves folder, pass --saves"))?;
-
-    let version = export::factorio_version(&factorio)
-        .map(|v| format!("{}.{}.{}", v[0], v[1], v[2]))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    println!("factorio {} ({})", version, factorio.display());
-    println!("mods     {}", user_mods.display());
-    println!("saves    {}", saves_dir.display());
-
-    // A saves folder usually holds several unrelated worlds, so accept a
-    // single .zip directly rather than making the user isolate one first.
-    let mut saves: Vec<PathBuf> = if saves_dir.is_file() {
-        vec![saves_dir.clone()]
-    } else {
-        let mut found: Vec<PathBuf> = std::fs::read_dir(&saves_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.iter().all(|part| part.parse::<usize>().is_ok()) {
+        return parts
+            .iter()
+            .filter_map(|part| part.parse::<usize>().ok())
+            .filter_map(|one_based| one_based.checked_sub(1))
+            .filter_map(|index| saves.get(index).cloned())
             .collect();
-        found.sort_by_key(|path| ordering_key(path));
-        found
-    };
+    }
 
-    if let Some(pattern) = args.match_name.as_deref() {
-        let needle = pattern.to_lowercase();
-        saves.retain(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| name.to_lowercase().contains(&needle))
-        });
+    let needle = trimmed.to_lowercase();
+    saves
+        .iter()
+        .filter(|path| {
+            path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.to_lowercase().contains(&needle))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The Lua mod's source, needed to stage a headless export. Tried next to
+/// this program first (how it travels once distributed), falling back to
+/// the current folder (how it's found running from the project source via
+/// `cargo run`).
+fn mod_source_dir() -> io::Result<PathBuf> {
+    let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
+    if let Some(dir) = &exe_sibling {
+        if dir.is_dir() {
+            return Ok(dir.clone());
+        }
     }
-    if let Some(n) = args.limit {
-        saves.truncate(n);
+    let cwd_candidate = PathBuf::from("mod");
+    if cwd_candidate.is_dir() {
+        return Ok(cwd_candidate);
     }
+    Err(io::Error::other(
+        "Could not find the mod/ folder needed to export from saves. It should sit next to \
+         this program (or in the current folder, if running from source).",
+    ))
+}
+
+/// `viewer` is a sibling binary, not a library this crate can call into
+/// directly (it depends on this one, not the other way around, and its
+/// `main` is a macroquad event loop besides), so launching it means finding
+/// the executable cargo already built next to this one.
+fn viewer_path() -> io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| io::Error::other("could not determine this program's own folder"))?;
+    let candidate = dir.join(format!("viewer{}", std::env::consts::EXE_SUFFIX));
+    if !candidate.exists() {
+        return Err(io::Error::other(format!(
+            "Could not find {} next to this program. Reinstall save-timelapse so both files \
+             end up in the same folder.",
+            candidate.display()
+        )));
+    }
+    Ok(candidate)
+}
+
+fn run_live_capture() -> io::Result<PathBuf> {
+    let user_dir = locate_factorio_user_dir_interactive()?;
+
+    let capture = user_dir.join("script-output").join("save-timelapse");
+    if !capture.join(replay::BASELINE_MANIFEST).exists() {
+        return Err(io::Error::other(format!(
+            "No live capture found at {}.\n\n\
+             In Factorio, turn on the \"save-timelapse-live-capture\" setting (Settings > Mod \
+             Settings > Runtime > Save Timelapse), play for a bit, then run this again.",
+            capture.display()
+        )));
+    }
+
+    let mut replay_state = replay::load_baseline(&capture)?;
+    println!(
+        "\nbaseline tick {} ({} entities, {} tiles)",
+        replay_state.baseline.tick,
+        replay_state.world.entity_count(),
+        replay_state.world.tile_count()
+    );
+    let surfaces: Vec<String> = replay_state.world.surface_names().into_iter().map(str::to_string).collect();
+    println!("surfaces: {}\n", surfaces.join(", "));
+
+    let chosen_surface = ask_surface_choice(&surfaces)?;
+
+    // Fixed and owned entirely by this tool, so it's safe to clear before
+    // every run: a shorter capture than last time can't leave stale,
+    // higher-numbered frames behind for the viewer to mix in with current
+    // data.
+    let out = user_dir.join("save-timelapse-frames");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+
+    let options = Options { interval: INTERVAL, max_frames: MAX_FRAMES };
+    let mut written = 0usize;
+    let mut error: Option<io::Error> = None;
+
+    let emitted = match &chosen_surface {
+        None => {
+            println!("rendering every surface, one frame per {INTERVAL} tick(s)\n");
+            replay::run(&mut replay_state, &capture, &options, |world, tick| {
+                if error.is_some() {
+                    return;
+                }
+                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written) {
+                    error = Some(e);
+                    return;
+                }
+                written += 1;
+                if written % 25 == 0 {
+                    print!("\r{written} frames");
+                    io::stdout().flush().ok();
+                }
+            })?
+        }
+        Some(name) => {
+            println!("rendering surface {name}, one frame per {INTERVAL} tick(s)\n");
+            replay::run(&mut replay_state, &capture, &options, |world, tick| {
+                if error.is_some() {
+                    return;
+                }
+                let frame = world.to_frame(name, tick);
+                let path = out.join(format!("frame_{written:04}.stfr"));
+                if let Err(e) = std::fs::write(&path, frame::write_binary(&frame.as_out())) {
+                    error = Some(e);
+                    return;
+                }
+                written += 1;
+                if written % 25 == 0 {
+                    print!("\r{written} frames");
+                    io::stdout().flush().ok();
+                }
+            })?
+        }
+    };
+    if let Some(e) = error {
+        return Err(e);
+    }
+    println!("\r{emitted} frames written to {}\n", out.display());
+
+    Ok(out)
+}
+
+fn run_from_saves() -> io::Result<PathBuf> {
+    let factorio = locate_factorio_exe_interactive()?;
+    let user_dir = locate_factorio_user_dir_interactive()?;
+    let user_mods = user_dir.join("mods");
+    let saves_dir = user_dir.join("saves");
+
+    let mut saves: Vec<PathBuf> = std::fs::read_dir(&saves_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
+        .collect();
+    saves.sort_by_key(|p| ordering_key(p));
 
     if saves.is_empty() {
-        return Err(std::io::Error::other(match args.match_name.as_deref() {
-            Some(pattern) => {
-                format!("no saves in {} match {pattern:?}", saves_dir.display())
-            }
-            None => format!("no .zip saves in {}", saves_dir.display()),
-        }));
+        return Err(io::Error::other(format!("No .zip saves found in {}.", saves_dir.display())));
     }
-    println!("{} save(s) to export\n", saves.len());
 
-    std::fs::create_dir_all(&args.out)?;
+    println!("\nFound {} save(s) in {}:", saves.len(), saves_dir.display());
+    for (i, save) in saves.iter().enumerate() {
+        println!("  {}) {}", i + 1, save.file_name().unwrap_or_default().to_string_lossy());
+    }
+
+    let chosen = loop {
+        let input = prompt(
+            "\nMultiple saves can be from different playthroughs; combining unrelated ones \
+             jumps between different bases in one timelapse.\n\
+             Which belong to ONE playthrough? Enter numbers (e.g. 1,3,4), a text filter \
+             matching part of the filename, or \"all\":",
+        )?;
+        let selected = parse_save_selection(&input, &saves);
+        if selected.is_empty() {
+            println!("That didn't match any save. Try again.");
+            continue;
+        }
+        break selected;
+    };
+
+    println!(
+        "\nUsing {} save(s): {}\n",
+        chosen.len(),
+        chosen
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let out = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("frames");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out)?;
+
     let workspace = std::env::temp_dir().join(format!("save-timelapse-{}", std::process::id()));
-
     let config = export::ExportConfig {
         factorio,
         user_mods,
-        mod_source: args.mod_source,
-        include_resources: args.include_resources,
+        mod_source: mod_source_dir()?,
+        include_resources: false,
     };
 
     let mut done = 0usize;
-    for (index, save) in saves.iter().enumerate() {
+    for (index, save) in chosen.iter().enumerate() {
         let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        print!("[{:>3}/{}] {label} ... ", index + 1, saves.len());
-        std::io::stdout().flush().ok();
+        print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
+        io::stdout().flush().ok();
 
         let staged = workspace.join(format!("stage_{index}"));
         match export::export_save(save, &staged, &config) {
             Ok(outcome) => {
-                let target = args.out.join(format!("frame_{index:04}.stfr"));
+                let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
-                std::fs::rename(primary, &target)
-                    .or_else(|_| std::fs::copy(primary, &target).map(drop))?;
-
+                std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
                 let kib = target.metadata().map(|m| m.len()).unwrap_or(0) / 1024;
                 println!("ok, {kib} KiB in {:.1}s", outcome.seconds);
                 done += 1;
@@ -146,16 +378,67 @@ fn run(args: Args) -> std::io::Result<()> {
         }
         let _ = std::fs::remove_dir_all(&staged);
     }
-
     let _ = std::fs::remove_dir_all(&workspace);
-    println!("\n{done} of {} exported to {}", saves.len(), args.out.display());
-    Ok(())
+    println!("\n{done} of {} exported to {}", chosen.len(), out.display());
+
+    if done == 0 {
+        return Err(io::Error::other("none of the selected saves exported successfully"));
+    }
+
+    Ok(out)
+}
+
+fn run() -> io::Result<PathBuf> {
+    println!("save-timelapse\n");
+    match ask_mode()? {
+        Mode::LiveCapture => run_live_capture(),
+        Mode::FromSaves => run_from_saves(),
+    }
+}
+
+/// A double-clicked console window closes the instant the process exits,
+/// which for an error message is worse than useless: the user sees a flash
+/// and nothing else. Waiting for Enter is what actually gives a double-click
+/// user, who never typed a command to begin with, a chance to read what went
+/// wrong.
+fn wait_for_enter() {
+    print!("\nPress Enter to close this window...");
+    io::stdout().flush().ok();
+    let mut discard = String::new();
+    io::stdin().read_line(&mut discard).ok();
 }
 
 fn main() {
-    if let Err(err) = run(Args::parse()) {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    // A panic (an unexpected bug, not one of the friendly errors `run`
+    // returns) would otherwise skip the pause below entirely: Rust prints
+    // the panic message and unwinds straight past the `Err` handling
+    // further down, and Windows closes the console the moment the process
+    // exits either way. Installing a hook is what catches that case too, so
+    // a bug here fails the same way a handled error does instead of just
+    // flashing shut.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("\nsave-timelapse hit an unexpected error: {info}");
+        wait_for_enter();
+    }));
+
+    let outcome = std::panic::catch_unwind(|| {
+        run().and_then(|out| {
+            let viewer = viewer_path()?;
+            println!("opening the viewer...");
+            Command::new(&viewer).arg(&out).spawn()?;
+            Ok(())
+        })
+    });
+
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("\n{e}");
+            wait_for_enter();
+            std::process::exit(1);
+        }
+        // The panic hook above already printed the message and waited.
+        Err(_) => std::process::exit(1),
     }
 }
 
@@ -165,11 +448,8 @@ mod tests {
 
     #[test]
     fn ordering_key_sorts_numerically_not_lexicographically() {
-        let mut saves = vec![
-            PathBuf::from("base2.zip"),
-            PathBuf::from("base10.zip"),
-            PathBuf::from("base1.zip"),
-        ];
+        let mut saves =
+            vec![PathBuf::from("base2.zip"), PathBuf::from("base10.zip"), PathBuf::from("base1.zip")];
         saves.sort_by_key(|p| ordering_key(p));
         assert_eq!(
             saves,
@@ -182,5 +462,59 @@ mod tests {
         let mut saves = vec![PathBuf::from("zzz.zip"), PathBuf::from("aaa.zip")];
         saves.sort_by_key(|p| ordering_key(p));
         assert_eq!(saves, vec![PathBuf::from("aaa.zip"), PathBuf::from("zzz.zip")]);
+    }
+
+    #[test]
+    fn find_surface_matches_case_insensitively() {
+        let surfaces = vec!["nauvis".to_string(), "vulcanus".to_string()];
+        assert_eq!(find_surface("Vulcanus", &surfaces), Some("vulcanus"));
+    }
+
+    #[test]
+    fn find_surface_returns_none_for_no_match() {
+        let surfaces = vec!["nauvis".to_string()];
+        assert_eq!(find_surface("fulgora", &surfaces), None);
+    }
+
+    fn saves(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn parse_save_selection_all_is_case_insensitive() {
+        let s = saves(&["a.zip", "b.zip"]);
+        assert_eq!(parse_save_selection("ALL", &s), s);
+        assert_eq!(parse_save_selection("all", &s), s);
+    }
+
+    #[test]
+    fn parse_save_selection_by_index() {
+        let s = saves(&["a.zip", "b.zip", "c.zip"]);
+        assert_eq!(parse_save_selection("1,3", &s), vec![s[0].clone(), s[2].clone()]);
+    }
+
+    #[test]
+    fn parse_save_selection_by_index_tolerates_spaces_and_ignores_out_of_range() {
+        let s = saves(&["a.zip", "b.zip"]);
+        assert_eq!(parse_save_selection("1, 5", &s), vec![s[0].clone()]);
+    }
+
+    #[test]
+    fn parse_save_selection_by_name_filter() {
+        let s = saves(&["base1.zip", "base2.zip", "other.zip"]);
+        assert_eq!(parse_save_selection("base", &s), vec![s[0].clone(), s[1].clone()]);
+    }
+
+    #[test]
+    fn parse_save_selection_empty_input_selects_nothing() {
+        let s = saves(&["a.zip"]);
+        assert!(parse_save_selection("", &s).is_empty());
+        assert!(parse_save_selection("   ", &s).is_empty());
+    }
+
+    #[test]
+    fn parse_save_selection_filter_with_no_matches_is_empty() {
+        let s = saves(&["a.zip"]);
+        assert!(parse_save_selection("zzz", &s).is_empty());
     }
 }
