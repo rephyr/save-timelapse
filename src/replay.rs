@@ -184,6 +184,28 @@ where
     Ok(emitted)
 }
 
+/// Writes every surface `world` has at `tick`, one `.stfr` file each, named
+/// `frame_<index>_<surface>.stfr` -- the same shape the mod's own baseline
+/// output uses, and what `viewer::group_by_surface` expects in order to show
+/// more than one world. A surface with nothing on it at this tick (not yet
+/// built, or already abandoned) is skipped rather than writing an empty
+/// file.
+///
+/// Shared by `save-timelapse-replay --all-surfaces` and
+/// `save-timelapse-watch`, which both want every surface rather than picking
+/// one busiest.
+pub fn write_all_surfaces(world: &World, tick: u64, out: &Path, index: usize) -> io::Result<()> {
+    for surface in world.surface_names() {
+        let frame = world.to_frame(surface, tick);
+        if frame.entities.is_empty() && frame.tiles.is_empty() {
+            continue;
+        }
+        let path = out.join(format!("frame_{index:04}_{surface}.stfr"));
+        std::fs::write(&path, frame::write_binary(&frame.as_out()))?;
+    }
+    Ok(())
+}
+
 /// Apply one tick's events together, then clear the buffer for reuse rather
 /// than allocating a new one per tick.
 fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
@@ -423,5 +445,35 @@ mod tests {
         let emitted = run(&mut replay, dir.path(), &Options::default(), |_, _| count += 1).unwrap();
         assert_eq!(emitted, 1);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn write_all_surfaces_skips_an_empty_surface_and_names_the_rest() {
+        let mut world = crate::world::World::new();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            entities: vec![crate::frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }],
+            count: 1,
+            tiles: Vec::new(),
+        });
+        // vulcanus exists (an event referenced it) but has nothing on it yet,
+        // e.g. a platform not built out this early in the timeline.
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "vulcanus".to_string(),
+            entities: Vec::new(),
+            count: 0,
+            tiles: Vec::new(),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        write_all_surfaces(&world, 100, dir.path(), 7).unwrap();
+
+        let written: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
     }
 }
