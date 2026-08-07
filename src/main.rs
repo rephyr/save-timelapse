@@ -315,6 +315,18 @@ fn mod_source_dir() -> io::Result<PathBuf> {
     ))
 }
 
+/// Where a mode writes its output: a folder beside the running exe, so the
+/// result is easy to find regardless of where Factorio's own user data
+/// happens to live. Falls back to the current directory only if the exe's
+/// own path can't be determined, which realistically never happens.
+fn output_dir_next_to_exe(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(name)
+}
+
 /// `viewer` is a sibling binary, not a library this crate can call into
 /// directly (it depends on this one, not the other way around, and its
 /// `main` is a macroquad event loop besides), so launching it means finding
@@ -379,7 +391,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // every run: a shorter capture than last time can't leave stale,
     // higher-numbered frames behind for the viewer to mix in with current
     // data.
-    let out = user_dir.join("save-timelapse-frames");
+    let out = output_dir_next_to_exe("save-timelapse-frames");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -495,11 +507,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
         false,
     )?;
 
-    let out = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("frames");
+    let out = output_dir_next_to_exe("frames");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 

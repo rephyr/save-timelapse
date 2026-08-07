@@ -12,13 +12,40 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    color_for, entity_footprint_size, icon_path, icon_source_rect, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, PlayerTrack, ProgressBar,
-    RenderFrame, Timeline, TypeRegistry, LOD_CELL_TILES,
+    build_episodes, build_sites_per_frame, choose_lock, color_for, entity_footprint_size, icon_path,
+    icon_source_rect, synthetic_frame, synthetic_tiles, use_chunk_lod, BuildEpisode, Camera, CameraTransition,
+    DrawCallCounter, FrameSequence, LoadProgress, PlayerTrack, ProgressBar, RenderFrame, Timeline, TypeRegistry,
+    LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
 const PLAY_INTERVAL_SECS: f32 = 0.25; // ~4 frames/sec auto-play
+/// Grid cell size (in tiles) used to group newly built entities into
+/// separate auto-follow sites; one Factorio chunk, a convenient existing
+/// scale rather than a principled choice.
+const AUTO_FOLLOW_CLUSTER_CELL_TILES: f32 = 32.0;
+/// How far (in tiles) beyond an in-progress episode's current box a new
+/// addition can land and still count as the same project growing, when
+/// chaining per-frame sites into episodes. Deliberately larger than the
+/// cluster cell above: a base's next addition is rarely inside the exact
+/// box built so far, just somewhere near it.
+const AUTO_FOLLOW_MERGE_MARGIN_TILES: f32 = 48.0;
+/// How many consecutive frames of no new activity near an episode before
+/// it's considered finished, rather than paused mid-build. Measured in
+/// frames (whatever game-time interval was chosen at export), not real
+/// seconds.
+const AUTO_FOLLOW_QUIET_FRAMES: usize = 2;
+/// Floor on how tight auto-follow can zoom onto a single episode, so
+/// focusing on one small, isolated placement doesn't fill the screen with a
+/// single tile.
+const AUTO_FOLLOW_MIN_FOCUS_TILES: f32 = 32.0;
+/// How long, in real seconds, a camera move to a newly-locked episode
+/// takes -- matching TLBE (the most-downloaded Factorio timelapse mod)'s
+/// own camera transition model: a fixed-duration linear glide from
+/// wherever the camera currently is, started fresh whenever the locked-on
+/// episode changes, rather than an exponential approach. See
+/// `Camera::CameraTransition`.
+const AUTO_FOLLOW_TRANSITION_SECS: f32 = 3.0;
 /// Below this, a sprite is imperceptible and not worth a texture draw over a
 /// flat rect -- the zoom-based sprites/shapes split agreed back in the
 /// milestone-1 discussion.
@@ -54,6 +81,39 @@ fn window_conf() -> macroquad::conf::Conf {
         draw_call_index_capacity: BATCH_INDEX_CAPACITY,
         ..Default::default()
     }
+}
+
+/// Everything the draw loop tracks per world/surface: playback position,
+/// camera, and auto-follow state. A named struct rather than a growing
+/// tuple, since the fields are no longer few enough to keep straight
+/// positionally once auto-follow joined them.
+struct WorldView {
+    name: String,
+    sequence: FrameSequence,
+    camera: Camera,
+    /// Every construction project's full active lifetime across the whole
+    /// sequence, precomputed once at load -- see `viewer::build_episodes`.
+    episodes: Vec<BuildEpisode>,
+    follow: FollowState,
+}
+
+#[derive(Default)]
+struct FollowState {
+    enabled: bool,
+    /// Index into `WorldView::episodes` of whichever project the camera is
+    /// currently locked onto. Sticky by design (see `viewer::choose_lock`):
+    /// this only changes when the locked episode stops being active, not on
+    /// every frame a bigger or player-closer one happens to also be active.
+    locked: Option<usize>,
+    /// The `sequence` index `locked` was last recomputed for, so that only
+    /// happens when the displayed frame actually changes rather than every
+    /// rendered frame. `None` also serves as "recompute immediately," used
+    /// when follow is freshly toggled on.
+    last_index: Option<usize>,
+    /// The in-flight move to wherever `locked` currently points, if any.
+    /// `None` once a transition finishes, at which point the camera just
+    /// sits exactly on the target -- that's the "lock" in "lock on."
+    transition: Option<CameraTransition>,
 }
 
 struct Args {
@@ -370,11 +430,13 @@ async fn main() {
     // and then tabbing to nauvis with vulcanus's view still applied would be
     // disorienting, and each world's own frames are what its camera was
     // fitted to in the first place.
-    let mut worlds: Vec<(String, FrameSequence, Camera)> = loaded
+    let mut worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence)| {
             let camera = Camera::fit_frames(sequence.frames(), screen_width(), screen_height());
-            (name, sequence, camera)
+            let build_sites = build_sites_per_frame(sequence.frames(), AUTO_FOLLOW_CLUSTER_CELL_TILES);
+            let episodes = build_episodes(&build_sites, AUTO_FOLLOW_MERGE_MARGIN_TILES, AUTO_FOLLOW_QUIET_FRAMES);
+            WorldView { name, sequence, camera, episodes, follow: FollowState::default() }
         })
         .collect();
     let mut current = 0usize;
@@ -395,7 +457,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let (world_name, sequence, camera) = &mut worlds[current];
+        let WorldView { name: world_name, sequence, camera, episodes, follow } = &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let mouse: Vec2 = mouse_position().into();
@@ -412,9 +474,11 @@ async fn main() {
             if dragging_timeline {
                 sequence.goto(timeline.index_for_x(mouse.x, sequence.len()));
                 playing = false;
+                follow.enabled = false;
             } else {
                 let delta = mouse - last_mouse;
                 camera.offset -= delta / camera.pixels_per_tile();
+                follow.enabled = false;
             }
         }
         last_mouse = mouse;
@@ -425,27 +489,39 @@ async fn main() {
             camera.zoom *= if wheel_y > 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
             camera.zoom = camera.zoom.clamp(0.01, 50.0);
             camera.offset = before - (mouse - screen_center) / camera.pixels_per_tile();
+            follow.enabled = false;
         }
 
         if is_key_pressed(KeyCode::Right) || is_key_pressed(KeyCode::Period) {
             sequence.step_forward();
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Comma) {
             sequence.step_back();
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Home) {
             sequence.goto(0);
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::End) {
             sequence.goto(sequence.len() - 1);
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Space) {
             playing = !playing;
             play_accum = 0.0;
+        }
+        // Toggling on resets `last_index` to `None` so the very next
+        // iteration recomputes a target immediately, rather than waiting
+        // for `sequence`'s index to change again.
+        if is_key_pressed(KeyCode::F) {
+            follow.enabled = !follow.enabled;
+            follow.last_index = None;
         }
         // Doubling/halving rather than a linear step: matches how video
         // players commonly expose speed, and keeps the displayed value a
@@ -484,6 +560,50 @@ async fn main() {
                     playing = false;
                     play_accum = 0.0;
                     break;
+                }
+            }
+        }
+
+        // Only recomputes the lock when the displayed frame actually changed
+        // (a lookup against the precomputed `episodes`, not a diff), so this
+        // stays cheap regardless of play speed. `choose_lock` is sticky --
+        // it keeps the current lock as long as that episode is still
+        // active, so the camera holds on one project instead of retargeting
+        // every time the player touches something else. A new transition
+        // only starts when the lock actually changes, from wherever the
+        // camera currently is (mid-transition or already settled), the same
+        // way TLBE retargets its own camera; stepping the transition runs
+        // every rendered frame regardless, since that's what turns it into
+        // a glide instead of a sequence of jumps.
+        if follow.enabled {
+            let index = sequence.index();
+            if follow.last_index != Some(index) {
+                let tick = sequence.frames()[index].tick;
+                let players: Vec<Vec2> = player_track
+                    .positions_at(world_name, tick)
+                    .into_iter()
+                    .map(|(_, x, y)| Vec2::new(x, y))
+                    .collect();
+                let new_lock = choose_lock(episodes, index, &players, follow.locked);
+                if new_lock != follow.locked {
+                    if let Some(site) = new_lock.and_then(|i| episodes.get(i)).map(|e| e.site) {
+                        let end = Camera::fit_bounds(
+                            site.center,
+                            site.half_extent * 2.0,
+                            screen_width(),
+                            screen_height(),
+                            AUTO_FOLLOW_MIN_FOCUS_TILES,
+                        );
+                        follow.transition = Some(CameraTransition::new(*camera, end, AUTO_FOLLOW_TRANSITION_SECS));
+                    }
+                    follow.locked = new_lock;
+                }
+                follow.last_index = Some(index);
+            }
+            if let Some(transition) = &mut follow.transition {
+                *camera = transition.step(get_frame_time());
+                if transition.is_finished() {
+                    follow.transition = None;
                 }
             }
         }
@@ -598,7 +718,7 @@ async fn main() {
         let total_items = frame.entities.len() + frame.tiles.len();
         draw_text(
             &format!(
-                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  {} fps  |  {:.1} ms",
+                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  follow {}  |  {} fps  |  {:.1} ms",
                 world_name,
                 current + 1,
                 world_count,
@@ -607,6 +727,7 @@ async fn main() {
                 frame.count,
                 frame.tiles.len(),
                 camera.zoom,
+                if follow.enabled { "on" } else { "off" },
                 get_fps(),
                 get_frame_time() * 1000.0,
             ),
@@ -649,8 +770,9 @@ async fn main() {
         let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({play_speed}x)  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub{tab_hint}",
-                if playing { "pause" } else { "play" }
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({play_speed}x)  |  s toggles sprites, l toggles LOD  |  f follows construction ({})  |  drag the bar below to scrub{tab_hint}",
+                if playing { "pause" } else { "play" },
+                if follow.enabled { "on" } else { "off" },
             ),
             10.0,
             64.0,

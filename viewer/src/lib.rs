@@ -8,6 +8,7 @@
 //! exactly as before this split -- `main.rs` needed no import changes.
 
 mod camera;
+mod construction;
 mod draw_calls;
 mod loading;
 mod player_track;
@@ -16,7 +17,10 @@ mod registry;
 mod render_frame;
 mod sprites;
 
-pub use camera::{entity_footprint_size, Camera, Timeline, BASE_PIXELS_PER_TILE};
+pub use camera::{entity_footprint_size, Camera, CameraTransition, Timeline, BASE_PIXELS_PER_TILE};
+pub use construction::{
+    build_episodes, build_sites_per_frame, choose_lock, cluster_new_construction, BuildEpisode, BuildSite,
+};
 pub use draw_calls::DrawCallCounter;
 pub use loading::{
     frame_paths, group_by_surface, load_frame, load_sequence, order_by_tick, synthetic_frame,
