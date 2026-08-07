@@ -35,7 +35,7 @@ For ongoing factories, enable live capture once and the mod records only increme
 
 ## Screenshots
 
-> **TODO:** Add screenshots and GIFs before the first public release.
+> **TODO:** Add screenshots and GIFs 
 
 - Overview of a megabase
 - Timeline scrubbing
