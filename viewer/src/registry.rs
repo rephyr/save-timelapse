@@ -208,6 +208,31 @@ pub fn is_resource(name: &str) -> bool {
     )
 }
 
+/// Entity types confirmed safe to rotate: a flat, top-down icon (visibly
+/// directional, like a belt's chevrons) rather than a stylized oblique-angle
+/// render (a fixed 3D camera perspective, like a chest, lab, or drill's).
+/// Rotating a flat icon conveys the entity's real facing; rotating an
+/// oblique one just spins that fixed camera angle around and looks wrong
+/// regardless of the angle used, confirmed by directly inspecting the icon
+/// files for both kinds.
+///
+/// An allowlist rather than a denylist deliberately: most Factorio entity
+/// icons are the oblique, don't-rotate kind (confirmed against everything
+/// checked so far), so a denylist would need to name nearly everything,
+/// while this only needs to grow one confirmed-good entry at a time. Add to
+/// it once an entity's rotated icon is checked and looks right; anything not
+/// listed renders unrotated by default, same as before this feature existed.
+const ALWAYS_ROTATE: &[&str] = &[
+    "transport-belt",
+    "fast-transport-belt",
+    "express-transport-belt",
+    "turbo-transport-belt",
+];
+
+pub fn is_rotation_allowed(name: &str) -> bool {
+    ALWAYS_ROTATE.contains(&name)
+}
+
 /// Deterministic name -> color, so a given entity type is always the same
 /// color across runs with nothing to curate as new Factorio types show up.
 pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
@@ -290,6 +315,25 @@ mod tests {
         }
         for name in ["transport-belt", "assembling-machine-1", "pumpjack"] {
             assert!(!is_resource(name), "{name} is a real building, not a resource deposit");
+        }
+    }
+
+    #[test]
+    fn is_rotation_allowed_recognizes_flat_icon_belts_not_oblique_ones() {
+        for name in ["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"] {
+            assert!(is_rotation_allowed(name), "{name}'s icon is flat and top-down, confirmed safe to rotate");
+        }
+        for name in [
+            "inserter",
+            "assembling-machine-1",
+            "chemical-plant",
+            "stone-furnace",
+            "iron-chest",
+            "lab",
+            "electric-mining-drill",
+            "pumpjack",
+        ] {
+            assert!(!is_rotation_allowed(name), "{name} is not on the curated allowlist");
         }
     }
 

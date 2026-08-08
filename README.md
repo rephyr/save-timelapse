@@ -144,9 +144,25 @@ Current features:
 - Player position marker
 - Camera auto-follow (on by default, `f` to toggle off): gradually pans and zooms out to keep the whole base in frame as it grows, the way TLBE's own camera does
 - Sprite rendering
+- Entity rotation (belts only for now, see the known limitation below)
 - Flat-color LOD rendering
 - Parallel loading
 - Progress indicator
+
+> **Known limitation:** rotation only renders for entities on a small,
+> curated allowlist (currently just the transport belt tiers), rather than
+> for every entity by default. Most Factorio icons are stylized
+> oblique-angle renders (a fixed 3D-ish camera perspective) rather than a
+> flat top-down one, so rotating the whole icon just spins that fixed camera
+> angle around and looks wrong regardless of the angle used; a belt's icon,
+> by contrast, is flat and top-down, so rotating it looks correct. The
+> allowlist grows as more entities are checked and confirmed to look right
+> rotated. Separately, even an allowlisted entity only rotates if its
+> footprint is square: Factorio reports a rotated rectangular entity's
+> footprint already swapped for the current direction, with no way to
+> recover the original, unrotated dimensions from what's captured, so
+> rotating the drawn box on top of that would misalign it from the entity's
+> real footprint instead of fixing it.
 
 ---
 
@@ -191,7 +207,7 @@ Video export moved out of this release see v1.0.
 ### v0.3
 
 - [x] Fix terrain being redundantly re-included in every frame instead of captured once (terrain is now captured to its own one-time file per surface instead of being duplicated into every replayed frame)
-- [ ] Entity rotation tracking (the wire format already carries a direction byte per entity, but rendering ignores it)
+- [x] Entity rotation tracking (square-footprint entities render rotated; see the known limitation in the Viewer section for non-square ones)
 - [ ] Entity upgrade/change tracking
 - [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)
 - [ ] Robust interrupted capture recovery (beyond today's manual `/timelapse-reset-capture`)

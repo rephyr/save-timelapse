@@ -12,10 +12,10 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    color_for, entity_footprint_size, growing_bounds_per_frame, icon_path, icon_source_rect, synthetic_frame,
-    synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds,
-    LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry,
-    LOD_CELL_TILES,
+    color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, growing_bounds_per_frame,
+    icon_path, icon_source_rect, is_rotation_allowed, synthetic_frame, synthetic_tiles, use_chunk_lod, Camera,
+    CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, LoadProgress, LodCell, PlayerTrack,
+    ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -359,7 +359,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
 // ---------------------------------------------------------------------------
 // Drawing
 
-fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Sprite>) {
+fn draw_entity(center: Vec2, size: Vec2, rotation: f32, color: Color, sprite: Option<&Sprite>) {
     let top_left = center - size / 2.0;
     match sprite {
         Some(sprite) => draw_texture_ex(
@@ -370,10 +370,17 @@ fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Sprite>) 
             DrawTextureParams {
                 dest_size: Some(size),
                 source: Some(sprite.icon_rect),
+                rotation,
                 ..Default::default()
             },
         ),
-        None => draw_rectangle(top_left.x, top_left.y, size.x, size.y, color),
+        None => draw_rectangle_ex(
+            center.x,
+            center.y,
+            size.x,
+            size.y,
+            DrawRectangleParams { rotation, offset: Vec2::splat(0.5), color },
+        ),
     }
 }
 
@@ -799,20 +806,22 @@ async fn main() {
             for run in &frame.entity_runs {
                 let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
                 let color = registry.entity_color(run.type_id);
+                let rotation_allowed = is_rotation_allowed(registry.name(run.type_id));
                 let mut drawn = 0;
                 for entity in &frame.entities[run.range()] {
-                    let half_w = entity.w as f32 / 2.0;
-                    let half_h = entity.h as f32 / 2.0;
-                    if entity.x + half_w < view_min.x
-                        || entity.x - half_w > view_max.x
-                        || entity.y + half_h < view_min.y
-                        || entity.y - half_h > view_max.y
+                    let (w, h) = (entity.w as u32, entity.h as u32);
+                    let half = entity_cull_half_extents(w, h, entity.d, rotation_allowed);
+                    if entity.x + half.x < view_min.x
+                        || entity.x - half.x > view_max.x
+                        || entity.y + half.y < view_min.y
+                        || entity.y - half.y > view_max.y
                     {
                         continue;
                     }
                     let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                    let size = entity_footprint_size(pixels_per_tile, entity.w as u32, entity.h as u32);
-                    draw_entity(screen, size, color, sprite);
+                    let size = entity_footprint_size(pixels_per_tile, w, h);
+                    let rotation = entity_rotation_radians(w, h, entity.d, rotation_allowed);
+                    draw_entity(screen, size, rotation, color, sprite);
                     drawn += 1;
                 }
                 counter.quads(sprite.map(|_| run.type_id), drawn);

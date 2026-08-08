@@ -17,7 +17,10 @@ mod registry;
 mod render_frame;
 mod sprites;
 
-pub use camera::{entity_footprint_size, Camera, CameraTransition, Timeline, BASE_PIXELS_PER_TILE};
+pub use camera::{
+    entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition,
+    Timeline, BASE_PIXELS_PER_TILE,
+};
 pub use construction::{growing_bounds_per_frame, GrowingBounds};
 pub use draw_calls::DrawCallCounter;
 pub use loading::{
@@ -26,7 +29,7 @@ pub use loading::{
 };
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};
-pub use registry::{color_for, TypeId, TypeRegistry};
+pub use registry::{color_for, is_rotation_allowed, TypeId, TypeRegistry};
 pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, LOD_CELL_TILES,
     LOD_MAX_TILE_PIXELS,

@@ -47,9 +47,9 @@ pub struct RenderEntity {
     /// Factorio's largest prototypes are far under 255 tiles across.
     pub w: u8,
     pub h: u8,
-    /// Unused by the current flat-sprite drawing, kept because it costs
-    /// nothing here (it lands in existing padding) and rotation-aware
-    /// sprites would otherwise need a reload to recover it.
+    /// Factorio's raw 16-way direction byte (0 = north, clockwise in 22.5
+    /// degree steps), used to rotate square-footprint entities on screen.
+    /// See `entity_rotation_radians` in `camera.rs`.
     pub d: u8,
 }
 
