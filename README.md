@@ -1,5 +1,5 @@
 # Save Timelapse
-Save timelapse is a mod for Factorio.
+Save Timelapse is a Factorio mod and companion desktop application for creating interactive factory timelapses.
 
 > Build an interactive timelapse of your Factorio factory  from existing saves or while you play.
 
