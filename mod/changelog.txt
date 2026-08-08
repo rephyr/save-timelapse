@@ -1,4 +1,9 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.1
+Date: 2026-08-08
+  Bugfixes:
+    - Fixed terrain capture duplicating the entire captured terrain tile set into every frame during live capture replay. On a long capture this made every frame file huge and could crash the viewer loading them. Terrain is now captured once per surface instead of re-included per frame.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-08-08
   Features:
