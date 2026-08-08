@@ -125,6 +125,23 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
     }
 }
 
+/// Where `surface`'s one-time terrain snapshot lives, next to its
+/// `frame_*.stfr` files. Never matched by `frame_is_candidate` (its stem
+/// starts with `"terrain_"`, not `"frame_"`), even for a surface literally
+/// named "frame" or "terrain", so it can sit in the same directory without
+/// being picked up as an extra frame.
+pub fn terrain_path(dir: &Path, surface: &str) -> PathBuf {
+    dir.join(format!("terrain_{surface}.stfr"))
+}
+
+/// `surface`'s terrain layer, if this capture has one. Terrain capture being
+/// off, or an older capture predating this file, are the same "nothing to
+/// show" case `load_frame`'s missing-path check already handles, so this is
+/// a thin wrapper rather than a second error path.
+pub fn load_terrain(dir: &Path, surface: &str) -> Option<Frame> {
+    load_frame(&terrain_path(dir, surface))
+}
+
 /// Loads many frame files across every available CPU core instead of one at
 /// a time. Reading and parsing a `.stfr` file is pure, independent work with
 /// nothing shared until frames become `RenderFrame`s (which need a single
@@ -497,5 +514,34 @@ mod tests {
         let frames = load_sequence(dir.path()).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].tick, 22630009);
+    }
+
+    /// `terrain_<surface>.stfr` sits in the same directory as every
+    /// `frame_*.stfr`, so it must never be picked up as an extra frame, even
+    /// for a surface literally named "frame".
+    #[test]
+    fn terrain_files_are_not_mistaken_for_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("frame_0000_nauvis.stfr");
+        write_stub_frame(dir.path(), "frame_0000_nauvis.stfr", 0, "nauvis", 0);
+        write_stub_frame(dir.path(), "terrain_nauvis.stfr", 0, "nauvis", 0);
+        write_stub_frame(dir.path(), "terrain_frame.stfr", 0, "frame", 0);
+
+        assert_eq!(frame_paths(dir.path()).unwrap(), vec![frame]);
+    }
+
+    #[test]
+    fn load_terrain_reads_a_surfaces_terrain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_frame(dir.path(), "terrain_nauvis.stfr", 0, "nauvis", 3);
+
+        let frame = load_terrain(dir.path(), "nauvis").unwrap();
+        assert_eq!(frame.entities.len(), 3);
+    }
+
+    #[test]
+    fn load_terrain_is_none_when_the_surface_has_no_terrain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_terrain(dir.path(), "nauvis").is_none());
     }
 }

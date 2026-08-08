@@ -125,16 +125,9 @@ in a live capture.
 
 > **Known limitation:** with terrain capture on, removing landfill during
 > the tracked playthrough leaves an empty tile in the replay instead of
-> reverting to the water underneath. Fixing this properly needs a two-layer
-> tile model; tracked for a future release.
-
-> **Known issue:** with terrain capture on, every emitted frame re-includes
-> the *entire* terrain tile set captured in the baseline, not just what
-> changed. On a live capture that runs for a while, this can make every
-> frame file huge (hundreds of MB each) and cause the viewer to run out of
-> memory loading them in parallel. Same root cause as the landfill
-> limitation above (no separate layer for static terrain vs. placed floor);
-> until it's fixed, keep terrain capture off for long-running live captures.
+> reverting to the water underneath. Fixing this properly needs the mod to
+> capture what a removed placed-floor tile is replacing at removal time;
+> tracked for a future release.
 
 ---
 
@@ -197,7 +190,7 @@ Video export moved out of this release see v1.0.
 
 ### v0.3
 
-- [ ] Fix terrain being redundantly re-included in every frame instead of captured once (see the known issue above; causes huge frame files and can crash the viewer on long live captures with terrain on)
+- [x] Fix terrain being redundantly re-included in every frame instead of captured once (terrain is now captured to its own one-time file per surface instead of being duplicated into every replayed frame)
 - [ ] Entity rotation tracking (the wire format already carries a direction byte per entity, but rendering ignores it)
 - [ ] Entity upgrade/change tracking
 - [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)

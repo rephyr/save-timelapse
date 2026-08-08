@@ -395,6 +395,15 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
+    // Terrain is fixed the instant the baseline loads (see
+    // `World::terrain_frame`), so it is written once here rather than once
+    // per emitted frame like `replay::run`'s per-tick callback below does.
+    // No-op per surface with terrain capture off.
+    match &chosen_surface {
+        None => replay::write_all_terrain(&replay_state.world, replay_state.baseline.tick, &out)?,
+        Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
+    }
+
     // A straight copy, not a re-parse: the mod's raw log and what the
     // viewer reads are the exact same shape by design (see
     // src/player_log.rs), so there's nothing to convert. Absent entirely

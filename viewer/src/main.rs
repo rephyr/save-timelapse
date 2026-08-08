@@ -14,7 +14,8 @@ use save_timelapse::locate::locate_factorio;
 use viewer::{
     color_for, entity_footprint_size, growing_bounds_per_frame, icon_path, icon_source_rect, synthetic_frame,
     synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds,
-    LoadProgress, PlayerTrack, ProgressBar, RenderFrame, Timeline, TypeRegistry, LOD_CELL_TILES,
+    LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry,
+    LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -88,6 +89,11 @@ struct WorldView {
     /// growing, precomputed once at load -- see `viewer::growing_bounds_per_frame`.
     growing_bounds: Vec<Option<GrowingBounds>>,
     follow: FollowState,
+    /// This surface's natural-terrain layer, loaded once (not per frame:
+    /// terrain never changes after the baseline, see
+    /// `save_timelapse::world::World::terrain_frame`). `None` when terrain
+    /// capture was off, or this capture predates it.
+    terrain: Option<RenderFrame>,
 }
 
 #[derive(Default)]
@@ -194,7 +200,7 @@ async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: boo
 /// One timeline per surface, named, so the caller can switch between them
 /// (tab, in the running viewer) instead of only ever seeing whichever one
 /// happened to be busiest.
-async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence)> {
+async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence, Option<RenderFrame>)> {
     let mut last = Instant::now();
     let mut progress =
         LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
@@ -217,72 +223,86 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         None
     };
 
-    let worlds: Vec<(String, Vec<save_timelapse::frame::Frame>)> = if let Some(mut frame) = single {
-        if let Some(n) = args.synthetic_tile_count {
-            frame.tiles = synthetic_tiles(n);
-        }
-        vec![(frame.surface.clone(), vec![frame])]
-    } else {
-        let path = args.path.as_ref().expect("checked above");
-        println!("loading {path}");
-        let paths =
-            viewer::frame_paths(std::path::Path::new(path)).expect("failed to enumerate frames");
-
-        // Reading and parsing each file is independent work, so it happens
-        // across every available core rather than one file at a time -- on a
-        // real megabase capture this is the dominant cost of opening the
-        // viewer. Converting to a RenderFrame needs a single, consistently
-        // numbered TypeRegistry, so that part stays sequential below.
-        progress.total = paths.len();
-        progress.detail = format!(
-            "{} core(s)",
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-        );
-        let load = viewer::ParallelFrameLoad::start(paths);
-        let loaded = loop {
-            progress.done = load.done();
-            redraw_progress(&progress, &mut last, true).await;
-            if let Some(loaded) = load.poll() {
-                break loaded;
+    let worlds: Vec<(String, Vec<save_timelapse::frame::Frame>, Option<save_timelapse::frame::Frame>)> =
+        if let Some(mut frame) = single {
+            if let Some(n) = args.synthetic_tile_count {
+                frame.tiles = synthetic_tiles(n);
             }
-        };
-        progress.done = progress.total;
-        redraw_progress(&progress, &mut last, true).await;
+            // Synthetic/default-fixture loads have no on-disk directory to
+            // look for a terrain file in, and nothing produces one for them.
+            vec![(frame.surface.clone(), vec![frame], None)]
+        } else {
+            let path = args.path.as_ref().expect("checked above");
+            println!("loading {path}");
+            let path = std::path::Path::new(path);
+            let paths = viewer::frame_paths(path).expect("failed to enumerate frames");
 
-        // Grouped before converting, not after: the mod's raw baseline
-        // output writes every surface at the same tick, and grouping is
-        // what keeps all of them (one timeline per surface) instead of
-        // collapsing to whichever was busiest.
-        let mut grouped = viewer::group_by_surface(loaded);
-        if let Some(n) = args.synthetic_tile_count {
-            for (_, frames) in &mut grouped {
-                for frame in frames {
-                    frame.tiles = synthetic_tiles(n);
+            // Reading and parsing each file is independent work, so it happens
+            // across every available core rather than one file at a time -- on a
+            // real megabase capture this is the dominant cost of opening the
+            // viewer. Converting to a RenderFrame needs a single, consistently
+            // numbered TypeRegistry, so that part stays sequential below.
+            progress.total = paths.len();
+            progress.detail = format!(
+                "{} core(s)",
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            );
+            let load = viewer::ParallelFrameLoad::start(paths);
+            let loaded = loop {
+                progress.done = load.done();
+                redraw_progress(&progress, &mut last, true).await;
+                if let Some(loaded) = load.poll() {
+                    break loaded;
+                }
+            };
+            progress.done = progress.total;
+            redraw_progress(&progress, &mut last, true).await;
+
+            // Grouped before converting, not after: the mod's raw baseline
+            // output writes every surface at the same tick, and grouping is
+            // what keeps all of them (one timeline per surface) instead of
+            // collapsing to whichever was busiest.
+            let mut grouped = viewer::group_by_surface(loaded);
+            if let Some(n) = args.synthetic_tile_count {
+                for (_, frames) in &mut grouped {
+                    for frame in frames {
+                        frame.tiles = synthetic_tiles(n);
+                    }
                 }
             }
-        }
-        grouped
-    };
+
+            // A single frame file's terrain (if it even has one) would sit
+            // beside it in its parent directory, same as a real capture's.
+            let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+            grouped
+                .into_iter()
+                .map(|(name, frames)| {
+                    let terrain = viewer::load_terrain(terrain_dir, &name);
+                    (name, frames, terrain)
+                })
+                .collect()
+        };
 
     progress.phase = "converting frames";
     progress.done = 0;
-    progress.total = worlds.iter().map(|(_, frames)| frames.len()).sum();
+    progress.total = worlds.iter().map(|(_, frames, _)| frames.len()).sum();
     let mut result = Vec::with_capacity(worlds.len());
-    for (name, frames) in worlds {
+    for (name, frames, terrain) in worlds {
         let mut rendered = Vec::with_capacity(frames.len());
         for frame in frames {
             rendered.push(RenderFrame::from_frame(frame, registry));
             progress.done += 1;
             redraw_progress(&progress, &mut last, false).await;
         }
-        result.push((name, FrameSequence::new(rendered).expect("no valid frames found")));
+        let terrain = terrain.map(|frame| RenderFrame::from_frame(frame, registry));
+        result.push((name, FrameSequence::new(rendered).expect("no valid frames found"), terrain));
     }
     redraw_progress(&progress, &mut last, true).await;
 
     println!(
         "{} world(s) loaded ({} frame(s) total), {} distinct type(s)",
         result.len(),
-        result.iter().map(|(_, seq)| seq.len()).sum::<usize>(),
+        result.iter().map(|(_, seq, _)| seq.len()).sum::<usize>(),
         registry.len()
     );
     result
@@ -392,6 +412,75 @@ fn view_bounds(camera: &Camera, screen_center: Vec2) -> (Vec2, Vec2) {
     (min, max)
 }
 
+/// Full-detail tile drawing, extracted so it can run twice: once for a
+/// terrain backdrop (if loaded), once for the current frame's own placed
+/// floor drawn on top of it, matching how paving over grass looks in-game.
+#[allow(clippy::too_many_arguments)]
+fn draw_tile_layer(
+    tiles: &[RenderTile],
+    tile_runs: &[Run],
+    camera: &Camera,
+    screen_center: Vec2,
+    view_min: Vec2,
+    view_max: Vec2,
+    registry: &TypeRegistry,
+    sprites: &[Option<Sprite>],
+    use_sprites: bool,
+    counter: &mut DrawCallCounter,
+) {
+    let tile_size = camera.pixels_per_tile().max(1.0);
+    for run in tile_runs {
+        let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
+        let color = registry.tile_color(run.type_id);
+        let mut drawn = 0;
+        for tile in &tiles[run.range()] {
+            // A tile at (x,y) covers [x,x+1) x [y,y+1).
+            let (x, y) = (tile.x as f32, tile.y as f32);
+            if x + 1.0 < view_min.x || x > view_max.x || y + 1.0 < view_min.y || y > view_max.y {
+                continue;
+            }
+            let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
+            draw_tile(screen, tile_size, color, sprite);
+            drawn += 1;
+        }
+        counter.quads(sprite.map(|_| run.type_id), drawn);
+    }
+}
+
+/// The chunk-LOD counterpart of `draw_tile_layer`, for the same terrain
+/// backdrop + current-frame-on-top drawing order at extreme zoom-out.
+#[allow(clippy::too_many_arguments)]
+fn draw_tile_lod_layer(
+    tile_lod: &[LodCell],
+    tile_lod_runs: &[Run],
+    camera: &Camera,
+    screen_center: Vec2,
+    view_min: Vec2,
+    view_max: Vec2,
+    registry: &TypeRegistry,
+    counter: &mut DrawCallCounter,
+) {
+    let chunk_px = camera.pixels_per_tile() * LOD_CELL_TILES as f32;
+    for run in tile_lod_runs {
+        let color = registry.tile_color(run.type_id);
+        let mut drawn = 0;
+        for cell in &tile_lod[run.range()] {
+            let origin = cell.world_origin();
+            if origin.x + (LOD_CELL_TILES as f32) < view_min.x
+                || origin.x > view_max.x
+                || origin.y + (LOD_CELL_TILES as f32) < view_min.y
+                || origin.y > view_max.y
+            {
+                continue;
+            }
+            let screen = camera.world_to_screen(origin, screen_center);
+            draw_lod_cell(screen, chunk_px, color);
+            drawn += 1;
+        }
+        counter.quads(None, drawn);
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let args = parse_args();
@@ -426,8 +515,9 @@ async fn main() {
     // fitted to in the first place.
     let mut worlds: Vec<WorldView> = loaded
         .into_iter()
-        .map(|(name, sequence)| {
-            let camera = Camera::fit_frames(sequence.frames(), screen_width(), screen_height());
+        .map(|(name, sequence, terrain)| {
+            let camera =
+                Camera::fit_frames(sequence.frames(), terrain.as_ref(), screen_width(), screen_height());
             let growing_bounds = growing_bounds_per_frame(sequence.frames(), &registry);
             // On by default: opening straight into the fully-zoomed-out
             // whole-sequence fit (see `Camera::fit_frames` above) looks
@@ -437,7 +527,7 @@ async fn main() {
             // base actually starts. `f` still toggles it off for anyone who
             // wants full manual control from the start.
             let follow = FollowState { enabled: true, ..Default::default() };
-            WorldView { name, sequence, camera, growing_bounds, follow }
+            WorldView { name, sequence, camera, growing_bounds, follow, terrain }
         })
         .collect();
     let mut current = 0usize;
@@ -458,7 +548,8 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let WorldView { name: world_name, sequence, camera, growing_bounds, follow } = &mut worlds[current];
+        let WorldView { name: world_name, sequence, camera, growing_bounds, follow, terrain } =
+            &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let mouse: Vec2 = mouse_position().into();
@@ -628,25 +719,29 @@ async fn main() {
             // here: binning millions of items into chunks is itself too
             // slow to redo every rendered frame, which is exactly the cost
             // this path exists to avoid.
-            let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
-            for run in &frame.tile_lod_runs {
-                let color = registry.tile_color(run.type_id);
-                let mut drawn = 0;
-                for cell in &frame.tile_lod[run.range()] {
-                    let origin = cell.world_origin();
-                    if origin.x + (LOD_CELL_TILES as f32) < view_min.x
-                        || origin.x > view_max.x
-                        || origin.y + (LOD_CELL_TILES as f32) < view_min.y
-                        || origin.y > view_max.y
-                    {
-                        continue;
-                    }
-                    let screen = camera.world_to_screen(origin, screen_center);
-                    draw_lod_cell(screen, chunk_px, color);
-                    drawn += 1;
-                }
-                counter.quads(None, drawn);
+            if let Some(terrain) = terrain.as_ref() {
+                draw_tile_lod_layer(
+                    &terrain.tile_lod,
+                    &terrain.tile_lod_runs,
+                    camera,
+                    screen_center,
+                    view_min,
+                    view_max,
+                    &registry,
+                    &mut counter,
+                );
             }
+            draw_tile_lod_layer(
+                &frame.tile_lod,
+                &frame.tile_lod_runs,
+                camera,
+                screen_center,
+                view_min,
+                view_max,
+                &registry,
+                &mut counter,
+            );
+            let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
             for run in &frame.entity_lod_runs {
                 let color = registry.entity_color(run.type_id);
                 let mut drawn = 0;
@@ -666,29 +761,40 @@ async fn main() {
                 counter.quads(None, drawn);
             }
         } else {
-            // Floor first, so buildings drawn afterward sit on top of it.
+            // Terrain backdrop first (if loaded), then this frame's own
+            // placed floor on top of it, then buildings on top of that,
+            // matching how paving over grass looks in-game.
             //
             // Iterating runs rather than raw items is what keeps the batch
             // intact: the sprite and color are decided once per type, so
             // macroquad sees a long stretch of quads sharing one texture
             // instead of a texture change per item.
-            let tile_size = pixels_per_tile.max(1.0);
-            for run in &frame.tile_runs {
-                let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
-                let color = registry.tile_color(run.type_id);
-                let mut drawn = 0;
-                for tile in &frame.tiles[run.range()] {
-                    // A tile at (x,y) covers [x,x+1) x [y,y+1).
-                    let (x, y) = (tile.x as f32, tile.y as f32);
-                    if x + 1.0 < view_min.x || x > view_max.x || y + 1.0 < view_min.y || y > view_max.y {
-                        continue;
-                    }
-                    let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
-                    draw_tile(screen, tile_size, color, sprite);
-                    drawn += 1;
-                }
-                counter.quads(sprite.map(|_| run.type_id), drawn);
+            if let Some(terrain) = terrain.as_ref() {
+                draw_tile_layer(
+                    &terrain.tiles,
+                    &terrain.tile_runs,
+                    camera,
+                    screen_center,
+                    view_min,
+                    view_max,
+                    &registry,
+                    &sprites,
+                    use_sprites,
+                    &mut counter,
+                );
             }
+            draw_tile_layer(
+                &frame.tiles,
+                &frame.tile_runs,
+                camera,
+                screen_center,
+                view_min,
+                view_max,
+                &registry,
+                &sprites,
+                use_sprites,
+                &mut counter,
+            );
 
             for run in &frame.entity_runs {
                 let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
@@ -713,10 +819,17 @@ async fn main() {
             }
         }
 
-        let total_items = frame.entities.len() + frame.tiles.len();
+        // `{} tiles` stays scoped to this frame's own placed floor (unchanged
+        // meaning: how much is this frame doing), with the terrain backdrop
+        // (loaded once, not per frame) called out separately rather than
+        // folded into the same number.
+        let terrain_tiles = terrain.as_ref().map_or(0, |t| t.tiles.len());
+        let terrain_suffix =
+            if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
+        let total_items = frame.entities.len() + frame.tiles.len() + terrain_tiles;
         draw_text(
             &format!(
-                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  follow {}  |  {} fps  |  {:.1} ms",
+                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles{terrain_suffix}  |  zoom {:.2}x  |  follow {}  |  {} fps  |  {:.1} ms",
                 world_name,
                 current + 1,
                 world_count,
