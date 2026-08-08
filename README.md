@@ -33,6 +33,25 @@ For ongoing factories, enable live capture once and the mod records only increme
 
 ---
 
+## Installation
+
+Two separate downloads, depending on what you want to do.
+
+**The tool** (`save-timelapse.exe` + `viewer.exe`): needed either way, since this is what builds and shows the timelapse.
+
+1. Download the latest release from [GitHub Releases](https://github.com/rephyr/save-timelapse/releases)
+2. Unzip `save-timelapse.exe` and `viewer.exe` into the same folder (the first launches the second, so they need to sit together)
+3. Run `save-timelapse.exe`
+
+**The mod**: only needed for live capture, not for building a timelapse from saves you already have.
+
+- Get it from the [Factorio mod portal](https://mods.factorio.com/mod/save-timelapse), or install it in-game via Settings > Mods > Install mods
+- Enable the `save-timelapse-live-capture` runtime setting to start recording
+
+No changes are made to your Factorio installation or mods folder unless you install the mod yourself.
+
+---
+
 ## Screenshots
 - Overview of the current state of the tool
 ![Tool overview](assets/save-timelapse-overview.PNG)
