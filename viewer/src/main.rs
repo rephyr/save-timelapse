@@ -12,13 +12,33 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    color_for, entity_footprint_size, icon_path, icon_source_rect, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, Camera, DrawCallCounter, FrameSequence, LoadProgress, PlayerTrack, ProgressBar,
-    RenderFrame, Timeline, TypeRegistry, LOD_CELL_TILES,
+    color_for, entity_footprint_size, growing_bounds_per_frame, icon_path, icon_source_rect, synthetic_frame,
+    synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds,
+    LoadProgress, PlayerTrack, ProgressBar, RenderFrame, Timeline, TypeRegistry, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
 const PLAY_INTERVAL_SECS: f32 = 0.25; // ~4 frames/sec auto-play
+/// Floor on how tight auto-follow can zoom in. Low rather than generous: the
+/// point is only to stop a single 1x1 entity (the very first thing ever
+/// placed, before a second one exists to give the box real size) from
+/// filling the screen -- by the time a real starter cluster exists (drill,
+/// furnace, a belt or two), its own natural extent is already bigger than
+/// this and the floor stops mattering. A high floor here was fighting the
+/// exact thing auto-follow is for: hugging the base as it actually is,
+/// starting from how small it actually starts.
+const AUTO_FOLLOW_MIN_FOCUS_TILES: f32 = 6.0;
+/// How much smaller than a bare edge-to-edge fit auto-follow zooms -- tight,
+/// unlike `fit_frames`'s own, more generous margin: the point of following
+/// is to hug the actual buildings closely, with the edge of the frame only
+/// slightly beyond the furthest one placed.
+const AUTO_FOLLOW_FIT_MARGIN: f32 = 0.92;
+/// How long, in real seconds, a camera move to the base's newly-grown extent
+/// takes -- matching TLBE (the most-downloaded Factorio timelapse mod)'s own
+/// camera transition model: a fixed-duration linear glide from wherever the
+/// camera currently is, started fresh whenever the tracked area grows,
+/// rather than an exponential approach. See `Camera::CameraTransition`.
+const AUTO_FOLLOW_TRANSITION_SECS: f32 = 1.5;
 /// Below this, a sprite is imperceptible and not worth a texture draw over a
 /// flat rect -- the zoom-based sprites/shapes split agreed back in the
 /// milestone-1 discussion.
@@ -54,6 +74,40 @@ fn window_conf() -> macroquad::conf::Conf {
         draw_call_index_capacity: BATCH_INDEX_CAPACITY,
         ..Default::default()
     }
+}
+
+/// Everything the draw loop tracks per world/surface: playback position,
+/// camera, and auto-follow state. A named struct rather than a growing
+/// tuple, since the fields are no longer few enough to keep straight
+/// positionally once auto-follow joined them.
+struct WorldView {
+    name: String,
+    sequence: FrameSequence,
+    camera: Camera,
+    /// The whole base's bounding box as of each frame, monotonically
+    /// growing, precomputed once at load -- see `viewer::growing_bounds_per_frame`.
+    growing_bounds: Vec<Option<GrowingBounds>>,
+    follow: FollowState,
+}
+
+#[derive(Default)]
+struct FollowState {
+    enabled: bool,
+    /// Whichever bounds the current (or last finished) transition is/was
+    /// headed towards, so a new one only starts once the tracked area
+    /// actually grows, not on every rendered frame.
+    target_bounds: Option<GrowingBounds>,
+    /// The in-flight move to `target_bounds`, if any. Deliberately left
+    /// running to completion rather than restarted on every frame the
+    /// tracked area happens to grow a little further: during active
+    /// building, the area can grow on nearly every displayed frame, and
+    /// restarting a multi-second glide that often meant it was constantly
+    /// interrupted a fraction of the way in, always chasing a target several
+    /// steps stale -- never actually centered or zoomed to the true current
+    /// extent. Waiting for one glide to finish before checking again means
+    /// it always catches up fully, straight to wherever the base currently
+    /// is, before starting the next one.
+    transition: Option<CameraTransition>,
 }
 
 struct Args {
@@ -370,11 +424,20 @@ async fn main() {
     // and then tabbing to nauvis with vulcanus's view still applied would be
     // disorienting, and each world's own frames are what its camera was
     // fitted to in the first place.
-    let mut worlds: Vec<(String, FrameSequence, Camera)> = loaded
+    let mut worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence)| {
             let camera = Camera::fit_frames(sequence.frames(), screen_width(), screen_height());
-            (name, sequence, camera)
+            let growing_bounds = growing_bounds_per_frame(sequence.frames(), &registry);
+            // On by default: opening straight into the fully-zoomed-out
+            // whole-sequence fit (see `Camera::fit_frames` above) looks
+            // exactly like broken auto-follow -- big from the very first
+            // frame, never zooming out further -- unless auto-follow is
+            // already active to immediately pull it in to how small the
+            // base actually starts. `f` still toggles it off for anyone who
+            // wants full manual control from the start.
+            let follow = FollowState { enabled: true, ..Default::default() };
+            WorldView { name, sequence, camera, growing_bounds, follow }
         })
         .collect();
     let mut current = 0usize;
@@ -395,7 +458,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let (world_name, sequence, camera) = &mut worlds[current];
+        let WorldView { name: world_name, sequence, camera, growing_bounds, follow } = &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let mouse: Vec2 = mouse_position().into();
@@ -412,9 +475,11 @@ async fn main() {
             if dragging_timeline {
                 sequence.goto(timeline.index_for_x(mouse.x, sequence.len()));
                 playing = false;
+                follow.enabled = false;
             } else {
                 let delta = mouse - last_mouse;
                 camera.offset -= delta / camera.pixels_per_tile();
+                follow.enabled = false;
             }
         }
         last_mouse = mouse;
@@ -425,27 +490,44 @@ async fn main() {
             camera.zoom *= if wheel_y > 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
             camera.zoom = camera.zoom.clamp(0.01, 50.0);
             camera.offset = before - (mouse - screen_center) / camera.pixels_per_tile();
+            follow.enabled = false;
         }
 
         if is_key_pressed(KeyCode::Right) || is_key_pressed(KeyCode::Period) {
             sequence.step_forward();
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Comma) {
             sequence.step_back();
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Home) {
             sequence.goto(0);
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::End) {
             sequence.goto(sequence.len() - 1);
             playing = false;
+            follow.enabled = false;
         }
         if is_key_pressed(KeyCode::Space) {
             playing = !playing;
             play_accum = 0.0;
+        }
+        // Toggling on clears both `target_bounds` and `transition`, so the
+        // very next iteration always starts a brand new glide from wherever
+        // the camera currently is (possibly just moved by the manual
+        // controls that disengaged follow in the first place) rather than
+        // either resuming a stale in-flight transition or, if the current
+        // frame's bounds happen to match whatever was last targeted before,
+        // seeing "no change" and doing nothing at all.
+        if is_key_pressed(KeyCode::F) {
+            follow.enabled = !follow.enabled;
+            follow.target_bounds = None;
+            follow.transition = None;
         }
         // Doubling/halving rather than a linear step: matches how video
         // players commonly expose speed, and keeps the displayed value a
@@ -484,6 +566,42 @@ async fn main() {
                     playing = false;
                     play_accum = 0.0;
                     break;
+                }
+            }
+        }
+
+        // A new transition only starts once any previous one has finished
+        // (`follow.transition.is_none()`) *and* the currently displayed
+        // frame's bounds differ from wherever that last glide was headed.
+        // Checking "is a transition already running" first, not just "did
+        // the target change", matters because during active building the
+        // tracked area can grow on nearly every displayed frame -- without
+        // this, a multi-frame-per-second retarget rate would restart the
+        // glide before it ever got there, permanently chasing a target
+        // several steps stale rather than ever actually landing on the
+        // true current extent. Waiting it out means every glide always
+        // finishes fully caught up before the next one begins.
+        if follow.enabled {
+            if follow.transition.is_none() {
+                if let Some(bounds) = growing_bounds[sequence.index()] {
+                    if follow.target_bounds != Some(bounds) {
+                        let end = Camera::fit_bounds(
+                            bounds.center,
+                            bounds.half_extent * 2.0,
+                            screen_width(),
+                            screen_height(),
+                            AUTO_FOLLOW_MIN_FOCUS_TILES,
+                            AUTO_FOLLOW_FIT_MARGIN,
+                        );
+                        follow.transition = Some(CameraTransition::new(*camera, end, AUTO_FOLLOW_TRANSITION_SECS));
+                        follow.target_bounds = Some(bounds);
+                    }
+                }
+            }
+            if let Some(transition) = &mut follow.transition {
+                *camera = transition.step(get_frame_time());
+                if transition.is_finished() {
+                    follow.transition = None;
                 }
             }
         }
@@ -598,7 +716,7 @@ async fn main() {
         let total_items = frame.entities.len() + frame.tiles.len();
         draw_text(
             &format!(
-                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  {} fps  |  {:.1} ms",
+                "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles  |  zoom {:.2}x  |  follow {}  |  {} fps  |  {:.1} ms",
                 world_name,
                 current + 1,
                 world_count,
@@ -607,6 +725,7 @@ async fn main() {
                 frame.count,
                 frame.tiles.len(),
                 camera.zoom,
+                if follow.enabled { "on" } else { "off" },
                 get_fps(),
                 get_frame_time() * 1000.0,
             ),
@@ -649,8 +768,9 @@ async fn main() {
         let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
         draw_text(
             &format!(
-                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({play_speed}x)  |  s toggles sprites, l toggles LOD  |  drag the bar below to scrub{tab_hint}",
-                if playing { "pause" } else { "play" }
+                "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({play_speed}x)  |  s toggles sprites, l toggles LOD  |  f auto-follows the growing base ({})  |  drag the bar below to scrub{tab_hint}",
+                if playing { "pause" } else { "play" },
+                if follow.enabled { "on" } else { "off" },
             ),
             10.0,
             64.0,

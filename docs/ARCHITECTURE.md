@@ -169,7 +169,7 @@ floor types.
 A surface is exported when it is nauvis or contains at least one entity owned
 by the player force. A manifest listing exported surfaces accompanies each
 set. Unlike the frame body, the manifest (`frame_<tick>_manifest.json`) and
-the live-capture baseline manifest (`baseline_<session>.json`, see "Live
+the live-capture baseline manifest (`<session>/baseline.json`, see "Live
 capture and replay" below) stay plain JSON: they hold one record per
 *surface*, not per entity, so they're tiny, written once, and worth keeping
 human readable for debugging the handshake between the mod and the Rust side.
@@ -206,35 +206,39 @@ The second way to build a timelapse, and the finer-grained one. The mod
 snapshots a save **once**, then logs only what changes; the Rust side
 reassembles any moment by replaying that log over the baseline.
 
-    <script-output>/save-timelapse/
-        baseline_<session>.json                 tick + surfaces the baseline covers
-        frame_<session>_<tick>_<surface>.stfr   the baseline itself, one per surface
-        events_<session>_<start_tick>.stev      append-only, one segment per timeline
+    <script-output>/save-timelapse/<session>/
+        baseline.json                 tick + surfaces the baseline covers
+        frame_<tick>_<surface>.stfr   the baseline itself, one per surface
+        events_<start_tick>.stev      append-only, one segment per timeline
+        players.jsonl                 optional, sampled player positions
 
-`baseline_<session>.json` is written last, so its existence means that
+`<session>/baseline.json` is written last, so its existence means that
 playthrough's baseline finished. It is the handshake: replay reads it to
 learn which frame files to seed from.
 
-`<session>` (an 8 digit hex tag) identifies which playthrough a file belongs
-to: `script-output/save-timelapse/` is one folder shared by every save that
-ever turns capture on, and `game.tick` restarts from 0 for each one, so a
-bare tick cannot tell two playthroughs' files apart. `control.lua`'s
-`compute_session_id` uses the map's terrain seed (`map_gen_settings.seed`),
-deterministic across save/reload of one playthrough and different across
-different ones with overwhelming probability, needing no new in-game UI to
-collect (unlike a save name, which mods have no API access to at all). The
-Rust side's `replay::discover_sessions` lists every tagged baseline it
-finds; `save-timelapse.exe` auto-picks the only one when there's just one,
-and otherwise asks which playthrough to build the timelapse from — the same
-reasoning as picking which save files belong to one playthrough in the
+`<session>` (an 8 digit hex folder name) identifies which playthrough these
+files belong to: `script-output/save-timelapse/` is shared by every save
+that ever turns capture on, and `game.tick` restarts from 0 for each one, so
+a bare tick cannot tell two playthroughs' files apart -- and unlike a bare
+filename, two playthroughs no longer share one directory to get confused in
+to begin with, since each gets its own. `control.lua`'s `compute_session_id`
+uses the map's terrain seed (`map_gen_settings.seed`), deterministic across
+save/reload of one playthrough and different across different ones with
+overwhelming probability, needing no new in-game UI to collect (unlike a
+save name, which mods have no API access to at all). The Rust side's
+`replay::discover_sessions` lists every session folder with a finished
+baseline; `save-timelapse.exe` auto-picks the only one when there's just
+one, and otherwise asks which playthrough to build the timelapse from — the
+same reasoning as picking which save files belong to one playthrough in the
 from-saves flow, just applied to live capture instead.
 
-A save whose capture state predates this tagging has no session id yet
-(`nil` in `storage.timelapse_capture`) and keeps writing the old, untagged
-`baseline.json`/`events_<tick>.stev`/`frame_<tick>_<surface>.stfr` names
-until `/timelapse-reset-capture` clears its state; the Rust side simply
-never matches those untagged filenames, so they sit inert rather than
-colliding with (or crashing) a properly tagged session's replay.
+A save whose capture state predates this folder-per-session scheme has no
+session id yet (`nil` in `storage.timelapse_capture`) and keeps writing the
+old, untagged `baseline.json`/`events_<tick>.stev`/`frame_<tick>_<surface>.stfr`
+names flat in the shared top-level folder until `/timelapse-reset-capture`
+clears its state; the Rust side simply never descends into anything but a
+session subfolder, so a leftover flat file sits inert rather than colliding
+with (or crashing) a properly tagged session's replay.
 
 The baseline is taken once per save, not periodically, and **synchronously**
 in a single tick — the game visibly freezes for its duration (measured on a
@@ -287,7 +291,7 @@ synchronous one.
 
 ### Event format
 
-Also a custom binary format (`events_<session>_<start_tick>.stev`), for the same reason
+Also a custom binary format (`<session>/events_<start_tick>.stev`), for the same reason
 as the frame format: this is written incrementally, live, as the player
 plays, so the cost of formatting and re-parsing text for every single
 construction event is a cost paid during real gameplay, not just at export

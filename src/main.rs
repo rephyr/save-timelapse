@@ -17,10 +17,14 @@ use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
 use save_timelapse::replay::{self, Options};
 
-/// One frame per minute of game time for the live-capture flow: a
-/// reasonable middle ground that isn't trying to be clever about how long
-/// the capture actually is.
-const INTERVAL: u64 = 3600;
+/// Default game time per frame during live-capture replay, asked about
+/// interactively so a longer playthrough can trade a larger export for
+/// smoother, more finely-spaced playback.
+const DEFAULT_FRAME_SECONDS: u64 = 60;
+
+/// Factorio's normal game speed: one real second is 60 ticks.
+const TICKS_PER_SECOND: u64 = 60;
+
 const MAX_FRAMES: usize = 100_000;
 
 enum Mode {
@@ -133,6 +137,31 @@ fn ask_yes_no(question: &str, default: bool) -> io::Result<bool> {
         match parse_yes_no(&input) {
             Some(answer) => return Ok(answer),
             None => println!("Please answer y or n.\n"),
+        }
+    }
+}
+
+/// `None` for anything that isn't a positive whole number, including empty
+/// input, matching `parse_yes_no`'s convention of leaving the "blank means
+/// default" decision to the caller.
+fn parse_frame_seconds(input: &str) -> Option<u64> {
+    let seconds: u64 = input.trim().parse().ok()?;
+    (seconds > 0).then_some(seconds)
+}
+
+fn ask_frame_seconds(default: u64) -> io::Result<u64> {
+    loop {
+        let input = prompt(&format!(
+            "How much game time should each frame represent? Fewer seconds means more \
+             frames, spaced closer together: smoother scrubbing and playback, at the cost of \
+             a larger export and slower load in the viewer. Enter seconds [default {default}]:"
+        ))?;
+        if input.trim().is_empty() {
+            return Ok(default);
+        }
+        match parse_frame_seconds(&input) {
+            Some(seconds) => return Ok(seconds),
+            None => println!("Please enter a whole number of seconds greater than 0.\n"),
         }
     }
 }
@@ -286,6 +315,18 @@ fn mod_source_dir() -> io::Result<PathBuf> {
     ))
 }
 
+/// Where a mode writes its output: a folder beside the running exe, so the
+/// result is easy to find regardless of where Factorio's own user data
+/// happens to live. Falls back to the current directory only if the exe's
+/// own path can't be determined, which realistically never happens.
+fn output_dir_next_to_exe(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(name)
+}
+
 /// `viewer` is a sibling binary, not a library this crate can call into
 /// directly (it depends on this one, not the other way around, and its
 /// `main` is a macroquad event loop besides), so launching it means finding
@@ -344,12 +385,13 @@ fn run_live_capture() -> io::Result<PathBuf> {
     println!("surfaces: {}\n", surfaces.join(", "));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;
+    let frame_seconds = ask_frame_seconds(DEFAULT_FRAME_SECONDS)?;
 
     // Fixed and owned entirely by this tool, so it's safe to clear before
     // every run: a shorter capture than last time can't leave stale,
     // higher-numbered frames behind for the viewer to mix in with current
     // data.
-    let out = user_dir.join("save-timelapse-frames");
+    let out = output_dir_next_to_exe("save-timelapse-frames");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -357,19 +399,19 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // viewer reads are the exact same shape by design (see
     // src/player_log.rs), so there's nothing to convert. Absent entirely
     // is normal, not an error -- e.g. nobody was connected during capture.
-    let players_log = capture.join(format!("players_{:08x}.jsonl", chosen.session_id));
+    let players_log = chosen.session_dir.join("players.jsonl");
     if players_log.exists() {
         std::fs::copy(&players_log, out.join("players.jsonl"))?;
     }
 
-    let options = Options { interval: INTERVAL, max_frames: MAX_FRAMES };
+    let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
     let mut written = 0usize;
     let mut error: Option<io::Error> = None;
 
     let emitted = match &chosen_surface {
         None => {
-            println!("rendering every surface, one frame per {INTERVAL} tick(s)\n");
-            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
+            println!("rendering every surface, one frame per {frame_seconds}s of game time\n");
+            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
@@ -385,8 +427,8 @@ fn run_live_capture() -> io::Result<PathBuf> {
             })?
         }
         Some(name) => {
-            println!("rendering surface {name}, one frame per {INTERVAL} tick(s)\n");
-            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
+            println!("rendering surface {name}, one frame per {frame_seconds}s of game time\n");
+            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
@@ -465,11 +507,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
         false,
     )?;
 
-    let out = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("frames");
+    let out = output_dir_next_to_exe("frames");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -592,6 +630,20 @@ mod tests {
         assert_eq!(parse_yes_no(""), None);
         assert_eq!(parse_yes_no("sure"), None);
         assert_eq!(parse_yes_no("maybe"), None);
+    }
+
+    #[test]
+    fn parse_frame_seconds_accepts_positive_whole_numbers() {
+        assert_eq!(parse_frame_seconds("60"), Some(60));
+        assert_eq!(parse_frame_seconds(" 15 "), Some(15));
+    }
+
+    #[test]
+    fn parse_frame_seconds_rejects_zero_negative_and_non_numeric_input() {
+        assert_eq!(parse_frame_seconds(""), None);
+        assert_eq!(parse_frame_seconds("0"), None);
+        assert_eq!(parse_frame_seconds("-5"), None);
+        assert_eq!(parse_frame_seconds("soon"), None);
     }
 
     #[test]

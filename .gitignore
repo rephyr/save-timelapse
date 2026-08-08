@@ -10,6 +10,11 @@
 *.gif
 scan_*.json
 
+# ...except intentional, committed demo media.
+!assets/*.mp4
+!assets/*.webm
+!assets/*.gif
+
 # Packaged mod
 /dist/
 *.zip

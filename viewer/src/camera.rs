@@ -7,6 +7,13 @@ use crate::render_frame::RenderFrame;
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 
+/// How much smaller than a bare edge-to-edge fit `fit_frames`'s initial,
+/// static whole-sequence view zooms. Leaves visible breathing room around
+/// the base instead of touching the window edges. Auto-follow uses its own,
+/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`) -- this one is
+/// only for the one-time opening view.
+const FIT_MARGIN: f32 = 0.75;
+
 #[derive(Clone, Copy)]
 pub struct Camera {
     pub offset: Vec2,
@@ -55,12 +62,69 @@ impl Camera {
             min = min.min(p);
             max = max.max(p);
         }
-        let center = (min + max) / 2.0;
-        let size = (max - min).max(Vec2::splat(1.0));
+        Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
+    }
+
+    /// Center on an arbitrary world-space box and pick a zoom that fits it on
+    /// screen. `min_size_tiles` floors how tight this can zoom in either
+    /// axis: framing a single small placement without a floor would zoom in
+    /// far enough to fill the screen with one tile, which reads as broken
+    /// rather than "focused." `margin` is how much smaller than a bare
+    /// edge-to-edge fit to zoom (1.0 = box edges touch the window border,
+    /// smaller = more breathing room) -- a caller's choice rather than a
+    /// fixed constant, since a one-time static view and a continuously
+    /// re-fitting auto-follow camera want different amounts of it (see
+    /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
+    pub fn fit_bounds(center: Vec2, size: Vec2, screen_width: f32, screen_height: f32, min_size_tiles: f32, margin: f32) -> Camera {
+        let size = size.max(Vec2::splat(min_size_tiles));
         let zoom = (screen_width / (size.x * BASE_PIXELS_PER_TILE))
             .min(screen_height / (size.y * BASE_PIXELS_PER_TILE))
-            * 0.9;
+            * margin;
         Camera { offset: center, zoom: zoom.clamp(0.01, 50.0) }
+    }
+}
+
+/// A camera move from wherever it currently is to a new target, over a
+/// fixed real-time duration -- the same model TLBE (the most-downloaded
+/// Factorio timelapse mod) uses for its own camera transitions: plain
+/// linear interpolation of both position and zoom against elapsed time,
+/// not an easing curve. A fixed duration is what makes a transition read as
+/// deliberate and gradual regardless of how far it's travelling, rather
+/// than an exponential approach that (without extra clamping of its own)
+/// moves fastest the instant a distant target first appears.
+#[derive(Clone, Copy)]
+pub struct CameraTransition {
+    start: Camera,
+    end: Camera,
+    elapsed_secs: f32,
+    duration_secs: f32,
+}
+
+impl CameraTransition {
+    /// Starts from `start` (the camera's live position, not the previous
+    /// target) so retargeting mid-transition -- the point of interest
+    /// moving again before the camera arrived -- glides on from wherever
+    /// the camera actually is, with no discontinuity, rather than jumping
+    /// back to resume an old transition's endpoint.
+    pub fn new(start: Camera, end: Camera, duration_secs: f32) -> Self {
+        CameraTransition { start, end, elapsed_secs: 0.0, duration_secs }
+    }
+
+    /// Advances the transition by `dt_secs` and returns the camera at the
+    /// new elapsed time. Zoom is interpolated linearly, matching TLBE,
+    /// rather than in log space: a "technically nicer" curve isn't the
+    /// point here, matching the reference mod's own feel is.
+    pub fn step(&mut self, dt_secs: f32) -> Camera {
+        self.elapsed_secs = (self.elapsed_secs + dt_secs).min(self.duration_secs);
+        let t = if self.duration_secs <= 0.0 { 1.0 } else { self.elapsed_secs / self.duration_secs };
+        Camera {
+            offset: self.start.offset + (self.end.offset - self.start.offset) * t,
+            zoom: self.start.zoom + (self.end.zoom - self.start.zoom) * t,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.elapsed_secs >= self.duration_secs
     }
 }
 
@@ -174,6 +238,104 @@ mod tests {
         let camera = Camera::fit_frames(&[], 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::ZERO);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
+    }
+
+    /// `min_size_tiles = 1.0` must reproduce `fit_frames`'s own
+    /// `.max(Vec2::splat(1.0))` floor exactly, or the refactor changed
+    /// behavior instead of just relocating it.
+    #[test]
+    fn fit_bounds_matches_fit_frames_on_the_same_box() {
+        let via_fit_frames = Camera::fit_frames(
+            std::slice::from_ref(&render(Frame {
+                tick: 0,
+                surface: "nauvis".to_string(),
+                count: 2,
+                entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
+                tiles: Vec::new(),
+            })),
+            800.0,
+            600.0,
+        );
+        let via_fit_bounds =
+            Camera::fit_bounds(Vec2::new(5.0, 5.0), Vec2::new(11.0, 11.0), 800.0, 600.0, 1.0, FIT_MARGIN);
+        assert_eq!(via_fit_frames.offset, via_fit_bounds.offset);
+        assert!((via_fit_frames.zoom - via_fit_bounds.zoom).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_bounds_floors_a_tiny_box_to_the_minimum_size() {
+        let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(0.1), 800.0, 600.0, 24.0, 1.0);
+        let at_floor = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(24.0), 800.0, 600.0, 24.0, 1.0);
+        assert!((tight.zoom - at_floor.zoom).abs() < 1e-6, "a box smaller than the floor should zoom as if it were exactly the floor size");
+    }
+
+    #[test]
+    fn fit_bounds_margin_scales_zoom_directly() {
+        let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(10.0), 800.0, 600.0, 1.0, 1.0);
+        let loose = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(10.0), 800.0, 600.0, 1.0, 0.5);
+        assert!((loose.zoom - tight.zoom * 0.5).abs() < 1e-4, "half the margin should mean half the zoom");
+    }
+
+    #[test]
+    fn camera_transition_is_a_no_op_at_zero_elapsed() {
+        let start = Camera { offset: Vec2::new(1.0, 2.0), zoom: 1.0 };
+        let end = Camera { offset: Vec2::new(100.0, 200.0), zoom: 10.0 };
+        let mut transition = CameraTransition::new(start, end, 2.0);
+        let step = transition.step(0.0);
+        assert_eq!(step.offset, start.offset);
+        assert!((step.zoom - start.zoom).abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_transition_is_halfway_at_half_the_duration() {
+        let start = Camera { offset: Vec2::ZERO, zoom: 1.0 };
+        let end = Camera { offset: Vec2::new(100.0, 0.0), zoom: 5.0 };
+        let mut transition = CameraTransition::new(start, end, 2.0);
+        let step = transition.step(1.0);
+        assert!((step.offset.x - 50.0).abs() < 1e-4);
+        assert!((step.zoom - 3.0).abs() < 1e-4, "zoom interpolates linearly, matching TLBE, not in log space");
+    }
+
+    #[test]
+    fn camera_transition_reaches_exactly_the_end_and_then_reports_finished() {
+        let start = Camera { offset: Vec2::ZERO, zoom: 1.0 };
+        let end = Camera { offset: Vec2::new(100.0, -40.0), zoom: 8.0 };
+        let mut transition = CameraTransition::new(start, end, 2.0);
+        let step = transition.step(2.0);
+        assert_eq!(step.offset, end.offset);
+        assert_eq!(step.zoom, end.zoom);
+        assert!(transition.is_finished());
+    }
+
+    /// Advancing past the end (e.g. one slow frame straddling the
+    /// transition's finish) must clamp rather than overshoot into
+    /// extrapolation, which a naive `t = elapsed / duration` without
+    /// clamping elapsed would do.
+    #[test]
+    fn camera_transition_clamps_past_the_end_instead_of_overshooting() {
+        let start = Camera { offset: Vec2::ZERO, zoom: 1.0 };
+        let end = Camera { offset: Vec2::new(100.0, 0.0), zoom: 1.0 };
+        let mut transition = CameraTransition::new(start, end, 1.0);
+        let step = transition.step(5.0);
+        assert_eq!(step.offset, end.offset);
+        assert!(transition.is_finished());
+    }
+
+    /// Multiple small steps that add up to the full duration must land in
+    /// the same place as one big step -- the draw loop calls `step` once
+    /// per rendered frame, so this is what makes the transition's total
+    /// duration independent of frame rate.
+    #[test]
+    fn camera_transition_many_small_steps_match_one_big_step() {
+        let start = Camera { offset: Vec2::ZERO, zoom: 1.0 };
+        let end = Camera { offset: Vec2::new(100.0, 50.0), zoom: 4.0 };
+        let mut stepped = CameraTransition::new(start, end, 2.0);
+        let mut result = stepped.step(0.0);
+        for _ in 0..120 {
+            result = stepped.step(2.0 / 120.0);
+        }
+        assert!((result.offset - end.offset).length() < 1e-3);
+        assert!((result.zoom - end.zoom).abs() < 1e-3);
     }
 
     #[test]

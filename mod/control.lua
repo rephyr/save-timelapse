@@ -70,8 +70,7 @@ end
 --- both run against a private, per-run script-output folder that nothing
 --- else ever writes into, so there is nothing for them to collide with.
 local function export_surface(surface, tick, session_id)
-  local tag = session_id and string.format("%08x_", session_id) or ""
-  local path = string.format("%sframe_%s%d_%s.stfr", EXPORT_DIR, tag, tick, surface.name)
+  local path = EXPORT_DIR .. encode.frame_name(session_id, tick, surface.name)
   local dict = encode.new_dictionary()
 
   local checksum = encode.checksum_init()
@@ -302,7 +301,7 @@ end
 -- Live capture
 
 local CAPTURE_FLUSH_EVERY = 200
-local CAPTURE_FLUSH_TICKS = 600 -- ~10 real seconds, bounds data loss even when idle
+local CAPTURE_FLUSH_TICKS = 240 -- ~4 real seconds, bounds data loss even when idle
 --- Work items encoded per tick while the periodic test-snapshot runs, and how
 --- many encoded strings accumulate before a file append. Deliberately small:
 --- the point of spreading that export over ticks is that no single tick
@@ -318,16 +317,17 @@ local SNAPSHOT_FLUSH_EVERY = 128
 --- Written once, after the baseline snapshot finishes, naming the tick and
 --- surfaces it covers. This is the handshake with the Rust side: it is the
 --- last file written, so its presence means the baseline is complete, and it
---- says which `frame_<session_id>_<tick>_<surface>.stfr` files make up that
---- baseline. Everything after the baseline is reconstructed by replaying the
---- event log. Tagged by session_id (see compute_session_id below) so each
---- playthrough gets its own manifest instead of overwriting another one's.
+--- says which `frame_<tick>_<surface>.stfr` files, alongside it in the same
+--- session folder, make up that baseline. Everything after the baseline is
+--- reconstructed by replaying the event log. Tagged by session_id (see
+--- compute_session_id below) so each playthrough gets its own folder instead
+--- of overwriting another one's.
 ---
 --- A save whose capture state predates session_id existing has it as `nil`
 --- (see ensure_capture_segment below, which only ever sets it while creating
---- fresh state): this keeps such a save on the untagged name it was already
---- using rather than erroring, until /timelapse-reset-capture clears its
---- state and lets it start over with a real one.
+--- fresh state): this keeps such a save on the untagged, folder-less name it
+--- was already using rather than erroring, until /timelapse-reset-capture
+--- clears its state and lets it start over with a real one.
 local function baseline_manifest_path(session_id)
   if not session_id then
     return EXPORT_DIR .. "baseline.json"
@@ -837,8 +837,8 @@ local CAPTURE_HANDLERS = {
 --
 -- Factorio keeps one handler per on_nth_tick interval, so a second feature
 -- registering the same interval silently replaces the first rather than
--- erroring. CAPTURE_FLUSH_TICKS is 600 (10 real seconds), and the periodic
--- test-snapshot setting below is also given in seconds, so a user picking 10
+-- erroring. CAPTURE_FLUSH_TICKS is 240 (4 real seconds), and the periodic
+-- test-snapshot setting below is also given in seconds, so a user picking 4
 -- there hits that interval by coincidence, not by doing anything unusual.
 -- Anything wanting a periodic callback is therefore collected into one table
 -- keyed by interval and chained, rather than each feature calling

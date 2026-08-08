@@ -108,6 +108,33 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(8, 8, 8));
     }
 
+    // Resource deposits: colored to match Factorio's own map-view resource
+    // palette (the little colored blobs shown in chart/map mode), since
+    // that's the mental model a player already has for "what color is
+    // iron" from staring at the map screen, not the ore chunk's in-world
+    // sprite. Only the vanilla set is curated -- the handful of Space Age
+    // additions in `is_resource` (tungsten ore, calcite, scrap) don't have
+    // an established look here yet, so they fall through to the hash
+    // palette below like any other unrecognized name.
+    if name == "iron-ore" {
+        return Some(rgb(140, 165, 200));
+    }
+    if name == "copper-ore" {
+        return Some(rgb(203, 106, 54));
+    }
+    if name == "coal" {
+        return Some(rgb(40, 40, 40));
+    }
+    if name == "stone" {
+        return Some(rgb(178, 158, 130));
+    }
+    if name == "uranium-ore" {
+        return Some(rgb(140, 168, 60));
+    }
+    if name == "crude-oil" {
+        return Some(rgb(126, 44, 96));
+    }
+
     // Placed infrastructure common enough to have a strong expected color.
     if name.starts_with("refined-hazard-concrete") || name.starts_with("hazard-concrete") {
         return Some(rgb(196, 160, 40));
@@ -129,17 +156,56 @@ fn known_color(name: &str) -> Option<Color> {
     // "dead"/"dry" variants (including desert trees) a dead-wood brown
     // rather than green, since that's the biggest visual distinction
     // between tree variants, not the specific species.
-    if name == "cliff" {
-        return Some(rgb(96, 92, 88));
-    }
-    if name.starts_with("dead-") || name.starts_with("dry-") {
-        return Some(rgb(107, 92, 66));
-    }
-    if name.starts_with("tree") {
+    if is_terrain_scatter(name) {
+        if name == "cliff" {
+            return Some(rgb(96, 92, 88));
+        }
+        if name.starts_with("dead-") || name.starts_with("dry-") {
+            return Some(rgb(107, 92, 66));
+        }
         return Some(rgb(53, 89, 42));
     }
 
     None
+}
+
+/// Whether `name` is a tree or cliff prototype -- decorative terrain scatter
+/// captured only when the terrain-capture setting is on (see
+/// `mod/control.lua`'s `excluded_types`), naturally scattered across a wide
+/// area independent of anything the player built. Shared with
+/// `construction.rs`'s auto-follow bounds, which needs to exclude exactly
+/// this set for the same reason it excludes tiles: it says nothing about how
+/// the factory grew, and counting it would track how much of the map has
+/// been revealed instead of where the buildings are.
+pub fn is_terrain_scatter(name: &str) -> bool {
+    name == "cliff" || name.starts_with("dead-") || name.starts_with("dry-") || name.starts_with("tree")
+}
+
+/// Whether `name` is a resource deposit -- ore, oil, and the like, captured
+/// only when the include-resources setting is on. Like terrain scatter,
+/// shared with `construction.rs`'s auto-follow bounds: a resource sits
+/// wherever the map generated it, entirely independent of anything the
+/// player built, so counting it can pull the tracked area out toward a
+/// distant oil field or ore patch instead of hugging the actual buildings.
+///
+/// Named exactly, not pattern-matched: unlike tree/cliff names, resource
+/// names share no common prefix, so this is the vanilla set plus what's
+/// confirmed from Space Age (`tungsten-ore`, `calcite` on Vulcanus,
+/// `scrap` on Fulgora) -- best-effort the same way `is_terrain_scatter` is;
+/// a modded or as-yet-unseen resource name just won't be caught.
+pub fn is_resource(name: &str) -> bool {
+    matches!(
+        name,
+        "iron-ore"
+            | "copper-ore"
+            | "coal"
+            | "stone"
+            | "uranium-ore"
+            | "crude-oil"
+            | "tungsten-ore"
+            | "calcite"
+            | "scrap"
+    )
 }
 
 /// Deterministic name -> color, so a given entity type is always the same
@@ -189,6 +255,41 @@ mod tests {
             "dead-tree-desert", "dry-hairy-tree",
         ] {
             assert!(known_color(name).is_some(), "{name} should have a curated color");
+        }
+    }
+
+    /// Distinct colors, not just "present": pinning that iron and copper in
+    /// particular don't end up looking alike guards against the kind of
+    /// mistake that's easy to make copy-pasting six similar `if` blocks.
+    #[test]
+    fn known_color_recognizes_resource_deposits_distinctly() {
+        let iron = known_color("iron-ore").unwrap();
+        let copper = known_color("copper-ore").unwrap();
+        let coal = known_color("coal").unwrap();
+        for name in ["iron-ore", "copper-ore", "coal", "stone", "uranium-ore", "crude-oil"] {
+            assert!(known_color(name).is_some(), "{name} should have a curated color");
+        }
+        assert_ne!((iron.r, iron.g, iron.b), (copper.r, copper.g, copper.b));
+        assert!(coal.r < 0.3 && coal.g < 0.3 && coal.b < 0.3, "coal should read as near-black");
+    }
+
+    #[test]
+    fn is_terrain_scatter_recognizes_trees_and_cliffs_not_ordinary_entities() {
+        for name in ["cliff", "tree-01", "tree-09-brown", "dead-tree-desert", "dry-hairy-tree"] {
+            assert!(is_terrain_scatter(name), "{name} should be recognized as terrain scatter");
+        }
+        for name in ["transport-belt", "assembling-machine-1", "stone-furnace"] {
+            assert!(!is_terrain_scatter(name), "{name} is a real building, not terrain scatter");
+        }
+    }
+
+    #[test]
+    fn is_resource_recognizes_ore_and_oil_not_ordinary_entities() {
+        for name in ["iron-ore", "copper-ore", "coal", "stone", "uranium-ore", "crude-oil"] {
+            assert!(is_resource(name), "{name} should be recognized as a resource");
+        }
+        for name in ["transport-belt", "assembling-machine-1", "pumpjack"] {
+            assert!(!is_resource(name), "{name} is a real building, not a resource deposit");
         }
     }
 
