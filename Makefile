@@ -80,6 +80,7 @@ package:
 	mkdir -p "dist/$(PACKAGE_NAME)/locale/en"
 	cp mod/control.lua mod/encode.lua mod/info.json mod/settings.lua mod/changelog.txt "dist/$(PACKAGE_NAME)/"
 	cp mod/locale/en/settings.cfg "dist/$(PACKAGE_NAME)/locale/en/"
+	if [ -f mod/thumbnail.png ]; then cp mod/thumbnail.png "dist/$(PACKAGE_NAME)/"; fi
 	cd dist && zip -rq "$(PACKAGE_NAME).zip" "$(PACKAGE_NAME)"
 	rm -rf "dist/$(PACKAGE_NAME)"
 	@echo "packaged to dist/$(PACKAGE_NAME).zip"
