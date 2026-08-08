@@ -10,7 +10,13 @@
 MOD_INSTALL ?= $(APPDATA)/Factorio/mods/save-timelapse
 FRAMES      ?= frames
 
-.PHONY: help build test test-lua run viewer drawcalls install-mod clean
+# Read once at parse time rather than re-derived in every recipe that needs
+# it: Make runs each recipe line in its own shell, so a shell variable set
+# in `package`'s first line wouldn't survive to its later lines anyway.
+VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
+PACKAGE_NAME := save-timelapse_$(VERSION)
+
+.PHONY: help build test test-lua run viewer drawcalls install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -21,6 +27,7 @@ help:
 	@echo "  viewer       open the interactive viewer on FRAMES"
 	@echo "  drawcalls    headless draw-call report on FRAMES"
 	@echo "  install-mod  copy mod/ into MOD_INSTALL (your Factorio mods folder)"
+	@echo "  package      zip mod/ into dist/$(PACKAGE_NAME).zip, ready for the mod portal"
 	@echo "  clean        cargo clean"
 	@echo ""
 	@echo "Variables (current value, override with make VAR=... target):"
@@ -53,10 +60,29 @@ drawcalls:
 # than zipped, overwriting whatever is already installed.
 install-mod:
 	mkdir -p "$(MOD_INSTALL)/tests" "$(MOD_INSTALL)/locale/en"
-	cp mod/control.lua mod/encode.lua mod/info.json mod/settings.lua "$(MOD_INSTALL)/"
+	cp mod/control.lua mod/encode.lua mod/info.json mod/settings.lua mod/changelog.txt "$(MOD_INSTALL)/"
 	cp mod/tests/encode_test.lua "$(MOD_INSTALL)/tests/"
 	cp mod/locale/en/settings.cfg "$(MOD_INSTALL)/locale/en/"
 	@echo "installed to $(MOD_INSTALL)"
+
+# The portal requires the zip's top-level folder to be named exactly
+# "<name>_<version>", matching info.json -- uploading a zip shaped any other
+# way is rejected. Built fresh into a scratch dir each time rather than
+# zipping mod/ in place, since mod/ itself is named "mod", not that.
+#
+# Lists files explicitly rather than copying mod/ wholesale (unlike
+# install-mod, which deliberately mirrors a real export's staging): mod/tests/
+# is a development-only lupa/lua test suite with no reason to ship to anyone
+# who installs this from the portal, and an explicit list means a future
+# dev-only file added under mod/ doesn't silently end up public by default.
+package:
+	rm -rf "dist/$(PACKAGE_NAME)"
+	mkdir -p "dist/$(PACKAGE_NAME)/locale/en"
+	cp mod/control.lua mod/encode.lua mod/info.json mod/settings.lua mod/changelog.txt "dist/$(PACKAGE_NAME)/"
+	cp mod/locale/en/settings.cfg "dist/$(PACKAGE_NAME)/locale/en/"
+	cd dist && zip -rq "$(PACKAGE_NAME).zip" "$(PACKAGE_NAME)"
+	rm -rf "dist/$(PACKAGE_NAME)"
+	@echo "packaged to dist/$(PACKAGE_NAME).zip"
 
 clean:
 	cargo clean

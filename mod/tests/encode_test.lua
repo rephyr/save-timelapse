@@ -269,21 +269,33 @@ end
 
 -- per-playthrough file naming ----------------------------------------------------
 
-check("baseline_manifest_name: session id as zero padded 8 digit hex",
+check("session_dir: session id as zero padded 8 digit hex",
+  encode.session_dir(0x1a2b3c),
+  "001a2b3c/")
+
+check("session_dir: a small session id still gets full width padding",
+  encode.session_dir(0),
+  "00000000/")
+
+check("baseline_manifest_name: lives inside the session's own folder",
   encode.baseline_manifest_name(0x1a2b3c),
-  "baseline_001a2b3c.json")
+  "001a2b3c/baseline.json")
 
-check("baseline_manifest_name: a small session id still gets full width padding",
-  encode.baseline_manifest_name(0),
-  "baseline_00000000.json")
-
-check("capture_segment_name: session id and tick side by side",
+check("capture_segment_name: tick only, folder already scopes it to one session",
   encode.capture_segment_name(0x1a2b3c, 22760790),
-  "events_001a2b3c_22760790.stev")
+  "001a2b3c/events_22760790.stev")
 
-check("player_log_name: session id as zero padded 8 digit hex",
+check("player_log_name: lives inside the session's own folder",
   encode.player_log_name(0x1a2b3c),
-  "players_001a2b3c.jsonl")
+  "001a2b3c/players.jsonl")
+
+check("frame_name: tagged, lives inside the session's own folder",
+  encode.frame_name(0x1a2b3c, 100, "nauvis"),
+  "001a2b3c/frame_100_nauvis.stfr")
+
+check("frame_name: untagged (timelapse-export / headless scan) stays flat",
+  encode.frame_name(nil, 100, "nauvis"),
+  "frame_100_nauvis.stfr")
 
 -- player position log ----------------------------------------------------
 

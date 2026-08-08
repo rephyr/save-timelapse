@@ -370,21 +370,44 @@ end
 -- is one folder shared by every save that ever turns capture on, so a raw
 -- tick number cannot tell two playthroughs apart. session_id (the world's
 -- map generation seed; see control.lua) is stable across save/reload of one
--- playthrough and differs across different ones, so every filename this mod
--- writes into that shared folder carries it.
+-- playthrough and differs across different ones, so every playthrough this
+-- mod ever captures gets its own subfolder, named after its session_id, of
+-- otherwise plain (untagged) filenames -- Factorio's write_file creates
+-- whatever subfolders a path needs, so this needs nothing beyond naming the
+-- path correctly. A folder per playthrough is easier to browse by hand than
+-- the flat, hex-in-every-filename scheme this replaced, and removes the
+-- need for anything reading this folder back to filter by session at all:
+-- each folder only ever contains one playthrough's files to begin with.
 
 --- Pure: plain values in and out, so these are testable the same way as
 --- next_capture_segment above, with no save/load cycle to trigger them.
+function M.session_dir(session_id)
+  return string.format("%08x/", session_id)
+end
+
 function M.baseline_manifest_name(session_id)
-  return string.format("baseline_%08x.json", session_id)
+  return M.session_dir(session_id) .. "baseline.json"
 end
 
 function M.capture_segment_name(session_id, start_tick)
-  return string.format("events_%08x_%d.stev", session_id, start_tick)
+  return M.session_dir(session_id) .. string.format("events_%d.stev", start_tick)
 end
 
 function M.player_log_name(session_id)
-  return string.format("players_%08x.jsonl", session_id)
+  return M.session_dir(session_id) .. "players.jsonl"
+end
+
+--- Unlike the three names above, a baseline's per-surface frame files are
+--- untagged even without a session_id (see control.lua's export_surface):
+--- `/timelapse-export` and the headless scan share one private, per-run
+--- script-output folder with nothing else, so there is nothing for their
+--- output to collide with.
+function M.frame_name(session_id, tick, surface)
+  local name = string.format("frame_%d_%s.stfr", tick, surface)
+  if not session_id then
+    return name
+  end
+  return M.session_dir(session_id) .. name
 end
 
 -- ---------------------------------------------------------------------------

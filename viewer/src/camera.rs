@@ -7,12 +7,11 @@ use crate::render_frame::RenderFrame;
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 
-/// How much smaller than a bare edge-to-edge fit `fit_bounds` zooms,
-/// shared by the initial whole-sequence view and auto-follow's per-episode
-/// framing alike. Leaves visible breathing room around whatever's framed
-/// instead of touching the window edges; 0.9 read as too tight (the fitted
-/// box's edges landed right at the window border), so this leaves more
-/// margin than a bare fit would.
+/// How much smaller than a bare edge-to-edge fit `fit_frames`'s initial,
+/// static whole-sequence view zooms. Leaves visible breathing room around
+/// the base instead of touching the window edges. Auto-follow uses its own,
+/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`) -- this one is
+/// only for the one-time opening view.
 const FIT_MARGIN: f32 = 0.75;
 
 #[derive(Clone, Copy)]
@@ -63,19 +62,24 @@ impl Camera {
             min = min.min(p);
             max = max.max(p);
         }
-        Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0)
+        Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
     }
 
     /// Center on an arbitrary world-space box and pick a zoom that fits it on
-    /// screen with the same margin `fit_frames` uses. `min_size_tiles` floors
-    /// how tight this can zoom in either axis: framing a single small
-    /// placement without a floor would zoom in far enough to fill the screen
-    /// with one tile, which reads as broken rather than "focused."
-    pub fn fit_bounds(center: Vec2, size: Vec2, screen_width: f32, screen_height: f32, min_size_tiles: f32) -> Camera {
+    /// screen. `min_size_tiles` floors how tight this can zoom in either
+    /// axis: framing a single small placement without a floor would zoom in
+    /// far enough to fill the screen with one tile, which reads as broken
+    /// rather than "focused." `margin` is how much smaller than a bare
+    /// edge-to-edge fit to zoom (1.0 = box edges touch the window border,
+    /// smaller = more breathing room) -- a caller's choice rather than a
+    /// fixed constant, since a one-time static view and a continuously
+    /// re-fitting auto-follow camera want different amounts of it (see
+    /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
+    pub fn fit_bounds(center: Vec2, size: Vec2, screen_width: f32, screen_height: f32, min_size_tiles: f32, margin: f32) -> Camera {
         let size = size.max(Vec2::splat(min_size_tiles));
         let zoom = (screen_width / (size.x * BASE_PIXELS_PER_TILE))
             .min(screen_height / (size.y * BASE_PIXELS_PER_TILE))
-            * FIT_MARGIN;
+            * margin;
         Camera { offset: center, zoom: zoom.clamp(0.01, 50.0) }
     }
 }
@@ -253,16 +257,23 @@ mod tests {
             600.0,
         );
         let via_fit_bounds =
-            Camera::fit_bounds(Vec2::new(5.0, 5.0), Vec2::new(11.0, 11.0), 800.0, 600.0, 1.0);
+            Camera::fit_bounds(Vec2::new(5.0, 5.0), Vec2::new(11.0, 11.0), 800.0, 600.0, 1.0, FIT_MARGIN);
         assert_eq!(via_fit_frames.offset, via_fit_bounds.offset);
         assert!((via_fit_frames.zoom - via_fit_bounds.zoom).abs() < 1e-6);
     }
 
     #[test]
     fn fit_bounds_floors_a_tiny_box_to_the_minimum_size() {
-        let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(0.1), 800.0, 600.0, 24.0);
-        let at_floor = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(24.0), 800.0, 600.0, 24.0);
+        let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(0.1), 800.0, 600.0, 24.0, 1.0);
+        let at_floor = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(24.0), 800.0, 600.0, 24.0, 1.0);
         assert!((tight.zoom - at_floor.zoom).abs() < 1e-6, "a box smaller than the floor should zoom as if it were exactly the floor size");
+    }
+
+    #[test]
+    fn fit_bounds_margin_scales_zoom_directly() {
+        let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(10.0), 800.0, 600.0, 1.0, 1.0);
+        let loose = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(10.0), 800.0, 600.0, 1.0, 0.5);
+        assert!((loose.zoom - tight.zoom * 0.5).abs() < 1e-4, "half the margin should mean half the zoom");
     }
 
     #[test]

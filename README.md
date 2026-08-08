@@ -37,9 +37,17 @@ For ongoing factories, enable live capture once and the mod records only increme
 - Overview of the current state of the tool
 ![Tool overview](assets/save-timelapse-overview.PNG)
 
+- Live capture, played back
+![Demo](assets/demo.gif)
+
 - Timeline scrubbing
+![Timeline scrubbing](assets/scrubbing.gif)
+
 - Zoomed sprite rendering
-- Live capture
+![Sprite rendering](assets/sprites.PNG)
+
+- Camera auto-follow gradually zooming out as the base grows
+![Camera auto-follow](assets/camera-follow.gif)
 
 ---
 
@@ -96,6 +104,11 @@ baseline after the mod already took it, not before: enable the
 reasoning as above) before your baseline is taken if you want it included
 in a live capture.
 
+> **Known limitation:** with terrain capture on, removing landfill during
+> the tracked playthrough leaves an empty tile in the replay instead of
+> reverting to the water underneath. Fixing this properly needs a two-layer
+> tile model; tracked for a future release.
+
 ---
 
 ## Viewer
@@ -109,6 +122,7 @@ Current features:
 - Home / End navigation
 - Surface switching
 - Player position marker
+- Camera auto-follow (on by default, `f` to toggle off): gradually pans and zooms out to keep the whole base in frame as it grows, the way TLBE's own camera does
 - Sprite rendering
 - Flat-color LOD rendering
 - Parallel loading
@@ -145,13 +159,14 @@ The Lua mod requires no build step.
 - [x] Versioning (the binary formats carry a version byte)
 - [x] Adjustable playback speed
 - [x] Better documentation
-- [ ] Add screenshots and gifs to README.md of the working project
+- [x] Add screenshots and gifs to README.md of the working project
 
 Bonus, not originally planned for v0.2 but delivered along the way:
 - [x] Terrain and terrain-scatter rendering (grass, water, trees, cliffs), opt-in given its export cost
 - [x] Player position tracking, shown as a marker in the viewer
+- [x] Camera auto-follow: gradually pans and zooms out to keep the whole growing base in frame, with smooth transitions (originally planned for v1.0)
 
-Video export moved out of this release — see v1.0.
+Video export moved out of this release see v1.0.
 
 ### v0.5
 
@@ -162,11 +177,9 @@ Video export moved out of this release — see v1.0.
 
 ### v1.0
 
-- [ ] Camera system
 - [ ] Bookmarks
 - [ ] Timeline markers
 - [ ] Statistics
-- [ ] Auto framing
 - [ ] Video export
 - [ ] Better export
 

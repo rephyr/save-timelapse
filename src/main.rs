@@ -399,7 +399,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // viewer reads are the exact same shape by design (see
     // src/player_log.rs), so there's nothing to convert. Absent entirely
     // is normal, not an error -- e.g. nobody was connected during capture.
-    let players_log = capture.join(format!("players_{:08x}.jsonl", chosen.session_id));
+    let players_log = chosen.session_dir.join("players.jsonl");
     if players_log.exists() {
         std::fs::copy(&players_log, out.join("players.jsonl"))?;
     }
@@ -411,7 +411,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let emitted = match &chosen_surface {
         None => {
             println!("rendering every surface, one frame per {frame_seconds}s of game time\n");
-            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
+            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
@@ -428,7 +428,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         }
         Some(name) => {
             println!("rendering surface {name}, one frame per {frame_seconds}s of game time\n");
-            replay::run(&mut replay_state, &capture, chosen.session_id, &options, |world, tick| {
+            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }

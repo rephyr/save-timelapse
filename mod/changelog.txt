@@ -1,0 +1,15 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-08-08
+  Features:
+    - Build a timelapse from existing save files, no need to have had the mod installed while you played
+    - Live capture mode: records incremental changes as you play instead of repeated full exports
+    - Interactive viewer with pan, zoom, timeline scrubbing and adjustable playback speed
+    - Camera auto-follow: locks onto wherever the base is actively being built, with smooth pan/zoom transitions; favors whichever site is closest to a tracked player when more than one is active at once
+    - Multi-surface support (Nauvis, platforms, planets)
+    - Optional terrain and terrain-scatter rendering (grass, water, trees, cliffs) around the base
+    - Player position tracking, shown as a marker in the viewer
+    - Checksums and format versioning, so a corrupted or outdated capture file is detected rather than silently misread
+  Changes:
+    - Live capture writes each playthrough's files into its own subfolder under script-output/save-timelapse, instead of one shared folder with every filename tagged
+---------------------------------------------------------------------------------------------------

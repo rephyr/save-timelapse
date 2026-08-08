@@ -3,20 +3,24 @@
 //! The capture directory the mod writes looks like this:
 //!
 //! ```text
-//! baseline_<session>.json                    tick + surfaces one playthrough's baseline covers
-//! frame_<session>_<tick>_<surface>.stfr      one per surface, that baseline itself
-//! events_<session>_<start_tick>.stev         append-only, one segment per timeline
+//! <session>/baseline.json                 tick + surfaces one playthrough's baseline covers
+//! <session>/frame_<tick>_<surface>.stfr   one per surface, that baseline itself
+//! <session>/events_<start_tick>.stev      append-only, one segment per timeline
+//! <session>/players.jsonl                 optional, sampled player positions
 //! ```
 //!
-//! `session` tags every file with which playthrough it belongs to (see
-//! mod/control.lua's `compute_session_id`): the capture folder is shared by
-//! every save that ever turns capture on, and `game.tick` restarts from 0
-//! for each one, so a bare tick cannot tell two playthroughs' files apart.
+//! `<session>` (an 8-digit hex folder name) is which playthrough these files
+//! belong to (see mod/control.lua's `compute_session_id`): the capture
+//! folder is shared by every save that ever turns capture on, and
+//! `game.tick` restarts from 0 for each one, so a bare tick cannot tell two
+//! playthroughs' files apart, and a bare filename cannot tell two
+//! playthroughs' files apart either -- but two playthroughs no longer share
+//! one directory to get confused in, since each gets its own.
 //!
-//! `baseline_<session>.json` is written last, so its presence means that
+//! `<session>/baseline.json` is written last, so its presence means that
 //! playthrough's baseline finished. Replay loads it, seeds a [`World`], then
-//! walks that session's event segments forward, emitting a frame whenever
-//! enough ticks have passed.
+//! walks that session folder's event segments forward, emitting a frame
+//! whenever enough ticks have passed.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,16 +46,18 @@ pub struct Baseline {
     pub session_id: u32,
 }
 
-/// Parses the hex session tag out of `baseline_<session>.json`. `None` for
-/// anything else, including the bare `baseline.json` every capture used
-/// before playthroughs were tagged, which is what makes such a leftover
-/// file invisible to `discover_sessions` rather than ambiguous.
-fn parse_baseline_filename(path: &Path) -> Option<u32> {
-    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+/// Parses a session's hex folder name (e.g. `00000001` in
+/// `save-timelapse/00000001/baseline.json`). `None` for anything else,
+/// including a `baseline.json` sitting directly in the shared top-level
+/// capture folder -- every capture used that shape before playthroughs got
+/// their own folder -- which is what makes such a leftover invisible to
+/// `discover_sessions` rather than ambiguous.
+fn parse_session_dir_name(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    if name.len() != 8 {
         return None;
     }
-    let hex = path.file_stem()?.to_str()?.strip_prefix("baseline_")?;
-    u32::from_str_radix(hex, 16).ok()
+    u32::from_str_radix(name, 16).ok()
 }
 
 impl Baseline {
@@ -69,17 +75,21 @@ impl Baseline {
         })?;
         let mut baseline: Baseline =
             serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        baseline.session_id = parse_baseline_filename(path).ok_or_else(|| {
+        baseline.session_id = path.parent().and_then(parse_session_dir_name).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{}: expected a baseline_<hex> filename to read a session id from", path.display()),
+                format!("{}: expected a hex-named parent folder to read a session id from", path.display()),
             )
         })?;
         Ok(baseline)
     }
 
+    /// The path of one of this baseline's per-surface snapshot files,
+    /// alongside it in the same session folder. Untagged -- unlike the
+    /// pre-folder scheme, this never needed the session id in the filename
+    /// itself, since the folder already scopes it.
     pub fn frame_path(&self, dir: &Path, surface: &str) -> PathBuf {
-        dir.join(format!("frame_{:08x}_{}_{}.stfr", self.session_id, self.tick, surface))
+        dir.join(format!("frame_{}_{}.stfr", self.tick, surface))
     }
 }
 
@@ -87,12 +97,16 @@ impl Baseline {
 #[derive(Debug)]
 pub struct Session {
     pub session_id: u32,
+    /// This session's own subfolder -- pass this, not the shared top-level
+    /// capture directory, to [`run`] and [`event::log_paths`].
+    pub session_dir: PathBuf,
     pub baseline_path: PathBuf,
     pub baseline: Baseline,
     pub last_modified: SystemTime,
 }
 
-/// Every tagged playthrough with a finished baseline in `dir`, newest first.
+/// Every playthrough with a finished baseline among `dir`'s session
+/// subfolders, newest first.
 ///
 /// "Newest" is the latest mtime among the baseline file and every one of
 /// that session's event segments, not just the baseline's own: the baseline
@@ -102,9 +116,20 @@ pub struct Session {
 pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
-        let path = entry.path();
-        let Some(session_id) = parse_baseline_filename(&path) else { continue };
-        let baseline = match Baseline::read_at(&path) {
+        let session_dir = entry.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let Some(session_id) = parse_session_dir_name(&session_dir) else { continue };
+
+        let baseline_path = session_dir.join("baseline.json");
+        if !baseline_path.exists() {
+            // Capture started (the folder exists) but the baseline hasn't
+            // finished yet, or never will -- not ready to show, same as no
+            // folder at all.
+            continue;
+        }
+        let baseline = match Baseline::read_at(&baseline_path) {
             Ok(baseline) => baseline,
             Err(e) => {
                 eprintln!("warning: skipping unreadable baseline: {e}");
@@ -112,8 +137,9 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
             }
         };
 
-        let mut last_modified = path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Ok(segments) = event::log_paths(dir, session_id) {
+        let mut last_modified =
+            baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+        if let Ok(segments) = event::log_paths(&session_dir) {
             for segment in segments {
                 if let Ok(modified) = segment.metadata().and_then(|m| m.modified()) {
                     last_modified = last_modified.max(modified);
@@ -121,7 +147,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
             }
         }
 
-        sessions.push(Session { session_id, baseline_path: path, baseline, last_modified });
+        sessions.push(Session { session_id, session_dir, baseline_path, baseline, last_modified });
     }
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     Ok(sessions)
@@ -205,9 +231,10 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
 ///
 /// `emit` receives the tick rather than a materialised frame so the caller
 /// decides what to do with the world: write every surface, one surface, or
-/// just measure. `session` scopes which playthrough's segments are walked
-/// -- normally `replay.baseline.session_id`.
-pub fn run<F>(replay: &mut Replay, dir: &Path, session: u32, options: &Options, mut emit: F) -> io::Result<usize>
+/// just measure. `dir` must be one playthrough's own session folder (a
+/// [`Session`]'s `session_dir`), not the shared top-level capture directory
+/// -- every segment in it is walked, with nothing left to scope by session.
+pub fn run<F>(replay: &mut Replay, dir: &Path, options: &Options, mut emit: F) -> io::Result<usize>
 where
     F: FnMut(&World, u64),
 {
@@ -222,7 +249,7 @@ where
         }
     };
 
-    for segment in event::log_paths(dir, session)? {
+    for segment in event::log_paths(dir)? {
         // A session can legitimately span more than one segment (a save
         // reload rolls over to a fresh one; see `next_capture_segment`), and
         // the mod has no way to notice or clean up an orphaned segment left
@@ -318,25 +345,26 @@ mod tests {
     use std::fs;
 
     /// The session id every test capture uses, as both the raw value and the
-    /// hex tag its filenames carry.
+    /// hex name its session folder carries.
     const TEST_SESSION: u32 = 1;
     const TEST_SESSION_HEX: &str = "00000001";
 
-    /// Builds a capture directory plus the path to its (already tagged)
-    /// baseline manifest, since `load_baseline` now takes that path
-    /// directly rather than a directory to search.
+    /// Builds a capture directory containing one session subfolder, plus the
+    /// path to its baseline manifest inside that folder, since `load_baseline`
+    /// takes that path directly rather than a directory to search. Callers
+    /// needing the session folder itself (to pass to `run`, or to write more
+    /// segments into) get it via `baseline_path.parent()`.
     fn capture_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let baseline_path = dir.path().join(format!("baseline_{TEST_SESSION_HEX}.json"));
+        let session_dir = dir.path().join(TEST_SESSION_HEX);
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let baseline_path = session_dir.join("baseline.json");
         fs::write(&baseline_path, r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
 
         let entities = vec![frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
         let out = frame::FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[] };
-        fs::write(
-            dir.path().join(format!("frame_{TEST_SESSION_HEX}_100_nauvis.stfr")),
-            frame::write_binary(&out),
-        )
-        .unwrap();
+        fs::write(session_dir.join("frame_100_nauvis.stfr"), frame::write_binary(&out)).unwrap();
 
         (dir, baseline_path)
     }
@@ -415,9 +443,9 @@ mod tests {
     #[test]
     fn a_missing_manifest_explains_what_it_means() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("baseline_{TEST_SESSION_HEX}.json"));
+        let path = dir.path().join(TEST_SESSION_HEX).join("baseline.json");
         let err = load_baseline(&path).unwrap_err();
-        assert!(err.to_string().contains("baseline_00000001.json"), "got: {err}");
+        assert!(err.to_string().contains("baseline.json"), "got: {err}");
     }
 
     #[test]
@@ -432,7 +460,9 @@ mod tests {
     #[test]
     fn a_manifest_naming_no_loadable_surface_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("baseline_{TEST_SESSION_HEX}.json"));
+        let session_dir = dir.path().join(TEST_SESSION_HEX);
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("baseline.json");
         fs::write(&path, r#"{"tick":5,"surfaces":["gone"]}"#).unwrap();
         assert!(load_baseline(&path).is_err());
     }
@@ -440,16 +470,17 @@ mod tests {
     #[test]
     fn replay_applies_events_and_emits_frames_on_the_interval() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut log = TestLog::new();
         log.tick(100).add_entity("nauvis", "transport-belt", 1.5, 0.5, 0);
         log.tick(160).add_entity("nauvis", "transport-belt", 2.5, 0.5, 0);
         log.tick(220).remove_entity("nauvis", 0.5, 0.5);
-        log.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_100.stev"));
+        log.write(session_dir, "events_100.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
         let mut seen: Vec<(u64, usize)> = Vec::new();
         let options = Options { interval: 50, max_frames: 100 };
-        run(&mut replay, dir.path(), TEST_SESSION, &options, |world, tick| {
+        run(&mut replay, session_dir, &options, |world, tick| {
             seen.push((tick, world.entity_count()));
         })
         .unwrap();
@@ -461,6 +492,7 @@ mod tests {
         assert_eq!(seen.last().unwrap().1, 2);
         assert!(seen.len() >= 3, "expected several frames, got {seen:?}");
         assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "ticks must not go backwards");
+        let _dir = dir; // kept alive for the duration of the test
     }
 
     /// Everything in one tick must land together: a frame boundary inside a
@@ -468,18 +500,18 @@ mod tests {
     #[test]
     fn events_sharing_a_tick_are_applied_as_one_batch() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut log = TestLog::new();
         log.tick(500);
         for i in 0..50 {
             log.add_entity("nauvis", "pipe", i as f32 + 0.5, 9.5, 0);
         }
-        log.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_100.stev"));
+        log.write(session_dir, "events_100.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
         let mut counts = Vec::new();
         let options = Options { interval: 100, max_frames: 100 };
-        run(&mut replay, dir.path(), TEST_SESSION, &options, |world, _| counts.push(world.entity_count()))
-            .unwrap();
+        run(&mut replay, session_dir, &options, |world, _| counts.push(world.entity_count())).unwrap();
 
         // No frame may show a partial tick: counts jump from 1 to 51.
         assert!(
@@ -487,90 +519,109 @@ mod tests {
             "a frame caught mid-tick: {counts:?}"
         );
         assert_eq!(*counts.last().unwrap(), 51);
+        let _dir = dir;
     }
 
     #[test]
     fn events_before_the_baseline_are_ignored() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut log = TestLog::new();
         log.tick(5).remove_entity("nauvis", 0.5, 0.5);
-        log.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_1.stev"));
+        log.write(session_dir, "events_1.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
-        run(&mut replay, dir.path(), TEST_SESSION, &Options::default(), |_, _| {}).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
         assert_eq!(replay.world.entity_count(), 1, "the pre-baseline removal was skipped");
+        let _dir = dir;
     }
 
     #[test]
     fn segments_replay_in_tick_order() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut later = TestLog::new();
         later.tick(9000).remove_entity("nauvis", 1.5, 0.5);
-        later.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_9000.stev"));
+        later.write(session_dir, "events_9000.stev");
 
         let mut earlier = TestLog::new();
         earlier.tick(200).add_entity("nauvis", "pipe", 1.5, 0.5, 0);
-        earlier.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_200.stev"));
+        earlier.write(session_dir, "events_200.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
-        run(&mut replay, dir.path(), TEST_SESSION, &Options::default(), |_, _| {}).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
         // Add at tick 200 then remove at 9000 nets out; replayed the other
         // way round the remove would no-op and the add would survive.
         assert_eq!(replay.world.entity_count(), 1);
         assert_eq!(replay.no_op_events, 0);
+        let _dir = dir;
     }
 
     #[test]
     fn max_frames_caps_output() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut log = TestLog::new();
         log.tick(100_000).add_entity("nauvis", "pipe", 5.5, 5.5, 0);
-        log.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_100.stev"));
+        log.write(session_dir, "events_100.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
         let options = Options { interval: 1, max_frames: 10 };
         let mut count = 0;
-        let emitted = run(&mut replay, dir.path(), TEST_SESSION, &options, |_, _| count += 1).unwrap();
+        let emitted = run(&mut replay, session_dir, &options, |_, _| count += 1).unwrap();
         assert_eq!(emitted, 10);
         assert_eq!(count, 10);
+        let _dir = dir;
     }
 
     #[test]
     fn a_capture_with_no_events_still_emits_the_baseline() {
         let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
         let mut replay = load_baseline(&baseline_path).unwrap();
         let mut count = 0;
-        let emitted = run(&mut replay, dir.path(), TEST_SESSION, &Options::default(), |_, _| count += 1).unwrap();
+        let emitted = run(&mut replay, session_dir, &Options::default(), |_, _| count += 1).unwrap();
         assert_eq!(emitted, 1);
         assert_eq!(count, 1);
+        let _dir = dir;
     }
 
     #[test]
-    fn discover_sessions_ignores_the_untagged_legacy_baseline() {
+    fn discover_sessions_ignores_a_leftover_flat_top_level_baseline() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join(format!("baseline_{TEST_SESSION_HEX}.json")),
-            r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#,
-        )
-        .unwrap();
-        // The shape every capture used before playthroughs were tagged.
+        let session_dir = dir.path().join(TEST_SESSION_HEX);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#)
+            .unwrap();
+        // The shape every capture used before playthroughs got their own
+        // folder: a plain file, not a directory, sitting at the top level.
         fs::write(dir.path().join("baseline.json"), r#"{"tick":1,"surfaces":[]}"#).unwrap();
 
         let sessions = discover_sessions(dir.path()).unwrap();
-        assert_eq!(sessions.len(), 1, "the untagged legacy baseline.json must not be picked up");
+        assert_eq!(sessions.len(), 1, "the flat top-level leftover must not be picked up");
         assert_eq!(sessions[0].session_id, TEST_SESSION);
+    }
+
+    #[test]
+    fn discover_sessions_ignores_a_session_folder_with_no_finished_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(TEST_SESSION_HEX)).unwrap();
+        assert!(discover_sessions(dir.path()).unwrap().is_empty());
     }
 
     #[test]
     fn discover_sessions_orders_newest_first() {
         let dir = tempfile::tempdir().unwrap();
+        for hex in ["00000001", "00000002"] {
+            fs::create_dir_all(dir.path().join(hex)).unwrap();
+        }
         fs::write(
-            dir.path().join("baseline_00000001.json"),
+            dir.path().join("00000001").join("baseline.json"),
             r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#,
         )
         .unwrap();
         fs::write(
-            dir.path().join("baseline_00000002.json"),
+            dir.path().join("00000002").join("baseline.json"),
             r#"{"tick":200,"entities":2,"tiles":0,"surfaces":["nauvis"]}"#,
         )
         .unwrap();
@@ -578,7 +629,7 @@ mod tests {
         let older = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::OpenOptions::new()
             .write(true)
-            .open(dir.path().join("baseline_00000001.json"))
+            .open(dir.path().join("00000001").join("baseline.json"))
             .unwrap()
             .set_modified(older)
             .unwrap();
@@ -590,23 +641,26 @@ mod tests {
     /// A real failure mode: clearing script-output by hand without running
     /// `/timelapse-reset-capture` first leaves the mod believing its current
     /// segment is already initialized, so the next flush recreates it via a
-    /// plain append with no magic header -- under the *same* session tag as
-    /// whatever segment the mod starts fresh with afterward. One orphaned,
-    /// unreadable segment must not sink replay of the rest of that session.
+    /// plain append with no magic header -- alongside whatever segment the
+    /// mod starts fresh with afterward, in the same session folder. One
+    /// orphaned, unreadable segment must not sink replay of the rest of that
+    /// session.
     #[test]
     fn run_skips_an_unreadable_segment_and_still_replays_the_rest_of_the_session() {
         let (dir, baseline_path) = capture_dir();
-        fs::write(dir.path().join(format!("events_{TEST_SESSION_HEX}_50.stev")), b"not a real segment").unwrap();
+        let session_dir = baseline_path.parent().unwrap();
+        fs::write(session_dir.join("events_50.stev"), b"not a real segment").unwrap();
 
         let mut log = TestLog::new();
         log.tick(150).add_entity("nauvis", "pipe", 5.5, 5.5, 0);
-        log.write(dir.path(), &format!("events_{TEST_SESSION_HEX}_100.stev"));
+        log.write(session_dir, "events_100.stev");
 
         let mut replay = load_baseline(&baseline_path).unwrap();
-        let emitted = run(&mut replay, dir.path(), TEST_SESSION, &Options::default(), |_, _| {}).unwrap();
+        let emitted = run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
         assert!(emitted >= 1, "replay must still complete rather than aborting on the bad segment");
         assert_eq!(replay.world.entity_count(), 2, "the good segment's event must still apply");
+        let _dir = dir;
     }
 
     #[test]

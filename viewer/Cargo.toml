@@ -1,8 +1,8 @@
 [package]
 name = "viewer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Milestone 1 spike: pan/zoom viewer for a single save-timelapse frame"
+description = "Interactive pan/zoom/scrub viewer for save-timelapse frame sequences, with camera auto-follow"
 
 [dependencies]
 save-timelapse = { path = ".." }
