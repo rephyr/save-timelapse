@@ -187,20 +187,44 @@ Bonus, not originally planned for v0.2 but delivered along the way:
 
 Video export moved out of this release see v1.0.
 
+### v0.3
+
+- [ ] Entity rotation tracking (the wire format already carries a direction byte per entity, but rendering ignores it)
+- [ ] Entity upgrade/change tracking
+- [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)
+- [ ] Robust interrupted capture recovery (beyond today's manual `/timelapse-reset-capture`)
+- [ ] Backward compatibility with previous capture versions
+- [ ] Broader modded-game compatibility (curated terrain/resource colors and auto-follow's exclusion lists are hardcoded to vanilla/Space Age names)
+
+### v0.4
+
+- [ ] Timeline timestamps
+- [ ] Timeline hover information
+- [ ] Timeline markers
+- [ ] Milestone/bookmark support
+- [ ] Better timeline navigation
+- [ ] Event/milestone indicators
+- [ ] Improved multi-surface navigation
+
 ### v0.5
 
-- [ ] One-click installer
-- [ ] Save detection
-- [ ] Performance improvements
-- [ ] Polish
+- [ ] First-run setup
+- [ ] Capture management (deleting/organizing old captures; selecting between them already works)
+- [ ] Settings/preferences (saved between runs, instead of asking fresh every time)
+- [ ] Better error recovery
+- [ ] Polished Windows packaging
 
 ### v1.0
 
-- [ ] Bookmarks
-- [ ] Timeline markers
-- [ ] Statistics
 - [ ] Video export
-- [ ] Better export
+- [ ] Smarter auto-follow (favor whichever site is actively being built, or nearest the player, instead of always framing the whole base)
+- [ ] Camera keyframes
+- [ ] Cinematic camera controls
+- [ ] Export resolution/FPS controls
+- [ ] MP4 export
+- [ ] Polished export workflow
+- [ ] Stable capture format
+- [ ] Migration between format versions
 
 ---
 
