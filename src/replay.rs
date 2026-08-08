@@ -323,6 +323,31 @@ pub fn write_all_surfaces(world: &World, tick: u64, out: &Path, index: usize) ->
     Ok(())
 }
 
+/// Writes `surface_name`'s natural-terrain layer to `terrain_<surface>.stfr`
+/// in `out`, once. Unlike `write_all_surfaces`, this is not called per
+/// emitted frame: terrain is fixed the instant the baseline loads (see
+/// `World::terrain_frame`), so one call right after loading the baseline
+/// covers the whole replay. Skipped, not an error, when there is no terrain
+/// to write (terrain capture was off, or this came from an older capture),
+/// so `terrain_<surface>.stfr`'s mere presence tells the viewer whether
+/// terrain is available.
+pub fn write_terrain(world: &World, surface_name: &str, tick: u64, out: &Path) -> io::Result<()> {
+    let frame = world.terrain_frame(surface_name, tick);
+    if frame.tiles.is_empty() {
+        return Ok(());
+    }
+    let path = out.join(format!("terrain_{surface_name}.stfr"));
+    std::fs::write(&path, frame::write_binary(&frame.as_out()))
+}
+
+/// `write_terrain` for every surface `world` has.
+pub fn write_all_terrain(world: &World, tick: u64, out: &Path) -> io::Result<()> {
+    for surface in world.surface_names() {
+        write_terrain(world, surface, tick, out)?;
+    }
+    Ok(())
+}
+
 /// Apply one tick's events together, then clear the buffer for reuse rather
 /// than allocating a new one per tick.
 fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
@@ -691,5 +716,61 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
+    }
+
+    #[test]
+    fn write_all_terrain_writes_one_file_per_surface_with_terrain_and_skips_the_rest() {
+        let mut world = crate::world::World::new();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            entities: Vec::new(),
+            count: 0,
+            tiles: vec![
+                crate::frame::Tile { n: "grass-1".into(), x: 0, y: 0 },
+                crate::frame::Tile { n: "concrete".into(), x: 1, y: 0 },
+            ],
+        });
+        // vulcanus has placed floor but no natural terrain, e.g. terrain
+        // capture was off when this baseline was taken.
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "vulcanus".to_string(),
+            entities: Vec::new(),
+            count: 0,
+            tiles: vec![crate::frame::Tile { n: "concrete".into(), x: 0, y: 0 }],
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        write_all_terrain(&world, 100, dir.path()).unwrap();
+
+        let written: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(written, vec!["terrain_nauvis.stfr"], "vulcanus has no terrain, so it gets no file");
+
+        let bytes = fs::read(dir.path().join("terrain_nauvis.stfr")).unwrap();
+        let frame = frame::read_binary(&bytes).unwrap();
+        assert_eq!(frame.tiles.len(), 1, "concrete is placed floor, not terrain");
+        assert_eq!(frame.tiles[0].n, "grass-1".into());
+        assert!(frame.entities.is_empty());
+    }
+
+    #[test]
+    fn write_terrain_is_a_no_op_when_the_surface_has_no_terrain() {
+        let mut world = crate::world::World::new();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            entities: Vec::new(),
+            count: 0,
+            tiles: vec![crate::frame::Tile { n: "concrete".into(), x: 0, y: 0 }],
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        write_terrain(&world, "nauvis", 100, dir.path()).unwrap();
+
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "no terrain means no file");
     }
 }

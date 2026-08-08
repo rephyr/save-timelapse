@@ -34,25 +34,37 @@ impl Camera {
     }
 
     /// Center on the bounding box of every entity and tile across every
-    /// frame given, and pick a zoom that fits it on screen. Fitting the
-    /// whole sequence rather than just the current frame means scrubbing
-    /// through a growing base doesn't jump-recenter every step. Real bases
-    /// are almost never near world origin, so an empty/degenerate input
-    /// falls back to a sane default rather than opening on empty space.
-    pub fn fit_frames(frames: &[RenderFrame], screen_width: f32, screen_height: f32) -> Camera {
+    /// frame given (plus `terrain`'s own tiles, if a terrain layer is
+    /// loaded), and pick a zoom that fits it on screen. Fitting the whole
+    /// sequence rather than just the current frame means scrubbing through a
+    /// growing base doesn't jump-recenter every step. Terrain is folded in
+    /// too so the opening view shows the factory sitting on real ground
+    /// rather than framing just the built area and cropping the terrain
+    /// captured around it. Real bases are almost never near world origin, so
+    /// an empty/degenerate input falls back to a sane default rather than
+    /// opening on empty space.
+    pub fn fit_frames(
+        frames: &[RenderFrame],
+        terrain: Option<&RenderFrame>,
+        screen_width: f32,
+        screen_height: f32,
+    ) -> Camera {
         // Each entity contributes its two footprint corners, not just its
         // center point -- for a small cluster of large buildings, ignoring
         // footprint here would zoom in as if they were 1x1, and a real
         // multi-tile entity would then render bigger than the whole window.
-        let mut points = frames.iter().flat_map(|f| {
-            let entity_corners = f.entities.iter().flat_map(|e| {
-                let half = Vec2::new(e.w as f32, e.h as f32) / 2.0;
-                let center = Vec2::new(e.x, e.y);
-                [center - half, center + half]
-            });
-            let tile_points = f.tiles.iter().map(|t| Vec2::new(t.x as f32, t.y as f32));
-            entity_corners.chain(tile_points)
-        });
+        let mut points = frames
+            .iter()
+            .flat_map(|f| {
+                let entity_corners = f.entities.iter().flat_map(|e| {
+                    let half = Vec2::new(e.w as f32, e.h as f32) / 2.0;
+                    let center = Vec2::new(e.x, e.y);
+                    [center - half, center + half]
+                });
+                let tile_points = f.tiles.iter().map(|t| Vec2::new(t.x as f32, t.y as f32));
+                entity_corners.chain(tile_points)
+            })
+            .chain(terrain.into_iter().flat_map(|t| t.tiles.iter().map(|t| Vec2::new(t.x as f32, t.y as f32))));
         let Some(first) = points.next() else {
             return Camera { offset: Vec2::ZERO, zoom: 1.0 };
         };
@@ -215,7 +227,7 @@ mod tests {
             entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
             tiles: Vec::new(),
         });
-        let camera = Camera::fit_frames(std::slice::from_ref(&frame), 800.0, 600.0);
+        let camera = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::new(5.0, 5.0));
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
     }
@@ -229,15 +241,49 @@ mod tests {
             entities: vec![entity("a", 3.0, 3.0)],
             tiles: Vec::new(),
         });
-        let camera = Camera::fit_frames(std::slice::from_ref(&frame), 800.0, 600.0);
+        let camera = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
     }
 
     #[test]
     fn fit_frames_on_empty_input_returns_a_sane_default() {
-        let camera = Camera::fit_frames(&[], 800.0, 600.0);
+        let camera = Camera::fit_frames(&[], None, 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::ZERO);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
+    }
+
+    /// The opening view is the whole point of turning terrain capture on: a
+    /// wide establishing shot of the factory sitting on real ground. A
+    /// terrain layer wider than the built area must expand the fit, not get
+    /// ignored.
+    #[test]
+    fn fit_frames_folds_terrain_into_the_bounding_box() {
+        let frame = render(Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 1,
+            entities: vec![entity("a", 0.0, 0.0)],
+            tiles: Vec::new(),
+        });
+        let terrain = render(Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles: vec![
+                save_timelapse::frame::Tile { n: "grass-1".into(), x: -50, y: -50 },
+                save_timelapse::frame::Tile { n: "grass-1".into(), x: 50, y: 50 },
+            ],
+        });
+
+        let without_terrain = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
+        let with_terrain = Camera::fit_frames(std::slice::from_ref(&frame), Some(&terrain), 800.0, 600.0);
+        assert!(
+            with_terrain.zoom < without_terrain.zoom,
+            "a wider terrain box must zoom out further: {} vs {}",
+            with_terrain.zoom,
+            without_terrain.zoom
+        );
     }
 
     /// `min_size_tiles = 1.0` must reproduce `fit_frames`'s own
@@ -253,6 +299,7 @@ mod tests {
                 entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
                 tiles: Vec::new(),
             })),
+            None,
             800.0,
             600.0,
         );

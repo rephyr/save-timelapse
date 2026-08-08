@@ -54,6 +54,39 @@ pub struct WorldEntity {
     pub id: Option<u64>,
 }
 
+/// Whether `name` is one of the placed-floor prototypes the mod tracks
+/// incrementally (concrete, landfill, and the like), mirroring
+/// `mod/encode.lua`'s `PLACED_FLOOR_TILES` list exactly. Anything else that
+/// shows up in a baseline's tiles is natural terrain (grass, water, sand,
+/// ...), captured once by `save-timelapse-capture-terrain` and never again:
+/// Factorio has no event for terrain changing (nobody "builds" grass), so
+/// unlike placed floor it needs no ongoing tracking, just a one-time split
+/// at baseline load time. See `Surface::terrain`.
+fn is_placed_floor(name: &str) -> bool {
+    matches!(
+        name,
+        "stone-path"
+            | "concrete"
+            | "hazard-concrete-left"
+            | "hazard-concrete-right"
+            | "refined-concrete"
+            | "refined-hazard-concrete-left"
+            | "refined-hazard-concrete-right"
+            | "landfill"
+            | "red-refined-concrete"
+            | "green-refined-concrete"
+            | "blue-refined-concrete"
+            | "orange-refined-concrete"
+            | "yellow-refined-concrete"
+            | "pink-refined-concrete"
+            | "purple-refined-concrete"
+            | "black-refined-concrete"
+            | "brown-refined-concrete"
+            | "cyan-refined-concrete"
+            | "acid-refined-concrete"
+    )
+}
+
 /// One surface's contents.
 ///
 /// Entities live in a slab with free-list reuse, so ids stay stable while
@@ -65,7 +98,17 @@ pub struct Surface {
     free: Vec<usize>,
     by_pos: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
+    /// Placed floor: seeded from the baseline, then kept current by
+    /// `AddTile`/`RemoveTile` events for as long as replay runs.
     tiles: HashMap<PosKey, NameId>,
+    /// Natural terrain: seeded from the baseline and never touched again
+    /// (see `is_placed_floor`). Kept separate from `tiles` specifically so
+    /// `to_frame` (called once per emitted replay frame, potentially
+    /// hundreds of times) never has to re-serialize it: a real capture's
+    /// terrain can be large, and doing that on every single frame is what
+    /// made every emitted frame file redundantly balloon to the same huge,
+    /// unchanging size.
+    terrain: HashMap<PosKey, NameId>,
 }
 
 impl Surface {
@@ -73,8 +116,20 @@ impl Surface {
         self.by_pos.len()
     }
 
+    /// Both layers together: what a baseline's "tiles" count means to
+    /// someone reading it, before they have any reason to know the two
+    /// layers exist internally. See `floor_tile_count`/`terrain_tile_count`
+    /// for the split.
     pub fn tile_count(&self) -> usize {
+        self.tiles.len() + self.terrain.len()
+    }
+
+    pub fn floor_tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    pub fn terrain_tile_count(&self) -> usize {
+        self.terrain.len()
     }
 
     pub fn entities(&self) -> impl Iterator<Item = &WorldEntity> {
@@ -209,7 +264,12 @@ impl World {
         }
         for tile in &frame.tiles {
             let name = self.names.intern(&tile.n);
-            surface.tiles.insert((tile.x, tile.y), name);
+            let key = (tile.x, tile.y);
+            if is_placed_floor(&tile.n) {
+                surface.tiles.insert(key, name);
+            } else {
+                surface.terrain.insert(key, name);
+            }
         }
 
         self.tick = self.tick.max(frame.tick);
@@ -263,14 +323,13 @@ impl World {
                 }
             }
             // Known gap, not fixed here: removing landfill fires this the
-            // same as any other tile removal, but `tiles` is a flat
-            // position -> name map with no idea what was there before the
-            // removed tile, e.g. the water a baseline captured underneath
-            // it (now that natural terrain is captured -- see
-            // mod/control.lua's terrain pass). The position just goes
-            // empty instead of reverting to water. A real fix needs a
-            // two-layer model (natural base + placed overlay), which is
-            // more than this single removal event can express on its own.
+            // same as any other tile removal, but `tiles` only ever holds
+            // placed floor now (see `Surface::terrain`) and still has no
+            // idea what was there before the removed tile, e.g. the water a
+            // baseline captured underneath it. The position just goes empty
+            // instead of reverting to water. A real fix needs the mod to
+            // capture what a removed placed-floor tile is replacing at
+            // removal time, which this event does not carry.
             Event::RemoveTile { x, y } => {
                 self.target(surface).is_some_and(|s| s.tiles.remove(&(*x, *y)).is_some())
             }
@@ -278,8 +337,13 @@ impl World {
     }
 
     /// Materialise one surface as a `Frame`, the format the viewer already
-    /// reads -- so replay is an offline step that produces ordinary frames
-    /// rather than a second thing the viewer has to understand.
+    /// reads, so replay is an offline step that produces ordinary frames
+    /// rather than a second thing the viewer has to understand. Placed
+    /// floor only: natural terrain lives in a separate, unchanging layer
+    /// (see `Surface::terrain`) that this deliberately never touches, since
+    /// this gets called once per emitted replay frame (potentially
+    /// hundreds of times) and terrain hasn't changed since the baseline
+    /// loaded it. Use `terrain_frame` to get that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
             return Frame {
@@ -291,14 +355,7 @@ impl World {
             };
         };
 
-        // Resolved once per call rather than once per entity/tile: a real
-        // surface has a few dozen distinct names against hundreds of
-        // thousands of entities (or millions of tiles), and replay emits one
-        // frame per interval, so re-allocating the same name string on every
-        // entity of every frame is pure waste `Arc::clone` skips.
-        let names: Vec<Arc<str>> = (0..self.names.len())
-            .map(|id| Arc::from(self.names.name(id as NameId)))
-            .collect();
+        let names = self.name_table();
 
         let entities: Vec<Entity> = surface
             .entities()
@@ -312,17 +369,52 @@ impl World {
             })
             .collect();
 
-        // Sorted so a replayed frame is byte-stable across runs: both the
-        // slab and the tile map iterate in an order that depends on
-        // allocation and hashing rather than on the world's contents.
-        let mut tiles: Vec<Tile> = surface
-            .tiles
+        let tiles = Self::materialize_tiles(&surface.tiles, &names);
+
+        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles }
+    }
+
+    /// Materialise one surface's natural-terrain layer as a `Frame`-shaped
+    /// snapshot in the same format `to_frame` uses (`entities` always
+    /// empty). Terrain never changes after the baseline loads it (see
+    /// `Surface::terrain`), so unlike `to_frame` this only ever needs
+    /// calling once per surface, right after loading the baseline, not once
+    /// per replayed frame.
+    pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
+        let Some(surface) = self.surfaces.get(surface_name) else {
+            return Frame {
+                tick,
+                surface: surface_name.to_string(),
+                entities: Vec::new(),
+                count: 0,
+                tiles: Vec::new(),
+            };
+        };
+
+        let names = self.name_table();
+        let tiles = Self::materialize_tiles(&surface.terrain, &names);
+        Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles }
+    }
+
+    /// Resolved once per call rather than once per entity/tile: a real
+    /// surface has a few dozen distinct names against hundreds of thousands
+    /// of entities (or millions of tiles), so re-allocating the same name
+    /// string on every entity/tile of every frame is pure waste `Arc::clone`
+    /// skips.
+    fn name_table(&self) -> Vec<Arc<str>> {
+        (0..self.names.len()).map(|id| Arc::from(self.names.name(id as NameId))).collect()
+    }
+
+    /// Sorted so a materialised frame is byte-stable across runs: a
+    /// `HashMap` iterates in an order that depends on allocation and
+    /// hashing rather than on its contents.
+    fn materialize_tiles(tiles: &HashMap<PosKey, NameId>, names: &[Arc<str>]) -> Vec<Tile> {
+        let mut out: Vec<Tile> = tiles
             .iter()
             .map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y })
             .collect();
-        tiles.sort_by_key(|t| (t.y, t.x));
-
-        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles }
+        out.sort_by_key(|t| (t.y, t.x));
+        out
     }
 }
 
@@ -569,6 +661,117 @@ mod tests {
     fn an_unknown_surface_materialises_as_an_empty_frame() {
         let world = World::new();
         let frame = world.to_frame("nowhere", 12);
+        assert_eq!(frame.count, 0);
+        assert!(frame.entities.is_empty() && frame.tiles.is_empty());
+        assert_eq!(frame.surface, "nowhere");
+    }
+
+    #[test]
+    fn is_placed_floor_matches_the_mods_placed_floor_list() {
+        for name in [
+            "stone-path",
+            "concrete",
+            "hazard-concrete-left",
+            "hazard-concrete-right",
+            "refined-concrete",
+            "refined-hazard-concrete-left",
+            "refined-hazard-concrete-right",
+            "landfill",
+            "red-refined-concrete",
+            "green-refined-concrete",
+            "blue-refined-concrete",
+            "orange-refined-concrete",
+            "yellow-refined-concrete",
+            "pink-refined-concrete",
+            "purple-refined-concrete",
+            "black-refined-concrete",
+            "brown-refined-concrete",
+            "cyan-refined-concrete",
+            "acid-refined-concrete",
+        ] {
+            assert!(is_placed_floor(name), "{name} should be placed floor");
+        }
+
+        for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3"] {
+            assert!(!is_placed_floor(name), "{name} should be natural terrain");
+        }
+    }
+
+    /// A baseline mixes both kinds of tile; loading must sort each into the
+    /// layer `is_placed_floor` says it belongs in, not lump them together.
+    #[test]
+    fn a_baseline_routes_tiles_to_the_right_layer() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(
+            Vec::new(),
+            vec![
+                Tile { n: "concrete".into(), x: 0, y: 0 },
+                Tile { n: "grass-1".into(), x: 1, y: 0 },
+                Tile { n: "landfill".into(), x: 2, y: 0 },
+                Tile { n: "water".into(), x: 3, y: 0 },
+            ],
+        ));
+
+        let surface = world.surface("nauvis").unwrap();
+        assert_eq!(surface.floor_tile_count(), 2, "concrete and landfill");
+        assert_eq!(surface.terrain_tile_count(), 2, "grass and water");
+        assert_eq!(surface.tile_count(), 4, "both layers together");
+    }
+
+    /// `to_frame` runs once per emitted replay frame, so it must only ever
+    /// carry placed floor: including terrain here is exactly the bug this
+    /// fix removes.
+    #[test]
+    fn to_frame_never_includes_terrain() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(
+            Vec::new(),
+            vec![
+                Tile { n: "concrete".into(), x: 0, y: 0 },
+                Tile { n: "grass-1".into(), x: 1, y: 0 },
+            ],
+        ));
+
+        let frame = world.to_frame("nauvis", 10);
+        assert_eq!(frame.tiles.len(), 1);
+        assert_eq!(frame.tiles[0].n, Arc::from("concrete"));
+    }
+
+    /// The counterpart to `to_frame_never_includes_terrain`: the terrain
+    /// layer materialises through its own method instead, with no entities
+    /// since natural terrain never has any.
+    #[test]
+    fn terrain_frame_carries_only_the_terrain_layer() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(
+            vec![entity("pipe", 1.5, 2.5)],
+            vec![
+                Tile { n: "concrete".into(), x: 0, y: 0 },
+                Tile { n: "grass-1".into(), x: 1, y: 0 },
+                Tile { n: "water".into(), x: 2, y: 0 },
+            ],
+        ));
+
+        let frame = world.terrain_frame("nauvis", 10);
+        assert_eq!(frame.count, 0);
+        assert!(frame.entities.is_empty());
+        let names: Vec<Arc<str>> = frame.tiles.iter().map(|t| t.n.clone()).collect();
+        assert_eq!(names, vec![Arc::from("grass-1"), Arc::from("water")]);
+    }
+
+    #[test]
+    fn terrain_frame_is_empty_when_the_baseline_had_no_terrain() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(Vec::new(), vec![Tile { n: "concrete".into(), x: 0, y: 0 }]));
+
+        let frame = world.terrain_frame("nauvis", 10);
+        assert!(frame.tiles.is_empty());
+    }
+
+    #[test]
+    fn terrain_frame_for_an_unknown_surface_is_empty() {
+        let world = World::new();
+        let frame = world.terrain_frame("nowhere", 12);
         assert_eq!(frame.count, 0);
         assert!(frame.entities.is_empty() && frame.tiles.is_empty());
         assert_eq!(frame.surface, "nowhere");
