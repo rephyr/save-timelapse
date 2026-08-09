@@ -1,14 +1,16 @@
 # Save Timelapse
-Save Timelapse is a Factorio mod and companion desktop application for creating interactive factory timelapses.
 
-> Build an interactive timelapse of your Factorio factory  from existing saves or while you play.
+Save Timelapse is a Factorio timelapse mod and companion desktop application for creating interactive, explorable timelapses of your Factorio factory.
 
-**Save Timelapse works with saves you already have**. Point it at your save folder, and it reconstructs your factory's history into an interactive replay you can pan, zoom, scrub, and explore.
+> Watch your Factorio factory grow. Record it live as you play, or build a timelapse from Factorio saves you already have.
+
+**Save Timelapse reconstructs your factory's history as an interactive replay**, not a fixed video. Pan, zoom, scrub through construction history, and watch your base grow from a small starter factory into a massive megabase.
+
+The companion tool automatically detects your Factorio saves folder, so you can generate a timelapse from existing saves with no manual setup. For live capture, install the mod and enable the `save-timelapse-live-capture` setting to record your factory as you play.
 
 > ⚠️ **Alpha:** The core pipeline is functional, but the project is under active development. Expect bugs, missing features, and breaking changes between releases.
 
 ---
-
 ## Features
 
 - 📦 Build timelapses from **existing save files**
