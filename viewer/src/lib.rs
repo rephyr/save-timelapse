@@ -16,6 +16,7 @@ mod progress;
 mod registry;
 mod render_frame;
 mod sprites;
+mod timecode;
 
 pub use camera::{
     entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition,
@@ -35,3 +36,4 @@ pub use render_frame::{
     LOD_MAX_TILE_PIXELS,
 };
 pub use sprites::{icon_candidates, icon_path, icon_source_rect};
+pub use timecode::{format_game_time, TICKS_PER_SECOND};

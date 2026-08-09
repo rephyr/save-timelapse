@@ -150,7 +150,7 @@ Current features:
 
 - Pan
 - Zoom
-- Timeline scrubbing
+- Timeline scrubbing, labelled with elapsed in-game time at each end and at the playhead, and hovering the bar shows the time and frame number at that point before you commit to a seek
 - Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
 - Home / End navigation
 - Surface switching
@@ -209,7 +209,7 @@ The Lua mod requires no build step.
 
 ### v0.4
 
-- [ ] Timeline timestamps and hover information
+- [x] Timeline timestamps and hover information
 - [ ] Milestones, bookmarks, and event indicators
 - [ ] Better timeline navigation
 

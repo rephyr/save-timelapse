@@ -12,10 +12,10 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, growing_bounds_per_frame,
-    icon_path, icon_source_rect, is_rotation_allowed, synthetic_frame, synthetic_tiles, use_chunk_lod, Camera,
-    CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, LoadProgress, LodCell, PlayerTrack,
-    ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, LOD_CELL_TILES,
+    color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, format_game_time,
+    growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed, synthetic_frame, synthetic_tiles,
+    use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, LoadProgress, LodCell,
+    PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -918,9 +918,28 @@ fn draw_hud(
     );
 }
 
+/// Text size for the bar's own labels, a step below the HUD's 20.0: these
+/// are reference marks read at a glance beside the bar, not primary readouts.
+const TIMELINE_LABEL_SIZE: f32 = 16.0;
+
+/// Elapsed game time at `index`, or an empty string for an index the
+/// sequence does not have. Frames carry the real `game.tick` they were
+/// emitted at (see `replay::run`), so this is the capture's own clock rather
+/// than anything derived from frame numbering.
+fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
+    sequence.frames().get(index).map(|frame| format_game_time(frame.tick)).unwrap_or_default()
+}
+
 /// The scrub bar: a filled track up to the current frame, tick marks when
-/// there are few enough to read, and a playhead circle.
-fn draw_timeline_bar(timeline: &Timeline, sequence: &FrameSequence) {
+/// there are few enough to read, a playhead circle, and the elapsed game
+/// time at the ends and at the playhead.
+///
+/// `mouse` and `scrubbing` drive the hover readout. Hover is kept alive
+/// while a drag is in progress even once the pointer has left the bar's hit
+/// box, since dragging a scrubber pulls the pointer off it vertically almost
+/// immediately, and losing the readout at exactly that moment would take it
+/// away whenever it is being used most deliberately.
+fn draw_timeline_bar(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2, scrubbing: bool) {
     // Track, filled up to the current frame, a tick per frame when
     // there are few enough to read, and a playhead on top.
     draw_line(timeline.left, timeline.y, timeline.left + timeline.width, timeline.y, 4.0, Color::new(1.0, 1.0, 1.0, 0.25));
@@ -933,6 +952,78 @@ fn draw_timeline_bar(timeline: &Timeline, sequence: &FrameSequence) {
         }
     }
     draw_circle(playhead_x, timeline.y, 7.0, WHITE);
+
+    draw_timeline_endpoint_labels(timeline, sequence);
+    draw_timeline_playhead_label(timeline, sequence, playhead_x);
+
+    if timeline.contains(mouse) || scrubbing {
+        draw_timeline_hover(timeline, sequence, mouse);
+    }
+}
+
+/// Where the capture starts and ends, anchored under the bar's two ends.
+/// These bound everything else on the bar: without them the playhead's time
+/// is a number with nothing to be a fraction of.
+fn draw_timeline_endpoint_labels(timeline: &Timeline, sequence: &FrameSequence) {
+    let dim = Color::new(1.0, 1.0, 1.0, 0.55);
+    let baseline = timeline.y + 22.0;
+
+    let start = frame_time_label(sequence, 0);
+    draw_text(&start, timeline.left, baseline, TIMELINE_LABEL_SIZE, dim);
+
+    // Right-aligned so it ends flush with the bar rather than starting at
+    // it and overhanging into the window edge as the label grows.
+    let end = frame_time_label(sequence, sequence.len().saturating_sub(1));
+    let end_width = measure_text(&end, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    draw_text(&end, timeline.left + timeline.width - end_width, baseline, TIMELINE_LABEL_SIZE, dim);
+}
+
+/// The current frame's time, centered over the playhead and clamped the same
+/// way the hover tooltip is, since the playhead reaches the same bar ends
+/// the cursor does.
+fn draw_timeline_playhead_label(timeline: &Timeline, sequence: &FrameSequence, playhead_x: f32) {
+    let label = format_game_time(sequence.current().tick);
+    let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    let left = Timeline::tooltip_left(playhead_x, width, screen_width());
+    draw_text(&label, left, timeline.y - 16.0, TIMELINE_LABEL_SIZE, WHITE);
+}
+
+/// A guide line at the hovered position plus a boxed readout of the time and
+/// frame number there, so the bar answers "what is at this point" before
+/// committing to a seek.
+///
+/// Deliberately reports the frame the cursor would actually land on, via the
+/// same `index_for_x` the click path uses, rather than interpolating time
+/// across the bar: frames are spaced by a fixed tick interval but the bar
+/// snaps to whole frames, so an interpolated label would disagree with what
+/// clicking there produces.
+fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2) {
+    let index = timeline.index_for_x(mouse.x, sequence.len());
+    let hover_x = timeline.x_for_index(index, sequence.len());
+
+    draw_line(hover_x, timeline.y - 10.0, hover_x, timeline.y + 10.0, 2.0, Color::new(1.0, 1.0, 1.0, 0.7));
+
+    let time = frame_time_label(sequence, index);
+    let counter = format!("frame {}/{}", index + 1, sequence.len());
+    let time_width = measure_text(&time, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    let counter_width = measure_text(&counter, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+
+    let padding = 8.0;
+    let box_width = time_width.max(counter_width) + padding * 2.0;
+    let box_height = TIMELINE_LABEL_SIZE * 2.0 + padding * 2.0 + 4.0;
+    let box_left = Timeline::tooltip_left(hover_x, box_width, screen_width());
+    let box_top = timeline.y - 34.0 - box_height;
+
+    draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.8));
+    draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, Color::new(1.0, 1.0, 1.0, 0.35));
+    draw_text(&time, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE, TIMELINE_LABEL_SIZE, WHITE);
+    draw_text(
+        &counter,
+        box_left + padding,
+        box_top + padding + TIMELINE_LABEL_SIZE * 2.0 + 4.0,
+        TIMELINE_LABEL_SIZE,
+        Color::new(1.0, 1.0, 1.0, 0.6),
+    );
 }
 
 /// Where the player(s) were as of `tick`, on whichever world/surface is
@@ -1052,7 +1143,7 @@ async fn main() {
             use_sprites,
             &counter,
         );
-        draw_timeline_bar(&timeline, sequence);
+        draw_timeline_bar(&timeline, sequence, mouse_position().into(), state.dragging_timeline);
         draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
 
         next_frame().await;
