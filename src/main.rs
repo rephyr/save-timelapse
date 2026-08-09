@@ -381,7 +381,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         replay_state.world.entity_count(),
         replay_state.world.tile_count()
     );
-    let surfaces: Vec<String> = replay_state.world.surface_names().into_iter().map(str::to_string).collect();
+    let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state.world)?;
     println!("surfaces: {}\n", surfaces.join(", "));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;

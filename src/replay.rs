@@ -237,6 +237,27 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     Ok(Replay { world, baseline, no_op_events: 0, applied_events: 0, skipped_segments: 0, out_of_order_batches: 0 })
 }
 
+/// Every surface either the baseline or the event log ever names, for
+/// offering a complete choice of surfaces before running the (much more
+/// expensive) replay itself. The baseline alone is not enough: a Space Age
+/// planet visited for the first time after capture already started gets no
+/// baseline entry (the baseline is taken once, at the start of a
+/// playthrough's capture), but its own construction events still name it,
+/// so scanning the event log too is what makes it choosable at all instead
+/// of only ever appearing already lumped into "every surface".
+pub fn discover_surfaces(session_dir: &Path, world: &World) -> io::Result<Vec<String>> {
+    let mut surfaces: std::collections::BTreeSet<String> =
+        world.surface_names().into_iter().map(String::from).collect();
+
+    for segment in event::log_paths(session_dir)? {
+        if let Ok(stream) = event::stream_log(&segment) {
+            surfaces.extend(stream.map(|logged| logged.surface));
+        }
+    }
+
+    Ok(surfaces.into_iter().collect())
+}
+
 /// Walk the event log forward, calling `emit` with the world at each frame
 /// boundary. Events are applied in whole-tick groups, so a frame is never cut
 /// halfway through a tick's changes: a blueprint landing 400 entities on one
@@ -513,6 +534,26 @@ mod tests {
         fs::write(&path, r#"{"tick":5,"surfaces":["gone"]}"#).unwrap();
         let err = load_baseline(&path).unwrap_err();
         assert!(err.to_string().contains("/timelapse-reset-capture"), "got: {err}");
+    }
+
+    /// The bug this guards against: a planet visited for the first time after
+    /// capture already started has no baseline entry (the baseline is taken
+    /// once, at the start of a playthrough's capture), so the surface list
+    /// shown before running the replay must also check the event log, not
+    /// just the baseline the world was seeded from.
+    #[test]
+    fn discover_surfaces_includes_a_surface_that_only_appears_in_events() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        log.tick(150).add_entity("gleba", "assembling-machine-1", 5.5, 5.5, 42);
+        log.write(session_dir, "events_100.stev");
+
+        let replay = load_baseline(&baseline_path).unwrap();
+        let surfaces = discover_surfaces(session_dir, &replay.world).unwrap();
+
+        assert_eq!(surfaces, vec!["gleba".to_string(), "nauvis".to_string()]);
+        let _dir = dir;
     }
 
     #[test]
