@@ -30,6 +30,8 @@ const MAX_FRAMES: usize = 100_000;
 enum Mode {
     LiveCapture,
     FromSaves,
+    ManageCaptures,
+    Quit,
 }
 
 /// Prints `question`, reads one line, and trims it. An empty `Ok` on EOF
@@ -54,12 +56,19 @@ fn ask_mode() -> io::Result<Mode> {
             "What would you like to do?\n\
              \x20 1) Update my timelapse from live capture (recommended if capture is on)\n\
              \x20 2) Build a timelapse from existing save files\n\
-             Enter 1 or 2:",
+             \x20 3) Manage my captures (name them, see their size, delete ones you're done with)\n\
+             Enter 1, 2 or 3, or press Enter to quit:",
         )?;
         match input.as_str() {
             "1" => return Ok(Mode::LiveCapture),
             "2" => return Ok(Mode::FromSaves),
-            _ => println!("Please enter 1 or 2.\n"),
+            "3" => return Ok(Mode::ManageCaptures),
+            // Managing captures returns here rather than exiting, so this
+            // menu needs its own way out. Blank rather than a fourth number:
+            // Enter is what someone already presses to leave the management
+            // screen, and it should keep meaning "back" one level up.
+            "" => return Ok(Mode::Quit),
+            _ => println!("Please enter 1, 2 or 3.\n"),
         }
     }
 }
@@ -223,15 +232,8 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
     let now = SystemTime::now();
     for (i, session) in sessions.iter().enumerate() {
         let age = now.duration_since(session.last_modified).unwrap_or_default();
-        println!(
-            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} ({})",
-            i + 1,
-            session.baseline.tick,
-            session.baseline.entities,
-            session.baseline.tiles,
-            session.baseline.surfaces.join(", "),
-            describe_age(age)
-        );
+        let _ = age;
+        println!("  {}) {}", i + 1, describe_session(session, now));
     }
     loop {
         let input =
@@ -404,14 +406,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
     }
 
-    // A straight copy, not a re-parse: the mod's raw log and what the
-    // viewer reads are the exact same shape by design (see
-    // src/player_log.rs), so there's nothing to convert. Absent entirely
-    // is normal, not an error, e.g. nobody was connected during capture.
-    let players_log = chosen.session_dir.join("players.jsonl");
-    if players_log.exists() {
-        std::fs::copy(&players_log, out.join("players.jsonl"))?;
-    }
+    copy_session_sidecars(&chosen.session_dir, &out)?;
 
     let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
     let mut written = 0usize;
@@ -464,6 +459,28 @@ fn run_live_capture() -> io::Result<PathBuf> {
         println!(
             "{} catch-up baseline(s) applied for surface(s) added to tracking after capture started\n",
             replay_state.catch_ups_applied
+        );
+    }
+
+    // Informational, deliberately not grouped with the warnings below: this
+    // is what a playthrough that was reloaded from an earlier save looks like
+    // when it replays correctly, so it reports rather than warns.
+    if replay_state.superseded_events > 0 {
+        println!(
+            "{} event(s) skipped from timeline(s) you reloaded away from; the timelapse follows \
+             what you actually played\n",
+            replay_state.superseded_events
+        );
+    }
+
+    // Its own line rather than folded into the message above, since this one
+    // names a different thing: not events dropped, but files that turned out
+    // to hold more than one attempt at the same stretch of play.
+    if replay_state.restarted_segments > 0 {
+        println!(
+            "{} segment(s) held more than one attempt at the same stretch of play, which is what \
+             reloading a save mid-capture looks like; only the last attempt at each was used\n",
+            replay_state.restarted_segments
         );
     }
 
@@ -603,12 +620,168 @@ fn run_from_saves() -> io::Result<PathBuf> {
     Ok(out)
 }
 
-fn run() -> io::Result<PathBuf> {
+/// `None` when there is nothing to open the viewer on, which is the case for
+/// managing captures: it is housekeeping, not a build.
+fn run() -> io::Result<Option<PathBuf>> {
     println!("save-timelapse\n");
-    match ask_mode()? {
-        Mode::LiveCapture => run_live_capture(),
-        Mode::FromSaves => run_from_saves(),
+    loop {
+        match ask_mode()? {
+            Mode::LiveCapture => return run_live_capture().map(Some),
+            Mode::FromSaves => return run_from_saves().map(Some),
+            // Loops back to the menu instead of returning, since managing
+            // captures is housekeeping done *before* building something:
+            // naming a playthrough and then being dropped out of the program
+            // means starting it again to actually use the name.
+            Mode::ManageCaptures => {
+                let capture = locate_factorio_user_dir_interactive()?
+                    .join("script-output")
+                    .join("save-timelapse");
+                manage_captures(&capture)?;
+                println!();
+            }
+            Mode::Quit => return Ok(None),
+        }
     }
+}
+
+/// Bytes as something a person can compare at a glance. Captures range from
+/// a few hundred KiB to several GiB, so a single unit would either be
+/// unreadably long or lose the distinction between the small ones.
+fn describe_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// One line describing a capture, for both the management screen and the
+/// picker that runs before a live-capture rebuild.
+///
+/// Leads with the name when there is one. Without it a capture is identified
+/// only by a hex session id and a relative age, which is no help at all in
+/// telling two playthroughs apart, and naming them is most of the point of
+/// the management screen.
+fn describe_session(session: &replay::Session, now: SystemTime) -> String {
+    let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
+    let name = session.label().unwrap_or_else(|| format!("unnamed ({:08x})", session.session_id));
+    format!(
+        "{name}  |  {}, baseline tick {} ({} entities, {} tiles)  |  surfaces: {}  |  {age}",
+        describe_size(session.size_on_disk()),
+        session.baseline.tick,
+        session.baseline.entities,
+        session.baseline.tiles,
+        session.baseline.surfaces.join(", "),
+    )
+}
+
+/// The capture management screen: name a playthrough so it can be told apart
+/// from the others, see what each is costing on disk, and delete ones that
+/// are finished with.
+///
+/// Deleting is offered here rather than only in game because the in-game
+/// reset only ever removes the playthrough you currently have loaded. There
+/// was no way at all to clear an old capture belonging to a save you no
+/// longer play, short of finding the folder by hand.
+fn manage_captures(capture_dir: &Path) -> io::Result<()> {
+    loop {
+        let mut sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
+        if sessions.is_empty() {
+            println!("
+No captures found in {}.", capture_dir.display());
+            return Ok(());
+        }
+
+        let now = SystemTime::now();
+        let total: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
+        println!("
+{} capture(s), {} in total:
+", sessions.len(), describe_size(total));
+        for (i, session) in sessions.iter().enumerate() {
+            println!("  {}) {}", i + 1, describe_session(session, now));
+        }
+
+        let action = prompt(
+            "
+Enter a number to name that capture, \"d <number>\" to delete one, or press Enter to go back:",
+        )?;
+        let action = action.trim().to_string();
+        if action.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(rest) = action.strip_prefix('d') {
+            let Some(index) = parse_session_index(rest, sessions.len()) else {
+                println!("Please enter \"d\" followed by a number between 1 and {}.", sessions.len());
+                continue;
+            };
+            // Named in the question rather than just numbered: a number is
+            // easy to mistype, and this cannot be undone.
+            let session = sessions.remove(index);
+            let described = describe_session(&session, now);
+
+            // Spelling out what is lost, not just which folder goes. "Delete
+            // this capture" sounds like discarding a rendered video you could
+            // rebuild; it is actually the only copy of that playthrough's
+            // history, since a Factorio save stores no construction record to
+            // reconstruct it from. The freeze is worth naming too: it is the
+            // part people are surprised by when they start over.
+            println!("\nThis permanently deletes {}", session.session_dir.display());
+            println!(
+                "That is the entire capture: the baseline snapshot and every construction event \
+                 recorded since. It cannot be recovered from your saves, because Factorio keeps no \
+                 history of when things were built. Capturing this playthrough again starts from a \
+                 fresh baseline, which freezes the game while it scans the base (tens of seconds on \
+                 a megabase)."
+            );
+            if ask_yes_no(&format!("Delete \"{described}\"?"), false)? {
+                match session.delete() {
+                    Ok(()) => println!("Deleted."),
+                    Err(e) => println!("Could not delete it: {e}"),
+                }
+            } else {
+                println!("Left alone.");
+            }
+            continue;
+        }
+
+        let Some(index) = parse_session_index(&action, sessions.len()) else {
+            println!("Please enter a number between 1 and {}, or \"d <number>\" to delete.", sessions.len());
+            continue;
+        };
+        let current = sessions[index].label().unwrap_or_default();
+        let hint = if current.is_empty() {
+            "Enter a name for this capture (or press Enter to leave it unnamed):".to_string()
+        } else {
+            format!("Enter a new name (currently \"{current}\", press Enter to clear it):")
+        };
+        let name = prompt(&hint)?;
+        sessions[index].set_label(&name)?;
+    }
+}
+
+/// Copies the plain-JSON sidecar logs a live capture writes alongside its
+/// frames into the rendered output, so the viewer finds them next to the
+/// frames it is pointed at.
+///
+/// A straight copy, not a re-parse: the mod's raw logs and what the viewer
+/// reads are the exact same shape by design (see `player_log.rs` and
+/// `milestone.rs`), so there is nothing to convert. Each one being absent is
+/// normal rather than an error: nobody was connected during the capture, or
+/// nothing milestone-worthy happened yet, or the capture predates the file
+/// existing at all.
+fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
+    let mut copied = Vec::new();
+    for name in ["players.jsonl", "milestones.jsonl"] {
+        let source = session_dir.join(name);
+        if source.exists() {
+            std::fs::copy(&source, out.join(name))?;
+            copied.push(name);
+        }
+    }
+    Ok(copied)
 }
 
 /// A double-clicked console window closes the instant the process exits,
@@ -638,6 +811,7 @@ fn main() {
 
     let outcome = std::panic::catch_unwind(|| {
         run().and_then(|out| {
+            let Some(out) = out else { return Ok(()) };
             let viewer = viewer_path()?;
             println!("opening the viewer...");
             Command::new(&viewer).arg(&out).spawn()?;
@@ -660,6 +834,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both sidecars a live capture writes have to land next to the frames,
+    /// or the viewer never sees them: it looks for them beside the frames it
+    /// was pointed at, not in the capture folder they came from.
+    #[test]
+    fn both_session_sidecars_are_copied_next_to_the_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, out) = (dir.path().join("session"), dir.path().join("out"));
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(session.join("players.jsonl"), "{\"tick\":1,\"players\":[]}
+").unwrap();
+        std::fs::write(
+            session.join("milestones.jsonl"),
+            "{\"tick\":9,\"kind\":\"rocket\",\"id\":\"rocket-launched\"}
+",
+        )
+        .unwrap();
+
+        let copied = copy_session_sidecars(&session, &out).unwrap();
+        assert_eq!(copied, ["players.jsonl", "milestones.jsonl"]);
+
+        // Copied verbatim, not re-encoded: the mod's shape and the reader's
+        // are the same by design, so the reader must accept it unchanged.
+        let milestones = save_timelapse::milestone::read(&out.join("milestones.jsonl")).unwrap();
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].label(), "First rocket launched");
+    }
+
+    /// Every combination of the two being absent is ordinary, not an error:
+    /// nobody connected, or nothing notable happened yet, or the capture
+    /// predates either file existing.
+    #[test]
+    fn missing_sidecars_are_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, out) = (dir.path().join("session"), dir.path().join("out"));
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+
+        assert!(copy_session_sidecars(&session, &out).unwrap().is_empty());
+
+        std::fs::write(session.join("milestones.jsonl"), "").unwrap();
+        assert_eq!(copy_session_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
+    }
 
     #[test]
     fn parse_yes_no_accepts_short_and_long_forms_case_insensitively() {
@@ -688,6 +906,39 @@ mod tests {
         assert_eq!(parse_frame_seconds("0"), None);
         assert_eq!(parse_frame_seconds("-5"), None);
         assert_eq!(parse_frame_seconds("soon"), None);
+    }
+
+    #[test]
+    fn describe_size_picks_a_unit_a_person_can_compare() {
+        assert_eq!(describe_size(0), "0 B");
+        assert_eq!(describe_size(512), "512 B");
+        assert_eq!(describe_size(1024), "1.0 KiB");
+        assert_eq!(describe_size(38 * (1 << 20)), "38.0 MiB");
+        assert_eq!(describe_size(3 * (1 << 30) / 2), "1.5 GiB");
+    }
+
+    /// A capture with no name has to stay identifiable, or the management
+    /// screen lists rows nobody can tell apart.
+    #[test]
+    fn an_unnamed_capture_is_described_by_its_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("0000002a");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("baseline.json"),
+            r#"{"tick":100,"entities":7,"tiles":3,"surfaces":["nauvis"]}"#,
+        )
+        .unwrap();
+
+        let sessions = replay::discover_sessions(dir.path()).unwrap();
+        let line = describe_session(&sessions[0], SystemTime::now());
+        assert!(line.contains("unnamed (0000002a)"), "got: {line}");
+        assert!(line.contains("nauvis") && line.contains("baseline tick 100"), "got: {line}");
+
+        sessions[0].set_label("Vulcanus run").unwrap();
+        let named = describe_session(&replay::discover_sessions(dir.path()).unwrap()[0], SystemTime::now());
+        assert!(named.starts_with("Vulcanus run"), "a named capture leads with its name: {named}");
+        assert!(!named.contains("unnamed"), "got: {named}");
     }
 
     #[test]

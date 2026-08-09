@@ -43,6 +43,53 @@ impl Camera {
     /// captured around it. Real bases are almost never near world origin, so
     /// an empty/degenerate input falls back to a sane default rather than
     /// opening on empty space.
+    ///
+    /// The whole-run fit, over a sequence rather than a slice of frames,
+    /// since frames are no longer all resident at once (see `FrameSequence`).
+    /// Every frame is materialized once into a shared scratch buffer as this
+    /// walks, which is why it takes corners as it goes rather than collecting
+    /// them: the frames do not outlive the walk.
+    pub fn fit_sequence(
+        frames: &crate::render_frame::FrameSequence,
+        terrain: Option<&RenderFrame>,
+        screen_width: f32,
+        screen_height: f32,
+    ) -> Camera {
+        let mut bounds: Option<(Vec2, Vec2)> = None;
+        let mut take = |point: Vec2| {
+            bounds = Some(match bounds {
+                Some((min, max)) => (min.min(point), max.max(point)),
+                None => (point, point),
+            });
+        };
+
+        frames.for_each_frame(|_, frame| {
+            for entity in &frame.entities {
+                let half = Vec2::new(entity.w as f32, entity.h as f32) / 2.0;
+                let center = Vec2::new(entity.x, entity.y);
+                take(center - half);
+                take(center + half);
+            }
+            for tile in &frame.tiles {
+                take(Vec2::new(tile.x as f32, tile.y as f32));
+                take(Vec2::new(tile.x as f32 + 1.0, tile.y as f32 + 1.0));
+            }
+        });
+        if let Some(terrain) = terrain {
+            for tile in &terrain.tiles {
+                take(Vec2::new(tile.x as f32, tile.y as f32));
+                take(Vec2::new(tile.x as f32 + 1.0, tile.y as f32 + 1.0));
+            }
+        }
+
+        match bounds {
+            Some((min, max)) => {
+                Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
+            }
+            None => Camera { offset: Vec2::ZERO, zoom: 1.0 },
+        }
+    }
+
     pub fn fit_frames(
         frames: &[RenderFrame],
         terrain: Option<&RenderFrame>,
@@ -248,6 +295,35 @@ impl Timeline {
     /// count as interacting with it rather than the view behind it.
     pub fn contains(&self, point: Vec2) -> bool {
         point.x >= self.left && point.x <= self.left + self.width && (point.y - self.y).abs() <= Self::HIT_HEIGHT
+    }
+
+    /// How close a tooltip is allowed to get to the window edge before it
+    /// stops following the cursor and parks instead.
+    pub const TOOLTIP_MARGIN: f32 = 8.0;
+
+    /// Left edge for a hover tooltip of `width` that would ideally be
+    /// centered on `center_x`, pushed back inside the window when centering
+    /// would hang it off an edge.
+    ///
+    /// Needed because the tooltip tracks the cursor across the whole bar
+    /// while the bar itself reaches to within 20% of each window edge (see
+    /// `for_screen`). A label wide enough to be worth reading is therefore
+    /// wider than the gap beside the bar's ends, so it would be clipped
+    /// exactly at the first and last frame, which are two of the positions
+    /// someone is most likely to go looking at.
+    ///
+    /// Clamping rather than flipping the tooltip to the other side of the
+    /// cursor: flipping keeps the pointer relationship exact but makes the
+    /// box jump sideways mid-drag, and a scrub bar is dragged along its
+    /// whole length, so that jump would happen constantly.
+    pub fn tooltip_left(center_x: f32, width: f32, screen_width: f32) -> f32 {
+        let margin = Self::TOOLTIP_MARGIN;
+        // A tooltip too wide for the window has no in-bounds placement at
+        // all, so max_left would fall below margin and invert the clamp
+        // range, which `f32::clamp` panics on. Pinning it left in that case
+        // at least keeps the start of the text readable.
+        let max_left = (screen_width - margin - width).max(margin);
+        (center_x - width / 2.0).clamp(margin, max_left)
     }
 }
 
@@ -514,5 +590,32 @@ mod tests {
         assert!(timeline.contains(mid));
         assert!(!timeline.contains(Vec2::new(timeline.left - 50.0, timeline.y)), "left of the bar");
         assert!(!timeline.contains(Vec2::new(mid.x, timeline.y - 200.0)), "far above the bar");
+    }
+
+    #[test]
+    fn a_tooltip_with_room_to_spare_is_centered_on_the_cursor() {
+        assert_eq!(Timeline::tooltip_left(500.0, 120.0, 1000.0), 440.0);
+    }
+
+    /// The bar reaches to within 20% of each window edge, so a tooltip at
+    /// the first or last frame is exactly where centering would clip it.
+    #[test]
+    fn a_tooltip_at_either_bar_end_is_pushed_back_on_screen() {
+        let timeline = Timeline::for_screen(1000.0, 600.0);
+        let margin = Timeline::TOOLTIP_MARGIN;
+        let width = 300.0;
+
+        let at_start = Timeline::tooltip_left(timeline.left, width, 1000.0);
+        assert!(at_start >= margin, "ran off the left edge: {at_start}");
+
+        let at_end = Timeline::tooltip_left(timeline.left + timeline.width, width, 1000.0);
+        assert!(at_end + width <= 1000.0 - margin, "ran off the right edge: {at_end}");
+    }
+
+    /// `f32::clamp` panics when its range is inverted, which a tooltip wider
+    /// than the window would otherwise produce.
+    #[test]
+    fn a_tooltip_wider_than_the_window_pins_left_instead_of_panicking() {
+        assert_eq!(Timeline::tooltip_left(400.0, 5000.0, 800.0), Timeline::TOOLTIP_MARGIN);
     }
 }

@@ -6,6 +6,7 @@
 
 local encode = require("encode")
 local export = require("export")
+local milestones = require("milestones")
 
 local M = {}
 
@@ -59,6 +60,16 @@ local capture_surfaces = encode.new_dictionary()
 --- one when the tick actually changes rather than once per event. Reset
 --- alongside the dictionaries above.
 local capture_last_written_tick = nil
+
+--- Whether this session has already reconciled its (empty, freshly re-run)
+--- dictionaries with whatever the segment file on disk already contains.
+---
+--- A plain module local specifically because Factorio resets these on every
+--- load, which is exactly the event that needs detecting. Nothing in
+--- `storage` can serve here: `storage` is saved inside the save file, so it
+--- rewinds along with it and can never tell "this save was just loaded" from
+--- "this save has been running a while".
+local capture_dictionaries_synced = false
 
 local excluded_type_set = nil
 --- Same filter as snapshot export, so a captured event never logs something
@@ -142,7 +153,7 @@ end
 --- instead of erroring.
 local function capture_segment_path(session_id, start_tick)
   if not session_id then
-    return string.format("%sevents_%d.stev", export.EXPORT_DIR, start_tick)
+    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick)
   end
   return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
 end
@@ -185,6 +196,13 @@ end
 --- predates `segment_initialized` existing has it as `nil`, which is
 --- correctly falsy here, so upgrading mid save self-heals on the very next
 --- check rather than producing a header-less file a reader can't recognize.
+---
+--- Note that `state.last_tick` tracks the last tick an event was actually
+--- logged at, not the last tick played, which is what makes the rollback
+--- check below neither trigger-happy nor blind. Reloading past a stretch
+--- where nothing was built discards no recorded history, so it correctly
+--- reports no rollback and keeps one segment; reloading past anything that
+--- was recorded correctly reports one.
 local function ensure_capture_segment()
   local state = storage.timelapse_capture
 
@@ -196,13 +214,6 @@ local function ensure_capture_segment()
       session_id = compute_session_id(),
     }
     storage.timelapse_capture = state
-  else
-    local next_start = encode.next_capture_segment(state.last_tick, game.tick, state.segment_start_tick)
-    if next_start ~= state.segment_start_tick then
-      state.segment_start_tick = next_start
-      state.last_tick = game.tick
-      state.segment_initialized = false
-    end
   end
 
   capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
@@ -213,7 +224,20 @@ local function ensure_capture_segment()
     capture_last_written_tick = nil
     export.safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
+  elseif not capture_dictionaries_synced then
+    -- Resuming a segment this save was already writing before it was loaded.
+    -- The module locals above were reset to empty by Factorio re-running
+    -- this file, while the segment on disk still holds every name defined
+    -- before the load, so the two sides now disagree about what id 0 means.
+    -- The record says so explicitly; see encode.event_reset_dictionaries for
+    -- why this cannot instead be solved by persisting the dictionary or by
+    -- starting a fresh segment.
+    export.safe_write_file(capture_path, encode.event_reset_dictionaries(), true)
   end
+
+  -- Set after both branches, so the very first call of a session takes one
+  -- of them and every later call in the same session takes neither.
+  capture_dictionaries_synced = true
 end
 
 --- Take the baseline once per save, then never again: everything after it is
@@ -384,6 +408,9 @@ function M.reset_capture(player)
 
   storage.timelapse_capture = nil
   capture_checked_rollover = false
+  -- The milestone file goes with the session folder, so the record of which
+  -- milestones already fired has to go too, or none would ever be rewritten.
+  milestones.reset()
 
   if settings.global["save-timelapse-live-capture"].value then
     if player then
@@ -522,6 +549,7 @@ function M.periodic_flush(tick)
   capture_checked_rollover = true
   flush_capture()
   export.sample_connected_players(tick, storage.timelapse_capture.session_id)
+  milestones.poll(tick, storage.timelapse_capture.session_id)
 end
 
 --- Run when the save-timelapse-live-capture setting is turned on: baselines

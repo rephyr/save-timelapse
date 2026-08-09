@@ -16,8 +16,10 @@ The companion tool automatically detects your Factorio saves folder, so you can 
 - 📦 Build timelapses from **existing save files**
 - 🎮 Live capture mode with minimal performance impact
 - 🎛️ In-game panel to control live capture: start/stop, choose which surfaces are recorded, and reset
+- 🗂 Capture management in the desktop tool: name each playthrough, see its size on disk, and delete ones you are finished with
 - 🗺 Interactive viewer with pan, zoom and timeline scrubbing
 - 🌍 Multi-surface support (Nauvis, platforms, planets)
+- 🏁 Milestone markers on the timeline: first science packs, first rocket, planets reached
 - ⚡ Chunked renderer with automatic level-of-detail rendering
 - 🦀 Written in Rust for performance
 - 🔧 No Python, command-line tools or FFmpeg required
@@ -57,10 +59,7 @@ No changes are made to your Factorio installation or mods folder unless you inst
 
 ## Screenshots
 - Overview of the current state of the tool
-![Tool overview](assets/save-timelapse-overview.PNG)
-
-- Live capture, played back
-![Demo](assets/demo.gif)
+![Tool overview](assets/overview.gif)
 
 - Timeline scrubbing
 ![Timeline scrubbing](assets/scrubbing.gif)
@@ -109,7 +108,10 @@ The mod:
 
 - performs one initial snapshot
 - records only entity additions/removals afterwards
-- keeps runtime overhead minimal
+- writes a compact binary format: entities are grouped by type and their
+  positions stored as small deltas, which measured roughly 5x smaller than
+  the previous format on a megabase (a 200 MB surface export became 38 MB)
+  while also being faster to write than the format it replaced
 - tags every capture with which playthrough it belongs to, so saves from
   different games never get mixed into one timelapse
 
@@ -150,7 +152,10 @@ Current features:
 
 - Pan
 - Zoom
-- Timeline scrubbing
+- Timeline scrubbing, labelled with elapsed in-game time at each end and at the playhead, and hovering the bar shows the time and frame number at that point before you commit to a seek
+- Activity graph along the scrub bar: how much got built at each point in the run, so busy stretches and idle ones are visible at a glance without playing through them
+- Construction heatmap (`h` to toggle, off by default): warm overlay showing where building happened over the last few frames, drawn under the factory so it never obscures what you built
+- Milestone markers under the scrub bar: the first of each science pack, the first rocket launch, and each planet reached, coloured by science pack and labelled on hover
 - Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
 - Home / End navigation
 - Surface switching
@@ -171,7 +176,18 @@ cargo build --release
 cargo test --workspace
 ```
 
-The Lua mod requires no build step.
+The Lua mod requires no build step, but it has its own test suite, which
+needs a Lua interpreter that `cargo test` deliberately does not depend on:
+
+```bash
+make test-lua                 # needs `lua` on PATH
+make test-lua LUA=lua52       # or point it at a specific interpreter
+```
+
+Use **Lua 5.2**, the version Factorio's modding API is. The suite passes
+under 5.1 through 5.5 alike, so a newer interpreter looks healthy while
+accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
+`math.type`) that Factorio will not run.
 
 ---
 
@@ -209,14 +225,15 @@ The Lua mod requires no build step.
 
 ### v0.4
 
-- [ ] Timeline timestamps and hover information
-- [ ] Milestones, bookmarks, and event indicators
-- [ ] Better timeline navigation
+- [x] Timeline timestamps and hover information
+- [x] Construction activity graph and map heatmap
+- [x] Milestone markers (first of each science pack, first rocket, each planet reached)
+- [x] Capture management: name your captures, see what they cost on disk, delete ones you are done with
 
 ### v0.5
 
+- [ ] Bookmarks and jumping between milestones and busy stretches
 - [ ] First-run setup
-- [ ] Capture management
 - [ ] Persistent settings and preferences
 - [ ] Complete tile change tracking
 - [ ] Polished Windows packaging
@@ -259,6 +276,8 @@ More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Landfill revert:** With terrain capture enabled, removing landfill leaves an empty tile instead of restoring the underlying water. Planned for a future release.
 - **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
+- **Milestones need live capture:** They are detected while you play, so a timelapse built from existing save files has none. The information is in a save (production statistics, researched technologies, rockets launched), so recovering them by comparing consecutive saves is possible, just not built yet.
+- **Nothing that moves is recorded:** The capture format records that something was built or destroyed, never that it moved, so biters, spitters and flying construction/logistics robots are deliberately excluded rather than drawn frozen wherever they happened to be. Stationary enemies are kept: nests and worms appear in red, so clearing them is visible as the front line moves outward.
 
 ---
 

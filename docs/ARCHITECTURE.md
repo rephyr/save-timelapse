@@ -179,16 +179,40 @@ human readable for debugging the handshake between the mod and the Rust side.
 Filtering happens in the `find_entities_filtered` query rather than in Lua, so
 excluded types are never returned across the API boundary.
 
-Excluded by default: characters, corpses, particles, projectiles, trees, rocks,
-cliffs, fish, fire, smoke, explosions, ghosts, dropped items, combat robots,
-streams, stickers and beams. Also excluded: biters, spitters and their
-spawners (`unit`, `unit-spawner`)  wildlife rather than factory, and without
-this a live-capture log fills with combat-death removals indistinguishable
-from the player mining something. Confirmed against a real capture, where
-these types were ~6% of exported entities. Worm turrets are left in: they
-share Factorio's `turret` type with player-built turrets, and filtering them
-out would mean matching by name instead of type, which risks catching a real
-player entity by pattern rather than excluding by what it actually is.
+Excluded by default: characters, corpses, particles, projectiles, fish, fire,
+smoke, explosions, ghosts, dropped items, streams, stickers and beams. Trees
+and cliffs are excluded only while `save-timelapse-capture-terrain` is off,
+since with it on they are wanted as ground context. Rocks are not part of that
+exception: they are `simple-entity`, which stays excluded either way, since
+that type is a catch-all covering whatever else Space Age puts in it rather
+than rocks specifically.
+
+The rest of the exclusions are all one idea: **this format records that
+something was built or destroyed, never that it moved.** A frame carries a
+position per entity and the event log carries add and remove records, and
+neither has any way to say "the thing you already know about is now
+somewhere else". Anything mobile is therefore pinned wherever it happened to
+be when it was captured, while the real one carries on, so drawing it is
+worse than leaving it out.
+
+- **Flying robots** (`construction-robot`, `logistic-robot`, `combat-robot`).
+  The highest-volume case by far: a megabase running a large construction job
+  has tens of thousands airborne at once, each one a record in the baseline
+  and in every frame of a from-saves export. Roboports stay, being the
+  stationary infrastructure that actually shows the network growing.
+- **Biters and spitters** (`unit`). Additionally, their combat deaths would
+  fill a live-capture log with removals indistinguishable from the player
+  mining something. Confirmed against a real capture, where enemies were ~6%
+  of exported entities.
+
+Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
+being enemies, because they are stationary and so the format represents them
+honestly. Watching the front line move outward as nests are cleared is a real
+part of how expansion looks, and the viewer colors both red so it reads at a
+glance (`viewer/src/registry.rs`'s `is_enemy`). Worms additionally could not
+be filtered safely even if wanted: they share Factorio's `turret` type with
+player-built turrets, so excluding them would mean matching by name rather
+than by what the entity actually is, risking a real player entity.
 
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
@@ -374,7 +398,7 @@ The version byte gives a reader the same "format I don't understand" signal
 the frame format's does, but there is deliberately no checksum trailer to
 go with it, unlike that format. A segment is append only and grows for as
 long as capture stays on, and is simply abandoned, not closed, when a
-rollover starts a new one (see `next_capture_segment` above), so there is no
+rollover starts a new one (see the reload note below), so there is no
 "this segment is now finished" moment to checksum against without inventing
 one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of
@@ -399,16 +423,33 @@ below). The wire format now makes this structurally impossible to get wrong
 in the old way: there is no shape a `RemoveEntity` record can take that omits
 position, unlike the old JSON line where `id` alone was a valid message.
 
-A segment file can be resumed across a save reload: Factorio re-runs all of
-`control.lua`'s top-level code on every load, which resets the in-memory name
-and surface dictionaries to empty. If play resumes appending to a segment
-file that already has earlier `DefineName`/`DefineSurface` records in it from
-before the reload, this session has no way to read those back (see "That same
-persistence is a trap" above for why not), so it may redefine a
-handful of names it cannot know were already defined. That's harmless, not a
-corruption: the reader always assigns ids purely by encounter order in the
-file, so a name defined twice just gets two ids that both resolve to the same
-string, at the cost of a few dozen redundant bytes, not a wrong replay.
+A segment file is resumed across a save reload: Factorio re-runs all of
+`capture.lua`'s top-level code on every load, which resets the in-memory name
+and surface dictionaries to empty while the file on disk keeps every
+`DefineName`/`DefineSurface` written before that point.
+
+This used to be documented here as harmless, on the reasoning that "a name
+defined twice just gets two ids that both resolve to the same string". That
+reasoning was wrong, and the bug it hid was severe. It holds only while the
+writer keeps counting up. Once the writer's dictionary resets it hands out id
+0 again, while the reader has been assigning ids by encounter order and is
+already past 0, so **every entity and tile logged after any reload decoded as
+whichever name happened to be defined first in that segment**. Nothing about
+the file looks damaged; the names are simply wrong.
+
+Event format version 2 fixes this with an explicit `ResetDictionaries` record
+(tag 7, no payload), written when a load resumes a segment already on disk.
+Both sides restart their ids from zero at that point. Version 1 files are
+still read, since captures in that format exist, but they carry the bug and
+nothing on the reading side can repair it: the record that would say where
+the reset happened is exactly what is missing.
+
+Persisting the dictionary in `storage` would not have worked, for the same
+reason the mod cannot detect a reload at all (below): `storage` rewinds with
+the save and would describe fewer names than the file already holds. Starting
+a fresh segment per load would not either, since every counter available to
+name that segment also lives in `storage`, so loading one save twice would
+reuse a filename and overwrite a sibling branch's history.
 
 ### Why replay is forgiving
 
@@ -430,8 +471,103 @@ large fraction means the log and baseline came from different playthroughs.
 Events are applied in whole-tick batches, so a frame is never cut halfway
 through a tick — a blueprint landing 400 entities appears whole or not at all.
 
+A frame is also pinned to its own tick rather than to whenever the next event
+happens to arrive. The two only look the same when events are dense: across a
+gap (a long stretch of research or walking with nothing built), every frame
+boundary inside the gap has to be emitted before the event that ends the gap
+is folded into the world, or all of them render with that event's changes
+already visible, showing something built at the end of a gap as though it had
+been standing there since the start of it. `replay::run` therefore flushes up
+to the tick *before* each incoming event, not up to the batch it just applied.
+
+### Reloading an earlier save
+
+Going back in time is ordinary play: a player reloads to undo a mistake or
+recover from a biter breach.
+
+**The mod cannot detect this at all.** Every version of `capture.lua` has had
+some form of "compare the tick play resumed at against the last tick we
+recorded, and roll over to a fresh segment if it went backwards". That check
+can never fire: both values come out of the save being loaded, since the
+recorded tick lives in `storage`, which Factorio serializes into the save
+file. A save made at tick T restores a recorded tick no greater than T while
+`game.tick` is exactly T, so the comparison is always false. Nothing else in
+the Lua sandbox helps, because anything durable enough to survive a load is
+also inside the save and rewinds with it.
+
+So reloads are resolved entirely on the reading side, where the evidence
+actually exists: ticks that jump backwards *inside* one segment mark where a
+reload happened, and `event::segment_run_bounds` splits the segment there.
+The cross-segment machinery below still applies to the segments a capture does
+end up with, and the mod still cannot delete or truncate anything it abandoned — Factorio's Lua sandbox offers
+`write_file` and `remove_path` and nothing finer, and removing the file
+outright would also throw away the part of it that is still real history. So
+the abandoned file keeps its records for a future that, from the player's
+perspective, never happened, and bounding it is the Rust side's job.
+
+`event::log_segments` does that. Each segment carries an `end_tick`, and
+events at or past it are dropped (counted as `Replay::superseded_events`,
+reported but deliberately not warned about: a nonzero count is just what a
+reloaded playthrough looks like when it replays correctly).
+
+Two things make that bound correct. First, segments are ordered by **mtime,
+not by the tick in the filename**, because start tick stops being
+chronological the moment a playthrough reloads twice: reload from 5000 back to
+3000, play to 8000, then reload again back to 1000, and the segments were
+created in the order 0, 3000, 1000. Sorting those by tick replays the second
+reload's log before the first reload's, which is backwards. mtime recovers the
+real order, since a segment is appended to for exactly as long as it is the
+live one and is never touched again once a rollover abandons it, so segments
+finish being written in the same order they were created.
+
+Second, a segment ends at the **smallest** start tick among all segments
+created after it, not simply the next one's: in that same example the second
+reload reaches back past where the first reload's segment began, so it
+invalidates part of that segment too. A suffix minimum over the creation order
+expresses exactly that. It also keeps the returned segments in ascending tick
+order despite being sorted by mtime, since a segment's events all fall below
+its `end_tick`, which is at most the following segment's `start_tick`.
+
+Two segments sharing an mtime (a capture folder copied in a way that flattened
+its timestamps, or a filesystem too coarse to separate two rollovers) fall
+back to ascending start tick, then to the rollover sequence in the filename,
+which stitches them together with the overlaps trimmed. That is still strictly
+better than replaying the overlaps twice.
+
+#### Reloading the *same* save twice
+
+Retrying something means loading the same save again, which resumes at exactly
+the tick the live segment already started at. Rollover used to be inferred
+downstream, by checking whether the tick play resumed at differed from the
+current segment's start; those are equal here, so it read as "no rollback" and
+the second attempt was appended straight onto the first attempt's records, in
+one file, with nothing marking the boundary, and that is simply how a reload
+looks: the mod cannot detect one (see above), so it never rolls over. What it
+does now announce is that its dictionaries were reset, which answers
+that question directly from the tick comparison that actually defines it, and
+`capture_segment_name` takes a rollover sequence so two segments starting at
+the same tick get different filenames (`events_<tick>_<seq>.stev`, with the
+suffix omitted at 0 so nothing that never reloaded changes name).
+
+Captures recorded before that fix still have both attempts in one file, so
+`event::segment_run_bounds` splits a segment into **append runs** at every
+point its ticks jump backwards, and bounds them by the same suffix minimum
+used across segments. That is the same rule one level down, and it is correct
+for the same reason: records within a file are in append order, which is real
+chronological order. A capture the fixed mod wrote always has exactly one run
+per segment, so the two mechanisms compose rather than overlapping.
+
+`Replay::restarted_segments` counts files that held more than one run. It is
+kept separate from `superseded_events` because ticks jumping backwards inside
+one file is also, in principle, what a segment corrupted by deleting
+`script-output` by hand would look like, and the two are indistinguishable
+from the file alone. In practice that corruption produces a header-less file
+that fails to open outright (counted as `skipped_segments`), so treating a
+regression as a reload boundary is the reading that matches what players
+actually do.
+
 A session can also legitimately span more than one segment file (a save
-reload rolls over to a fresh one; see `next_capture_segment` above), and the
+reload cannot roll over to a fresh one; see above), and the
 mod has no way to notice or clean up a segment orphaned by deleting capture
 files by hand without running `/timelapse-reset-capture` first: its next
 flush recreates the file via a plain append, with no magic header, under the

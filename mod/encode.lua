@@ -19,14 +19,36 @@ local M = {}
 -- find_entities_filtered with invert, so these never cross the API boundary.
 M.EXCLUDED_TYPES = {
   -- actors and their remains
-  "character", "corpse", "combat-robot", "fish",
-  -- enemies: wildlife rather than factory, and their deaths in combat would
-  -- otherwise flood live capture with removal events unrelated to
-  -- construction. Worm turrets are left in: they share the "turret" type
-  -- with player turrets, and are stationary and comparatively few, so
-  -- filtering them would risk excluding a real player entity by name-sniffing
-  -- instead of type.
-  "unit", "unit-spawner",
+  "character", "corpse", "fish",
+  -- Flying robots, all of them. Same reasoning as the mobile enemies below:
+  -- an airborne bot is an entity with a position that this format has no way
+  -- to update, so it would be pinned wherever it happened to be at capture
+  -- time while the real one flew on. Worse than the biter case for volume,
+  -- though, and that is the main reason these are here: a megabase running a
+  -- large construction job has tens of thousands of bots in the air at once,
+  -- every one of them a record in the baseline snapshot and in every frame of
+  -- a from-saves export, describing nothing about how the factory grew.
+  --
+  -- Roboports and the logistics network they form are of course kept: those
+  -- are stationary infrastructure, and they are the part that actually shows
+  -- the factory growing.
+  "combat-robot", "construction-robot", "logistic-robot",
+  -- Mobile enemies only. Biters and spitters are excluded for two reasons
+  -- that both still hold: their combat deaths would flood live capture with
+  -- removal events unrelated to construction, and this format records
+  -- construction and destruction but never movement, so a captured biter
+  -- would sit frozen wherever it was first logged while the real one walked
+  -- away, which is worse than not drawing it at all.
+  --
+  -- Nests ("unit-spawner") are NOT excluded, despite being enemies too:
+  -- they are stationary, so the format represents them honestly, and they
+  -- are few enough to cost nothing. Clearing them is one of the things a
+  -- player most wants to watch happen in a timelapse, since the front line
+  -- moving outward is how expansion actually looks. Worm turrets are in for
+  -- the same reason, and additionally could not be filtered safely anyway:
+  -- they share the "turret" type with player turrets, so excluding them
+  -- would mean name-sniffing and risking a real player entity.
+  "unit",
   -- generic decorative/rock scatter, kept out for now: unlike trees and
   -- cliffs (rendered as ground context, see export.lua's terrain capture),
   -- this catch-all covers whatever else Space Age uses it for, which is
@@ -101,8 +123,16 @@ M.EVENT_MAGIC = "STE1"
 --- Independent per format, since the frame and event formats change on their
 --- own schedules: a frame-only tweak has no reason to also bump the event
 --- version, and vice versa.
-M.FRAME_VERSION = 1
-M.EVENT_VERSION = 1
+--- Version 2 groups records into per-name runs and stores coordinates as
+--- zigzag varint deltas, measured 4.7x smaller than version 1 on a real
+--- frame. See src/frame.rs, which reads both.
+M.FRAME_VERSION = 2
+--- Version 2 adds the dictionary-reset record (tag 7, see
+--- `event_reset_dictionaries`). A version 1 reader hitting that record stops
+--- the stream rather than misreading it, since an unknown tag ends parsing,
+--- so the bump is what turns "silently wrong from the reload onward" into a
+--- refusal an older build can explain.
+M.EVENT_VERSION = 2
 
 --- JSON string quoting, still needed for the manifest files
 --- (baseline.json, frame_<tick>_manifest.json): those stay JSON since
@@ -210,38 +240,135 @@ function M.dictionary_id(dict, name, define_tag)
   return id, M.u8(define_tag) .. M.str(name)
 end
 
+--- LEB128: seven bits per byte, high bit set while more follow, so a small
+--- number costs one byte. Pure arithmetic, since Factorio's Lua 5.2 has no
+--- bitwise operators, the same constraint u32le above works around.
+function M.varint(n)
+  -- One and two byte values are almost everything this ever sees: a
+  -- coordinate delta between neighbouring entities, a name id, a run length.
+  -- Spelling those out avoids building and concatenating a table per call,
+  -- which at two calls per entity was the whole of this encoder's remaining
+  -- cost over the old per-entity one.
+  if n < 128 then
+    return string.char(n)
+  end
+  if n < 16384 then
+    return string.char(n % 128 + 128, math.floor(n / 128))
+  end
+
+  local out = {}
+  while n >= 128 do
+    out[#out + 1] = string.char(n % 128 + 128)
+    n = math.floor(n / 128)
+  end
+  out[#out + 1] = string.char(n)
+  return table.concat(out)
+end
+
+--- Zigzag: maps small magnitudes to small unsigned values whichever side of
+--- zero they are on, so a coordinate delta of -1 costs one byte rather than
+--- ten. Needs no shifts or xor, which is just as well here: it is exactly
+--- 2v for a non-negative v and -2v-1 otherwise.
+function M.zigzag(v)
+  if v >= 0 then
+    return 2 * v
+  end
+  return -2 * v - 1
+end
+
+function M.varint_i32(v)
+  return M.varint(M.zigzag(v))
+end
+
 -- Frame format (frame_<tick>_<surface>.stfr)
 
 function M.frame_header(tick, surface)
   return M.FRAME_MAGIC .. M.u8(M.FRAME_VERSION) .. M.u64le(tick) .. M.str(surface)
 end
 
---- One entity, as a "DefineName" chunk (if needed) followed by tag 1 and its
---- fixed size record. `direction`/`tile_width`/`tile_height` are always
---- written now rather than omitted at their default: once a record is this
---- compact, a variable width encoding to skip a default value costs more
---- complexity than the bytes it would save.
-function M.frame_entity_record(dict, entity)
-  local id, define = M.dictionary_id(dict, entity.name, 0)
-  local pos = entity.position
-  local direction = entity.direction or 0
-  local w = clamp_u8(entity.tile_width or 1)
-  local h = clamp_u8(entity.tile_height or 1)
-  return define
-    .. M.u8(1)
-    .. M.u16le(id)
-    .. M.i32le(M.round10(pos.x))
-    .. M.i32le(M.round10(pos.y))
-    .. M.u8(direction)
-    .. M.u8(w)
-    .. M.u8(h)
+--- Defines a name and the footprint every entity of that name shares.
+---
+--- Footprint belongs here rather than on each entity: it is a property of the
+--- prototype, so an assembling machine repeating "3x3" on every one of
+--- thousands of records was two bytes each spent restating a constant.
+function M.frame_define_name(dict, name, w, h)
+  local id = dict.ids[name]
+  if id then
+    return id, ""
+  end
+  id = dict.count
+  dict.count = id + 1
+  dict.ids[name] = id
+  return id, M.u8(0) .. M.str(name) .. M.u8(clamp_u8(w or 1)) .. M.u8(clamp_u8(h or 1))
 end
 
---- Tiles are corner positioned and integer aligned, unlike entities.
-function M.frame_tile_record(dict, tile)
-  local id, define = M.dictionary_id(dict, tile.name, 0)
-  local pos = tile.position
-  return define .. M.u8(2) .. M.u16le(id) .. M.i32le(pos.x) .. M.i32le(pos.y)
+--- One run of same-named entities: the name id and count once for the group,
+--- then each item's position as a delta from the one before it.
+---
+--- Takes parallel arrays rather than an array of per-entity tables, and that
+--- is a performance decision, not a style one. A table per entity was
+--- measured at 900k entities under real Lua 5.2: it made encoding 1.26x
+--- slower than the per-entity string records this format replaced, wiping
+--- out the win. Grouping straight into flat arrays as entities are scanned
+--- costs a few integer-keyed stores instead, and lands at 0.60x, so the
+--- smaller format is also the faster one to produce.
+---
+--- Deltas are against the previous item in the run rather than the origin,
+--- and the caller's order is kept rather than sorted: a real export already
+--- lays same-type entities out with enough locality for that to pay, and
+--- sorting first measured only 0.3% better, which is not worth sorting every
+--- entity mid-export.
+---
+--- The direction byte is carried per run, not per entity: whether a
+--- prototype rotates is the same answer for every item in the group, so a run
+--- of chests spends nothing on it.
+function M.frame_entity_run(dict, name, w, h, xs, ys, ds, count)
+  local id, define = M.frame_define_name(dict, name, w, h)
+
+  local directions = false
+  for i = 1, count do
+    if ds[i] ~= 0 then
+      directions = true
+      break
+    end
+  end
+
+  local parts = { define, M.u8(1), M.varint(id), M.varint(count), M.u8(directions and 1 or 0) }
+  local n = 5
+  local px, py = 0, 0
+  for i = 1, count do
+    local x, y = M.round10(xs[i]), M.round10(ys[i])
+    -- Appended separately rather than concatenated into one string: that
+    -- intermediate was one more allocation per entity, and table.concat at
+    -- the end joins them just as well.
+    parts[n + 1] = M.varint_i32(x - px)
+    parts[n + 2] = M.varint_i32(y - py)
+    n = n + 2
+    if directions then
+      n = n + 1
+      parts[n] = M.u8(ds[i])
+    end
+    px, py = x, y
+  end
+  return table.concat(parts)
+end
+
+--- The tile section's equivalent. Tiles are integer aligned and always one
+--- by one, but the footprint is still written into the definition so a name
+--- record has one shape in both sections.
+function M.frame_tile_run(dict, name, xs, ys, count)
+  local id, define = M.frame_define_name(dict, name, 1, 1)
+  local parts = { define, M.u8(2), M.varint(id), M.varint(count) }
+  local n = 4
+  local px, py = 0, 0
+  for i = 1, count do
+    local x, y = xs[i], ys[i]
+    parts[n + 1] = M.varint_i32(x - px)
+    parts[n + 2] = M.varint_i32(y - py)
+    n = n + 2
+    px, py = x, y
+  end
+  return table.concat(parts)
 end
 
 --- Marks the end of the entity section and the start of the tile section.
@@ -267,6 +394,29 @@ end
 --- entities) usually share a tick.
 function M.event_set_tick(tick)
   return M.u8(2) .. M.u64le(tick)
+end
+
+--- Tells a reader to forget every name and surface id defined so far in this
+--- segment, so the ids that follow are read against a fresh dictionary.
+---
+--- Needed because Factorio re-runs the whole mod on every load, which resets
+--- the writer's dictionaries to empty, while the segment file it is appending
+--- to keeps every `DefineName` written before that point. Without this record
+--- the writer hands out id 0 again for its next new name while the reader is
+--- still counting up from the ids already in the file, and every entity and
+--- tile logged after the reload decodes as whichever name happened to be
+--- defined first. That was silent: nothing about the file looks damaged, the
+--- names are simply wrong.
+---
+--- Cheaper than the alternatives. Persisting the dictionary in `storage` does
+--- not work, since `storage` is saved inside the save file and so rewinds
+--- with it, leaving it describing fewer names than the file already has.
+--- Starting a fresh segment per load does not work either, for the same
+--- reason: every counter available to name that segment lives in `storage`,
+--- so loading one save twice would reuse a filename and overwrite the
+--- sibling branch's history.
+function M.event_reset_dictionaries()
+  return M.u8(7)
 end
 
 --- `id` of nil or 0 means the add carries no unit_number (some entity kinds
@@ -315,17 +465,26 @@ function M.event_remove_tile(surfaces, surface, x, y)
   return define_surface .. M.u8(6) .. M.i32le(x) .. M.i32le(y) .. M.u16le(surface_id)
 end
 
---- Given the tick already recorded up to and the tick play resumed at,
---- decide whether this is a reload of an older save, something an
---- append-only log can't represent as one timeline, and if so, what
---- segment to start. Pure: plain values in and out, no Factorio state, so
---- the decision is testable without a save/load cycle to actually trigger.
-function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)
-  if resumed_tick < last_tick then
-    return resumed_tick -- rolled back: start a fresh segment here
-  end
-  return current_segment_start -- keep appending to the existing segment
-end
+-- Detecting a reload from inside the mod is deliberately not attempted.
+--
+-- Every version of this file has had some form of "compare the tick play
+-- resumed at against the last tick we recorded, and start a fresh segment if
+-- it went backwards". That check can never fire. Both values come out of the
+-- save being loaded: the recorded tick lives in `storage`, which Factorio
+-- serializes into the save file, so a save made at tick T restores a recorded
+-- tick no greater than T while `game.tick` is exactly T. The comparison is
+-- always false, and the rollover it guarded never happened.
+--
+-- Nothing else in the Lua sandbox helps, since anything durable enough to
+-- survive a load is also inside the save and rewinds with it.
+--
+-- So reloads are not handled here at all. They are handled where the evidence
+-- actually exists, on the reading side: ticks that jump backwards inside one
+-- segment mark where a reload happened, and `event::segment_run_bounds`
+-- (src/event.rs) splits the segment there and discards the superseded
+-- stretch. The one thing this side must still do is announce that its name
+-- dictionaries were reset by the load, which `event_reset_dictionaries`
+-- below covers.
 
 -- Checksums
 --
@@ -342,7 +501,7 @@ end
 -- stays on has no "finished" moment to checksum against.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- next_capture_segment above.
+--- event_reset_dictionaries above.
 function M.checksum_init()
   return 5381
 end
@@ -373,7 +532,7 @@ end
 -- each folder only ever contains one playthrough's files to begin with.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- next_capture_segment above, with no save/load cycle to trigger them.
+--- event_reset_dictionaries above, with no save/load cycle to trigger them.
 function M.session_dir(session_id)
   return string.format("%08x/", session_id)
 end
@@ -383,7 +542,18 @@ function M.baseline_manifest_name(session_id)
 end
 
 function M.capture_segment_name(session_id, start_tick)
-  return M.session_dir(session_id) .. string.format("events_%d.stev", start_tick)
+  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick)
+end
+
+--- Split out from `capture_segment_name` so a save with no session_id (one
+--- whose capture state predates session folders) can build the same name
+--- without one. See capture.lua's `capture_segment_path`.
+function M.capture_segment_basename(start_tick)
+  return string.format("events_%d.stev", start_tick)
+end
+
+function M.milestone_name(session_id)
+  return M.session_dir(session_id) .. "milestones.jsonl"
 end
 
 function M.player_log_name(session_id)
@@ -401,6 +571,37 @@ function M.frame_name(session_id, tick, surface)
     return name
   end
   return M.session_dir(session_id) .. name
+end
+
+-- Milestones
+--
+-- Notable moments worth marking on the timeline: the first of each science
+-- pack, the first rocket, the first visit to each planet. Plain
+-- newline-delimited JSON for the same reason the player log below is: a
+-- whole playthrough produces on the order of a dozen of these, nowhere near
+-- the volume that justified a binary format for frames and events, and a
+-- format that can be read by eye is worth more here than the few hundred
+-- bytes packing it would save.
+
+--- One milestone: `{"tick":T,"kind":K,"id":I}`.
+---
+--- `kind` says what sort of thing happened ("science", "rocket", "planet")
+--- and `id` which one, rather than a prebaked sentence, so the viewer decides
+--- the wording and can filter by kind without parsing prose.
+function M.milestone_line(tick, kind, id)
+  return string.format('{"tick":%d,"kind":%s,"id":%s}\n', tick, M.quote(kind), M.quote(id))
+end
+
+--- Whether `name` is a science pack, by suffix rather than by a fixed list,
+--- so a modded pack is picked up for free.
+---
+--- Only ever asked about names that came out of *item* production
+--- statistics, which is what makes the suffix safe: the two other
+--- science-pack-ish prototype names in the game, the `science-pack` item
+--- subgroup and the `signal-science-pack` virtual signal, are not items and
+--- so can never appear there.
+function M.is_science_pack(name)
+  return name:sub(-13) == "-science-pack"
 end
 
 -- Player position log

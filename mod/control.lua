@@ -15,6 +15,7 @@ local export = require("export")
 local capture = require("capture")
 local snapshot = require("snapshot")
 local gui = require("gui")
+local milestones = require("milestones")
 
 -- Timers
 --
@@ -54,6 +55,18 @@ local function sync_subscriptions()
   for event_id, handler in pairs(capture.CAPTURE_HANDLERS) do
     script.on_event(event_id, capture_on and handler or nil)
   end
+
+  -- Milestones ride on the same setting as capture: they are markers on a
+  -- capture's timeline, so there is nothing for them to annotate when one is
+  -- not being recorded. Subscribed only while it is on, like the handlers
+  -- above, so there is no hook cost when off.
+  script.on_event(
+    defines.events.on_rocket_launched,
+    capture_on and function(event)
+      local state = storage.timelapse_capture
+      milestones.on_rocket_launched(event, state and state.session_id)
+    end or nil
+  )
 
   local by_interval = {}
   local function want(interval, handler)

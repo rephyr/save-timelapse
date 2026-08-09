@@ -35,7 +35,7 @@
 use macroquad::math::Vec2;
 
 use crate::registry::{is_resource, is_terrain_scatter, TypeRegistry};
-use crate::render_frame::RenderFrame;
+use crate::render_frame::{FrameSequence, RenderFrame};
 
 /// A world-space box: a center and half-extent, the shape `Camera::fit_bounds`
 /// wants.
@@ -85,17 +85,17 @@ fn union_min_max(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2) {
 /// playback, for the same reason the chunk-LOD pass in `render_frame.rs` is:
 /// this is O(total entities across the whole sequence) done once at load,
 /// not redone on every step of playback.
-pub fn growing_bounds_per_frame(frames: &[RenderFrame], registry: &TypeRegistry) -> Vec<Option<GrowingBounds>> {
+pub fn growing_bounds_per_frame(frames: &FrameSequence, registry: &TypeRegistry) -> Vec<Option<GrowingBounds>> {
     let mut result = Vec::with_capacity(frames.len());
     let mut running: Option<(Vec2, Vec2)> = None;
-    for frame in frames {
+    frames.for_each_frame(|_, frame| {
         running = match (running, frame_bounds(frame, registry)) {
             (Some(r), Some(f)) => Some(union_min_max(r, f)),
             (Some(r), None) => Some(r),
             (None, other) => other,
         };
         result.push(running.map(|(min, max)| GrowingBounds { center: (min + max) / 2.0, half_extent: (max - min) / 2.0 }));
-    }
+    });
     result
 }
 
@@ -120,7 +120,7 @@ mod tests {
     fn growing_bounds_is_none_while_nothing_has_been_built() {
         let mut registry = TypeRegistry::new();
         let frames = vec![render(Vec::new(), Vec::new(), &mut registry)];
-        let bounds = growing_bounds_per_frame(&frames, &registry);
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert_eq!(bounds, vec![None]);
     }
 
@@ -129,7 +129,7 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let frames =
             vec![render(vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)], Vec::new(), &mut registry)];
-        let bounds = growing_bounds_per_frame(&frames, &registry)[0].unwrap();
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(5.0, 5.0));
     }
 
@@ -140,7 +140,7 @@ mod tests {
             render(vec![entity("a", 0.0, 0.0)], Vec::new(), &mut registry),
             render(vec![entity("a", 0.0, 0.0), entity("b", 100.0, 0.0)], Vec::new(), &mut registry),
         ];
-        let bounds = growing_bounds_per_frame(&frames, &registry);
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert!(bounds[1].unwrap().half_extent.x > bounds[0].unwrap().half_extent.x, "the box must grow");
     }
 
@@ -153,7 +153,7 @@ mod tests {
             render(vec![entity("a", 0.0, 0.0), entity("b", 100.0, 0.0)], Vec::new(), &mut registry),
             render(vec![entity("a", 0.0, 0.0)], Vec::new(), &mut registry),
         ];
-        let bounds = growing_bounds_per_frame(&frames, &registry);
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert_eq!(bounds[0], bounds[1], "removing b must not shrink the tracked area");
     }
 
@@ -169,7 +169,7 @@ mod tests {
             vec![Tile { n: "grass".into(), x: 5000, y: 5000 }],
             &mut registry,
         )];
-        let bounds = growing_bounds_per_frame(&frames, &registry)[0].unwrap();
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the far away terrain tile must not affect the box");
     }
 
@@ -177,7 +177,7 @@ mod tests {
     fn growing_bounds_is_none_for_a_frame_with_only_tiles_and_no_entities() {
         let mut registry = TypeRegistry::new();
         let frames = vec![render(Vec::new(), vec![Tile { n: "concrete".into(), x: 50, y: 50 }], &mut registry)];
-        assert!(growing_bounds_per_frame(&frames, &registry)[0].is_none());
+        assert!(growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].is_none());
     }
 
     /// The bug this guards against: with terrain capture on, trees and
@@ -193,7 +193,7 @@ mod tests {
             Vec::new(),
             &mut registry,
         )];
-        let bounds = growing_bounds_per_frame(&frames, &registry)[0].unwrap();
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant tree and cliff must not affect the box");
     }
 
@@ -201,7 +201,7 @@ mod tests {
     fn growing_bounds_is_none_for_a_frame_with_only_terrain_scatter() {
         let mut registry = TypeRegistry::new();
         let frames = vec![render(vec![entity("tree-01", 0.0, 0.0)], Vec::new(), &mut registry)];
-        assert!(growing_bounds_per_frame(&frames, &registry)[0].is_none());
+        assert!(growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].is_none());
     }
 
     /// The real bug this guards against: with include-resources on, a
@@ -216,7 +216,7 @@ mod tests {
             Vec::new(),
             &mut registry,
         )];
-        let bounds = growing_bounds_per_frame(&frames, &registry)[0].unwrap();
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant oil deposit must not affect the box");
     }
 
@@ -227,7 +227,7 @@ mod tests {
             render(Vec::new(), Vec::new(), &mut registry),
             render(vec![entity("a", 1.0, 1.0)], Vec::new(), &mut registry),
         ];
-        let bounds = growing_bounds_per_frame(&frames, &registry);
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert!(bounds[0].is_none());
         assert!(bounds[1].is_some());
     }

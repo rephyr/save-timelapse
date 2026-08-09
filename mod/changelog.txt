@@ -1,4 +1,29 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.4.0
+Date: 2026-08-09
+  Features:
+    - Milestone markers on the timeline: the first of each science pack, the first rocket launch, and each planet you reach, shown under the scrub bar and labelled on hover
+    - Manage your captures from the desktop tool: give each playthrough a name so you can tell them apart, see how much disk it uses, and delete ones you are finished with
+    - The timeline now shows elapsed in-game time at each end and above the playhead, and hovering it shows the time and frame number at that point before you commit to a seek
+    - Activity graph along the scrub bar showing how much was built at each point in the run, so busy stretches and idle ones are visible without playing through them
+    - Construction heatmap in the viewer (press h, off by default): shows where building happened over the last few frames, drawn under the factory so it never hides what you built
+  Optimizations:
+    - Exported frames are roughly 5x smaller. Entities of the same type are grouped together and their positions stored as small differences rather than full coordinates, and each prototype's size is recorded once instead of on every entity. On a megabase, one surface went from 200 MB to 38 MB
+    - That format is also faster to write than the one it replaced, so the baseline export freezes the game for less time rather than more
+    - The viewer keeps a whole timelapse as spans rather than a full copy of every frame, which measured 37.7x less memory on a large capture, and loads in small batches so opening a long capture no longer needs the whole thing in memory at once
+  Changes:
+    - Construction and logistics robots are no longer recorded. The capture format stores that something was built or destroyed, never that it moved, so a bot in flight was pinned wherever it happened to be while the real one flew on. A megabase mid construction job also has tens of thousands of them, all describing nothing about how the factory grew
+    - Biter nests and worm turrets are now recorded, and the viewer draws them in red. They are stationary, so unlike biters the format represents them honestly, and watching the front line move outward as they are cleared is part of how expansion looks
+  Bugfixes:
+    - Fixed live capture mislabelling every entity and tile logged after any reload. Loading a save resets the mod's internal name table while the log it was writing keeps the names already in it, so from that point on everything decoded as whichever name happened to be first. Nothing about the file looked damaged; the names were simply wrong
+    - Fixed reloading an earlier save leaking entities from the timeline you reloaded away from, which made things you had undone appear immediately and stay for the rest of the timelapse
+    - Fixed anything built after a long stretch with no construction appearing at the start of that stretch instead of when it was actually built
+    - The viewer now explains that it found no loadable frames instead of crashing, which is what happened when it was pointed at captures from an older format version
+    - Fixed the mod's own packaging leaving out a required file, which would have made this release fail to load
+  Info:
+    - This release changes both file formats, so update save-timelapse.exe and the viewer alongside the mod. An older tool will refuse the new files rather than misread them
+    - Captures recorded by earlier versions still open. They keep the mislabelling described above wherever they were resumed, which cannot be repaired after the fact
+---------------------------------------------------------------------------------------------------
 Version: 0.3.0
 Date: 2026-08-09
   Features:

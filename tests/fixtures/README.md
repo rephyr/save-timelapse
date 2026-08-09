@@ -59,3 +59,17 @@ Two knobs:
 
 To run the real CLI against it, build a fake install tree with the binary at
 `bin/x64/factorio` and an empty `data/` beside it, then pass `--factorio`.
+
+## frames/milestones.jsonl
+
+Hand written, unlike everything else in `frames/`, which came out of a real
+export. The five `.stfr` files there carry no milestones of their own (they
+predate the feature, and milestones come from live capture rather than from a
+save), so this exists purely to have something to look at while working on how
+markers are drawn:
+
+    make viewer FRAMES=tests/fixtures/frames
+
+Its ticks were chosen to spread across the range those frames cover, roughly
+one to five hours of game time. Treat the timings as illustrative, not as a
+record of a real playthrough.

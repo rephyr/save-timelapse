@@ -281,6 +281,64 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
 /// Surfaces are returned busiest-first (by peak entity count), so a caller
 /// that only ever shows the first one gets the same surface loading used to
 /// always pick before there was any way to see the others.
+/// Groups frame *paths* by surface and orders each group by tick, reading
+/// only each file's header rather than parsing it.
+///
+/// The path-based twin of [`group_by_surface`], and the piece that makes a
+/// streaming load possible at all: a loader has to know which surface each
+/// file belongs to and what order they go in before it can fold them in one
+/// at a time, and grouping parsed frames means every frame is resident at
+/// exactly the moment that is trying to be avoided. Headers are a bounded
+/// read per file (see `frame::read_header`), so this costs roughly a
+/// directory scan.
+///
+/// Surfaces come back busiest first, matched to `group_by_surface`'s ordering
+/// so the default world is the same either way. "Busiest" is by file size
+/// here rather than entity count, since counting entities would mean parsing:
+/// the two agree closely, both being dominated by entity records.
+///
+/// A file whose header will not read is dropped with a warning rather than
+/// failing the load, matching how the full parse already treats one.
+pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<PathBuf>)> {
+    /// One frame file as this needs it before parsing: when it is, how big
+    /// it is (standing in for how busy), and where it lives.
+    type Candidate = (u64, u64, PathBuf);
+
+    let mut by_surface: HashMap<String, Vec<Candidate>> = HashMap::new();
+    for path in paths {
+        match save_timelapse::frame::read_header(&path) {
+            Ok((tick, surface)) => {
+                let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                by_surface.entry(surface).or_default().push((tick, size, path));
+            }
+            Err(e) => eprintln!("warning: skipping unreadable frame {}: {e}", path.display()),
+        }
+    }
+
+    let mut surfaces: Vec<(String, Vec<Candidate>)> = by_surface.into_iter().collect();
+    for (_, group) in &mut surfaces {
+        // Same rule as `order_by_tick`: ascending tick, and where two files
+        // claim one tick for a surface, the larger wins as the busier.
+        group.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        group.dedup_by_key(|(tick, _, _)| *tick);
+    }
+    surfaces.sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|(_, size, _)| *size).max().unwrap_or(0)));
+
+    surfaces
+        .into_iter()
+        .map(|(name, group)| (name, group.into_iter().map(|(_, _, path)| path).collect()))
+        .collect()
+}
+
+/// Parses `paths` in parallel and returns the frames in the same order,
+/// skipping any that fail. Unlike [`ParallelFrameLoad`], which loads a whole
+/// capture at once, this is meant to be handed one bounded batch at a time so
+/// peak memory stays at the batch rather than the capture.
+pub fn load_batch(paths: &[PathBuf]) -> Vec<Frame> {
+    let ignored = AtomicUsize::new(0);
+    load_all(paths, &ignored)
+}
+
 pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
     let mut by_surface: HashMap<String, Vec<Frame>> = HashMap::new();
     for frame in frames {
@@ -433,6 +491,38 @@ mod tests {
         }
         let frames = load_sequence(dir.path()).unwrap();
         assert_eq!(frames.iter().map(|f| f.tick).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn grouping_paths_by_header_matches_grouping_parsed_frames() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
+        let paths = frame_paths(dir).unwrap();
+
+        let by_header = group_paths_by_surface(paths.clone());
+        let by_parse = group_by_surface(load_batch(&paths));
+
+        assert_eq!(by_header.len(), by_parse.len(), "same number of surfaces");
+        for ((header_name, header_paths), (parse_name, parse_frames)) in by_header.iter().zip(&by_parse) {
+            assert_eq!(header_name, parse_name, "surfaces must come back in the same order");
+            assert_eq!(header_paths.len(), parse_frames.len(), "{header_name}: same frame count");
+            // The orders have to agree file for file, since this decides the
+            // sequence the spans are folded in.
+            let header_ticks: Vec<u64> =
+                header_paths.iter().map(|p| save_timelapse::frame::read_header(p).unwrap().0).collect();
+            let parse_ticks: Vec<u64> = parse_frames.iter().map(|f| f.tick).collect();
+            assert_eq!(header_ticks, parse_ticks, "{header_name}: tick order");
+        }
+    }
+
+    #[test]
+    fn grouping_paths_skips_a_file_it_cannot_read_a_header_from() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_frame(dir.path(), "frame_100_nauvis.stfr", 100, "nauvis", 1);
+        std::fs::write(dir.path().join("frame_200_nauvis.stfr"), b"garbage").unwrap();
+
+        let grouped = group_paths_by_surface(frame_paths(dir.path()).unwrap());
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].1.len(), 1, "the unreadable file must be dropped, not fail the load");
     }
 
     #[test]

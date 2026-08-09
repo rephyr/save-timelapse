@@ -67,6 +67,33 @@ impl<'a> ByteReader<'a> {
         self.take(8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
 
+    /// LEB128: seven bits per byte, high bit set while more follow.
+    ///
+    /// Refuses anything longer than ten bytes, which is the most a `u64` can
+    /// legitimately need, so a corrupt stream of all-high-bit bytes ends the
+    /// read rather than looping to the end of the file.
+    pub fn varint(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = self.u8()?;
+            if shift == 63 && byte > 1 {
+                return None; // would overflow a u64
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Zigzag: small magnitudes stay small whichever side of zero they are
+    /// on, so a coordinate delta of -1 costs one byte rather than ten.
+    pub fn varint_i32(&mut self) -> Option<i32> {
+        let raw = self.varint()?;
+        Some(((raw >> 1) as i64 ^ -((raw & 1) as i64)) as i32)
+    }
+
     pub fn i32(&mut self) -> Option<i32> {
         self.take(4).map(|s| i32::from_le_bytes(s.try_into().unwrap()))
     }
@@ -116,6 +143,21 @@ impl ByteWriter {
         self
     }
 
+    /// See `ByteReader::varint`.
+    pub fn varint(&mut self, mut value: u64) -> &mut Self {
+        while value >= 0x80 {
+            self.buf.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        self.buf.push(value as u8);
+        self
+    }
+
+    /// See `ByteReader::varint_i32`.
+    pub fn varint_i32(&mut self, value: i32) -> &mut Self {
+        self.varint(((value << 1) ^ (value >> 31)) as u32 as u64)
+    }
+
     pub fn i32(&mut self, value: i32) -> &mut Self {
         self.buf.extend_from_slice(&value.to_le_bytes());
         self
@@ -135,6 +177,79 @@ impl ByteWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn varints_round_trip_across_the_whole_range() {
+        let mut w = ByteWriter::new();
+        let values = [0u64, 1, 127, 128, 300, 16_383, 16_384, u32::MAX as u64, u64::MAX];
+        for v in values {
+            w.varint(v);
+        }
+        let bytes = w.into_vec();
+        let mut r = ByteReader::new(&bytes);
+        for v in values {
+            assert_eq!(r.varint(), Some(v), "round trip {v}");
+        }
+    }
+
+    /// The property the frame format leans on: a small value costs one byte,
+    /// which is what makes coordinate deltas cheap.
+    #[test]
+    fn small_varints_cost_one_byte_and_grow_seven_bits_at_a_time() {
+        let len = |v: u64| {
+            let mut w = ByteWriter::new();
+            w.varint(v);
+            w.into_vec().len()
+        };
+        assert_eq!(len(0), 1);
+        assert_eq!(len(127), 1);
+        assert_eq!(len(128), 2);
+        assert_eq!(len(16_383), 2);
+        assert_eq!(len(16_384), 3);
+        assert_eq!(len(u64::MAX), 10);
+    }
+
+    /// Zigzag is why a delta of -1 is as cheap as +1: without it a negative
+    /// would set every high bit and take the full ten bytes.
+    #[test]
+    fn zigzag_keeps_small_negatives_small() {
+        let len = |v: i32| {
+            let mut w = ByteWriter::new();
+            w.varint_i32(v);
+            w.into_vec().len()
+        };
+        assert_eq!(len(0), 1);
+        assert_eq!(len(-1), 1);
+        assert_eq!(len(63), 1);
+        assert_eq!(len(-64), 1);
+        assert_eq!(len(-65), 2);
+
+        let mut w = ByteWriter::new();
+        let values = [0i32, 1, -1, 63, -64, 1000, -1000, i32::MAX, i32::MIN];
+        for v in values {
+            w.varint_i32(v);
+        }
+        let bytes = w.into_vec();
+        let mut r = ByteReader::new(&bytes);
+        for v in values {
+            assert_eq!(r.varint_i32(), Some(v), "round trip {v}");
+        }
+    }
+
+    /// A stream of all-high-bit bytes must end the read rather than loop to
+    /// the end of the file looking for a terminator that never comes.
+    #[test]
+    fn a_corrupt_unterminated_varint_is_none_rather_than_a_runaway() {
+        let bytes = [0xffu8; 32];
+        assert_eq!(ByteReader::new(&bytes).varint(), None);
+    }
+
+    #[test]
+    fn a_varint_too_large_for_a_u64_is_rejected() {
+        // Ten bytes whose final byte pushes past 64 bits.
+        let bytes = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+        assert_eq!(ByteReader::new(&bytes).varint(), None);
+    }
 
     #[test]
     fn primitives_round_trip() {

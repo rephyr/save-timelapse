@@ -74,47 +74,74 @@ end
 -- frame format
 
 check("frame_header: magic, version, tick, surface", encode.frame_header(100, "nauvis"),
-  "STF1" .. bytes(1) .. encode.u64le(100) .. encode.str("nauvis"))
+  "STF1" .. bytes(2) .. encode.u64le(100) .. encode.str("nauvis"))
+
+-- varints
+
+check("varint: a small value is one byte", encode.varint(0), bytes(0))
+check("varint: the largest one byte value", encode.varint(127), bytes(127))
+check("varint: 128 rolls into two bytes", encode.varint(128), bytes(128, 1))
+check("varint: seven bits per byte", encode.varint(300), bytes(172, 2))
+check("varint: two byte maximum", encode.varint(16383), bytes(255, 127))
+check("varint: 16384 rolls into three", encode.varint(16384), bytes(128, 128, 1))
+
+-- Zigzag keeps a small negative small: without it, -1 would set every high
+-- bit and take ten bytes. No shifts or xor needed, which matters because
+-- Factorio's Lua 5.2 has neither.
+check("zigzag: zero", encode.zigzag(0), 0)
+check("zigzag: positives double", encode.zigzag(1), 2)
+check("zigzag: negatives interleave", encode.zigzag(-1), 1)
+check("zigzag: -64 still fits one varint byte", encode.zigzag(-64), 127)
+check("zigzag: -65 needs a second", encode.zigzag(-65), 129)
+check("varint_i32: a negative delta is one byte", encode.varint_i32(-1), bytes(1))
+
+-- Runs replace the old per-entity records: the name id and count are written
+-- once for a group, and each position is a delta from the one before it.
 
 do
   local dict = encode.new_dictionary()
-  local record = encode.frame_entity_record(dict, {
-    name = "transport-belt",
-    position = { x = -80.5, y = 28.5 },
-    direction = 4,
-  })
-  local expected = bytes(0) .. encode.str("transport-belt") -- DefineName, first use
-    .. bytes(1) .. encode.u16le(0) .. encode.i32le(-805) .. encode.i32le(285) .. bytes(4) .. bytes(1) .. bytes(1)
-  check("frame_entity_record: direction present, defaults w/h to 1x1", record, expected)
+  -- Parallel arrays, not a table per entity: see frame_entity_run on why.
+  local run = encode.frame_entity_run(dict, "transport-belt", 1, 1,
+    { -80.5, -79.5 }, { 28.5, 28.5 }, { 4, 6 }, 2)
+  local expected = bytes(0) .. encode.str("transport-belt") .. bytes(1) .. bytes(1) -- DefineName carries the footprint
+    .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(1) -- run: id, count, directions flag
+    .. encode.varint_i32(-805) .. encode.varint_i32(285) .. bytes(4) -- first item, delta from origin
+    .. encode.varint_i32(10) .. encode.varint_i32(0) .. bytes(6) -- second, delta from the first
+  check("frame_entity_run: footprint in the definition, positions as deltas", run, expected)
 end
 
 do
   local dict = encode.new_dictionary()
-  encode.dictionary_id(dict, "assembling-machine-1", 0) -- pre-seed so this record doesn't redefine it
-  local record = encode.frame_entity_record(dict, {
-    name = "assembling-machine-1",
-    position = { x = 5, y = 5 },
-    direction = 0,
-    tile_width = 3,
-    tile_height = 3,
-  })
-  local expected = bytes(1) .. encode.u16le(0) .. encode.i32le(50) .. encode.i32le(50) .. bytes(0) .. bytes(3) .. bytes(3)
-  check("frame_entity_record: an already defined name is not redefined", record, expected)
+  -- Nothing in this run rotates, so the flag is clear and no direction
+  -- bytes are written at all.
+  local run = encode.frame_entity_run(dict, "wooden-chest", 1, 1,
+    { 0.5, 1.5 }, { 0.5, 0.5 }, { 0, 0 }, 2)
+  local expected = bytes(0) .. encode.str("wooden-chest") .. bytes(1) .. bytes(1)
+    .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(0)
+    .. encode.varint_i32(5) .. encode.varint_i32(5)
+    .. encode.varint_i32(10) .. encode.varint_i32(0)
+  check("frame_entity_run: a run that never rotates spends nothing on direction", run, expected)
 end
 
 do
   local dict = encode.new_dictionary()
-  local record = encode.frame_tile_record(dict, { name = "concrete", position = { x = -5, y = -12 } })
-  local expected = bytes(0) .. encode.str("concrete")
-    .. bytes(2) .. encode.u16le(0) .. encode.i32le(-5) .. encode.i32le(-12)
-  check("frame_tile_record: integer coordinates, no rounding", record, expected)
+  encode.frame_define_name(dict, "concrete", 1, 1) -- pre-seed, so the run does not redefine it
+  local run = encode.frame_tile_run(dict, "concrete", { -5, -4 }, { 12, 12 }, 2)
+  local expected = bytes(2) .. encode.varint(0) .. encode.varint(2)
+    .. encode.varint_i32(-5) .. encode.varint_i32(12)
+    .. encode.varint_i32(1) .. encode.varint_i32(0)
+  check("frame_tile_run: integer coordinates, also delta encoded", run, expected)
 end
 
 check("frame_end_entities: tag 9, no payload", encode.frame_end_entities(), bytes(9))
 
 -- live capture event format
 
-check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(1))
+check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(2))
+-- Written when a load resumes a segment already on disk: Factorio has just
+-- emptied the writer's dictionaries while the file still holds every name
+-- defined before the load, so both sides restart their ids from 0 here.
+check("event_reset_dictionaries: bare tag 7", encode.event_reset_dictionaries(), bytes(7))
 check("event_set_tick: tag 2 then the tick", encode.event_set_tick(1234), bytes(2) .. encode.u64le(1234))
 
 do
@@ -201,19 +228,12 @@ do
   check("event_add_tile: a second, already defined surface is referenced by its id", record, expected)
 end
 
--- next_capture_segment
-
-check("next_capture_segment: normal forward play keeps the segment",
-  encode.next_capture_segment(5000, 5010, 100),
-  100)
-
-check("next_capture_segment: resuming exactly where recording left off keeps the segment",
-  encode.next_capture_segment(5000, 5000, 100),
-  100)
-
-check("next_capture_segment: loading an older save starts a new segment at the resumed tick",
-  encode.next_capture_segment(5000, 3000, 100),
-  3000)
+-- Reload handling deliberately has no test here, because the mod deliberately
+-- does not attempt it. Every value that could reveal a reload lives in
+-- `storage`, which Factorio saves inside the save file and therefore rewinds
+-- along with it, so a comparison against the resumed tick is always false.
+-- See the note above `event_reset_dictionaries` in encode.lua; reloads are
+-- resolved on the reading side by `event::segment_run_bounds`.
 
 -- checksums
 
@@ -285,6 +305,10 @@ check("capture_segment_name: tick only, folder already scopes it to one session"
   encode.capture_segment_name(0x1a2b3c, 22760790),
   "001a2b3c/events_22760790.stev")
 
+check("capture_segment_basename: no session folder, same naming rule",
+  encode.capture_segment_basename(22760790),
+  "events_22760790.stev")
+
 check("player_log_name: lives inside the session's own folder",
   encode.player_log_name(0x1a2b3c),
   "001a2b3c/players.jsonl")
@@ -340,12 +364,28 @@ check("EXCLUDED_TYPES: contains character", excluded["character"], true)
 check("EXCLUDED_TYPES: does not contain tree", excluded["tree"], nil)
 check("EXCLUDED_TYPES: does not contain cliff", excluded["cliff"], nil)
 check("EXCLUDED_TYPES: still contains the generic decorative scatter type", excluded["simple-entity"], true)
--- Enemies are wildlife, not factory, and their deaths would otherwise flood
--- live capture with removals unrelated to construction. Regression: a real
--- capture showed ~6% of exported entities were biters/spitters/spawners
--- before these were added.
+-- Every flying robot type. These are the highest-volume mobile entity in the
+-- game: a megabase mid construction job has tens of thousands airborne, each
+-- one a record in the baseline and in every from-saves frame, pinned wherever
+-- it happened to be since the format cannot update a position.
+check("EXCLUDED_TYPES: contains construction-robot", excluded["construction-robot"], true)
+check("EXCLUDED_TYPES: contains logistic-robot", excluded["logistic-robot"], true)
+check("EXCLUDED_TYPES: contains combat-robot", excluded["combat-robot"], true)
+-- The stationary infrastructure that flies them stays: it is the part that
+-- actually shows the factory growing.
+check("EXCLUDED_TYPES: does not contain roboport", excluded["roboport"], nil)
+-- Mobile enemies stay excluded: their combat deaths would flood live capture
+-- with removals unrelated to construction, and since this format records
+-- construction and destruction but never movement, a captured biter would sit
+-- frozen wherever it was first logged. Regression: a real capture showed ~6%
+-- of exported entities were biters/spitters/spawners before these were added,
+-- and that bulk was the mobile units rather than the nests that spawn them.
 check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true)
-check("EXCLUDED_TYPES: contains unit-spawner", excluded["unit-spawner"], true)
+-- Nests are deliberately captured despite being enemies: stationary, so the
+-- format represents them honestly, few enough to cost little, and watching
+-- them get cleared is how expansion actually reads in a timelapse. The viewer
+-- colors them red (see viewer/src/registry.rs's is_enemy).
+check("EXCLUDED_TYPES: does not contain unit-spawner", excluded["unit-spawner"], nil)
 
 local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILES")
 check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)
