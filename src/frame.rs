@@ -214,6 +214,53 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// The tick and surface from a frame file, without reading the rest of it.
+///
+/// Exists so a loader can group and order a whole capture before parsing any
+/// of it. Grouping used to require every frame parsed and resident first,
+/// which is the peak memory a streaming loader is trying to avoid: it needs
+/// to know which surface each file belongs to and what order they go in
+/// *before* it can fold them in one at a time and drop them.
+///
+/// Reads a bounded prefix rather than the file, so this costs one small read
+/// per file regardless of how large the frames are. It deliberately does not
+/// verify the checksum, which would mean reading everything and defeat the
+/// point; the real parse still does, so a corrupt file is caught there.
+pub fn read_header(path: &std::path::Path) -> io::Result<(u64, String)> {
+    use std::io::Read;
+
+    // Magic, version, tick, then a u16-prefixed surface name. Prototype and
+    // surface names are short by construction (see `ByteWriter::string`), so
+    // this prefix always covers the whole header.
+    let mut prefix = [0u8; 512];
+    let read = {
+        let mut file = std::fs::File::open(path)?;
+        let mut filled = 0;
+        loop {
+            match file.read(&mut prefix[filled..])? {
+                0 => break filled,
+                n => filled += n,
+            }
+            if filled == prefix.len() {
+                break filled;
+            }
+        }
+    };
+
+    let mut r = ByteReader::new(&prefix[..read]);
+    r.magic(MAGIC).ok_or_else(|| invalid(format!("{}: not a frame file (bad magic)", path.display())))?;
+    let version = r.u8().ok_or_else(truncated)?;
+    if version != CURRENT_VERSION {
+        return Err(invalid(format!(
+            "{}: unsupported frame format version {version} (this build only understands version {CURRENT_VERSION})",
+            path.display()
+        )));
+    }
+    let tick = r.u64().ok_or_else(truncated)?;
+    let surface = r.string().ok_or_else(truncated)?;
+    Ok((tick, surface))
+}
+
 pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     // Magic + version + at least an empty trailer: anything shorter cannot
     // possibly be a complete file, whatever else is wrong with it.
@@ -295,6 +342,25 @@ mod tests {
 
     /// Known counts from tests/fixtures/README.md, real captured frames, so
     /// this also guards against the format silently drifting.
+    #[test]
+    fn read_header_matches_a_full_parse_without_reading_the_file() {
+        for name in ["frame_0000.stfr", "frame_0004.stfr"] {
+            let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames")).join(name);
+            let (tick, surface) = read_header(&path).unwrap();
+            let full = load_fixture(name);
+            assert_eq!(tick, full.tick, "{name}: tick");
+            assert_eq!(surface, full.surface, "{name}: surface");
+        }
+    }
+
+    #[test]
+    fn read_header_rejects_a_file_that_is_not_a_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.stfr");
+        std::fs::write(&path, b"not a frame at all").unwrap();
+        assert!(read_header(&path).is_err());
+    }
+
     #[test]
     fn real_fixtures_parse_with_known_entity_counts() {
         let expected = [

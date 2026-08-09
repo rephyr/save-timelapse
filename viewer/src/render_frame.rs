@@ -417,38 +417,17 @@ impl FrameSequence {
     /// too should fold frame by frame as it parses, since this still sees
     /// every frame alive at once.
     pub fn new(frames: Vec<RenderFrame>) -> Option<Self> {
-        if frames.is_empty() {
-            return None;
-        }
-
-        let mut entities = SpanBuilder::new();
-        let mut tiles = SpanBuilder::new();
-        let mut entity_lod = SpanBuilder::new();
-        let mut tile_lod = SpanBuilder::new();
-        let mut ticks = Vec::with_capacity(frames.len());
-        let mut counts = Vec::with_capacity(frames.len());
-
+        let mut builder = SequenceBuilder::new();
         for frame in frames {
-            ticks.push(frame.tick);
-            counts.push(frame.count);
-            entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
-            tiles.push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
-            entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
-            tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
+            builder.push(&frame);
         }
+        builder.finish()
+    }
 
-        let mut sequence = Self {
-            entities: entities.finish(),
-            tiles: tiles.finish(),
-            entity_lod: entity_lod.finish(),
-            tile_lod: tile_lod.finish(),
-            ticks,
-            counts,
-            current: RenderFrame::empty(),
-            index: 0,
-        };
-        sequence.rebuild_current();
-        Some(sequence)
+    /// Folds frames in one at a time, so a loader never has to hold more than
+    /// the batch it is currently parsing.
+    pub fn builder() -> SequenceBuilder {
+        SequenceBuilder::new()
     }
 
     fn rebuild_current(&mut self) {
@@ -526,6 +505,73 @@ impl FrameSequence {
 
     pub fn step_back(&mut self) {
         self.goto(self.index.saturating_sub(1));
+    }
+}
+
+/// Builds a [`FrameSequence`] frame by frame.
+///
+/// The whole point of the span layout is that a capture never has to be fully
+/// resident, and `FrameSequence::new` taking a `Vec<RenderFrame>` gives that
+/// away at exactly the moment it matters: every frame is alive at once right
+/// before they are folded down. A loader that parses in bounded batches and
+/// pushes here keeps peak memory at one batch plus the spans, which is what
+/// actually lifts the ceiling on capture size.
+#[derive(Default)]
+pub struct SequenceBuilder {
+    entities: SpanBuilder<RenderEntity>,
+    tiles: SpanBuilder<RenderTile>,
+    entity_lod: SpanBuilder<LodCell>,
+    tile_lod: SpanBuilder<LodCell>,
+    ticks: Vec<u64>,
+    counts: Vec<usize>,
+}
+
+impl SequenceBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the frame by reference and copies what it needs, so the caller
+    /// can drop it immediately after.
+    pub fn push(&mut self, frame: &RenderFrame) {
+        self.ticks.push(frame.tick);
+        self.counts.push(frame.count);
+        self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| {
+            span_key(e.x, e.y)
+        }));
+        self.tiles.push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| {
+            span_key(t.x as f32, t.y as f32)
+        }));
+        self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
+        self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
+    }
+
+    pub fn len(&self) -> usize {
+        self.ticks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ticks.is_empty()
+    }
+
+    /// `None` for a capture with no frames in it, matching `FrameSequence`'s
+    /// promise of always being non-empty.
+    pub fn finish(self) -> Option<FrameSequence> {
+        if self.ticks.is_empty() {
+            return None;
+        }
+        let mut sequence = FrameSequence {
+            entities: self.entities.finish(),
+            tiles: self.tiles.finish(),
+            entity_lod: self.entity_lod.finish(),
+            tile_lod: self.tile_lod.finish(),
+            ticks: self.ticks,
+            counts: self.counts,
+            current: RenderFrame::empty(),
+            index: 0,
+        };
+        sequence.rebuild_current();
+        Some(sequence)
     }
 }
 

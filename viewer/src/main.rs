@@ -62,6 +62,11 @@ const BATCH_INDEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 6;
 /// How often loading pauses to draw the progress bar. Yielding per item would
 /// pace loading to the display's refresh rate; this keeps the bar responsive
 /// while leaving loading effectively at full speed.
+/// Frame files parsed at once before being folded into spans and dropped.
+/// Bounds peak load memory at roughly this many frames, while still being
+/// wide enough to keep every core busy parsing (see `load_batch`).
+const LOAD_BATCH_FRAMES: usize = 16;
+
 const PROGRESS_REDRAW: std::time::Duration = std::time::Duration::from_millis(33);
 
 fn window_conf() -> macroquad::conf::Conf {
@@ -248,102 +253,89 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         None
     };
 
-    let worlds: Vec<(String, Vec<save_timelapse::frame::Frame>, Option<save_timelapse::frame::Frame>)> =
-        if let Some(mut frame) = single {
-            if let Some(n) = args.synthetic_tile_count {
-                frame.tiles = synthetic_tiles(n);
-            }
-            // Synthetic/default-fixture loads have no on-disk directory to
-            // look for a terrain file in, and nothing produces one for them.
-            vec![(frame.surface.clone(), vec![frame], None)]
-        } else {
-            let path = args.path.as_ref().expect("checked above");
-            println!("loading {path}");
-            let path = std::path::Path::new(path);
-            let paths = viewer::frame_paths(path).expect("failed to enumerate frames");
+    let mut result: Vec<(String, FrameSequence, Option<RenderFrame>)> = Vec::new();
 
-            // A single frame file's terrain (if it even has one) would sit
-            // beside it in its parent directory, same as a real capture's.
-            let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-            let terrain_file_paths = viewer::terrain_paths(terrain_dir).unwrap_or_default();
+    if let Some(mut frame) = single {
+        if let Some(n) = args.synthetic_tile_count {
+            frame.tiles = synthetic_tiles(n);
+        }
+        let name = frame.surface.clone();
+        let mut builder = FrameSequence::builder();
+        builder.push(&RenderFrame::from_frame(frame, registry));
+        // Synthetic/default-fixture loads have no on-disk directory to look
+        // for a terrain file in, and nothing produces one for them.
+        if let Some(sequence) = builder.finish() {
+            result.push((name, sequence, None));
+        }
+    } else {
+        let path = args.path.as_ref().expect("checked above");
+        println!("loading {path}");
+        let path = std::path::Path::new(path);
+        let paths = viewer::frame_paths(path).expect("failed to enumerate frames");
 
-            // Reading and parsing each file is independent work, so it happens
-            // across every available core rather than one file at a time. On a
-            // real megabase capture this is the dominant cost of opening the
-            // viewer. Converting to a RenderFrame needs a single, consistently
-            // numbered TypeRegistry, so that part stays sequential below.
-            //
-            // Terrain starts loading here too, not after the regular frames
-            // finish: it's a separate set of files with nothing shared until
-            // both are done, discovered straight from the directory (see
-            // `terrain_paths`) rather than waited on until grouping below
-            // learns the surface list from the (unrelated) frame files. Two
-            // independent waits back to back would cost their sum; started
-            // together, the wait is bounded by whichever is slower.
-            progress.total = paths.len() + terrain_file_paths.len();
-            progress.detail = format!(
-                "{} core(s)",
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-            );
-            let load = viewer::ParallelFrameLoad::start(paths);
-            let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
-            let mut loaded_frames = None;
-            let mut loaded_terrain = None;
-            let (loaded, loaded_terrain) = loop {
-                progress.done = load.done() + terrain_load.done();
-                redraw_progress(&progress, &mut last, true).await;
-                // `poll` only ever yields its result once, so each is only
-                // ever called again while still waiting on that one; the
-                // other's own result, once captured, is left alone even
-                // while this loop keeps running for whichever is slower.
-                loaded_frames = loaded_frames.or_else(|| load.poll());
-                loaded_terrain = loaded_terrain.or_else(|| terrain_load.poll());
-                if let (Some(_), Some(_)) = (&loaded_frames, &loaded_terrain) {
-                    break (loaded_frames.take().unwrap(), loaded_terrain.take().unwrap());
-                }
-            };
-            progress.done = progress.total;
-            redraw_progress(&progress, &mut last, true).await;
+        // A single frame file's terrain (if it even has one) would sit beside
+        // it in its parent directory, same as a real capture's.
+        let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        let terrain_file_paths = viewer::terrain_paths(terrain_dir).unwrap_or_default();
 
-            let mut terrain_by_surface: std::collections::HashMap<String, save_timelapse::frame::Frame> =
-                loaded_terrain.into_iter().map(|frame| (frame.surface.clone(), frame)).collect();
+        // Terrain starts loading here, before the frames, since it is a
+        // separate set of files with nothing shared until both are done.
+        // Two independent waits back to back would cost their sum; started
+        // together, the wait is bounded by whichever is slower. It stays on
+        // the load-everything-at-once path deliberately: there is at most one
+        // terrain file per surface, so it is bounded by surface count rather
+        // than by capture length.
+        progress.total = paths.len() + terrain_file_paths.len();
+        progress.detail =
+            format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
 
-            // Grouped before converting, not after: the mod's raw baseline
-            // output writes every surface at the same tick, and grouping is
-            // what keeps all of them (one timeline per surface) instead of
-            // collapsing to whichever was busiest.
-            let mut grouped = viewer::group_by_surface(loaded);
-            if let Some(n) = args.synthetic_tile_count {
-                for (_, frames) in &mut grouped {
-                    for frame in frames {
+        // Grouped from headers rather than from parsed frames, which is what
+        // makes the streaming below possible: knowing each file's surface and
+        // tick is enough to fix the order, and that costs a bounded read per
+        // file instead of holding the whole capture in memory to sort it.
+        progress.phase = "reading frame headers";
+        redraw_progress(&progress, &mut last, true).await;
+        let grouped = viewer::group_paths_by_surface(paths);
+
+        progress.phase = "loading frames";
+        let mut done = 0usize;
+        for (name, paths) in grouped {
+            let mut builder = FrameSequence::builder();
+            for chunk in paths.chunks(LOAD_BATCH_FRAMES) {
+                // One batch is parsed across every core, folded into spans,
+                // and dropped before the next is read, so peak memory is a
+                // batch plus the spans rather than the whole capture.
+                for mut frame in viewer::load_batch(chunk) {
+                    if let Some(n) = args.synthetic_tile_count {
                         frame.tiles = synthetic_tiles(n);
                     }
+                    builder.push(&RenderFrame::from_frame(frame, registry));
                 }
+                done += chunk.len();
+                progress.done = done + terrain_load.done();
+                redraw_progress(&progress, &mut last, false).await;
             }
-
-            grouped
-                .into_iter()
-                .map(|(name, frames)| {
-                    let terrain = terrain_by_surface.remove(&name);
-                    (name, frames, terrain)
-                })
-                .collect()
-        };
-
-    progress.phase = "converting frames";
-    progress.done = 0;
-    progress.total = worlds.iter().map(|(_, frames, _)| frames.len()).sum();
-    let mut result = Vec::with_capacity(worlds.len());
-    for (name, frames, terrain) in worlds {
-        let mut rendered = Vec::with_capacity(frames.len());
-        for frame in frames {
-            rendered.push(RenderFrame::from_frame(frame, registry));
-            progress.done += 1;
-            redraw_progress(&progress, &mut last, false).await;
+            if let Some(sequence) = builder.finish() {
+                result.push((name, sequence, None));
+            }
         }
-        let terrain = terrain.map(|frame| RenderFrame::from_frame(frame, registry));
-        result.push((name, FrameSequence::new(rendered).expect("no valid frames found"), terrain));
+
+        progress.phase = "loading terrain";
+        let loaded_terrain = loop {
+            progress.done = done + terrain_load.done();
+            redraw_progress(&progress, &mut last, true).await;
+            if let Some(loaded) = terrain_load.poll() {
+                break loaded;
+            }
+        };
+        let mut terrain_by_surface: std::collections::HashMap<String, save_timelapse::frame::Frame> =
+            loaded_terrain.into_iter().map(|frame| (frame.surface.clone(), frame)).collect();
+        for (name, _, terrain) in &mut result {
+            *terrain = terrain_by_surface.remove(name).map(|frame| RenderFrame::from_frame(frame, registry));
+        }
     }
+
     redraw_progress(&progress, &mut last, true).await;
 
     println!(
