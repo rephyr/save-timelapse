@@ -5,7 +5,7 @@
 //!
 //! This mirrors TLBE (the most-downloaded Factorio timelapse mod)'s own
 //! "base" tracker, which extends its tracked area on every new entity built
-//! and never shrinks it back down when something is later removed -- so the
+//! and never shrinks it back down when something is later removed, so the
 //! camera gradually zooms out to keep the whole factory in frame as it
 //! grows, rather than chasing individual build sites around the map. A
 //! smarter, more targeted follow mode (favoring wherever's currently being
@@ -16,7 +16,7 @@
 //! Entities only, deliberately unlike `Camera::fit_frames`'s initial static
 //! view, which also considers tiles: TLBE's own tracker reacts only to
 //! entities being built, never to tiles, and tiles here include natural
-//! terrain (when terrain capture is on) covering a margin around the base --
+//! terrain (when terrain capture is on) covering a margin around the base,
 //! rendered for context, not something the player built. Including it would
 //! make "how much has been built" track how much of the map has been
 //! revealed instead, holding the camera on a wide, mostly-empty view instead
@@ -77,7 +77,7 @@ fn union_min_max(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2) {
 }
 
 /// The bounding box of everything built by each frame, unioned with every
-/// prior frame's box so it only ever grows -- see the module doc comment.
+/// prior frame's box so it only ever grows. See the module doc comment.
 /// One entry per frame; `None` only for a leading run of frames with
 /// nothing built yet.
 ///

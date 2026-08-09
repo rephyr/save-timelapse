@@ -54,7 +54,7 @@ impl DrawCallCounter {
         self.quads += 1;
     }
 
-    /// Record `n` consecutive quads sharing one texture -- the batched case,
+    /// Record `n` consecutive quads sharing one texture: the batched case,
     /// without looping per quad.
     pub fn quads(&mut self, texture: Option<TypeId>, n: usize) {
         if n == 0 {
@@ -116,7 +116,7 @@ mod tests {
     }
 
     /// Even perfectly grouped, macroquad's index buffer caps a draw call at
-    /// `max_indices / 6` quads -- the ceiling that made raising the capacity
+    /// `max_indices / 6` quads: the ceiling that made raising the capacity
     /// worth doing alongside the sorting.
     #[test]
     fn a_full_index_buffer_splits_one_texture_across_draw_calls() {

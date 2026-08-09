@@ -205,7 +205,7 @@ impl Surface {
 pub struct World {
     names: NameTable,
     surfaces: HashMap<String, Surface>,
-    /// The surface events fall back to when they name none -- logs written
+    /// The surface events fall back to when they name none: logs written
     /// before events carried a surface, and removals keyed by id.
     default_surface: Option<String>,
     pub tick: u64,
@@ -281,7 +281,7 @@ impl World {
     }
 
     /// Apply one event. Returns whether it changed anything, which is what
-    /// the replay uses to decide a chunk is dirty -- and what makes the
+    /// the replay uses to decide a chunk is dirty, and what makes the
     /// baseline smear visible as a count rather than silently absorbed.
     pub fn apply(&mut self, surface: Option<&str>, event: &Event) -> bool {
         match event {
@@ -299,7 +299,7 @@ impl World {
             }
             // Id first: unit_number is unique game-wide (so this searches
             // every surface, not just `surface`) and resolves in O(1) for
-            // anything replay already has registered -- which is anything
+            // anything replay already has registered, which is anything
             // built after capture began, since its AddEntity carried the
             // same id. Position is the fallback, and the only thing that
             // can resolve an entity that already existed when the baseline
@@ -525,7 +525,7 @@ mod tests {
     /// later mined. The removal event therefore carries an id lookup can
     /// never resolve, alongside the position that can. Before the fix, the
     /// mod sent id alone whenever one was available and this removal was a
-    /// silent no-op forever -- the entity never disappeared from the
+    /// silent no-op forever: the entity never disappeared from the
     /// replayed timeline.
     #[test]
     fn removing_a_baseline_entity_by_an_id_replay_never_registered_falls_back_to_position() {

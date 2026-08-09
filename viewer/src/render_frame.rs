@@ -12,7 +12,7 @@ use crate::registry::{TypeId, TypeRegistry};
 
 /// A contiguous span of one type within a [`RenderFrame`]'s entity or tile
 /// array. Draws iterate runs rather than individual items, so the texture is
-/// bound once per type instead of being re-decided per entity -- which is
+/// bound once per type instead of being re-decided per entity, which is
 /// what keeps macroquad from breaking the batch. See [`crate::DrawCallCounter`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
@@ -37,7 +37,7 @@ impl Run {
 
 /// An entity stripped to what drawing actually reads. The name is gone (the
 /// enclosing [`Run`] carries it), so this is 12 bytes against roughly 80 for
-/// a `frame::Entity` -- 48 for the struct plus a heap allocation for a name
+/// a `frame::Entity`: 48 for the struct plus a heap allocation for a name
 /// that was one of a few dozen repeated strings.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderEntity {
@@ -47,9 +47,9 @@ pub struct RenderEntity {
     /// Factorio's largest prototypes are far under 255 tiles across.
     pub w: u8,
     pub h: u8,
-    /// Unused by the current flat-sprite drawing, kept because it costs
-    /// nothing here (it lands in existing padding) and rotation-aware
-    /// sprites would otherwise need a reload to recover it.
+    /// Factorio's raw 16-way direction byte (0 = north, clockwise in 22.5
+    /// degree steps), used to rotate square-footprint entities on screen.
+    /// See `entity_rotation_radians` in `camera.rs`.
     pub d: u8,
 }
 
@@ -64,25 +64,25 @@ pub struct RenderTile {
 /// type is most common in it and discarding the rest.
 ///
 /// Independent of Factorio's own 32-tile chunk size, despite starting out
-/// equal to it -- that was borrowed as a convenient existing grid, not
+/// equal to it: that was borrowed as a convenient existing grid, not
 /// because rendering needs to align with it. 32 turned out too coarse:
 /// aggregating 1,024 tiles into one dominant-type color loses so much that a
 /// paved area with belts and machines running through it just reads as a
 /// solid gray block. Smaller cells keep more structure recognizable, at the
-/// cost of more (but still vastly fewer than full-detail) quads submitted --
+/// cost of more (but still vastly fewer than full-detail) quads submitted,
 /// halved again from 8 to 4 once 8 measured with FPS to spare.
 pub const LOD_CELL_TILES: i32 = 4;
 
 /// Below this on-screen tile size (in pixels), draw chunk-aggregated
 /// [`LodCell`]s instead of individual items. At this scale a 1x1 entity
 /// spans a fraction of a pixel anyway, so individual items are already
-/// imperceptible -- the only question is whether the CPU still pays to
+/// imperceptible, and the only question is whether the CPU still pays to
 /// transform and submit each one. Comfortably below `SPRITE_MIN_PIXELS`, so
 /// sprites are never in play once LOD is.
 ///
 /// A *tile's* pixel size, not a *chunk's*: a chunk is 32 tiles across, so
 /// gating on the chunk's on-screen size instead would only trigger LOD 32x
-/// later than intended -- a real base at the zoom level that motivated this
+/// later than intended: a real base at the zoom level that motivated this
 /// (0.32 px/tile, individual tiles long since imperceptible) measured 3.27M
 /// quads submitted and 7 fps with that version of the check, because a
 /// 10px chunk still looked "big enough" even though every tile inside it was
@@ -94,7 +94,7 @@ pub fn use_chunk_lod(pixels_per_tile: f32) -> bool {
 }
 
 /// One `LOD_CELL_TILES`-square chunk of the world, drawn as a single
-/// flat-colored quad. Only ever produced for the level-of-detail pass --
+/// flat-colored quad. Only ever produced for the level-of-detail pass:
 /// full-detail rendering uses [`RenderEntity`]/[`RenderTile`] instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LodCell {
@@ -132,14 +132,25 @@ pub struct RenderFrame {
     pub entity_lod_runs: Vec<Run>,
 }
 
+/// Below this many items, `group_by_type`/`build_chunk_lod` just run
+/// single-threaded: thread-spawn overhead would dwarf the actual work for
+/// an ordinary per-tick frame, which is exactly the common case. Above it
+/// (realistically only ever a large baseline or a terrain scan spanning
+/// millions of tiles) they split across every available core instead.
+const PARALLEL_THRESHOLD: usize = 10_000;
+
+fn worker_count() -> usize {
+    std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1)
+}
+
 /// Group `items` by type into contiguous runs, by counting sort.
 ///
 /// Counting sort rather than `sort_by_key` because this is O(n) with one
 /// pass to count and one to scatter, needs no comparisons, and avoids the
-/// temporary `Vec<(TypeId, T)>` that sorting in place would require -- which
+/// temporary `Vec<(TypeId, T)>` that sorting in place would require, which
 /// at megabase entity counts is the difference between a brief allocation
 /// spike and none.
-fn group_by_type<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
+fn group_by_type_sequential<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
     let mut counts = vec![0u32; type_count + 1];
     for &id in ids {
         counts[id as usize + 1] += 1;
@@ -164,17 +175,69 @@ fn group_by_type<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usi
     (grouped, runs)
 }
 
-/// Aggregate items into one dominant type per `LOD_CELL_TILES`-square chunk,
-/// for the level-of-detail pass. `chunk_coords[i]` is the chunk containing
-/// `ids[i]`/the item at the same index in whatever array these came from.
+/// Same result as `group_by_type_sequential`, computed across every
+/// available core once there's enough work to be worth it. Splits `ids`/
+/// `items` into contiguous chunks (one per core) and runs the existing
+/// sequential algorithm on each chunk in its own thread, reusing it as the
+/// per-chunk worker rather than a separate parallel implementation, then
+/// concatenates each type's slice across chunks *in chunk order*. Chunks
+/// are contiguous slices of the original arrays in original order, so this
+/// preserves the same stable within-type ordering the sequential version
+/// produces (an item that came before another of the same type keeps
+/// coming before it).
+fn group_by_type<T: Copy + Default + Send + Sync>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
+    let workers = worker_count();
+    if ids.len() < PARALLEL_THRESHOLD || workers <= 1 {
+        return group_by_type_sequential(ids, items, type_count);
+    }
+
+    let chunk_size = ids.len().div_ceil(workers);
+    let partials: Vec<(Vec<T>, Vec<Run>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ids
+            .chunks(chunk_size)
+            .zip(items.chunks(chunk_size))
+            .map(|(id_chunk, item_chunk)| {
+                scope.spawn(move || group_by_type_sequential(id_chunk, item_chunk, type_count))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("group_by_type worker thread panicked")).collect()
+    });
+
+    let mut grouped = Vec::with_capacity(items.len());
+    let mut runs = Vec::new();
+    for type_id in 0..type_count as TypeId {
+        let start = grouped.len() as u32;
+        for (partial_grouped, partial_runs) in &partials {
+            if let Some(run) = partial_runs.iter().find(|r| r.type_id == type_id) {
+                grouped.extend_from_slice(&partial_grouped[run.range()]);
+            }
+        }
+        let end = grouped.len() as u32;
+        if end > start {
+            runs.push(Run { type_id, start, end });
+        }
+    }
+
+    (grouped, runs)
+}
+
+/// The per-item counting pass `build_chunk_lod` splits out from its own
+/// finalization, so a large scan can run this half in parallel: see
+/// `build_chunk_lod`'s own doc comment for why merging partial results
+/// needs to sum rather than concatenate.
 ///
 /// A per-chunk `Vec<(TypeId, count)>` rather than a `type_count`-sized array
 /// per chunk: a chunk of floor tiles is realistically one or two types, and
 /// a real base can have thousands of occupied chunks, so a dense per-chunk
 /// array (tens of entries, nearly all zero) would waste far more than the
 /// linear scan through a handful of real entries costs.
-fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
-    let mut counts: HashMap<(i32, i32), Vec<(TypeId, u32)>> = HashMap::new();
+/// Per-chunk counts keyed by chunk coordinate, each value a list of
+/// `(type, count)` pairs actually seen in that chunk (see `chunk_lod_counts`'s
+/// own doc comment for why a short list beats a dense per-type array here).
+type ChunkCounts = HashMap<(i32, i32), Vec<(TypeId, u32)>>;
+
+fn chunk_lod_counts(ids: &[TypeId], chunk_coords: &[(i32, i32)]) -> ChunkCounts {
+    let mut counts: ChunkCounts = HashMap::new();
     for (&coord, &id) in chunk_coords.iter().zip(ids) {
         let entry = counts.entry(coord).or_default();
         match entry.iter_mut().find(|(t, _)| *t == id) {
@@ -182,7 +245,13 @@ fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usiz
             None => entry.push((id, 1)),
         }
     }
+    counts
+}
 
+/// The other half of `build_chunk_lod`: picks the dominant type per chunk
+/// from already-finished counts, then groups the resulting cells into
+/// per-type runs the same way entities/tiles are.
+fn finalize_chunk_lod(counts: ChunkCounts, type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
     let mut cell_ids = Vec::with_capacity(counts.len());
     let mut cells = Vec::with_capacity(counts.len());
     for ((cx, cy), type_counts) in counts {
@@ -192,6 +261,52 @@ fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usiz
     }
 
     group_by_type(&cell_ids, &cells, type_count)
+}
+
+/// Aggregate items into one dominant type per `LOD_CELL_TILES`-square chunk,
+/// for the level-of-detail pass. `chunk_coords[i]` is the chunk containing
+/// `ids[i]`/the item at the same index in whatever array these came from.
+///
+/// Below `PARALLEL_THRESHOLD` this is just `chunk_lod_counts` then
+/// `finalize_chunk_lod`, unchanged from before the split. Above it, each
+/// core computes its own *partial* counts on a slice of the input (chunks
+/// split by item index, not by chunk coordinate, so the same `(cx, cy)`
+/// can and does land in more than one thread's slice), and the partials
+/// are merged by summing matching `(coord, type)` entries rather than
+/// concatenating: summing is commutative, so correctness never depends on
+/// which thread happened to see which tiles. That merge is bounded by
+/// however many distinct chunks exist times the worker count, not by item
+/// count, so it stays cheap even done single-threaded.
+fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
+    let workers = worker_count();
+    if ids.len() < PARALLEL_THRESHOLD || workers <= 1 {
+        return finalize_chunk_lod(chunk_lod_counts(ids, chunk_coords), type_count);
+    }
+
+    let chunk_size = ids.len().div_ceil(workers);
+    let partials: Vec<ChunkCounts> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ids
+            .chunks(chunk_size)
+            .zip(chunk_coords.chunks(chunk_size))
+            .map(|(id_chunk, coord_chunk)| scope.spawn(move || chunk_lod_counts(id_chunk, coord_chunk)))
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("build_chunk_lod worker thread panicked")).collect()
+    });
+
+    let mut merged: ChunkCounts = HashMap::new();
+    for partial in partials {
+        for (coord, type_counts) in partial {
+            let entry = merged.entry(coord).or_default();
+            for (type_id, count) in type_counts {
+                match entry.iter_mut().find(|(t, _)| *t == type_id) {
+                    Some((_, total)) => *total += count,
+                    None => entry.push((type_id, count)),
+                }
+            }
+        }
+    }
+
+    finalize_chunk_lod(merged, type_count)
 }
 
 impl RenderFrame {
@@ -373,6 +488,57 @@ mod tests {
         assert_eq!(coords, vec![(-6, 3), (-5, 1)]);
     }
 
+    /// The existing tests above all use small item counts, so none of them
+    /// ever cross `PARALLEL_THRESHOLD` and exercise the parallel path at
+    /// all. This is the one that actually does, checking it against the
+    /// known-correct sequential implementation directly rather than just
+    /// checking it doesn't crash.
+    #[test]
+    fn group_by_type_parallel_path_matches_sequential_at_scale() {
+        let type_count = 5;
+        let n = PARALLEL_THRESHOLD * 3;
+        let ids: Vec<TypeId> = (0..n).map(|i| (i % type_count) as TypeId).collect();
+        let items: Vec<u32> = (0..n as u32).collect();
+
+        let (parallel_grouped, parallel_runs) = group_by_type(&ids, &items, type_count);
+        let (sequential_grouped, sequential_runs) = group_by_type_sequential(&ids, &items, type_count);
+
+        assert_eq!(parallel_grouped, sequential_grouped, "must keep the same stable within-type order");
+        assert_eq!(parallel_runs, sequential_runs);
+    }
+
+    /// Same idea for `build_chunk_lod`, with chunk coordinates deliberately
+    /// cycled across the whole array (not clustered) so any index-based
+    /// worker split still has more than one worker see the same chunk
+    /// coordinate, exercising the summed merge the parallel path needs
+    /// (see `build_chunk_lod`'s own doc comment for why). Compared by
+    /// content rather than position: `finalize_chunk_lod` iterates a
+    /// `HashMap`, whose order isn't guaranteed stable between the
+    /// sequential and parallel paths' separately-constructed maps even for
+    /// identical input.
+    #[test]
+    fn build_chunk_lod_parallel_path_matches_sequential_at_scale() {
+        let type_count = 4;
+        let n = PARALLEL_THRESHOLD * 3;
+        let ids: Vec<TypeId> = (0..n).map(|i| (i % type_count) as TypeId).collect();
+        let chunk_coords: Vec<(i32, i32)> = (0..n).map(|i| ((i % 3) as i32, 0)).collect();
+
+        let (parallel_cells, parallel_runs) = build_chunk_lod(&ids, &chunk_coords, type_count);
+        let (sequential_cells, sequential_runs) =
+            finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
+
+        let content = |cells: &[LodCell], runs: &[Run]| {
+            let mut pairs: Vec<(TypeId, i32, i32)> = runs
+                .iter()
+                .flat_map(|r| cells[r.range()].iter().map(move |c| (r.type_id, c.cx, c.cy)))
+                .collect();
+            pairs.sort();
+            pairs
+        };
+
+        assert_eq!(content(&parallel_cells, &parallel_runs), content(&sequential_cells, &sequential_runs));
+    }
+
     #[test]
     fn render_frame_saturates_oversized_footprints_into_a_byte() {
         let mut registry = TypeRegistry::new();
@@ -440,8 +606,8 @@ mod tests {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 2,
-            // -0.5 floors to -1, landing in the chunk to the left of origin
-            // -- exercises div_euclid rather than plain integer division,
+            // -0.5 floors to -1, landing in the chunk to the left of origin.
+            // Exercises div_euclid rather than plain integer division,
             // which would incorrectly floor a negative toward zero. The
             // second entity sits in the last column of chunk (0,0).
             entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],

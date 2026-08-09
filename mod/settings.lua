@@ -8,7 +8,7 @@
 --
 -- Live capture is the opposite case: it's the player choosing to record
 -- during an active session, not the CLI forcing a flag on an existing save,
--- so it belongs as an ordinary runtime setting -- changeable live from the
+-- so it belongs as an ordinary runtime setting, changeable live from the
 -- in-game settings menu, the normal reason runtime settings exist.
 
 data:extend({
@@ -52,8 +52,8 @@ data:extend({
     -- Snapshot the whole surface on a timer, for testing the export path
     -- during real play independent of live capture. 0 disables it.
     --
-    -- Spread over many ticks the same way the live-capture baseline is
-    -- (SNAPSHOT_BATCH_SIZE work items per tick in control.lua), so this does
+    -- Spread over many ticks (SNAPSHOT_BATCH_SIZE work items per tick in
+    -- snapshot.lua), so this does
     -- not stall the game the way one giant single-tick export would. The
     -- cost is elapsed time instead: on a large base a snapshot can still be
     -- running when the next one is due, in which case the timer's tick is

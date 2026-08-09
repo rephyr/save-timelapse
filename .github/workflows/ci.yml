@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust:
+    name: Build, test, and lint (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # macroquad/miniquad (the viewer crate) link against X11/GL/ALSA even
+      # for a headless build+test run, so these need to be present before
+      # cargo can produce a runnable test binary, not just to open a window.
+      - name: Install viewer's native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  mod:
+    name: Lua unit tests (mod/encode.lua)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+
+      # Deliberately its own job, not folded into `cargo test`: encode_test.lua's
+      # own header notes that cargo test's "needs nothing but the Rust
+      # toolchain" promise shouldn't start silently depending on lua. Running
+      # it here as a separate CI check gets real coverage of the Lua side
+      # (otherwise unverifiable without a live Factorio install) without
+      # touching that.
+      - name: Run mod/tests/encode_test.lua
+        run: lua5.3 mod/tests/encode_test.lua

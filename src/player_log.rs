@@ -4,10 +4,10 @@
 //!
 //! Deliberately plain newline-delimited JSON, not a tagged binary format
 //! like `frame.rs`/`event.rs`: a sample happens at most once every several
-//! seconds by design (see mod/control.lua), nowhere near the per-tick
+//! seconds by design (see mod/export.lua), nowhere near the per-tick
 //! construction volume that actually justified a binary format there. The
-//! same shape is both what the mod writes and what this reads directly --
-//! save-timelapse.exe only ever relocates the file, never rewrites it.
+//! same shape is both what the mod writes and what this reads directly,
+//! so save-timelapse.exe only ever relocates the file, never rewrites it.
 //!
 //! One line per sample:
 //! ```text
@@ -21,7 +21,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 /// One player's position at a given tick, already flattened out of the
-/// per-line `players` array -- callers want "every position Alice was ever
+/// per-line `players` array: callers want "every position Alice was ever
 /// at" far more often than "what did this one line say."
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSample {

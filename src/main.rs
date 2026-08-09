@@ -224,7 +224,7 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
     for (i, session) in sessions.iter().enumerate() {
         let age = now.duration_since(session.last_modified).unwrap_or_default();
         println!(
-            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} -- {}",
+            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} ({})",
             i + 1,
             session.baseline.tick,
             session.baseline.entities,
@@ -381,7 +381,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         replay_state.world.entity_count(),
         replay_state.world.tile_count()
     );
-    let surfaces: Vec<String> = replay_state.world.surface_names().into_iter().map(str::to_string).collect();
+    let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
     println!("surfaces: {}\n", surfaces.join(", "));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;
@@ -407,7 +407,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // A straight copy, not a re-parse: the mod's raw log and what the
     // viewer reads are the exact same shape by design (see
     // src/player_log.rs), so there's nothing to convert. Absent entirely
-    // is normal, not an error -- e.g. nobody was connected during capture.
+    // is normal, not an error, e.g. nobody was connected during capture.
     let players_log = chosen.session_dir.join("players.jsonl");
     if players_log.exists() {
         std::fs::copy(&players_log, out.join("players.jsonl"))?;
@@ -429,7 +429,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
                     return;
                 }
                 written += 1;
-                if written % 25 == 0 {
+                if written.is_multiple_of(25) {
                     print!("\r{written} frames");
                     io::stdout().flush().ok();
                 }
@@ -448,7 +448,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
                     return;
                 }
                 written += 1;
-                if written % 25 == 0 {
+                if written.is_multiple_of(25) {
                     print!("\r{written} frames");
                     io::stdout().flush().ok();
                 }
@@ -459,6 +459,41 @@ fn run_live_capture() -> io::Result<PathBuf> {
         return Err(e);
     }
     println!("\r{emitted} frames written to {}\n", out.display());
+
+    if replay_state.catch_ups_applied > 0 {
+        println!(
+            "{} catch-up baseline(s) applied for surface(s) added to tracking after capture started\n",
+            replay_state.catch_ups_applied
+        );
+    }
+
+    // Both counters are already computed by `replay::run`; surfacing them
+    // (and pausing so the message can't be missed the way a mid-run
+    // eprintln! can, especially in a double-clicked .exe with no persistent
+    // console) is the whole point, not the counting itself.
+    let mut warned = false;
+    if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
+        println!(
+            "warning: {} segment(s) could not be read and {} batch(es) were out of tick order. \
+             This capture may be missing history, see the warnings above, and run \
+             /timelapse-reset-capture in-game before your next capture if this session's \
+             files were ever deleted by hand.",
+            replay_state.skipped_segments, replay_state.out_of_order_batches
+        );
+        warned = true;
+    }
+    let total = replay_state.applied_events + replay_state.no_op_events;
+    if total >= 20 && replay_state.no_op_events * 2 > total {
+        println!(
+            "warning: {} of {total} events did nothing when replayed. This usually means \
+             the event log doesn't match this session's baseline.",
+            replay_state.no_op_events
+        );
+        warned = true;
+    }
+    if warned {
+        wait_for_enter();
+    }
 
     Ok(out)
 }

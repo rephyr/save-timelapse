@@ -5,7 +5,7 @@
 //! its session id (the map's terrain seed; see mod/control.lua's
 //! `compute_session_id`), since `script-output/save-timelapse/` is shared by
 //! every save that ever turns capture on and `game.tick` restarts from 0 for
-//! each one -- a raw tick alone cannot tell two playthroughs' segments
+//! each one, so a raw tick alone cannot tell two playthroughs' segments
 //! apart, but two playthroughs no longer share a directory to get confused
 //! in to begin with:
 //!
@@ -252,7 +252,7 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
 /// Every `events_<tick>.stev` segment in `dir`, ordered by start tick.
 ///
 /// `dir` is expected to already be one playthrough's own session folder (see
-/// `replay::discover_sessions`) -- there is no session to filter by here
+/// `replay::discover_sessions`); there is no session to filter by here
 /// anymore, since two playthroughs can no longer share a directory to get
 /// confused in.
 ///
@@ -270,8 +270,8 @@ pub fn log_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 /// Parses the decimal tick out of `events_<tick>.stev`. `None` for anything
-/// else -- a differently-named file sharing this session's folder, or the
-/// wrong extension -- so a stray file is silently ignored rather than
+/// else (a differently-named file sharing this session's folder, or the
+/// wrong extension), so a stray file is silently ignored rather than
 /// crashing discovery.
 fn segment_tick(path: &Path) -> Option<u64> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {

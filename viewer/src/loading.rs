@@ -1,5 +1,5 @@
 //! Discovering, reading, and grouping raw `save_timelapse::frame::Frame`
-//! data from disk (or synthesizing it for load testing) -- everything here
+//! data from disk (or synthesizing it for load testing). Everything here
 //! stays at that level, never touching `TypeRegistry`/`RenderFrame`.
 
 use std::collections::HashMap;
@@ -142,6 +142,30 @@ pub fn load_terrain(dir: &Path, surface: &str) -> Option<Frame> {
     load_frame(&terrain_path(dir, surface))
 }
 
+/// Every `terrain_<surface>.stfr` file directly in `dir`, for loading all of
+/// a capture's terrain in one batch via `ParallelFrameLoad`, the same way
+/// `frame_paths` finds all of its per-tick frames. Deliberately independent
+/// of which surfaces the regular frames turn out to have: discovering
+/// terrain this way, straight from the directory, is what lets terrain
+/// loading start immediately, in parallel with frame loading, instead of
+/// waiting to first learn the surface list from the (unrelated) frame
+/// files.
+pub fn terrain_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("stfr")
+                && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("terrain_"))
+        })
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
 /// Loads many frame files across every available CPU core instead of one at
 /// a time. Reading and parsing a `.stfr` file is pure, independent work with
 /// nothing shared until frames become `RenderFrame`s (which need a single
@@ -246,7 +270,7 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
 
 /// Splits a loaded batch of frames into one timeline per surface, each
 /// ordered and deduplicated by tick exactly like `order_by_tick` already
-/// does for a single sequence -- multiple surfaces sharing a tick (the
+/// does for a single sequence. Multiple surfaces sharing a tick (the
 /// mod's raw baseline output, six surfaces all named `frame_<tick>_<surface>`)
 /// is exactly the case that needs separating rather than collapsing.
 ///
@@ -528,6 +552,29 @@ mod tests {
         write_stub_frame(dir.path(), "terrain_frame.stfr", 0, "frame", 0);
 
         assert_eq!(frame_paths(dir.path()).unwrap(), vec![frame]);
+    }
+
+    #[test]
+    fn terrain_paths_finds_every_terrain_file_and_ignores_regular_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_frame(dir.path(), "frame_0000_nauvis.stfr", 0, "nauvis", 0);
+        write_stub_frame(dir.path(), "terrain_nauvis.stfr", 0, "nauvis", 0);
+        write_stub_frame(dir.path(), "terrain_vulcanus.stfr", 0, "vulcanus", 0);
+
+        let found = terrain_paths(dir.path()).unwrap();
+        assert_eq!(
+            found,
+            vec![dir.path().join("terrain_nauvis.stfr"), dir.path().join("terrain_vulcanus.stfr")]
+        );
+    }
+
+    #[test]
+    fn terrain_paths_is_empty_for_a_path_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_directory.stfr");
+        write_stub_frame(dir.path(), "not_a_directory.stfr", 0, "nauvis", 0);
+
+        assert!(terrain_paths(&file).unwrap().is_empty());
     }
 
     #[test]

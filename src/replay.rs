@@ -3,18 +3,24 @@
 //! The capture directory the mod writes looks like this:
 //!
 //! ```text
-//! <session>/baseline.json                 tick + surfaces one playthrough's baseline covers
+//! <session>/baseline.json                 tick + surfaces the original baseline covers
 //! <session>/frame_<tick>_<surface>.stfr   one per surface, that baseline itself
 //! <session>/events_<start_tick>.stev      append-only, one segment per timeline
 //! <session>/players.jsonl                 optional, sampled player positions
 //! ```
+//!
+//! A surface added to tracking after the original baseline already ran gets
+//! its own later `frame_<tick>_<surface>.stfr`, at its own tick, with no
+//! entry in `baseline.json` (which never changes after it's first written).
+//! `discover_catch_up_baselines` finds these by scanning rather than reading
+//! them out of the manifest; see [`CatchUpBaseline`].
 //!
 //! `<session>` (an 8-digit hex folder name) is which playthrough these files
 //! belong to (see mod/control.lua's `compute_session_id`): the capture
 //! folder is shared by every save that ever turns capture on, and
 //! `game.tick` restarts from 0 for each one, so a bare tick cannot tell two
 //! playthroughs' files apart, and a bare filename cannot tell two
-//! playthroughs' files apart either -- but two playthroughs no longer share
+//! playthroughs' files apart either, but two playthroughs no longer share
 //! one directory to get confused in, since each gets its own.
 //!
 //! `<session>/baseline.json` is written last, so its presence means that
@@ -40,7 +46,7 @@ pub struct Baseline {
     #[serde(default)]
     pub tiles: usize,
     pub surfaces: Vec<String>,
-    /// Not part of the JSON body -- derived from the filename by `read_at`,
+    /// Not part of the JSON body: derived from the filename by `read_at`,
     /// since that's also where the mod's writer gets it from.
     #[serde(skip)]
     pub session_id: u32,
@@ -49,8 +55,8 @@ pub struct Baseline {
 /// Parses a session's hex folder name (e.g. `00000001` in
 /// `save-timelapse/00000001/baseline.json`). `None` for anything else,
 /// including a `baseline.json` sitting directly in the shared top-level
-/// capture folder -- every capture used that shape before playthroughs got
-/// their own folder -- which is what makes such a leftover invisible to
+/// capture folder (every capture used that shape before playthroughs got
+/// their own folder), which is what makes such a leftover invisible to
 /// `discover_sessions` rather than ambiguous.
 fn parse_session_dir_name(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
@@ -85,7 +91,7 @@ impl Baseline {
     }
 
     /// The path of one of this baseline's per-surface snapshot files,
-    /// alongside it in the same session folder. Untagged -- unlike the
+    /// alongside it in the same session folder. Untagged: unlike the
     /// pre-folder scheme, this never needed the session id in the filename
     /// itself, since the folder already scopes it.
     pub fn frame_path(&self, dir: &Path, surface: &str) -> PathBuf {
@@ -93,11 +99,80 @@ impl Baseline {
     }
 }
 
+/// A surface added to tracking after the playthrough's original baseline
+/// already ran (see `mod/capture.lua`'s `M.on_surface_included`): an
+/// ordinary `frame_<tick>_<surface>.stfr` file, just written later and for
+/// a surface `baseline.json` doesn't name, with no manifest entry of its
+/// own. `baseline.json` never changes after it's first written, so this is
+/// how a session accumulates more than one baseline tick over its
+/// lifetime: found by scanning the session folder rather than reading it
+/// out of JSON.
+#[derive(Debug)]
+struct CatchUpBaseline {
+    tick: u64,
+    surface: String,
+    path: PathBuf,
+}
+
+impl CatchUpBaseline {
+    /// Parses a session folder entry the same way `viewer::loading::frame_is_candidate`
+    /// recognizes a frame file (duplicated, not shared: `viewer` depends on
+    /// this crate, not the other way around). Extension first, then a
+    /// `frame_` prefix, then split once on the first remaining underscore so
+    /// a surface name that itself contains one (a modded planet might)
+    /// survives intact in the second half.
+    fn from_path(path: &Path) -> Option<CatchUpBaseline> {
+        if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
+            return None;
+        }
+        let stem = path.file_stem()?.to_str()?;
+        let rest = stem.strip_prefix("frame_")?;
+        let mut parts = rest.splitn(2, '_');
+        let tick_part = parts.next().unwrap_or("");
+        let surface_part = parts.next().unwrap_or("");
+        if surface_part.is_empty() || surface_part == "manifest" {
+            return None;
+        }
+        Some(CatchUpBaseline { tick: tick_part.parse().ok()?, surface: surface_part.to_string(), path: path.to_path_buf() })
+    }
+
+    /// Actually reads and parses this catch-up's frame file. Deferred by
+    /// design until `run`'s tick-ordered walk actually reaches its tick,
+    /// since a session can accumulate several of these, each potentially as
+    /// large as any other baseline surface.
+    fn load(&self) -> io::Result<frame::Frame> {
+        let bytes = std::fs::read(&self.path)?;
+        frame::read_binary(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Every catch-up baseline in `dir`, ascending by tick: every
+/// `frame_<tick>_<surface>.stfr` file that isn't one of `baseline`'s own
+/// (the original set `load_baseline` already loads eagerly). Filtering by
+/// exact expected path, not by re-deriving and comparing a (tick, surface)
+/// pair, sidesteps needing the original set to ever agree with a filename
+/// parse at all: `baseline.frame_path` already builds each original path
+/// deterministically, so anything else matching the general frame shape is
+/// definitionally a catch-up.
+fn discover_catch_up_baselines(dir: &Path, baseline: &Baseline) -> io::Result<Vec<CatchUpBaseline>> {
+    let known: std::collections::HashSet<PathBuf> =
+        baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
+
+    let mut catch_ups: Vec<CatchUpBaseline> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| !known.contains(p))
+        .filter_map(|p| CatchUpBaseline::from_path(&p))
+        .collect();
+    catch_ups.sort_by_key(|c| c.tick);
+    Ok(catch_ups)
+}
+
 /// One playthrough with a finished baseline, as found by [`discover_sessions`].
 #[derive(Debug)]
 pub struct Session {
     pub session_id: u32,
-    /// This session's own subfolder -- pass this, not the shared top-level
+    /// This session's own subfolder: pass this, not the shared top-level
     /// capture directory, to [`run`] and [`event::log_paths`].
     pub session_dir: PathBuf,
     pub baseline_path: PathBuf,
@@ -125,7 +200,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
         let baseline_path = session_dir.join("baseline.json");
         if !baseline_path.exists() {
             // Capture started (the folder exists) but the baseline hasn't
-            // finished yet, or never will -- not ready to show, same as no
+            // finished yet, or never will. Not ready to show, same as no
             // folder at all.
             continue;
         }
@@ -149,7 +224,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
 
         sessions.push(Session { session_id, session_dir, baseline_path, baseline, last_modified });
     }
-    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_modified));
     Ok(sessions)
 }
 
@@ -170,12 +245,32 @@ impl Default for Options {
 pub struct Replay {
     pub world: World,
     pub baseline: Baseline,
-    /// Events that changed nothing. A steady trickle is normal -- it is the
+    /// Events that changed nothing. A steady trickle is normal: it is the
     /// baseline smear (see `world`) plus removals of entities filtered out of
     /// snapshots. A large fraction suggests events and baseline disagree,
     /// e.g. a log replayed against the wrong save.
     pub no_op_events: usize,
     pub applied_events: usize,
+    /// Segments skipped for failing to open (bad magic, unreadable). See the
+    /// warning already printed at the skip site in `run`. Never happens for
+    /// an uninterrupted capture; the documented cause is a stale-header
+    /// segment recreated after `script-output` files were deleted by hand
+    /// without running `/timelapse-reset-capture` first.
+    pub skipped_segments: usize,
+    /// Batches whose tick was less than the highest tick already applied.
+    /// Never legitimate within one continuous capture: the same stale-header
+    /// segment that causes `skipped_segments` can also land within a
+    /// readable file, sharing tick territory with a real one.
+    pub out_of_order_batches: usize,
+    /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
+    /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
+    /// each one in turn; never re-populated after `load_baseline`.
+    pending_catch_ups: Vec<CatchUpBaseline>,
+    /// How many catch-up baselines `run` actually applied. Orthogonal to
+    /// `applied_events`/`no_op_events`/`out_of_order_batches`: loading a
+    /// baseline is not an event, exactly like the original baseline's own
+    /// load in `load_baseline` never touches those counters either.
+    pub catch_ups_applied: usize,
 }
 
 /// Seed a world from the baseline at `baseline_path`.
@@ -213,7 +308,9 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} names {} surface(s) but none could be loaded",
+                "{} names {} surface(s) but none could be loaded. If this session's files were \
+                 ever deleted from script-output by hand, run /timelapse-reset-capture in-game \
+                 before your next capture.",
                 baseline_path.display(),
                 baseline.surfaces.len()
             ),
@@ -221,19 +318,59 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     }
 
     world.tick = baseline.tick;
-    Ok(Replay { world, baseline, no_op_events: 0, applied_events: 0 })
+
+    let pending_catch_ups = discover_catch_up_baselines(dir, &baseline).unwrap_or_else(|e| {
+        eprintln!("warning: could not scan {} for catch-up baselines: {e}", dir.display());
+        Vec::new()
+    });
+
+    Ok(Replay {
+        world,
+        baseline,
+        no_op_events: 0,
+        applied_events: 0,
+        skipped_segments: 0,
+        out_of_order_batches: 0,
+        pending_catch_ups,
+        catch_ups_applied: 0,
+    })
+}
+
+/// Every surface the baseline, a pending catch-up baseline, or the event log
+/// ever names, for offering a complete choice of surfaces before running the
+/// (much more expensive) replay itself. The baseline alone is not enough: a
+/// Space Age planet visited for the first time after capture already started
+/// gets no baseline entry (the baseline is taken once, at the start of a
+/// playthrough's capture), but its own construction events still name it, so
+/// scanning the event log too is what makes it choosable at all instead of
+/// only ever appearing already lumped into "every surface". A surface with a
+/// catch-up baseline but no events of its own yet (included, then nothing
+/// built there before capture stopped) would otherwise be invisible to both
+/// checks, so `replay.pending_catch_ups` is checked directly too.
+pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<String>> {
+    let mut surfaces: std::collections::BTreeSet<String> =
+        replay.world.surface_names().into_iter().map(String::from).collect();
+    surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
+
+    for segment in event::log_paths(session_dir)? {
+        if let Ok(stream) = event::stream_log(&segment) {
+            surfaces.extend(stream.map(|logged| logged.surface));
+        }
+    }
+
+    Ok(surfaces.into_iter().collect())
 }
 
 /// Walk the event log forward, calling `emit` with the world at each frame
 /// boundary. Events are applied in whole-tick groups, so a frame is never cut
-/// halfway through a tick's changes -- a blueprint landing 400 entities on one
+/// halfway through a tick's changes: a blueprint landing 400 entities on one
 /// tick shows up whole or not at all.
 ///
 /// `emit` receives the tick rather than a materialised frame so the caller
 /// decides what to do with the world: write every surface, one surface, or
 /// just measure. `dir` must be one playthrough's own session folder (a
-/// [`Session`]'s `session_dir`), not the shared top-level capture directory
-/// -- every segment in it is walked, with nothing left to scope by session.
+/// [`Session`]'s `session_dir`), not the shared top-level capture directory:
+/// every segment in it is walked, with nothing left to scope by session.
 pub fn run<F>(replay: &mut Replay, dir: &Path, options: &Options, mut emit: F) -> io::Result<usize>
 where
     F: FnMut(&World, u64),
@@ -241,9 +378,10 @@ where
     let mut next_emit = replay.baseline.tick;
     let mut emitted = 0;
 
-    let mut flush_until = |world: &World, tick: u64, next: &mut u64, emitted: &mut usize| {
+    let mut flush_until = |replay: &mut Replay, tick: u64, next: &mut u64, emitted: &mut usize| {
         while tick >= *next && *emitted < options.max_frames {
-            emit(world, *next);
+            apply_due_catch_ups(replay, *next);
+            emit(&replay.world, *next);
             *emitted += 1;
             *next += options.interval;
         }
@@ -262,6 +400,7 @@ where
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("warning: skipping unreadable event segment {}: {e}", segment.display());
+                replay.skipped_segments += 1;
                 continue;
             }
         };
@@ -274,11 +413,49 @@ where
             if logged.tick < replay.baseline.tick {
                 continue;
             }
+            // Same idea, per surface: the mod starts logging a surface's
+            // events the instant it's included, but its catch-up snapshot
+            // itself isn't captured until BASELINE_WARNING_DELAY_TICKS later
+            // (mod/capture.lua), so a handful of real events can be logged
+            // for a tick earlier than the surface's own baseline. Whatever
+            // they did is already reflected in that later snapshot, so they
+            // must not also apply, or it would double count.
+            if pending_catch_up_tick(&replay.pending_catch_ups, &logged.surface).is_some_and(|t| logged.tick < t) {
+                continue;
+            }
+
+            // A surface can go long stretches with no events at all before a
+            // catch-up (that's the whole point: it was excluded, so nothing
+            // was being logged for it). Left to the ordinary per-tick
+            // batching below, a catch-up would only ever get applied (via
+            // flush_until's own internal apply_due_catch_ups) once some
+            // *later* event's batch happens to trigger a flush, by which
+            // point that later event has already been applied to the world
+            // too, making every frame across that whole gap retroactively
+            // show it, including ones chronologically before the catch-up's
+            // own tick. Explicitly flushing up through each due catch-up's
+            // tick first, before this event ever gets folded into `pending`,
+            // is what keeps frames before it clean.
+            while replay.pending_catch_ups.first().is_some_and(|c| c.tick <= logged.tick) {
+                let catch_up_tick = replay.pending_catch_ups[0].tick;
+                apply_batch(replay, &mut pending);
+                pending_tick = None;
+                flush_until(replay, catch_up_tick, &mut next_emit, &mut emitted);
+                // flush_until's own internal apply_due_catch_ups call only
+                // fires when an interval checkpoint lands at or past this
+                // tick, and a coarse interval can overshoot it in a single
+                // jump, never landing on or after it within *this* call.
+                // Applying it directly guarantees it actually happens
+                // (a no-op if flush_until's own call already did), which is
+                // also what keeps this loop from spinning forever on a
+                // catch-up flush_until never gets around to.
+                apply_due_catch_ups(replay, catch_up_tick);
+            }
 
             if pending_tick != Some(logged.tick) {
                 apply_batch(replay, &mut pending);
                 if let Some(tick) = pending_tick {
-                    flush_until(&replay.world, tick, &mut next_emit, &mut emitted);
+                    flush_until(replay, tick, &mut next_emit, &mut emitted);
                 }
                 pending_tick = Some(logged.tick);
             }
@@ -287,9 +464,15 @@ where
 
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {
-            flush_until(&replay.world, tick, &mut next_emit, &mut emitted);
+            flush_until(replay, tick, &mut next_emit, &mut emitted);
         }
     }
+
+    // Every catch-up still outstanding at this point has no later event to
+    // trigger it, but a completed catch-up file is genuinely part of "the
+    // base as it actually was" by the time capture stopped, so it still
+    // belongs in the final frame below.
+    apply_due_catch_ups(replay, u64::MAX);
 
     // Always land a final frame on the finished world, so the timelapse ends
     // on the base as it actually was rather than at the last interval
@@ -302,8 +485,48 @@ where
     Ok(emitted)
 }
 
+/// The tick `surface`'s own catch-up baseline is scheduled for, if it still
+/// has one outstanding. See `run`'s use of this: whether `surface`'s entry
+/// has already been applied to `world` by the time a given event is checked
+/// does not matter here, this only answers "is there a tick this surface's
+/// events must not predate."
+fn pending_catch_up_tick(pending: &[CatchUpBaseline], surface: &str) -> Option<u64> {
+    pending.iter().find(|c| c.surface == surface).map(|c| c.tick)
+}
+
+/// Applies every pending catch-up baseline whose own tick is at most `tick`,
+/// removing each from `replay.pending_catch_ups` as it lands (the list stays
+/// sorted ascending, see `discover_catch_up_baselines`).
+fn apply_due_catch_ups(replay: &mut Replay, tick: u64) {
+    while replay.pending_catch_ups.first().is_some_and(|c| c.tick <= tick) {
+        let catch_up = replay.pending_catch_ups.remove(0);
+        match catch_up.load() {
+            Ok(frame) => {
+                if frame.tick < replay.world.tick {
+                    eprintln!(
+                        "warning: catch-up baseline {} claims tick {} but replay has already \
+                         reached tick {}; loading it anyway (a baseline load never moves the \
+                         clock backward), but this file's tick looks wrong",
+                        catch_up.path.display(),
+                        frame.tick,
+                        replay.world.tick
+                    );
+                }
+                replay.world.load_baseline(&frame);
+                replay.catch_ups_applied += 1;
+            }
+            Err(e) => eprintln!(
+                "warning: catch-up baseline {} unreadable or unparseable: {e}. That surface's \
+                 state as of when it was added to tracking will be missing from this replay; \
+                 anything built on it afterward should still show up.",
+                catch_up.path.display()
+            ),
+        }
+    }
+}
+
 /// Writes every surface `world` has at `tick`, one `.stfr` file each, named
-/// `frame_<index>_<surface>.stfr` -- the same shape the mod's own baseline
+/// `frame_<index>_<surface>.stfr`, the same shape the mod's own baseline
 /// output uses, and what `viewer::group_by_surface` expects in order to show
 /// more than one world. A surface with nothing on it at this tick (not yet
 /// built, or already abandoned) is skipped rather than writing an empty
@@ -351,6 +574,14 @@ pub fn write_all_terrain(world: &World, tick: u64, out: &Path) -> io::Result<()>
 /// Apply one tick's events together, then clear the buffer for reuse rather
 /// than allocating a new one per tick.
 fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
+    // All events in one batch share a tick (see `run`'s grouping), so the
+    // first is representative. Less than the running max is never
+    // legitimate within one continuous capture: see `Replay::out_of_order_batches`.
+    if let Some(first) = pending.first() {
+        if first.tick < replay.world.tick {
+            replay.out_of_order_batches += 1;
+        }
+    }
     for logged in pending.iter() {
         if replay.world.apply(Some(logged.surface.as_str()), &logged.event) {
             replay.applied_events += 1;
@@ -489,7 +720,28 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("baseline.json");
         fs::write(&path, r#"{"tick":5,"surfaces":["gone"]}"#).unwrap();
-        assert!(load_baseline(&path).is_err());
+        let err = load_baseline(&path).unwrap_err();
+        assert!(err.to_string().contains("/timelapse-reset-capture"), "got: {err}");
+    }
+
+    /// The bug this guards against: a planet visited for the first time after
+    /// capture already started has no baseline entry (the baseline is taken
+    /// once, at the start of a playthrough's capture), so the surface list
+    /// shown before running the replay must also check the event log, not
+    /// just the baseline the world was seeded from.
+    #[test]
+    fn discover_surfaces_includes_a_surface_that_only_appears_in_events() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        log.tick(150).add_entity("gleba", "assembling-machine-1", 5.5, 5.5, 42);
+        log.write(session_dir, "events_100.stev");
+
+        let replay = load_baseline(&baseline_path).unwrap();
+        let surfaces = discover_surfaces(session_dir, &replay).unwrap();
+
+        assert_eq!(surfaces, vec!["gleba".to_string(), "nauvis".to_string()]);
+        let _dir = dir;
     }
 
     #[test]
@@ -666,7 +918,7 @@ mod tests {
     /// A real failure mode: clearing script-output by hand without running
     /// `/timelapse-reset-capture` first leaves the mod believing its current
     /// segment is already initialized, so the next flush recreates it via a
-    /// plain append with no magic header -- alongside whatever segment the
+    /// plain append with no magic header, alongside whatever segment the
     /// mod starts fresh with afterward, in the same session folder. One
     /// orphaned, unreadable segment must not sink replay of the rest of that
     /// session.
@@ -685,7 +937,183 @@ mod tests {
 
         assert!(emitted >= 1, "replay must still complete rather than aborting on the bad segment");
         assert_eq!(replay.world.entity_count(), 2, "the good segment's event must still apply");
+        assert_eq!(replay.skipped_segments, 1);
         let _dir = dir;
+    }
+
+    /// The documented failure this guards: a stale-header segment recreated
+    /// after files were deleted by hand can land within a readable file,
+    /// sharing tick territory with a real one, rather than always failing
+    /// to open outright.
+    #[test]
+    fn run_counts_a_batch_whose_tick_regresses_relative_to_the_running_max() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        log.tick(500).add_entity("nauvis", "pipe", 5.5, 5.5, 0);
+        log.tick(200).add_entity("nauvis", "transport-belt", 6.5, 5.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        assert_eq!(replay.out_of_order_batches, 1);
+        let _dir = dir;
+    }
+
+    /// Writes a hand-built catch-up baseline frame directly into a session
+    /// folder, the same shape `M.export_surfaces_to` (mod/export.lua)
+    /// produces: an ordinary frame_<tick>_<surface>.stfr with no manifest
+    /// entry of its own.
+    fn write_catch_up_frame(session_dir: &Path, tick: u64, surface: &str, entities: Vec<frame::Entity>) {
+        let out = frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
+        fs::write(session_dir.join(format!("frame_{tick}_{surface}.stfr")), frame::write_binary(&out)).unwrap();
+    }
+
+    fn vulcanus_entity(x: f32, y: f32) -> frame::Entity {
+        frame::Entity { n: "pipe".into(), x, y, d: 0, w: 1, h: 1 }
+    }
+
+    /// The core scenario this whole feature exists for: a surface included
+    /// after the original baseline already ran gets its own later baseline,
+    /// and must not appear in any frame before that baseline's own tick.
+    #[test]
+    fn catch_up_baseline_surface_appears_only_from_its_own_tick_onward() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        write_catch_up_frame(
+            session_dir,
+            500,
+            "vulcanus",
+            vec![vulcanus_entity(1.5, 1.5), vulcanus_entity(2.5, 1.5)],
+        );
+
+        let mut log = TestLog::new();
+        // Before the catch-up: logged (the mod starts logging the instant a
+        // surface is included) but must not apply, since it predates the
+        // snapshot taken after it.
+        log.tick(300).add_entity("vulcanus", "transport-belt", 9.5, 9.5, 0);
+        // After the catch-up: a real, applicable change.
+        log.tick(600).add_entity("vulcanus", "transport-belt", 3.5, 1.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        let options = Options { interval: 50, max_frames: 1000 };
+        run(&mut replay, session_dir, &options, |world, tick| {
+            seen.push((tick, world.surface("vulcanus").map(|s| s.entity_count()).unwrap_or(0)));
+        })
+        .unwrap();
+
+        for &(tick, count) in &seen {
+            if tick < 500 {
+                assert_eq!(count, 0, "vulcanus must not exist before its own catch-up tick {tick}");
+            }
+        }
+        assert_eq!(
+            seen.iter().find(|(tick, _)| *tick == 500).unwrap().1,
+            2,
+            "the catch-up snapshot's own 2 entities, nothing from the dropped tick-300 event"
+        );
+        assert_eq!(
+            seen.last().unwrap().1,
+            3,
+            "the snapshot's 2 plus the tick-600 event's 1"
+        );
+        assert_eq!(replay.catch_ups_applied, 1);
+        let _dir = dir;
+    }
+
+    /// A pre-catch-up event for that surface is dropped outright, not
+    /// queued to apply once the catch-up lands: its distinct position would
+    /// show up in the final count if it were.
+    #[test]
+    fn events_for_a_pending_catch_up_surface_before_its_tick_are_dropped_not_deferred() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        write_catch_up_frame(session_dir, 500, "vulcanus", vec![vulcanus_entity(1.5, 1.5)]);
+
+        let mut log = TestLog::new();
+        log.tick(300).add_entity("vulcanus", "transport-belt", 40.5, 40.5, 0); // distinct position, must never show up
+        log.tick(600).add_entity("vulcanus", "transport-belt", 3.5, 1.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        assert_eq!(
+            replay.world.surface("vulcanus").unwrap().entity_count(),
+            2,
+            "only the snapshot's entity plus the tick-600 add; the tick-300 add must be gone entirely"
+        );
+        let _dir = dir;
+    }
+
+    /// The documented failure this guards against, applied to catch-ups: a
+    /// catch-up baseline with a tick behind ticks already processed (a
+    /// corrupt or misnamed file) must never rewind the replayed clock.
+    #[test]
+    fn a_catch_up_with_a_stale_filename_tick_does_not_move_world_tick_backward() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        // Behind the session's own baseline tick of 100.
+        write_catch_up_frame(session_dir, 50, "vulcanus", vec![vulcanus_entity(1.5, 1.5)]);
+
+        let mut log = TestLog::new();
+        log.tick(5000).add_entity("nauvis", "pipe", 9.5, 9.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        let mut ticks: Vec<u64> = Vec::new();
+        run(&mut replay, session_dir, &Options::default(), |_, tick| ticks.push(tick)).unwrap();
+
+        assert!(ticks.windows(2).all(|w| w[0] <= w[1]), "emitted ticks must never go backward: {ticks:?}");
+        assert_eq!(replay.world.tick, 5000);
+        let _dir = dir;
+    }
+
+    /// Loading a catch-up baseline is not an event: it must not be folded
+    /// into the counters that describe the event log's own health.
+    #[test]
+    fn catch_up_baselines_do_not_affect_the_event_or_batch_counters() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        write_catch_up_frame(session_dir, 500, "vulcanus", vec![vulcanus_entity(1.5, 1.5)]);
+
+        let mut log = TestLog::new();
+        log.tick(300).add_entity("vulcanus", "transport-belt", 40.5, 40.5, 0);
+        log.tick(600).add_entity("vulcanus", "transport-belt", 3.5, 1.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        assert_eq!(replay.applied_events, 1, "only the tick-600 event; tick-300 is dropped before it ever reaches apply_batch");
+        assert_eq!(replay.no_op_events, 0);
+        assert_eq!(replay.out_of_order_batches, 0);
+        assert_eq!(replay.catch_ups_applied, 1);
+        let _dir = dir;
+    }
+
+    #[test]
+    fn discover_surfaces_includes_a_pending_catch_up_surface_with_no_events_of_its_own() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        write_catch_up_frame(session_dir, 500, "vulcanus", vec![vulcanus_entity(1.5, 1.5)]);
+
+        let replay = load_baseline(&baseline_path).unwrap();
+        let surfaces = discover_surfaces(session_dir, &replay).unwrap();
+
+        assert_eq!(surfaces, vec!["nauvis".to_string(), "vulcanus".to_string()]);
+        let _dir = dir;
+    }
+
+    #[test]
+    fn catch_up_filename_parsing_keeps_an_underscore_containing_surface_name_intact() {
+        let path = Path::new("frame_500_my_modded_planet.stfr");
+        let parsed = CatchUpBaseline::from_path(path).unwrap();
+        assert_eq!(parsed.tick, 500);
+        assert_eq!(parsed.surface, "my_modded_planet");
     }
 
     #[test]

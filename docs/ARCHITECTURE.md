@@ -107,7 +107,7 @@ Wire format, all integers little endian:
     checksum  u32, djb2 of every byte before it (magic and version included)
 
 The version byte lets a reader tell "this is a format I don't understand"
-apart from a generic parse failure -- this project has already changed this
+apart from a generic parse failure. This project has already changed this
 format more than once, each time with no way for an older build to say
 anything clearer than a confusing parse error about a newer file. The
 checksum catches a narrower, different problem the tag structure alone
@@ -120,12 +120,12 @@ which does hold the whole file in memory, just hashes the payload in one
 pass and compares. Both formats' hash functions (`encode.checksum_update`
 in Lua, `frame::checksum` in Rust) implement the same djb2 variant using
 only multiply/add/mod, with no bitwise primitive, since Factorio's Lua 5.2
-has neither `string.pack` nor a `bit32` library -- the same constraint
+has neither `string.pack` nor a `bit32` library, the same constraint
 `u32le`/`i32le` above already work around by hand. A test in each language
 asserts both agree on the same known input.
 
 A file from before this version byte existed has neither it nor the
-trailer and will not parse under the current reader -- consistent with this
+trailer and will not parse under the current reader, consistent with this
 project's precedent of clean breaks over carrying old formats forward at
 this alpha stage (see "Live capture and replay" below, which made the same
 call for session tagging).
@@ -219,7 +219,7 @@ learn which frame files to seed from.
 `<session>` (an 8 digit hex folder name) identifies which playthrough these
 files belong to: `script-output/save-timelapse/` is shared by every save
 that ever turns capture on, and `game.tick` restarts from 0 for each one, so
-a bare tick cannot tell two playthroughs' files apart -- and unlike a bare
+a bare tick cannot tell two playthroughs' files apart, and unlike a bare
 filename, two playthroughs no longer share one directory to get confused in
 to begin with, since each gets its own. `control.lua`'s `compute_session_id`
 uses the map's terrain seed (`map_gen_settings.seed`), deterministic across
@@ -258,27 +258,71 @@ truncated baseline that replay would trust.
 
 Because nothing renders while a tick's Lua is still running, there is no way
 to show a live progress bar for a freeze that happens entirely inside one
-tick. `request_baseline`/`perform_baseline` split the work across two ticks
-purely so a warning can be seen at all: `request_baseline` prints an entity
+tick. `request_baseline`/`perform_baseline` split the work across two moments
+purely so a warning can actually be read: `request_baseline` prints an entity
 count (`LuaSurface::count_entities_filtered`, cheap since it never builds the
-array `export_surface` needs) and sets a flag, then `on_tick` runs
-`perform_baseline` the *next* tick. Printing and freezing in the same tick
-would put the warning and the "finished" message on screen at the same
-moment, after the freeze already ended.
+array `export_surface` needs) and schedules `perform_baseline` for
+`BASELINE_WARNING_DELAY_TICKS` later (about two real seconds), not just the
+next tick, since one tick is only one rendered frame, often too brief to
+actually read the message before the freeze hits. Printing and freezing in
+the same tick would put the warning and the "finished" message on screen at
+the same moment, after the freeze already ended.
 
-That same persistence is a trap if the *output* is deleted rather than the
-save: `storage` survives independently of `script-output`, and the mod has
-no way to notice the mismatch. Checked against Factorio's own
-`runtime-api.json`: `LuaHelpers` exposes `write_file` and `remove_path` and
-nothing else, no read and no directory listing, so a mod genuinely cannot
-ask "is the file I wrote still there." Deleting `script-output/save-timelapse`
-by hand leaves `baseline_tick` set, `request_baseline` keeps returning early,
-and nothing gets rewritten — the reported symptom was live capture producing
-an `events_*.stev` (which doesn't check `baseline_tick` at all) with no
-baseline files alongside it. `/timelapse-reset-capture` is the manual
-equivalent of the detection the mod cannot do automatically: it clears
-`storage.timelapse_capture` outright, so the next check retakes the baseline
-and starts a fresh event segment.
+That same persistence used to be a trap if the *output* was deleted rather
+than the save, since `storage` survives independently of `script-output` and
+the mod has no way to notice the mismatch on its own. Checked against
+Factorio's own `runtime-api.json`: `LuaHelpers` exposes `write_file` and
+`remove_path` and nothing else, no read and no directory listing, so a mod
+genuinely cannot ask "is the file I wrote still there." `remove_path` can
+still delete a path it already knows it wrote, though, which is what
+`M.reset_capture` (the `/timelapse-reset-capture` command and the panel's
+reset button) now does: it deletes this playthrough's own session folder
+outright (via `encode.session_dir`, since every playthrough already gets
+one) before clearing `storage.timelapse_capture`, so the next baseline starts
+from a genuinely empty folder rather than assuming the player already
+cleared it by hand.
+
+### Per-surface exclusion and catch-up baselines
+
+The in-game panel (`mod/gui.lua`, opened via a toolbar shortcut or
+Control+Shift+T) lets a player exclude individual surfaces from recording,
+including planets not yet visited (listed from `game.planets`, which covers
+every planet prototype regardless of whether its surface has been created
+yet, alongside whatever else already exists in `game.surfaces`).
+`storage.timelapse_excluded_surfaces` is an opt-out set: presence as a key
+means excluded, so a surface absent from it is recorded, which is what lets
+a brand new planet or platform keep recording automatically the moment it's
+created, with no special-casing. `log_event` checks this before anything
+else, and `request_baseline`/`perform_baseline` skip an excluded surface
+too, so exclusion also means "don't pay this surface's baseline cost," not
+just "stop logging its future changes."
+
+Un-excluding a surface that already had something built on it needs a
+baseline of its own, taken at that moment, or the timelapse for it would
+start from empty and silently miss everything built before inclusion.
+`storage.timelapse_capture.baselined_surfaces` tracks which surfaces have
+ever gotten one and at what tick; `request_baseline`/`perform_baseline` were
+generalized to mean "baseline whatever currently-included surfaces aren't in
+this table yet," which serves the first-ever baseline, a reset, and a later
+catch-up identically. A catch-up (triggered by `M.on_surface_included` when
+a panel checkbox flips from excluded to included) exports only the
+newly-eligible surfaces through `export.export_surfaces_to`, an ordinary
+`frame_<tick>_<surface>.stfr` per surface with **no manifest write at all**:
+`baseline.json` keeps meaning exactly what it means for the original,
+once-per-session baseline, and never changes after it is first written.
+
+The Rust side discovers a catch-up by scanning the session folder for
+`frame_<tick>_<surface>.stfr` files `baseline.json` doesn't already name
+(`replay::discover_catch_up_baselines`), since nothing else in a session
+folder is ever named that way. `replay::run`'s tick-ordered walk applies a
+due catch-up (`World::load_baseline`) at the exact point its own tick is
+reached, not eagerly at the start, so the surface it covers is entirely
+absent from every emitted frame before that tick and appears fully formed
+from it onward, exactly as if it had just been visited for the first time.
+Events logged for that surface before its catch-up tick (the mod starts
+logging the instant a surface is included, but the snapshot itself lands
+`BASELINE_WARNING_DELAY_TICKS` later) are dropped, not deferred, since
+whatever they did is already reflected in the snapshot taken after them.
 
 Snapshotting periodically instead would be pure duplication of what the log
 already says: at roughly 50 bytes per entity, a megabase snapshot every ten
@@ -330,7 +374,7 @@ The version byte gives a reader the same "format I don't understand" signal
 the frame format's does, but there is deliberately no checksum trailer to
 go with it, unlike that format. A segment is append only and grows for as
 long as capture stays on, and is simply abandoned, not closed, when a
-rollover starts a new one (see `next_capture_segment` above) -- there is no
+rollover starts a new one (see `next_capture_segment` above), so there is no
 "this segment is now finished" moment to checksum against without inventing
 one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of

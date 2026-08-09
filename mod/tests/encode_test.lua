@@ -1,5 +1,5 @@
 -- Unit tests for mod/encode.lua: the pure binary-encoding logic shared by
--- snapshot export and live capture. No Factorio required -- run with:
+-- snapshot export and live capture. No Factorio required, run with:
 --
 --   lua mod/tests/encode_test.lua
 --
@@ -26,7 +26,7 @@ local function check(name, actual, expected)
   end
 end
 
--- low level byte packing -----------------------------------------------------
+-- low level byte packing
 
 check("u8: a plain byte", encode.u8(200), bytes(200))
 check("u16le: little endian order", encode.u16le(40000), bytes(64, 156))
@@ -43,14 +43,14 @@ check("i32le: zero", encode.i32le(0), bytes(0, 0, 0, 0))
 check("str: length prefix then bytes", encode.str("nauvis"), bytes(6, 0) .. "nauvis")
 check("str: empty string is just a zero length prefix", encode.str(""), bytes(0, 0))
 
--- round10 ----------------------------------------------------------------------
+-- round10
 
 check("round10: a positive value already at one decimal", encode.round10(28.5), 285)
 check("round10: a negative value already at one decimal", encode.round10(-80.5), -805)
 check("round10: zero", encode.round10(0), 0)
 check("round10: a whole number", encode.round10(327.0), 3270)
 
--- dictionary_id ------------------------------------------------------------------
+-- dictionary_id
 
 do
   local dict = encode.new_dictionary()
@@ -71,7 +71,7 @@ do
   check("dictionary_id: a different tag is used verbatim (DefineSurface)", define_surface, bytes(1) .. encode.str("nauvis"))
 end
 
--- frame format -------------------------------------------------------------------
+-- frame format
 
 check("frame_header: magic, version, tick, surface", encode.frame_header(100, "nauvis"),
   "STF1" .. bytes(1) .. encode.u64le(100) .. encode.str("nauvis"))
@@ -112,7 +112,7 @@ end
 
 check("frame_end_entities: tag 9, no payload", encode.frame_end_entities(), bytes(9))
 
--- live capture event format -------------------------------------------------------
+-- live capture event format
 
 check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(1))
 check("event_set_tick: tag 2 then the tick", encode.event_set_tick(1234), bytes(2) .. encode.u64le(1234))
@@ -153,8 +153,8 @@ end
 -- (pre-existing) unit_number when Factorio reports it removed, but replay's
 -- world state never learned that number from a snapshot, which records no
 -- ids. Sending id alone, as the JSON format once did, made every such
--- removal an unresolvable no-op. See mod/control.lua's ensure_baseline for
--- the other half of this.
+-- removal an unresolvable no-op. See mod/capture.lua's request_baseline/
+-- perform_baseline for the other half of this.
 do
   local surfaces = encode.new_dictionary()
   local record = encode.event_remove_entity(surfaces, "nauvis", 10.5, 20.5, 8842)
@@ -201,7 +201,7 @@ do
   check("event_add_tile: a second, already defined surface is referenced by its id", record, expected)
 end
 
--- next_capture_segment -----------------------------------------------------------
+-- next_capture_segment
 
 check("next_capture_segment: normal forward play keeps the segment",
   encode.next_capture_segment(5000, 5010, 100),
@@ -215,7 +215,7 @@ check("next_capture_segment: loading an older save starts a new segment at the r
   encode.next_capture_segment(5000, 3000, 100),
   3000)
 
--- checksums ------------------------------------------------------------------
+-- checksums
 
 check("checksum_init: the djb2 seed", encode.checksum_init(), 5381)
 
@@ -235,7 +235,7 @@ do
   check("checksum_update: splitting the input across calls gives the same result", hash, 5863208)
 end
 
--- terrain capture bounding box -------------------------------------------------
+-- terrain capture bounding box
 
 check("new_bbox: starts with nothing seen", encode.new_bbox().min_x, nil)
 
@@ -267,7 +267,7 @@ do
   check("expand_bbox: right_bottom y is max_y plus the margin", area[2][2], 34)
 end
 
--- per-playthrough file naming ----------------------------------------------------
+-- per-playthrough file naming
 
 check("session_dir: session id as zero padded 8 digit hex",
   encode.session_dir(0x1a2b3c),
@@ -297,7 +297,7 @@ check("frame_name: untagged (timelapse-export / headless scan) stays flat",
   encode.frame_name(nil, 100, "nauvis"),
   "frame_100_nauvis.stfr")
 
--- player position log ----------------------------------------------------
+-- player position log
 
 check("player_log_line: one player, tick and fields in order",
   encode.player_log_line(100, { { name = "Alice", surface = "nauvis", x = 10.5, y = -3.2 } }),
@@ -311,7 +311,7 @@ check("player_log_line: multiple players are comma separated",
   '{"tick":1,"players":[{"name":"Alice","surface":"nauvis","x":1,"y":2},' ..
     '{"name":"Bob","surface":"vulcanus","x":3,"y":4}]}\n')
 
--- The empty case itself is never actually written: control.lua's callers
+-- The empty case itself is never actually written: export.lua's callers
 -- skip the write_file call entirely when nobody was sampled. Still worth
 -- pinning here as a value, since something downstream could start calling
 -- this with an empty list directly.
@@ -319,7 +319,7 @@ check("player_log_line: an empty player list is an empty JSON array",
   encode.player_log_line(1, {}),
   '{"tick":1,"players":[]}\n')
 
--- list sanity ------------------------------------------------------------------
+-- list sanity
 
 local function assert_no_duplicates(list, label)
   local seen = {}
@@ -335,7 +335,7 @@ end
 
 local excluded = assert_no_duplicates(encode.EXCLUDED_TYPES, "EXCLUDED_TYPES")
 check("EXCLUDED_TYPES: contains character", excluded["character"], true)
--- Rendered as ground context now (see control.lua's terrain capture), not
+-- Rendered as ground context now (see export.lua's terrain capture), not
 -- excluded like other terrain scatter.
 check("EXCLUDED_TYPES: does not contain tree", excluded["tree"], nil)
 check("EXCLUDED_TYPES: does not contain cliff", excluded["cliff"], nil)
@@ -351,8 +351,6 @@ local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILE
 check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)
 check("PLACED_FLOOR_TILES: contains landfill", floor["landfill"], true)
 check("PLACED_FLOOR_TILES: contains stone-path", floor["stone-path"], true)
-
--- ------------------------------------------------------------------------------
 
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))

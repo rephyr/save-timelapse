@@ -1,5 +1,5 @@
 //! Pan/zoom camera and the timeline scrub bar. Geometry and hit-testing
-//! only -- drawing and input polling stay in `main.rs`.
+//! only; drawing and input polling stay in `main.rs`.
 
 use macroquad::math::Vec2;
 
@@ -10,7 +10,7 @@ pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 /// How much smaller than a bare edge-to-edge fit `fit_frames`'s initial,
 /// static whole-sequence view zooms. Leaves visible breathing room around
 /// the base instead of touching the window edges. Auto-follow uses its own,
-/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`) -- this one is
+/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`); this one is
 /// only for the one-time opening view.
 const FIT_MARGIN: f32 = 0.75;
 
@@ -50,7 +50,7 @@ impl Camera {
         screen_height: f32,
     ) -> Camera {
         // Each entity contributes its two footprint corners, not just its
-        // center point -- for a small cluster of large buildings, ignoring
+        // center point. For a small cluster of large buildings, ignoring
         // footprint here would zoom in as if they were 1x1, and a real
         // multi-tile entity would then render bigger than the whole window.
         let mut points = frames
@@ -83,7 +83,7 @@ impl Camera {
     /// far enough to fill the screen with one tile, which reads as broken
     /// rather than "focused." `margin` is how much smaller than a bare
     /// edge-to-edge fit to zoom (1.0 = box edges touch the window border,
-    /// smaller = more breathing room) -- a caller's choice rather than a
+    /// smaller = more breathing room), a caller's choice rather than a
     /// fixed constant, since a one-time static view and a continuously
     /// re-fitting auto-follow camera want different amounts of it (see
     /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
@@ -97,7 +97,7 @@ impl Camera {
 }
 
 /// A camera move from wherever it currently is to a new target, over a
-/// fixed real-time duration -- the same model TLBE (the most-downloaded
+/// fixed real-time duration, the same model TLBE (the most-downloaded
 /// Factorio timelapse mod) uses for its own camera transitions: plain
 /// linear interpolation of both position and zoom against elapsed time,
 /// not an easing curve. A fixed duration is what makes a transition read as
@@ -114,8 +114,8 @@ pub struct CameraTransition {
 
 impl CameraTransition {
     /// Starts from `start` (the camera's live position, not the previous
-    /// target) so retargeting mid-transition -- the point of interest
-    /// moving again before the camera arrived -- glides on from wherever
+    /// target) so retargeting mid-transition (the point of interest
+    /// moving again before the camera arrived) glides on from wherever
     /// the camera actually is, with no discontinuity, rather than jumping
     /// back to resume an old transition's endpoint.
     pub fn new(start: Camera, end: Camera, duration_secs: f32) -> Self {
@@ -141,7 +141,7 @@ impl CameraTransition {
 }
 
 /// The on-screen size of an entity's footprint, in pixels. Most entities are
-/// 1x1, but assemblers, furnaces and the like span several tiles -- sizing
+/// 1x1, but assemblers, furnaces and the like span several tiles, so sizing
 /// every entity to a fixed 1-tile square (the pre-footprint behavior) is why
 /// multi-tile buildings used to render undersized and visually disconnected
 /// from whatever was actually touching them.
@@ -149,8 +149,64 @@ pub fn entity_footprint_size(pixels_per_tile: f32, w: u32, h: u32) -> Vec2 {
     Vec2::new((w as f32 * pixels_per_tile).max(1.0), (h as f32 * pixels_per_tile).max(1.0))
 }
 
+/// Whether an entity's footprint is safe to rotate at all. `is_rotation_allowed`
+/// is the curated `registry::is_rotation_allowed` allowlist result: only
+/// entities confirmed to have a flat, top-down icon go through (this also
+/// covers terrain scatter for free, since trees/cliffs are never added to
+/// that allowlist). Separately, a non-square footprint's `w`/`h` already
+/// reflect Factorio's own post-rotation swap (see `entity_rotation_radians`),
+/// so rotating the already-swapped quad again would double count it. A
+/// square footprint has no such swap (it's a no-op regardless of
+/// direction), so it's the only footprint shape safe to rotate.
+fn is_rotatable_square(w: u32, h: u32, is_rotation_allowed: bool) -> bool {
+    is_rotation_allowed && w == h
+}
+
+/// An entity's on-screen rotation, in radians, from Factorio's raw 16-way
+/// `direction` byte (0 = north, clockwise in 22.5 degree steps). Zero for
+/// anything not safe to rotate: Factorio's own `tile_width`/`tile_height`
+/// (our `w`/`h`) are read straight off the live, already-rotated entity,
+/// so for a rotated rectangular entity they already reflect the
+/// post-rotation footprint swap. Rotating the drawn quad again on top of
+/// that would misalign it from the entity's real world-space footprint,
+/// and there is no native, unrotated size captured anywhere to undo the
+/// swap correctly. See `is_rotatable_square`.
+///
+/// The `- 4.0`: confirmed against a real capture that a belt set to face
+/// east (`d = 4`) rendered facing south instead, for every direction, not
+/// just that one. This project's icons are the generic square inventory
+/// icons (not Factorio's real in-world sprites, see `sprites.rs`), and the
+/// belt icon's own native, unrotated artwork already depicts it facing
+/// east, not north as first assumed. Solving the reported symptom directly
+/// (observed south at `d = 4`, wanted east) gives a fixed reference-angle
+/// correction of one quarter turn, not a sign flip.
+pub fn entity_rotation_radians(w: u32, h: u32, d: u8, is_rotation_allowed: bool) -> f32 {
+    if !is_rotatable_square(w, h, is_rotation_allowed) {
+        return 0.0;
+    }
+    (d as f32 - 4.0) * (std::f32::consts::PI / 8.0)
+}
+
+/// Half-extents to use for view-frustum culling, in world-space tiles.
+/// Plain `w/2, h/2` for everything except a rotatable square at a
+/// non-cardinal direction (`d` not a multiple of 4): a rotated square's
+/// on-screen bounding box grows by up to sqrt(2) on each axis, maximal
+/// exactly at a 45 degree diagonal rather than at a cardinal angle, so
+/// culling against the unrotated box there would occasionally clip an
+/// entity a few pixels early at the view's edge. Gated on `!d.is_multiple_of(4)`
+/// (a plain integer check, no trig) so the common case, a cardinally
+/// placed square building, pays nothing extra.
+pub fn entity_cull_half_extents(w: u32, h: u32, d: u8, is_rotation_allowed: bool) -> Vec2 {
+    let half = Vec2::new(w as f32, h as f32) / 2.0;
+    if is_rotatable_square(w, h, is_rotation_allowed) && !d.is_multiple_of(4) {
+        half * std::f32::consts::SQRT_2
+    } else {
+        half
+    }
+}
+
 /// A horizontal scrub bar, centered near the bottom of the window, mapping
-/// between screen-x and frame index. Geometry and hit-testing only -- drawing
+/// between screen-x and frame index. Geometry and hit-testing only; drawing
 /// and input polling stay in main.rs, same split as Camera.
 #[derive(Clone, Copy)]
 pub struct Timeline {
@@ -369,7 +425,7 @@ mod tests {
     }
 
     /// Multiple small steps that add up to the full duration must land in
-    /// the same place as one big step -- the draw loop calls `step` once
+    /// the same place as one big step: the draw loop calls `step` once
     /// per rendered frame, so this is what makes the transition's total
     /// duration independent of frame rate.
     #[test]
@@ -395,6 +451,37 @@ mod tests {
     fn entity_footprint_size_never_collapses_to_zero_at_tiny_zoom() {
         let size = entity_footprint_size(0.001, 1, 1);
         assert!(size.x >= 1.0 && size.y >= 1.0);
+    }
+
+    #[test]
+    fn entity_rotation_radians_is_zero_for_non_square_footprints() {
+        assert_eq!(entity_rotation_radians(1, 2, 4, true), 0.0, "already-swapped footprint, don't double-rotate");
+    }
+
+    #[test]
+    fn entity_rotation_radians_is_zero_when_rotation_is_not_allowed() {
+        assert_eq!(entity_rotation_radians(3, 3, 4, false), 0.0, "not on the curated allowlist");
+    }
+
+    /// The `d = 4` case is the regression check: a belt facing east must
+    /// render at zero rotation (its icon's own native artwork already faces
+    /// east), not `PI/2` as an uncorrected `d * PI/8` formula would give.
+    #[test]
+    fn entity_rotation_radians_scales_cardinal_directions_correctly() {
+        use std::f32::consts::PI;
+        assert!((entity_rotation_radians(3, 3, 0, true) - (-PI / 2.0)).abs() < 1e-6, "north");
+        assert_eq!(entity_rotation_radians(3, 3, 4, true), 0.0, "east: the icon's own native facing");
+        assert!((entity_rotation_radians(3, 3, 8, true) - PI / 2.0).abs() < 1e-6, "south");
+        assert!((entity_rotation_radians(3, 3, 12, true) - PI).abs() < 1e-6, "west");
+    }
+
+    #[test]
+    fn entity_cull_half_extents_only_widens_non_cardinal_square_entities() {
+        use std::f32::consts::SQRT_2;
+        assert_eq!(entity_cull_half_extents(2, 2, 0, true), Vec2::splat(1.0), "cardinal square: unchanged");
+        assert_eq!(entity_cull_half_extents(2, 2, 2, true), Vec2::splat(SQRT_2), "diagonal square: widened");
+        assert_eq!(entity_cull_half_extents(1, 2, 2, true), Vec2::new(0.5, 1.0), "non-square: never widened");
+        assert_eq!(entity_cull_half_extents(2, 2, 2, false), Vec2::splat(1.0), "not allowed: never widened");
     }
 
     #[test]

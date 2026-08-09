@@ -1,4 +1,16 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.0
+Date: 2026-08-09
+  Features:
+    - In-game control panel for live capture: a toolbar shortcut (and Control+Shift+T) opens a panel to toggle live capture, choose which surfaces are recorded (including planets not yet visited), and reset capture, without the settings menu or console commands
+    - Live capture can now exclude individual surfaces from recording, skipping their baseline cost entirely rather than only their future events
+    - Un-excluding a surface and pressing the panel's Generate button gives it its own catch-up baseline without disturbing already-tracked surfaces; checking several surfaces before generating batches them into one freeze
+    - Resetting capture now asks for confirmation first, since it permanently deletes this playthrough's recorded data
+  Changes:
+    - Resetting capture (the console command or the new panel button) now deletes this playthrough's own capture files instead of only clearing in-memory state, so files no longer need to be deleted by hand first
+    - A failed capture write now degrades gracefully instead of crashing the game
+    - Baseline warnings now name which surface(s) they cover and pause long enough to actually be read before the game freezes to export them
+---------------------------------------------------------------------------------------------------
 Version: 0.2.1
 Date: 2026-08-08
   Bugfixes:
