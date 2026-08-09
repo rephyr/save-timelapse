@@ -5,7 +5,7 @@
 //! one owns its own `#[cfg(test)] mod tests`, so a test lives next to the
 //! code it exercises instead of in one undifferentiated block at the end.
 //! Re-exported here so every name is still reachable as `viewer::Name`
-//! exactly as before this split -- `main.rs` needed no import changes.
+//! exactly as before this split, so `main.rs` needed no import changes.
 
 mod camera;
 mod construction;

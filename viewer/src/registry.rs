@@ -75,7 +75,7 @@ impl TypeRegistry {
 /// they actually look in Factorio, checked before falling back to
 /// `color_for`'s hash. Best-effort and pattern-matched against the real
 /// names a live capture actually produced (see the terrain-capture work in
-/// mod/control.lua), not an exhaustive prototype list -- Factorio and Space
+/// mod/control.lua), not an exhaustive prototype list. Factorio and Space
 /// Age have dozens of terrain names across four planets, and hashing is a
 /// perfectly good fallback for whatever this doesn't recognize. Without
 /// this, ordinary factory infrastructure (concrete, a hazard floor) got the
@@ -112,7 +112,7 @@ fn known_color(name: &str) -> Option<Color> {
     // palette (the little colored blobs shown in chart/map mode), since
     // that's the mental model a player already has for "what color is
     // iron" from staring at the map screen, not the ore chunk's in-world
-    // sprite. Only the vanilla set is curated -- the handful of Space Age
+    // sprite. Only the vanilla set is curated: the handful of Space Age
     // additions in `is_resource` (tungsten ore, calcite, scrap) don't have
     // an established look here yet, so they fall through to the hash
     // palette below like any other unrecognized name.
@@ -141,7 +141,7 @@ fn known_color(name: &str) -> Option<Color> {
     }
     if name == "concrete" || name == "refined-concrete" {
         // Dark enough that entities sitting on it (colored via the bright
-        // hash palette below) stay readable against it -- a mid grey was
+        // hash palette below) stay readable against it. A mid grey was
         // too close in brightness to blend into rather than contrast with.
         return Some(rgb(58, 58, 60));
     }
@@ -169,7 +169,7 @@ fn known_color(name: &str) -> Option<Color> {
     None
 }
 
-/// Whether `name` is a tree or cliff prototype -- decorative terrain scatter
+/// Whether `name` is a tree or cliff prototype: decorative terrain scatter
 /// captured only when the terrain-capture setting is on (see
 /// `mod/control.lua`'s `excluded_types`), naturally scattered across a wide
 /// area independent of anything the player built. Shared with
@@ -181,7 +181,7 @@ pub fn is_terrain_scatter(name: &str) -> bool {
     name == "cliff" || name.starts_with("dead-") || name.starts_with("dry-") || name.starts_with("tree")
 }
 
-/// Whether `name` is a resource deposit -- ore, oil, and the like, captured
+/// Whether `name` is a resource deposit: ore, oil, and the like, captured
 /// only when the include-resources setting is on. Like terrain scatter,
 /// shared with `construction.rs`'s auto-follow bounds: a resource sits
 /// wherever the map generated it, entirely independent of anything the
@@ -191,7 +191,7 @@ pub fn is_terrain_scatter(name: &str) -> bool {
 /// Named exactly, not pattern-matched: unlike tree/cliff names, resource
 /// names share no common prefix, so this is the vanilla set plus what's
 /// confirmed from Space Age (`tungsten-ore`, `calcite` on Vulcanus,
-/// `scrap` on Fulgora) -- best-effort the same way `is_terrain_scatter` is;
+/// `scrap` on Fulgora), best-effort the same way `is_terrain_scatter` is;
 /// a modded or as-yet-unseen resource name just won't be caught.
 pub fn is_resource(name: &str) -> bool {
     matches!(

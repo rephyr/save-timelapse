@@ -14,7 +14,7 @@
 //! folder is shared by every save that ever turns capture on, and
 //! `game.tick` restarts from 0 for each one, so a bare tick cannot tell two
 //! playthroughs' files apart, and a bare filename cannot tell two
-//! playthroughs' files apart either -- but two playthroughs no longer share
+//! playthroughs' files apart either, but two playthroughs no longer share
 //! one directory to get confused in, since each gets its own.
 //!
 //! `<session>/baseline.json` is written last, so its presence means that
@@ -40,7 +40,7 @@ pub struct Baseline {
     #[serde(default)]
     pub tiles: usize,
     pub surfaces: Vec<String>,
-    /// Not part of the JSON body -- derived from the filename by `read_at`,
+    /// Not part of the JSON body: derived from the filename by `read_at`,
     /// since that's also where the mod's writer gets it from.
     #[serde(skip)]
     pub session_id: u32,
@@ -49,8 +49,8 @@ pub struct Baseline {
 /// Parses a session's hex folder name (e.g. `00000001` in
 /// `save-timelapse/00000001/baseline.json`). `None` for anything else,
 /// including a `baseline.json` sitting directly in the shared top-level
-/// capture folder -- every capture used that shape before playthroughs got
-/// their own folder -- which is what makes such a leftover invisible to
+/// capture folder (every capture used that shape before playthroughs got
+/// their own folder), which is what makes such a leftover invisible to
 /// `discover_sessions` rather than ambiguous.
 fn parse_session_dir_name(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
@@ -85,7 +85,7 @@ impl Baseline {
     }
 
     /// The path of one of this baseline's per-surface snapshot files,
-    /// alongside it in the same session folder. Untagged -- unlike the
+    /// alongside it in the same session folder. Untagged: unlike the
     /// pre-folder scheme, this never needed the session id in the filename
     /// itself, since the folder already scopes it.
     pub fn frame_path(&self, dir: &Path, surface: &str) -> PathBuf {
@@ -97,7 +97,7 @@ impl Baseline {
 #[derive(Debug)]
 pub struct Session {
     pub session_id: u32,
-    /// This session's own subfolder -- pass this, not the shared top-level
+    /// This session's own subfolder: pass this, not the shared top-level
     /// capture directory, to [`run`] and [`event::log_paths`].
     pub session_dir: PathBuf,
     pub baseline_path: PathBuf,
@@ -125,7 +125,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
         let baseline_path = session_dir.join("baseline.json");
         if !baseline_path.exists() {
             // Capture started (the folder exists) but the baseline hasn't
-            // finished yet, or never will -- not ready to show, same as no
+            // finished yet, or never will. Not ready to show, same as no
             // folder at all.
             continue;
         }
@@ -149,7 +149,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
 
         sessions.push(Session { session_id, session_dir, baseline_path, baseline, last_modified });
     }
-    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_modified));
     Ok(sessions)
 }
 
@@ -170,7 +170,7 @@ impl Default for Options {
 pub struct Replay {
     pub world: World,
     pub baseline: Baseline,
-    /// Events that changed nothing. A steady trickle is normal -- it is the
+    /// Events that changed nothing. A steady trickle is normal: it is the
     /// baseline smear (see `world`) plus removals of entities filtered out of
     /// snapshots. A large fraction suggests events and baseline disagree,
     /// e.g. a log replayed against the wrong save.
@@ -239,14 +239,14 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
 
 /// Walk the event log forward, calling `emit` with the world at each frame
 /// boundary. Events are applied in whole-tick groups, so a frame is never cut
-/// halfway through a tick's changes -- a blueprint landing 400 entities on one
+/// halfway through a tick's changes: a blueprint landing 400 entities on one
 /// tick shows up whole or not at all.
 ///
 /// `emit` receives the tick rather than a materialised frame so the caller
 /// decides what to do with the world: write every surface, one surface, or
 /// just measure. `dir` must be one playthrough's own session folder (a
-/// [`Session`]'s `session_dir`), not the shared top-level capture directory
-/// -- every segment in it is walked, with nothing left to scope by session.
+/// [`Session`]'s `session_dir`), not the shared top-level capture directory:
+/// every segment in it is walked, with nothing left to scope by session.
 pub fn run<F>(replay: &mut Replay, dir: &Path, options: &Options, mut emit: F) -> io::Result<usize>
 where
     F: FnMut(&World, u64),
@@ -317,7 +317,7 @@ where
 }
 
 /// Writes every surface `world` has at `tick`, one `.stfr` file each, named
-/// `frame_<index>_<surface>.stfr` -- the same shape the mod's own baseline
+/// `frame_<index>_<surface>.stfr`, the same shape the mod's own baseline
 /// output uses, and what `viewer::group_by_surface` expects in order to show
 /// more than one world. A surface with nothing on it at this tick (not yet
 /// built, or already abandoned) is skipped rather than writing an empty
@@ -689,7 +689,7 @@ mod tests {
     /// A real failure mode: clearing script-output by hand without running
     /// `/timelapse-reset-capture` first leaves the mod believing its current
     /// segment is already initialized, so the next flush recreates it via a
-    /// plain append with no magic header -- alongside whatever segment the
+    /// plain append with no magic header, alongside whatever segment the
     /// mod starts fresh with afterward, in the same session folder. One
     /// orphaned, unreadable segment must not sink replay of the rest of that
     /// session.

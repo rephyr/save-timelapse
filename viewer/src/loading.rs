@@ -1,5 +1,5 @@
 //! Discovering, reading, and grouping raw `save_timelapse::frame::Frame`
-//! data from disk (or synthesizing it for load testing) -- everything here
+//! data from disk (or synthesizing it for load testing). Everything here
 //! stays at that level, never touching `TypeRegistry`/`RenderFrame`.
 
 use std::collections::HashMap;
@@ -246,7 +246,7 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
 
 /// Splits a loaded batch of frames into one timeline per surface, each
 /// ordered and deduplicated by tick exactly like `order_by_tick` already
-/// does for a single sequence -- multiple surfaces sharing a tick (the
+/// does for a single sequence. Multiple surfaces sharing a tick (the
 /// mod's raw baseline output, six surfaces all named `frame_<tick>_<surface>`)
 /// is exactly the case that needs separating rather than collapsing.
 ///

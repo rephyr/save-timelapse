@@ -12,7 +12,7 @@ use crate::registry::{TypeId, TypeRegistry};
 
 /// A contiguous span of one type within a [`RenderFrame`]'s entity or tile
 /// array. Draws iterate runs rather than individual items, so the texture is
-/// bound once per type instead of being re-decided per entity -- which is
+/// bound once per type instead of being re-decided per entity, which is
 /// what keeps macroquad from breaking the batch. See [`crate::DrawCallCounter`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
@@ -37,7 +37,7 @@ impl Run {
 
 /// An entity stripped to what drawing actually reads. The name is gone (the
 /// enclosing [`Run`] carries it), so this is 12 bytes against roughly 80 for
-/// a `frame::Entity` -- 48 for the struct plus a heap allocation for a name
+/// a `frame::Entity`: 48 for the struct plus a heap allocation for a name
 /// that was one of a few dozen repeated strings.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderEntity {
@@ -64,25 +64,25 @@ pub struct RenderTile {
 /// type is most common in it and discarding the rest.
 ///
 /// Independent of Factorio's own 32-tile chunk size, despite starting out
-/// equal to it -- that was borrowed as a convenient existing grid, not
+/// equal to it: that was borrowed as a convenient existing grid, not
 /// because rendering needs to align with it. 32 turned out too coarse:
 /// aggregating 1,024 tiles into one dominant-type color loses so much that a
 /// paved area with belts and machines running through it just reads as a
 /// solid gray block. Smaller cells keep more structure recognizable, at the
-/// cost of more (but still vastly fewer than full-detail) quads submitted --
+/// cost of more (but still vastly fewer than full-detail) quads submitted,
 /// halved again from 8 to 4 once 8 measured with FPS to spare.
 pub const LOD_CELL_TILES: i32 = 4;
 
 /// Below this on-screen tile size (in pixels), draw chunk-aggregated
 /// [`LodCell`]s instead of individual items. At this scale a 1x1 entity
 /// spans a fraction of a pixel anyway, so individual items are already
-/// imperceptible -- the only question is whether the CPU still pays to
+/// imperceptible, and the only question is whether the CPU still pays to
 /// transform and submit each one. Comfortably below `SPRITE_MIN_PIXELS`, so
 /// sprites are never in play once LOD is.
 ///
 /// A *tile's* pixel size, not a *chunk's*: a chunk is 32 tiles across, so
 /// gating on the chunk's on-screen size instead would only trigger LOD 32x
-/// later than intended -- a real base at the zoom level that motivated this
+/// later than intended: a real base at the zoom level that motivated this
 /// (0.32 px/tile, individual tiles long since imperceptible) measured 3.27M
 /// quads submitted and 7 fps with that version of the check, because a
 /// 10px chunk still looked "big enough" even though every tile inside it was
@@ -94,7 +94,7 @@ pub fn use_chunk_lod(pixels_per_tile: f32) -> bool {
 }
 
 /// One `LOD_CELL_TILES`-square chunk of the world, drawn as a single
-/// flat-colored quad. Only ever produced for the level-of-detail pass --
+/// flat-colored quad. Only ever produced for the level-of-detail pass:
 /// full-detail rendering uses [`RenderEntity`]/[`RenderTile`] instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LodCell {
@@ -136,7 +136,7 @@ pub struct RenderFrame {
 ///
 /// Counting sort rather than `sort_by_key` because this is O(n) with one
 /// pass to count and one to scatter, needs no comparisons, and avoids the
-/// temporary `Vec<(TypeId, T)>` that sorting in place would require -- which
+/// temporary `Vec<(TypeId, T)>` that sorting in place would require, which
 /// at megabase entity counts is the difference between a brief allocation
 /// spike and none.
 fn group_by_type<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
@@ -440,8 +440,8 @@ mod tests {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 2,
-            // -0.5 floors to -1, landing in the chunk to the left of origin
-            // -- exercises div_euclid rather than plain integer division,
+            // -0.5 floors to -1, landing in the chunk to the left of origin.
+            // Exercises div_euclid rather than plain integer division,
             // which would incorrectly floor a negative toward zero. The
             // second entity sits in the last column of chunk (0,0).
             entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],

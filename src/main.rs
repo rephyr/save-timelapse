@@ -224,7 +224,7 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
     for (i, session) in sessions.iter().enumerate() {
         let age = now.duration_since(session.last_modified).unwrap_or_default();
         println!(
-            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} -- {}",
+            "  {}) baseline tick {} ({} entities, {} tiles), surfaces: {} ({})",
             i + 1,
             session.baseline.tick,
             session.baseline.entities,
@@ -407,7 +407,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // A straight copy, not a re-parse: the mod's raw log and what the
     // viewer reads are the exact same shape by design (see
     // src/player_log.rs), so there's nothing to convert. Absent entirely
-    // is normal, not an error -- e.g. nobody was connected during capture.
+    // is normal, not an error, e.g. nobody was connected during capture.
     let players_log = chosen.session_dir.join("players.jsonl");
     if players_log.exists() {
         std::fs::copy(&players_log, out.join("players.jsonl"))?;
@@ -429,7 +429,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
                     return;
                 }
                 written += 1;
-                if written % 25 == 0 {
+                if written.is_multiple_of(25) {
                     print!("\r{written} frames");
                     io::stdout().flush().ok();
                 }
@@ -448,7 +448,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
                     return;
                 }
                 written += 1;
-                if written % 25 == 0 {
+                if written.is_multiple_of(25) {
                     print!("\r{written} frames");
                     io::stdout().flush().ok();
                 }

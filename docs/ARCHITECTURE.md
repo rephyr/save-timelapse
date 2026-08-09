@@ -107,7 +107,7 @@ Wire format, all integers little endian:
     checksum  u32, djb2 of every byte before it (magic and version included)
 
 The version byte lets a reader tell "this is a format I don't understand"
-apart from a generic parse failure -- this project has already changed this
+apart from a generic parse failure. This project has already changed this
 format more than once, each time with no way for an older build to say
 anything clearer than a confusing parse error about a newer file. The
 checksum catches a narrower, different problem the tag structure alone
@@ -120,12 +120,12 @@ which does hold the whole file in memory, just hashes the payload in one
 pass and compares. Both formats' hash functions (`encode.checksum_update`
 in Lua, `frame::checksum` in Rust) implement the same djb2 variant using
 only multiply/add/mod, with no bitwise primitive, since Factorio's Lua 5.2
-has neither `string.pack` nor a `bit32` library -- the same constraint
+has neither `string.pack` nor a `bit32` library, the same constraint
 `u32le`/`i32le` above already work around by hand. A test in each language
 asserts both agree on the same known input.
 
 A file from before this version byte existed has neither it nor the
-trailer and will not parse under the current reader -- consistent with this
+trailer and will not parse under the current reader, consistent with this
 project's precedent of clean breaks over carrying old formats forward at
 this alpha stage (see "Live capture and replay" below, which made the same
 call for session tagging).
@@ -219,7 +219,7 @@ learn which frame files to seed from.
 `<session>` (an 8 digit hex folder name) identifies which playthrough these
 files belong to: `script-output/save-timelapse/` is shared by every save
 that ever turns capture on, and `game.tick` restarts from 0 for each one, so
-a bare tick cannot tell two playthroughs' files apart -- and unlike a bare
+a bare tick cannot tell two playthroughs' files apart, and unlike a bare
 filename, two playthroughs no longer share one directory to get confused in
 to begin with, since each gets its own. `control.lua`'s `compute_session_id`
 uses the map's terrain seed (`map_gen_settings.seed`), deterministic across
@@ -330,7 +330,7 @@ The version byte gives a reader the same "format I don't understand" signal
 the frame format's does, but there is deliberately no checksum trailer to
 go with it, unlike that format. A segment is append only and grows for as
 long as capture stays on, and is simply abandoned, not closed, when a
-rollover starts a new one (see `next_capture_segment` above) -- there is no
+rollover starts a new one (see `next_capture_segment` above), so there is no
 "this segment is now finished" moment to checksum against without inventing
 one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of

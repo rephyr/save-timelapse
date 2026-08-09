@@ -208,9 +208,7 @@ Video export moved out of this release see v1.0.
 
 - [x] Fix terrain being redundantly re-included in every frame instead of captured once (terrain is now captured to its own one-time file per surface instead of being duplicated into every replayed frame)
 - [x] Entity rotation tracking (square-footprint entities render rotated; see the known limitation in the Viewer section for non-square ones)
-- [ ] Entity upgrade/change tracking
-- [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)
-- [ ] Robust interrupted capture recovery (beyond today's manual `/timelapse-reset-capture`)
+- [x] Robust interrupted capture recovery (a failed capture write now degrades gracefully instead of crashing the game, and the CLI now warns about skipped segments, out-of-order events, and high no-op rates instead of staying silent; `/timelapse-reset-capture` remains necessary for files deleted by hand, since a mod has no way to detect that on its own)
 - [ ] Backward compatibility with previous capture versions
 - [ ] Broader modded-game compatibility (curated terrain/resource colors and auto-follow's exclusion lists are hardcoded to vanilla/Space Age names)
 
@@ -230,11 +228,11 @@ Video export moved out of this release see v1.0.
 - [ ] Capture management (deleting/organizing old captures; selecting between them already works)
 - [ ] Settings/preferences (saved between runs, instead of asking fresh every time)
 - [ ] Better error recovery
+- [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)
 - [ ] Polished Windows packaging
 
 ### v1.0
 
-- [ ] Video export
 - [ ] Smarter auto-follow (favor whichever site is actively being built, or nearest the player, instead of always framing the whole base)
 - [ ] Camera keyframes
 - [ ] Cinematic camera controls

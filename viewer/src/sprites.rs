@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use macroquad::math::Rect;
 
 /// Vanilla/Space-Age icons follow a predictable path under the Factorio
-/// install's data directory, keyed by prototype name -- verified against
+/// install's data directory, keyed by prototype name, verified against
 /// Wube's own base-game source (e.g. `__base__/graphics/icons/stone-furnace.png`
 /// resolves to `<data_dir>/base/graphics/icons/stone-furnace.png`). There's no
 /// runtime API a mod could use to export the exact path (checked before
-/// building this), and no reliable convention for third-party mod icons --
+/// building this), and no reliable convention for third-party mod icons:
 /// a lookup miss just means falling back to a colored shape, never an error.
 pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
     ["base", "space-age"]
@@ -25,7 +25,7 @@ pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
 /// Vanilla and Space Age icon files are a horizontal mipmap strip, not a
 /// single image: the primary icon at full size, then progressively smaller
 /// copies laid out to its right, all sharing the strip's height (verified
-/// against real files -- e.g. 64+32+16+8=120 wide, 64 tall). Drawing the
+/// against real files, e.g. 64+32+16+8=120 wide, 64 tall). Drawing the
 /// whole file stretched into one entity's box renders all of them squashed
 /// together, which is what "sprites have 4 sprites in them" was.
 ///

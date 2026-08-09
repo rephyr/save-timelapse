@@ -5,7 +5,7 @@
 //! Headless on purpose: it models macroquad's batching rule (see
 //! `DrawCallCounter`) rather than driving a GPU, so it runs in CI, on a
 //! machine with no Factorio, and without a window. Numbers are draw calls
-//! submitted for a fully-visible frame -- the zoomed-out worst case, before
+//! submitted for a fully-visible frame: the zoomed-out worst case, before
 //! culling removes anything.
 //!
 //!     cargo run -p viewer --bin drawcalls --release [-- <frames dir or file>]
@@ -41,7 +41,7 @@ fn calls(order: &[Option<TypeId>], max_indices: usize) -> usize {
 }
 
 /// Roughly what the parsed frame occupies: struct size plus one heap
-/// allocation per name string. Approximate -- it ignores allocator overhead,
+/// allocation per name string. Approximate: it ignores allocator overhead,
 /// which makes it an underestimate of the real cost, not an overestimate.
 fn parsed_bytes(frame: &Frame) -> usize {
     let entities: usize = frame
@@ -73,7 +73,7 @@ fn synthetic_report(count: usize) {
     let order: Vec<Option<TypeId>> = rendered
         .entity_runs
         .iter()
-        .flat_map(|run| std::iter::repeat(Some(run.type_id)).take(run.len()))
+        .flat_map(|run| std::iter::repeat_n(Some(run.type_id), run.len()))
         .collect();
 
     println!("synthetic: {count} entities across {} types\n", registry.len());
@@ -96,8 +96,8 @@ fn main() {
     // Loaded once, in parallel: this used to also call load_sequence just to
     // fail fast on an empty/invalid directory, then reload and reparse every
     // file a second time in the loop below for per-frame stats. One parallel
-    // load serves both -- the total count for the summary at the bottom and
-    // the per-frame detail here -- without parsing gigabytes of real capture
+    // load serves both (the total count for the summary at the bottom and
+    // the per-frame detail here) without parsing gigabytes of real capture
     // data twice.
     let paths = viewer::frame_paths(Path::new(path)).unwrap_or_default();
     let frames = block_on_load(ParallelFrameLoad::start(paths));
@@ -116,7 +116,7 @@ fn main() {
     let mut lod_totals = (0usize, 0usize); // (items, chunk cells)
     let frame_count = frames.len();
     for frame in frames {
-        // Type ids in the order the exporter wrote them -- what the viewer
+        // Type ids in the order the exporter wrote them: what the viewer
         // used to iterate, and the batching worst case.
         let mut registry = TypeRegistry::new();
         let mut file_order: Vec<Option<TypeId>> = Vec::with_capacity(frame.tiles.len() + frame.entities.len());
@@ -134,7 +134,7 @@ fn main() {
             .tile_runs
             .iter()
             .chain(rendered.entity_runs.iter())
-            .flat_map(|run| std::iter::repeat(Some(run.type_id)).take(run.len()))
+            .flat_map(|run| std::iter::repeat_n(Some(run.type_id), run.len()))
             .collect();
 
         let runs = rendered.tile_runs.len() + rendered.entity_runs.len();

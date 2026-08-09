@@ -27,7 +27,7 @@
 //! different problem the tag-based structure alone can't: silent bit-level
 //! corruption that still happens to decode as plausible-looking records.
 //! Both are new as of this version; a file from before it has neither and
-//! will not parse -- consistent with this project's existing precedent of
+//! will not parse, consistent with this project's existing precedent of
 //! clean breaks over carrying old formats forward at this alpha stage (see
 //! the session-tagging change earlier).
 //!
@@ -77,7 +77,7 @@ const TAG_END_ENTITIES: u8 = 9;
 /// disk. `u32` wrapping arithmetic here is exactly the Lua side's `% 2^32`.
 /// Chosen for being trivial to implement identically on both sides without
 /// a bitwise primitive (Factorio's Lua 5.2 has none), not for cryptographic
-/// strength -- it only needs to catch accidental corruption.
+/// strength: it only needs to catch accidental corruption.
 fn checksum(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 5381;
     for &b in bytes {
@@ -440,7 +440,7 @@ mod tests {
 
     /// Cutting bytes off the end lands inside the trailer here (it's only 4
     /// bytes), which the checksum catches as a mismatch rather than the
-    /// reader running out of bytes mid tag -- still an error either way,
+    /// reader running out of bytes mid tag, still an error either way,
     /// just a different `io::ErrorKind` than a cut mid-payload would give.
     #[test]
     fn a_truncated_file_is_an_error_rather_than_a_panic() {
@@ -454,7 +454,7 @@ mod tests {
     }
 
     /// Cutting deep enough to remove real payload, not just the trailer,
-    /// still must not panic -- the length guard at the top of `read_binary`
+    /// still must not panic: the length guard at the top of `read_binary`
     /// exists specifically for inputs shorter than a header and trailer
     /// combined.
     #[test]

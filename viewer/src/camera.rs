@@ -1,5 +1,5 @@
 //! Pan/zoom camera and the timeline scrub bar. Geometry and hit-testing
-//! only -- drawing and input polling stay in `main.rs`.
+//! only; drawing and input polling stay in `main.rs`.
 
 use macroquad::math::Vec2;
 
@@ -10,7 +10,7 @@ pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 /// How much smaller than a bare edge-to-edge fit `fit_frames`'s initial,
 /// static whole-sequence view zooms. Leaves visible breathing room around
 /// the base instead of touching the window edges. Auto-follow uses its own,
-/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`) -- this one is
+/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`); this one is
 /// only for the one-time opening view.
 const FIT_MARGIN: f32 = 0.75;
 
@@ -50,7 +50,7 @@ impl Camera {
         screen_height: f32,
     ) -> Camera {
         // Each entity contributes its two footprint corners, not just its
-        // center point -- for a small cluster of large buildings, ignoring
+        // center point. For a small cluster of large buildings, ignoring
         // footprint here would zoom in as if they were 1x1, and a real
         // multi-tile entity would then render bigger than the whole window.
         let mut points = frames
@@ -83,7 +83,7 @@ impl Camera {
     /// far enough to fill the screen with one tile, which reads as broken
     /// rather than "focused." `margin` is how much smaller than a bare
     /// edge-to-edge fit to zoom (1.0 = box edges touch the window border,
-    /// smaller = more breathing room) -- a caller's choice rather than a
+    /// smaller = more breathing room), a caller's choice rather than a
     /// fixed constant, since a one-time static view and a continuously
     /// re-fitting auto-follow camera want different amounts of it (see
     /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
@@ -97,7 +97,7 @@ impl Camera {
 }
 
 /// A camera move from wherever it currently is to a new target, over a
-/// fixed real-time duration -- the same model TLBE (the most-downloaded
+/// fixed real-time duration, the same model TLBE (the most-downloaded
 /// Factorio timelapse mod) uses for its own camera transitions: plain
 /// linear interpolation of both position and zoom against elapsed time,
 /// not an easing curve. A fixed duration is what makes a transition read as
@@ -114,8 +114,8 @@ pub struct CameraTransition {
 
 impl CameraTransition {
     /// Starts from `start` (the camera's live position, not the previous
-    /// target) so retargeting mid-transition -- the point of interest
-    /// moving again before the camera arrived -- glides on from wherever
+    /// target) so retargeting mid-transition (the point of interest
+    /// moving again before the camera arrived) glides on from wherever
     /// the camera actually is, with no discontinuity, rather than jumping
     /// back to resume an old transition's endpoint.
     pub fn new(start: Camera, end: Camera, duration_secs: f32) -> Self {
@@ -141,7 +141,7 @@ impl CameraTransition {
 }
 
 /// The on-screen size of an entity's footprint, in pixels. Most entities are
-/// 1x1, but assemblers, furnaces and the like span several tiles -- sizing
+/// 1x1, but assemblers, furnaces and the like span several tiles, so sizing
 /// every entity to a fixed 1-tile square (the pre-footprint behavior) is why
 /// multi-tile buildings used to render undersized and visually disconnected
 /// from whatever was actually touching them.
@@ -206,7 +206,7 @@ pub fn entity_cull_half_extents(w: u32, h: u32, d: u8, is_rotation_allowed: bool
 }
 
 /// A horizontal scrub bar, centered near the bottom of the window, mapping
-/// between screen-x and frame index. Geometry and hit-testing only -- drawing
+/// between screen-x and frame index. Geometry and hit-testing only; drawing
 /// and input polling stay in main.rs, same split as Camera.
 #[derive(Clone, Copy)]
 pub struct Timeline {
@@ -425,7 +425,7 @@ mod tests {
     }
 
     /// Multiple small steps that add up to the full duration must land in
-    /// the same place as one big step -- the draw loop calls `step` once
+    /// the same place as one big step: the draw loop calls `step` once
     /// per rendered frame, so this is what makes the transition's total
     /// duration independent of frame rate.
     #[test]

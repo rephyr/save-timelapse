@@ -4,7 +4,7 @@
 ///
 /// Loading is blocking work in front of a window that is already open, so
 /// without this the viewer shows an empty frame for as long as it takes to
-/// parse every frame file and load every sprite -- which on a real save set
+/// parse every frame file and load every sprite, which on a real save set
 /// is many seconds with no indication anything is happening.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadProgress {

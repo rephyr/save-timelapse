@@ -2,8 +2,8 @@
 //!
 //! A base has tens of distinct prototype names against hundreds of thousands
 //! of entities, so storing the name on each one is a heap allocation per
-//! entity for one of a few dozen repeated strings. Everything downstream --
-//! replayed world state, the viewer's render frames -- refers to names by a
+//! entity for one of a few dozen repeated strings. Everything downstream
+//! (replayed world state, the viewer's render frames) refers to names by a
 //! `u16` instead and looks the string up only when it has to.
 
 use std::collections::HashMap;

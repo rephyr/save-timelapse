@@ -24,7 +24,7 @@ impl PlayerTrack {
     }
 
     /// Each tracked player's latest known position at or before `tick`,
-    /// filtered to whichever surface they were last seen on -- the same
+    /// filtered to whichever surface they were last seen on, the same
     /// nearest-preceding "step function" semantics `World` already uses to
     /// reconstruct entity state from events. A player not yet sampled by
     /// `tick`, or last seen on a different surface, isn't returned: they

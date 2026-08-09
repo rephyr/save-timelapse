@@ -1,5 +1,5 @@
 -- save-timelapse: pure binary-encoding helpers shared by snapshot export
--- (control.lua) and live event capture. Nothing here touches
+-- (export.lua) and live event capture (capture.lua). Nothing here touches
 -- game/surface/settings/helpers, so this file loads and runs under a plain
 -- `lua` interpreter with no Factorio present. See tests/encode_test.lua.
 --
@@ -28,7 +28,7 @@ M.EXCLUDED_TYPES = {
   -- instead of type.
   "unit", "unit-spawner",
   -- generic decorative/rock scatter, kept out for now: unlike trees and
-  -- cliffs (rendered as ground context, see control.lua's terrain capture),
+  -- cliffs (rendered as ground context, see export.lua's terrain capture),
   -- this catch-all covers whatever else Space Age uses it for, which is
   -- harder to predict without the game's prototype data on hand.
   "simple-entity", "simple-entity-with-force", "simple-entity-with-owner",
@@ -54,18 +54,17 @@ M.PLACED_FLOOR_TILES = {
   "cyan-refined-concrete", "acid-refined-concrete",
 }
 
--- ---------------------------------------------------------------------------
 -- Terrain capture bounding box
 --
 -- Natural terrain (grass, water, sand, ...) covers every generated tile on
 -- a surface, not just where the player built, so capturing all of it would
--- dwarf everything else this mod exports. Instead, control.lua captures a
+-- dwarf everything else this mod exports. Instead, export.lua captures a
 -- margin of ground around wherever entities and placed floor actually are,
 -- tracked here as a running box grown one position at a time while those
 -- are scanned, needing no second pass over the surface just to learn its
 -- extent.
 
---- `nil` fields mean "nothing seen yet" -- an untouched surface has no
+--- `nil` fields mean "nothing seen yet": an untouched surface has no
 --- factory to show context around, distinct from a box that happens to be
 --- a single point.
 function M.new_bbox()
@@ -100,7 +99,7 @@ M.FRAME_MAGIC = "STF1"
 M.EVENT_MAGIC = "STE1"
 
 --- Independent per format, since the frame and event formats change on their
---- own schedules -- a frame-only tweak has no reason to also bump the event
+--- own schedules: a frame-only tweak has no reason to also bump the event
 --- version, and vice versa.
 M.FRAME_VERSION = 1
 M.EVENT_VERSION = 1
@@ -113,7 +112,6 @@ function M.quote(text)
   return '"' .. text:gsub('[\\"]', '\\%0') .. '"'
 end
 
--- ---------------------------------------------------------------------------
 -- Low level byte packing
 
 function M.u8(n)
@@ -178,15 +176,14 @@ local function clamp_u8(n)
   return n
 end
 
--- ---------------------------------------------------------------------------
 -- Name dictionaries
 --
 -- A name is written out in full the first time it is used (a "DefineName"
 -- chunk) and given the next sequential id; every later reference to that
 -- name is just the two byte id. This is what lets a frame or event segment
 -- skip repeating "transport-belt" once per entity. The dictionary is a
--- plain table so the caller (control.lua) can decide its lifetime: one per
--- frame file, or one per live-capture segment.
+-- plain table so the caller (export.lua, capture.lua, or snapshot.lua) can
+-- decide its lifetime: one per frame file, or one per live-capture segment.
 
 function M.new_dictionary()
   return { ids = {}, count = 0 }
@@ -213,7 +210,6 @@ function M.dictionary_id(dict, name, define_tag)
   return id, M.u8(define_tag) .. M.str(name)
 end
 
--- ---------------------------------------------------------------------------
 -- Frame format (frame_<tick>_<surface>.stfr)
 
 function M.frame_header(tick, surface)
@@ -260,7 +256,6 @@ function M.frame_end_entities()
   return M.u8(9)
 end
 
--- ---------------------------------------------------------------------------
 -- Live capture event format (events_<start_tick>.stev)
 
 function M.event_header()
@@ -332,20 +327,19 @@ function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)
   return current_segment_start -- keep appending to the existing segment
 end
 
--- ---------------------------------------------------------------------------
 -- Checksums
 --
 -- djb2, a simple multiplicative hash, computed with plain multiply/add/mod
 -- rather than the usual bitwise XOR/shift form: Factorio's Lua 5.2 has no
 -- bit32 library, the same reason u32le/i32le above pack integers by hand
--- instead of with bitwise ops. Not chosen for cryptographic strength --
--- it only needs to catch accidental corruption, not resist tampering --
--- but for being trivial to implement identically on both this side and the
--- Rust reader's. `control.lua` threads the running hash through every
--- write for a frame file and appends it as a trailer once the file is
--- complete; nothing on the event log side uses this, since an append-only
--- segment that grows for as long as capture stays on has no "finished"
--- moment to checksum against.
+-- instead of with bitwise ops. Not chosen for cryptographic strength, only
+-- to catch accidental corruption, not resist tampering, but for being
+-- trivial to implement identically on both this side and the Rust reader's.
+-- `export.lua` (and `capture.lua`/`snapshot.lua` via it) threads the
+-- running hash through every write for a frame file and appends it as a
+-- trailer once the file is complete; nothing on the event log side uses
+-- this, since an append-only segment that grows for as long as capture
+-- stays on has no "finished" moment to checksum against.
 
 --- Pure: plain values in and out, so these are testable the same way as
 --- next_capture_segment above.
@@ -363,16 +357,15 @@ function M.checksum_update(hash, data)
   return hash
 end
 
--- ---------------------------------------------------------------------------
 -- Per-playthrough file naming
 --
 -- game.tick restarts from 0 for every save, and script-output/save-timelapse/
 -- is one folder shared by every save that ever turns capture on, so a raw
 -- tick number cannot tell two playthroughs apart. session_id (the world's
--- map generation seed; see control.lua) is stable across save/reload of one
+-- map generation seed; see capture.lua) is stable across save/reload of one
 -- playthrough and differs across different ones, so every playthrough this
 -- mod ever captures gets its own subfolder, named after its session_id, of
--- otherwise plain (untagged) filenames -- Factorio's write_file creates
+-- otherwise plain (untagged) filenames. Factorio's write_file creates
 -- whatever subfolders a path needs, so this needs nothing beyond naming the
 -- path correctly. A folder per playthrough is easier to browse by hand than
 -- the flat, hex-in-every-filename scheme this replaced, and removes the
@@ -398,7 +391,7 @@ function M.player_log_name(session_id)
 end
 
 --- Unlike the three names above, a baseline's per-surface frame files are
---- untagged even without a session_id (see control.lua's export_surface):
+--- untagged even without a session_id (see export.lua's export_surface):
 --- `/timelapse-export` and the headless scan share one private, per-run
 --- script-output folder with nothing else, so there is nothing for their
 --- output to collide with.
@@ -410,12 +403,11 @@ function M.frame_name(session_id, tick, surface)
   return M.session_dir(session_id) .. name
 end
 
--- ---------------------------------------------------------------------------
 -- Player position log
 --
 -- Deliberately plain newline-delimited JSON, not a tagged binary format
 -- like the frame/event formats above: a position sample happens at most
--- once every several seconds by design (see control.lua), nowhere near
+-- once every several seconds by design (see export.lua), nowhere near
 -- the per-tick construction volume that actually justified paying for a
 -- binary format there. The same shape is both what the mod writes and
 -- what the viewer reads directly (src/player_log.rs), so
@@ -423,7 +415,7 @@ end
 
 --- One line: `{"tick":T,"players":[{"name":...,"surface":...,"x":...,"y":...}]}`.
 --- `players` is a list of `{name=, surface=, x=, y=}` tables, already
---- resolved by the caller (control.lua has two: periodic sampling during
+--- resolved by the caller (export.lua has two: periodic sampling during
 --- live capture, and a one-shot sample alongside every full export).
 function M.player_log_line(tick, players)
   local entries = {}
