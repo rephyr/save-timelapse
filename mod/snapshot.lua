@@ -27,14 +27,19 @@ local function snapshot_path(tick, surface_name)
   return string.format("%sframe_%d_%s.stfr", export.EXPORT_DIR, tick, surface_name)
 end
 
---- Groups whatever is pending by name and writes it as runs.
+--- Writes whatever has been grouped so far as runs.
 ---
---- Grouping happens here, per flush, rather than over the whole snapshot,
---- which is the whole point of this exporter: it spreads one export across
---- many ticks so no single tick does the lot, and buffering a megabase to
---- group it would put that stall straight back. A flush's worth across the
---- few dozen distinct names on a surface still leaves runs long enough for
---- the name id and count to amortize.
+--- Grouping happens as items are scanned, into the parallel flat arrays this
+--- encodes, rather than into a table per entity: measured at 900k entities
+--- under real Lua 5.2, a table each made encoding 1.26x slower than the
+--- per-entity format this replaced, against 0.60x this way.
+---
+--- Grouped per flush rather than over the whole snapshot, which is the point
+--- of this exporter: it spreads one export across many ticks so no single
+--- tick does the lot, and buffering a megabase to group it would put that
+--- stall straight back. A flush's worth across the few dozen distinct names
+--- on a surface still leaves runs long enough for the name id and count to
+--- amortize.
 ---
 --- `state.phase` says which section is being written. Both final flushes
 --- happen before the phase advances, so this is never asked to guess.
@@ -43,31 +48,31 @@ local function snapshot_flush(state)
     return
   end
 
-  local order, groups = {}, {}
-  for i = 1, state.pending_count do
-    local item = state.pending[i]
-    local group = groups[item.name]
-    if not group then
-      group = { w = item.w, h = item.h, items = {} }
-      groups[item.name] = group
-      order[#order + 1] = item.name
-    end
-    group.items[#group.items + 1] = item
-  end
-
   local parts = {}
-  for i = 1, #order do
-    local name = order[i]
-    local group = groups[name]
+  for i = 1, #state.order do
+    local name = state.order[i]
+    local g = state.groups[name]
     if state.phase == "tiles" then
-      parts[i] = encode.frame_tile_run(state.dict, name, group.items)
+      parts[i] = encode.frame_tile_run(state.dict, name, g.xs, g.ys, g.n)
     else
-      parts[i] = encode.frame_entity_run(state.dict, name, group.w, group.h, group.items)
+      parts[i] = encode.frame_entity_run(state.dict, name, g.w, g.h, g.xs, g.ys, g.ds, g.n)
     end
   end
 
   state.checksum = export.checksummed_write(state.path, table.concat(parts), true, state.checksum)
-  state.pending, state.pending_count = {}, 0
+  state.order, state.groups, state.pending_count = {}, {}, 0
+end
+
+--- The run `name` is being collected into, created on first sight. `w`/`h`
+--- are nil for tiles, which are always one by one.
+local function snapshot_group(state, name, w, h)
+  local g = state.groups[name]
+  if not g then
+    g = { w = w, h = h, n = 0, xs = {}, ys = {}, ds = {} }
+    state.groups[name] = g
+    state.order[#state.order + 1] = name
+  end
+  return g
 end
 
 local function snapshot_begin_surface(state, surface)
@@ -136,17 +141,12 @@ local function snapshot_step()
       if entity.valid then
         s.written = s.written + 1
         s.pending_count = s.pending_count + 1
-        -- Read across the API boundary once into a plain table, since the
-        -- grouping above would otherwise re-read every field.
+        -- Each field crosses the API boundary, so each is read exactly once,
+        -- straight into the run being built.
         local pos = entity.position
-        s.pending[s.pending_count] = {
-          name = entity.name,
-          x = pos.x,
-          y = pos.y,
-          d = entity.direction,
-          w = entity.tile_width,
-          h = entity.tile_height,
-        }
+        local g = snapshot_group(s, entity.name, entity.tile_width, entity.tile_height)
+        local k = g.n + 1
+        g.n, g.xs[k], g.ys[k], g.ds[k] = k, pos.x, pos.y, entity.direction
         if s.pending_count >= SNAPSHOT_FLUSH_EVERY then
           snapshot_flush(s)
         end
@@ -170,7 +170,9 @@ local function snapshot_step()
       s.tiles_written = s.tiles_written + 1
       s.pending_count = s.pending_count + 1
       local pos = tile.position
-      s.pending[s.pending_count] = { name = tile.name, x = pos.x, y = pos.y }
+      local g = snapshot_group(s, tile.name)
+      local k = g.n + 1
+      g.n, g.xs[k], g.ys[k] = k, pos.x, pos.y
       if s.pending_count >= SNAPSHOT_FLUSH_EVERY then
         snapshot_flush(s)
       end
@@ -214,7 +216,8 @@ function M.start(tick)
     tiles_written = 0,
     total_entities = 0,
     total_tiles = 0,
-    pending = {},
+    order = {},
+    groups = {},
     pending_count = 0,
     path = nil,
     surface_name = nil,

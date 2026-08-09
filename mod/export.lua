@@ -107,41 +107,45 @@ local function export_surface(surface, tick, session_id)
   -- the whole surface just to learn its extent.
   local bbox = encode.new_bbox()
 
-  local pending, pending_count, written = {}, 0, 0
+  local pending_count, written = 0, 0
 
   -- Records are grouped by name into runs (see encode.frame_entity_run), so
-  -- entities are collected into a batch and grouped when it fills, rather
-  -- than encoded one at a time as they are scanned.
+  -- entities are collected by name as they are scanned and written out when
+  -- the batch fills.
   --
   -- Grouped per batch and not per frame deliberately: buffering a whole
   -- megabase to group it would reintroduce exactly the stall the incremental
   -- exporter exists to avoid. A batch of FLUSH_EVERY across the few dozen
   -- distinct names on a surface still leaves runs long enough for the name id
   -- and count to amortize, which is where the saving is.
+  --
+  -- Straight into parallel flat arrays, never a table per entity: measured at
+  -- 900k entities, a table each made encoding 1.26x slower than the format
+  -- this replaced, against 0.60x this way.
+  local order, groups = {}, {}
+
+  local function group_for(name, w, h)
+    local group = groups[name]
+    if not group then
+      group = { w = w, h = h, n = 0, xs = {}, ys = {}, ds = {} }
+      groups[name] = group
+      order[#order + 1] = name
+    end
+    return group
+  end
+
   local function flush_entities()
     if pending_count == 0 then
       return
     end
-    local order, groups = {}, {}
-    for i = 1, pending_count do
-      local item = pending[i]
-      local group = groups[item.name]
-      if not group then
-        group = { w = item.w, h = item.h, items = {} }
-        groups[item.name] = group
-        order[#order + 1] = item.name
-      end
-      group.items[#group.items + 1] = item
-    end
-
     local parts = {}
     for i = 1, #order do
       local name = order[i]
       local group = groups[name]
-      parts[i] = encode.frame_entity_run(dict, name, group.w, group.h, group.items)
+      parts[i] = encode.frame_entity_run(dict, name, group.w, group.h, group.xs, group.ys, group.ds, group.n)
     end
     checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
-    pending, pending_count = {}, 0
+    order, groups, pending_count = {}, {}, 0
   end
 
   for _, entity in pairs(surface.find_entities_filtered({
@@ -149,20 +153,14 @@ local function export_surface(surface, tick, session_id)
     invert = true,
   })) do
     if entity.valid then
-      -- Read out of the API once into a plain table: every field below
-      -- crosses the mod/game boundary, and the grouping above would
-      -- otherwise re-read them.
+      -- Each field crosses the mod/game boundary, so each is read exactly
+      -- once, straight into the run being built.
       local pos = entity.position
-      pending_count = pending_count + 1
+      local group = group_for(entity.name, entity.tile_width, entity.tile_height)
+      local k = group.n + 1
+      group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
       written = written + 1
-      pending[pending_count] = {
-        name = entity.name,
-        x = pos.x,
-        y = pos.y,
-        d = entity.direction,
-        w = entity.tile_width,
-        h = entity.tile_height,
-      }
+      pending_count = pending_count + 1
       encode.grow_bbox(bbox, pos.x, pos.y)
 
       -- Each write_file call is a separate file append, so flushing per entity
@@ -177,39 +175,40 @@ local function export_surface(surface, tick, session_id)
 
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
-  pending, pending_count = {}, 0
   local tiles_written = 0
 
   -- Same batching as the entity section above, for the same reason.
+  local function tile_group_for(name)
+    local group = groups[name]
+    if not group then
+      group = { n = 0, xs = {}, ys = {} }
+      groups[name] = group
+      order[#order + 1] = name
+    end
+    return group
+  end
+
   local function flush_tiles()
     if pending_count == 0 then
       return
     end
-    local order, groups = {}, {}
-    for i = 1, pending_count do
-      local item = pending[i]
-      local group = groups[item.name]
-      if not group then
-        group = {}
-        groups[item.name] = group
-        order[#order + 1] = item.name
-      end
-      group[#group + 1] = item
-    end
-
     local parts = {}
     for i = 1, #order do
-      parts[i] = encode.frame_tile_run(dict, order[i], groups[order[i]])
+      local name = order[i]
+      local group = groups[name]
+      parts[i] = encode.frame_tile_run(dict, name, group.xs, group.ys, group.n)
     end
     checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
-    pending, pending_count = {}, 0
+    order, groups, pending_count = {}, {}, 0
   end
 
   for _, tile in pairs(surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })) do
     local pos = tile.position
-    pending_count = pending_count + 1
+    local group = tile_group_for(tile.name)
+    local k = group.n + 1
+    group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
     tiles_written = tiles_written + 1
-    pending[pending_count] = { name = tile.name, x = pos.x, y = pos.y }
+    pending_count = pending_count + 1
     encode.grow_bbox(bbox, pos.x, pos.y)
 
     if pending_count >= FLUSH_EVERY then
@@ -236,9 +235,11 @@ local function export_surface(surface, tick, session_id)
       invert = true,
     })) do
       local pos = tile.position
-      pending_count = pending_count + 1
+      local group = tile_group_for(tile.name)
+      local k = group.n + 1
+      group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
       tiles_written = tiles_written + 1
-      pending[pending_count] = { name = tile.name, x = pos.x, y = pos.y }
+      pending_count = pending_count + 1
 
       if pending_count >= FLUSH_EVERY then
         flush_tiles()

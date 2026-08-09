@@ -100,10 +100,9 @@ check("varint_i32: a negative delta is one byte", encode.varint_i32(-1), bytes(1
 
 do
   local dict = encode.new_dictionary()
-  local run = encode.frame_entity_run(dict, "transport-belt", 1, 1, {
-    { x = -80.5, y = 28.5, d = 4 },
-    { x = -79.5, y = 28.5, d = 6 },
-  })
+  -- Parallel arrays, not a table per entity: see frame_entity_run on why.
+  local run = encode.frame_entity_run(dict, "transport-belt", 1, 1,
+    { -80.5, -79.5 }, { 28.5, 28.5 }, { 4, 6 }, 2)
   local expected = bytes(0) .. encode.str("transport-belt") .. bytes(1) .. bytes(1) -- DefineName carries the footprint
     .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(1) -- run: id, count, directions flag
     .. encode.varint_i32(-805) .. encode.varint_i32(285) .. bytes(4) -- first item, delta from origin
@@ -115,10 +114,8 @@ do
   local dict = encode.new_dictionary()
   -- Nothing in this run rotates, so the flag is clear and no direction
   -- bytes are written at all.
-  local run = encode.frame_entity_run(dict, "wooden-chest", 1, 1, {
-    { x = 0.5, y = 0.5, d = 0 },
-    { x = 1.5, y = 0.5 },
-  })
+  local run = encode.frame_entity_run(dict, "wooden-chest", 1, 1,
+    { 0.5, 1.5 }, { 0.5, 0.5 }, { 0, 0 }, 2)
   local expected = bytes(0) .. encode.str("wooden-chest") .. bytes(1) .. bytes(1)
     .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(0)
     .. encode.varint_i32(5) .. encode.varint_i32(5)
@@ -129,7 +126,7 @@ end
 do
   local dict = encode.new_dictionary()
   encode.frame_define_name(dict, "concrete", 1, 1) -- pre-seed, so the run does not redefine it
-  local run = encode.frame_tile_run(dict, "concrete", { { x = -5, y = 12 }, { x = -4, y = 12 } })
+  local run = encode.frame_tile_run(dict, "concrete", { -5, -4 }, { 12, 12 }, 2)
   local expected = bytes(2) .. encode.varint(0) .. encode.varint(2)
     .. encode.varint_i32(-5) .. encode.varint_i32(12)
     .. encode.varint_i32(1) .. encode.varint_i32(0)
