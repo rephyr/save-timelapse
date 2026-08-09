@@ -7,6 +7,7 @@
 //! Re-exported here so every name is still reachable as `viewer::Name`
 //! exactly as before this split, so `main.rs` needed no import changes.
 
+mod activity;
 mod camera;
 mod construction;
 mod draw_calls;
@@ -18,6 +19,7 @@ mod render_frame;
 mod sprites;
 mod timecode;
 
+pub use activity::{activity_heights, analyze_activity, recent_heat, Activity, HeatCell, HEAT_CELL_TILES};
 pub use camera::{
     entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition,
     Timeline, BASE_PIXELS_PER_TILE,

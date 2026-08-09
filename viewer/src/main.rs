@@ -12,10 +12,11 @@ use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use viewer::{
-    color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, format_game_time,
-    growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, LoadProgress, LodCell,
-    PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, LOD_CELL_TILES,
+    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size,
+    entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect,
+    is_rotation_allowed, recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, Camera, CameraTransition,
+    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar,
+    RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -88,6 +89,18 @@ struct WorldView {
     /// The whole base's bounding box as of each frame, monotonically
     /// growing, precomputed once at load. See `viewer::growing_bounds_per_frame`.
     growing_bounds: Vec<Option<GrowingBounds>>,
+    /// How much got built in each frame, already normalized to 0..1 for
+    /// drawing. Precomputed at load alongside `growing_bounds`, which walks
+    /// the same entities: recovering this needs a diff between consecutive
+    /// frames (see `viewer::activity_per_frame`), far too much to redo every
+    /// time the bar is drawn.
+    activity: Vec<f32>,
+    /// Where construction happened in each frame, binned into cells for the
+    /// heatmap overlay. Same pass as `activity` above.
+    heat: Vec<Vec<HeatCell>>,
+    /// The busiest single cell of the run, so heat brightness stays anchored
+    /// to a fixed reference rather than to whatever is currently on screen.
+    heat_peak: u32,
     follow: FollowState,
     /// This surface's natural-terrain layer, loaded once (not per frame:
     /// terrain never changes after the baseline, see
@@ -126,6 +139,7 @@ struct ViewerState {
     dragging_timeline: bool,
     sprites_enabled: bool,
     lod_enabled: bool,
+    heatmap_enabled: bool,
 }
 
 struct Args {
@@ -615,6 +629,10 @@ fn handle_input(
     // LOD off is the A/B for what per-item CPU cost costs at extreme
     // zoom-out: forces full-detail rendering even below the chunk
     // threshold, so the difference is directly comparable.
+    if is_key_pressed(KeyCode::H) {
+        state.heatmap_enabled = !state.heatmap_enabled;
+    }
+
     if is_key_pressed(KeyCode::L) {
         state.lod_enabled = !state.lod_enabled;
     }
@@ -707,8 +725,16 @@ fn draw_world(
     sprites: &[Option<Sprite>],
     use_sprites: bool,
     use_lod: bool,
+    heat: Option<(&[Vec<HeatCell>], u32, usize)>,
     counter: &mut DrawCallCounter,
 ) {
+    // Applied between the ground and the buildings in both branches below,
+    // so the factory always draws on top of it at full brightness.
+    let paint_heat = |camera: &Camera| {
+        if let Some((cells, peak, index)) = heat {
+            draw_construction_heat(cells, peak, index, camera, screen_center);
+        }
+    };
     let pixels_per_tile = camera.pixels_per_tile();
     let (view_min, view_max) = view_bounds(camera, screen_center);
 
@@ -747,6 +773,8 @@ fn draw_world(
             registry,
             counter,
         );
+        paint_heat(camera);
+
         let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
         for run in &frame.entity_lod_runs {
             let color = registry.entity_color(run.type_id);
@@ -801,6 +829,8 @@ fn draw_world(
             use_sprites,
             counter,
         );
+
+        paint_heat(camera);
 
         for run in &frame.entity_runs {
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
@@ -906,9 +936,10 @@ fn draw_hud(
     let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
     draw_text(
         format!(
-            "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({}x)  |  s toggles sprites, l toggles LOD  |  f auto-follows the growing base ({})  |  drag the bar below to scrub{tab_hint}",
+            "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({}x)  |  s toggles sprites, l toggles LOD  |  h build heatmap ({})  |  f auto-follows the growing base ({})  |  drag the bar below to scrub{tab_hint}",
             if state.playing { "pause" } else { "play" },
             state.play_speed,
+            if state.heatmap_enabled { "on" } else { "off" },
             if follow_enabled { "on" } else { "off" },
         ),
         10.0,
@@ -922,12 +953,100 @@ fn draw_hud(
 /// are reference marks read at a glance beside the bar, not primary readouts.
 const TIMELINE_LABEL_SIZE: f32 = 16.0;
 
+/// How many frames back the construction heatmap reaches, oldest fading to
+/// nothing. Short on purpose: the point is showing where work is happening
+/// *now*, so the glow trails the construction front and dies out behind it
+/// rather than accumulating into a map of everywhere you have ever been.
+const HEAT_WINDOW_FRAMES: usize = 10;
+/// Alpha at the hottest core. The overlay is opt-in (`h`) and draws beneath
+/// the entities, so it can afford to be genuinely bright: the factory is
+/// painted over the top of it regardless, and anything dimmer read as barely
+/// there against the ground.
+const HEAT_MAX_ALPHA: f32 = 0.85;
+/// How far heat bleeds outward from where something was actually built, in
+/// cells (so `HEAT_SPREAD_CELLS * HEAT_CELL_TILES` tiles). This is what turns
+/// a scatter of individually lit machines into one glow over the area being
+/// worked on. See `viewer::recent_heat`.
+const HEAT_SPREAD_CELLS: i32 = 3;
+
+// Vertical layout above the scrub bar, stacked upward from the track: the
+// activity graph sits directly on it, the current-time label clears the
+// graph, and the hover tooltip clears the label. Named and derived from each
+// other rather than written as separate magic offsets, since every one of
+// them has to move whenever the graph's height changes.
+
+/// How tall the activity graph stands at its busiest frame.
+const ACTIVITY_HEIGHT: f32 = 26.0;
+/// Gap between the track and the graph's baseline, so the two read as
+/// separate things rather than the graph growing out of the bar itself.
+const ACTIVITY_GAP: f32 = 5.0;
+/// Baseline of the current-time label, clearing the graph's full height.
+const PLAYHEAD_LABEL_OFFSET: f32 = ACTIVITY_GAP + ACTIVITY_HEIGHT + 14.0;
+/// Bottom edge of the hover tooltip, clearing the label above the graph.
+const HOVER_TOOLTIP_OFFSET: f32 = PLAYHEAD_LABEL_OFFSET + 10.0;
+
 /// Elapsed game time at `index`, or an empty string for an index the
 /// sequence does not have. Frames carry the real `game.tick` they were
 /// emitted at (see `replay::run`), so this is the capture's own clock rather
 /// than anything derived from frame numbering.
 fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
     sequence.frames().get(index).map(|frame| format_game_time(frame.tick)).unwrap_or_default()
+}
+
+/// The construction heatmap: where building happened over the last
+/// `HEAT_WINDOW_FRAMES`, as translucent warm quads, oldest faintest.
+///
+/// Drawn between the ground and the entities (see `draw_world`), which is
+/// what keeps it from covering the view in the way that actually matters:
+/// the factory itself renders on top at full brightness, so no belt or
+/// assembler is ever dimmed or hazed by it. Low alpha alone would not do
+/// that, since it would still wash over everything built.
+///
+/// Accumulated per rendered frame rather than precomputed per frame, because
+/// the window slides: cell lists are a few hundred entries each and only
+/// `HEAT_WINDOW_FRAMES` of them are ever touched, so this is a few thousand
+/// operations, unlike the per-entity pass that produced them.
+fn draw_construction_heat(
+    heat: &[Vec<HeatCell>],
+    peak: u32,
+    index: usize,
+    camera: &Camera,
+    screen_center: Vec2,
+) {
+    let size = HEAT_CELL_TILES as f32;
+
+    // Culled to the screen before spreading, grown by the spread radius so
+    // a hot cell just off the edge still bleeds correctly into view.
+    let (view_min, view_max) = view_bounds(camera, screen_center);
+    let to_cell = |world: f32| (world / size).floor() as i32;
+    let view = (
+        to_cell(view_min.x) - HEAT_SPREAD_CELLS,
+        to_cell(view_min.y) - HEAT_SPREAD_CELLS,
+        to_cell(view_max.x) + HEAT_SPREAD_CELLS,
+        to_cell(view_max.y) + HEAT_SPREAD_CELLS,
+    );
+
+    let pixels = size * camera.pixels_per_tile();
+    for (cx, cy, intensity) in
+        recent_heat(heat, index, HEAT_WINDOW_FRAMES, HEAT_SPREAD_CELLS, peak, Some(view))
+    {
+        let world = Vec2::new(cx as f32 * size, cy as f32 * size);
+        let screen = camera.world_to_screen(world, screen_center);
+        draw_rectangle(screen.x, screen.y, pixels, pixels, heat_color(intensity));
+    }
+}
+
+/// Fire: a red core, through orange and yellow as it cools, fading out
+/// entirely at the edges.
+///
+/// Hue and alpha both move with intensity, which is what makes the edges
+/// disappear rather than ending on a visible yellow rim. Red is reserved for
+/// the hottest cells specifically because the spread above saturates dense
+/// construction and leaves isolated machines dim, so red genuinely means
+/// "a lot went up right here" rather than just "something is here".
+fn heat_color(intensity: f32) -> Color {
+    let t = intensity.clamp(0.0, 1.0);
+    Color::new(1.0, 0.85 - 0.70 * t, 0.25 - 0.20 * t, t * HEAT_MAX_ALPHA)
 }
 
 /// The scrub bar: a filled track up to the current frame, tick marks when
@@ -939,7 +1058,15 @@ fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
 /// box, since dragging a scrubber pulls the pointer off it vertically almost
 /// immediately, and losing the readout at exactly that moment would take it
 /// away whenever it is being used most deliberately.
-fn draw_timeline_bar(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2, scrubbing: bool) {
+fn draw_timeline_bar(
+    timeline: &Timeline,
+    sequence: &FrameSequence,
+    activity: &[f32],
+    mouse: Vec2,
+    scrubbing: bool,
+) {
+    draw_activity_graph(timeline, sequence, activity);
+
     // Track, filled up to the current frame, a tick per frame when
     // there are few enough to read, and a playhead on top.
     draw_line(timeline.left, timeline.y, timeline.left + timeline.width, timeline.y, 4.0, Color::new(1.0, 1.0, 1.0, 0.25));
@@ -958,6 +1085,52 @@ fn draw_timeline_bar(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2,
 
     if timeline.contains(mouse) || scrubbing {
         draw_timeline_hover(timeline, sequence, mouse);
+    }
+}
+
+/// How much got built over the run, as a filled area standing on the scrub
+/// bar: tall where a lot went up, flat where nothing did.
+///
+/// Drawn as one vertical bar per screen column rather than one per frame,
+/// which is what makes it read the same at any capture length. A 40-frame
+/// capture would otherwise leave visible gaps between marks, and a
+/// 4000-frame one would pile dozens of frames onto each column and draw
+/// them all. Each column takes the loudest frame it covers rather than the
+/// mean, so a single busy frame stays visible instead of being averaged away
+/// by the quiet ones either side of it, the same reason a waveform display
+/// shows peaks.
+///
+/// Everything up to the playhead is drawn brighter, so the graph doubles as
+/// the progress fill rather than fighting with it.
+fn draw_activity_graph(timeline: &Timeline, sequence: &FrameSequence, activity: &[f32]) {
+    if activity.is_empty() || sequence.len() <= 1 {
+        return;
+    }
+
+    let baseline = timeline.y - ACTIVITY_GAP;
+    let playhead_x = timeline.x_for_index(sequence.index(), sequence.len());
+    let past = Color::new(1.0, 1.0, 1.0, 0.45);
+    let future = Color::new(1.0, 1.0, 1.0, 0.18);
+
+    let columns = timeline.width.max(1.0) as usize;
+    for column in 0..columns {
+        let x = timeline.left + column as f32;
+        // The frames this column covers, taken from the same index mapping
+        // the playhead and click path use so the graph lines up with them.
+        // Clamped against `activity` rather than trusted to match the
+        // sequence length: they are built together and do match, but this
+        // indexes a slice every column of every frame, so it should not be
+        // one refactor away from a panic in the draw loop.
+        let last = activity.len() - 1;
+        let from = timeline.index_for_x(x, sequence.len()).min(last);
+        let to = timeline.index_for_x(x + 1.0, sequence.len()).clamp(from, last);
+        let peak = activity[from..=to].iter().copied().fold(0.0f32, f32::max);
+        if peak <= 0.0 {
+            continue;
+        }
+        let height = peak * ACTIVITY_HEIGHT;
+        let color = if x <= playhead_x { past } else { future };
+        draw_line(x, baseline, x, baseline - height, 1.0, color);
     }
 }
 
@@ -985,7 +1158,7 @@ fn draw_timeline_playhead_label(timeline: &Timeline, sequence: &FrameSequence, p
     let label = format_game_time(sequence.current().tick);
     let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
     let left = Timeline::tooltip_left(playhead_x, width, screen_width());
-    draw_text(&label, left, timeline.y - 16.0, TIMELINE_LABEL_SIZE, WHITE);
+    draw_text(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
 }
 
 /// A guide line at the hovered position plus a boxed readout of the time and
@@ -1012,7 +1185,7 @@ fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec
     let box_width = time_width.max(counter_width) + padding * 2.0;
     let box_height = TIMELINE_LABEL_SIZE * 2.0 + padding * 2.0 + 4.0;
     let box_left = Timeline::tooltip_left(hover_x, box_width, screen_width());
-    let box_top = timeline.y - 34.0 - box_height;
+    let box_top = timeline.y - HOVER_TOOLTIP_OFFSET - box_height;
 
     draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.8));
     draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, Color::new(1.0, 1.0, 1.0, 0.35));
@@ -1077,6 +1250,9 @@ async fn main() {
             let camera =
                 Camera::fit_frames(sequence.frames(), terrain.as_ref(), screen_width(), screen_height());
             let growing_bounds = growing_bounds_per_frame(sequence.frames(), &registry);
+            let measured = analyze_activity(sequence.frames(), &registry);
+            let activity = activity_heights(&measured.counts);
+            let (heat, heat_peak) = (measured.cells, measured.peak_cell);
             // On by default: opening straight into the fully-zoomed-out
             // whole-sequence fit (see `Camera::fit_frames` above) looks
             // exactly like broken auto-follow (big from the very first
@@ -1085,7 +1261,7 @@ async fn main() {
             // base actually starts. `f` still toggles it off for anyone who
             // wants full manual control from the start.
             let follow = FollowState { enabled: true, ..Default::default() };
-            WorldView { name, sequence, camera, growing_bounds, follow, terrain }
+            WorldView { name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain }
         })
         .collect();
     let mut current = 0usize;
@@ -1098,8 +1274,28 @@ async fn main() {
         dragging_timeline: false,
         sprites_enabled: true,
         lod_enabled: true,
+        heatmap_enabled: false,
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
+
+    // Nothing loaded means the draw loop below would index `worlds[current]`
+    // on an empty vec and panic with "index out of bounds: the len is 0",
+    // which says nothing about the actual problem. Every individual reason a
+    // frame was rejected has already been printed by now (wrong magic,
+    // unsupported version, unreadable), so this only has to name the
+    // directory and stop.
+    //
+    // Reachable through ordinary use, not just a bad argument: pointing the
+    // viewer at a directory of captures from an older format version rejects
+    // every one of them, and that is exactly what an upgrade leaves behind.
+    if worlds.is_empty() {
+        eprintln!(
+            "no loadable frames found. Every file that looked like a frame was rejected \
+             for the reasons above, which usually means they were written by a different \
+             version of this tool than the one reading them."
+        );
+        return;
+    }
 
     loop {
         // Captured before the mutable borrow below, which holds `worlds`
@@ -1108,7 +1304,9 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let WorldView { name: world_name, sequence, camera, growing_bounds, follow, terrain } =
+        let WorldView {
+            name: world_name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain
+        } =
             &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
@@ -1126,7 +1324,20 @@ async fn main() {
         let frame = sequence.current();
         counter.reset();
 
-        draw_world(frame, terrain.as_ref(), camera, screen_center, &registry, &sprites, use_sprites, use_lod, &mut counter);
+        let heat_layer =
+            state.heatmap_enabled.then(|| (heat.as_slice(), *heat_peak, sequence.index()));
+        draw_world(
+            frame,
+            terrain.as_ref(),
+            camera,
+            screen_center,
+            &registry,
+            &sprites,
+            use_sprites,
+            use_lod,
+            heat_layer,
+            &mut counter,
+        );
 
         let terrain_tiles = terrain.as_ref().map_or(0, |t| t.tiles.len());
         draw_hud(
@@ -1143,7 +1354,7 @@ async fn main() {
             use_sprites,
             &counter,
         );
-        draw_timeline_bar(&timeline, sequence, mouse_position().into(), state.dragging_timeline);
+        draw_timeline_bar(&timeline, sequence, activity, mouse_position().into(), state.dragging_timeline);
         draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
 
         next_frame().await;

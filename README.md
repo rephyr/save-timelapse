@@ -151,6 +151,8 @@ Current features:
 - Pan
 - Zoom
 - Timeline scrubbing, labelled with elapsed in-game time at each end and at the playhead, and hovering the bar shows the time and frame number at that point before you commit to a seek
+- Activity graph along the scrub bar: how much got built at each point in the run, so busy stretches and idle ones are visible at a glance without playing through them
+- Construction heatmap (`h` to toggle, off by default): warm overlay showing where building happened over the last few frames, drawn under the factory so it never obscures what you built
 - Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
 - Home / End navigation
 - Surface switching
@@ -210,6 +212,7 @@ The Lua mod requires no build step.
 ### v0.4
 
 - [x] Timeline timestamps and hover information
+- [x] Construction activity graph and map heatmap
 - [ ] Milestones, bookmarks, and event indicators
 - [ ] Better timeline navigation
 
