@@ -140,13 +140,7 @@ Terrain works differently here, since save-timelapse.exe only reads a
 baseline after the mod already took it, not before: enable the
 `save-timelapse-capture-terrain` **startup** setting (off by default, same
 reasoning as above) before your baseline is taken if you want it included
-in a live capture.
-
-> **Known limitation:** with terrain capture on, removing landfill during
-> the tracked playthrough leaves an empty tile in the replay instead of
-> reverting to the water underneath. Fixing this properly needs the mod to
-> capture what a removed placed-floor tile is replacing at removal time;
-> tracked for a future release.
+in a live capture (see [Known Limitations](#known-limitations)).
 
 ---
 
@@ -163,25 +157,10 @@ Current features:
 - Player position marker
 - Camera auto-follow (on by default, `f` to toggle off): gradually pans and zooms out to keep the whole base in frame as it grows, the way TLBE's own camera does
 - Sprite rendering
-- Entity rotation (belts only for now, see the known limitation below)
+- Entity rotation (belts only for now, see [Known Limitations](#known-limitations))
 - Flat-color LOD rendering
 - Parallel loading
 - Progress indicator
-
-> **Known limitation:** rotation only renders for entities on a small,
-> curated allowlist (currently just the transport belt tiers), rather than
-> for every entity by default. Most Factorio icons are stylized
-> oblique-angle renders (a fixed 3D-ish camera perspective) rather than a
-> flat top-down one, so rotating the whole icon just spins that fixed camera
-> angle around and looks wrong regardless of the angle used; a belt's icon,
-> by contrast, is flat and top-down, so rotating it looks correct. The
-> allowlist grows as more entities are checked and confirmed to look right
-> rotated. Separately, even an allowlisted entity only rotates if its
-> footprint is square: Factorio reports a rotated rectangular entity's
-> footprint already swapped for the current direction, with no way to
-> recover the original, unrotated dimensions from what's captured, so
-> rotating the drawn box on top of that would misalign it from the entity's
-> real footprint instead of fixing it.
 
 ---
 
@@ -273,6 +252,13 @@ Factorio Save
 ```
 
 More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+---
+
+## Known Limitations
+
+- **Landfill revert:** With terrain capture enabled, removing landfill leaves an empty tile instead of restoring the underlying water. Planned for a future release.
+- **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
 
 ---
 
