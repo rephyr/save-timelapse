@@ -15,13 +15,25 @@ FRAMES      ?= frames
 # hardcoded at the one call site. See test-lua below for which version.
 LUA         ?= lua
 
+# Every Lua file that is part of the shipped mod, named once and used by both
+# install-mod and package below.
+#
+# Explicit rather than a mod/*.lua glob, so a development-only file added
+# under mod/ never silently ends up installed or published. The cost of that
+# is a file being forgotten instead, which is worse: control.lua `require`s
+# each of these, so a missing one is not a degraded mod but one Factorio
+# refuses to load at all. `check-mod-files` below closes that gap by failing
+# when mod/ holds a .lua this list does not mention.
+MOD_LUA := control.lua capture.lua export.lua gui.lua data.lua snapshot.lua encode.lua milestones.lua
+MOD_META := info.json settings.lua changelog.txt
+
 # Read once at parse time rather than re-derived in every recipe that needs
 # it: Make runs each recipe line in its own shell, so a shell variable set
 # in `package`'s first line wouldn't survive to its later lines anyway.
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua run viewer drawcalls install-mod package clean
+.PHONY: help build test test-lua run viewer drawcalls check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -77,12 +89,21 @@ viewer:
 drawcalls:
 	cargo run -p viewer --release --bin drawcalls -- $(FRAMES)
 
+# Fails if mod/ holds a .lua that neither list names, which is exactly how a
+# newly added, required file would otherwise reach a player: control.lua
+# `require`s these, so a missing one is not a degraded mod but one Factorio
+# refuses to load at all. A prerequisite of both install-mod and package
+# rather than something to remember, since those are the two moments it
+# matters.
+check-mod-files:
+	@for f in mod/*.lua; do case " $(MOD_LUA) $(MOD_META) " in *" $$(basename $$f) "*) ;; *) echo "mod/$$(basename $$f) is in neither MOD_LUA nor MOD_META, so it would not be installed or published"; exit 1;; esac; done
+
 # Mirrors what stage_mods (src/export.rs) copies for a real export, minus the
 # rest of the user's mods folder: just this mod's own files, loose rather
 # than zipped, overwriting whatever is already installed.
-install-mod:
+install-mod: check-mod-files
 	mkdir -p "$(MOD_INSTALL)/tests" "$(MOD_INSTALL)/locale/en" "$(MOD_INSTALL)/graphics"
-	cp mod/control.lua mod/capture.lua mod/export.lua mod/gui.lua mod/data.lua mod/snapshot.lua mod/encode.lua mod/info.json mod/settings.lua mod/changelog.txt "$(MOD_INSTALL)/"
+	cp $(addprefix mod/,$(MOD_LUA) $(MOD_META)) "$(MOD_INSTALL)/"
 	cp mod/tests/encode_test.lua "$(MOD_INSTALL)/tests/"
 	cp mod/locale/en/settings.cfg mod/locale/en/gui.cfg "$(MOD_INSTALL)/locale/en/"
 	cp mod/graphics/shortcut-x32.png mod/graphics/shortcut-x24.png "$(MOD_INSTALL)/graphics/"
@@ -98,10 +119,10 @@ install-mod:
 # is a development-only lupa/lua test suite with no reason to ship to anyone
 # who installs this from the portal, and an explicit list means a future
 # dev-only file added under mod/ doesn't silently end up public by default.
-package:
+package: check-mod-files
 	rm -rf "dist/$(PACKAGE_NAME)"
 	mkdir -p "dist/$(PACKAGE_NAME)/locale/en" "dist/$(PACKAGE_NAME)/graphics"
-	cp mod/control.lua mod/capture.lua mod/export.lua mod/gui.lua mod/data.lua mod/snapshot.lua mod/encode.lua mod/info.json mod/settings.lua mod/changelog.txt "dist/$(PACKAGE_NAME)/"
+	cp $(addprefix mod/,$(MOD_LUA) $(MOD_META)) "dist/$(PACKAGE_NAME)/"
 	cp mod/locale/en/settings.cfg mod/locale/en/gui.cfg "dist/$(PACKAGE_NAME)/locale/en/"
 	cp mod/graphics/shortcut-x32.png mod/graphics/shortcut-x24.png "dist/$(PACKAGE_NAME)/graphics/"
 	if [ -f mod/thumbnail.png ]; then cp mod/thumbnail.png "dist/$(PACKAGE_NAME)/"; fi
