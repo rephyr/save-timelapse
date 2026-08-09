@@ -176,6 +176,17 @@ pub struct Replay {
     /// e.g. a log replayed against the wrong save.
     pub no_op_events: usize,
     pub applied_events: usize,
+    /// Segments skipped for failing to open (bad magic, unreadable). See the
+    /// warning already printed at the skip site in `run`. Never happens for
+    /// an uninterrupted capture; the documented cause is a stale-header
+    /// segment recreated after `script-output` files were deleted by hand
+    /// without running `/timelapse-reset-capture` first.
+    pub skipped_segments: usize,
+    /// Batches whose tick was less than the highest tick already applied.
+    /// Never legitimate within one continuous capture: the same stale-header
+    /// segment that causes `skipped_segments` can also land within a
+    /// readable file, sharing tick territory with a real one.
+    pub out_of_order_batches: usize,
 }
 
 /// Seed a world from the baseline at `baseline_path`.
@@ -213,7 +224,9 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} names {} surface(s) but none could be loaded",
+                "{} names {} surface(s) but none could be loaded. If this session's files were \
+                 ever deleted from script-output by hand, run /timelapse-reset-capture in-game \
+                 before your next capture.",
                 baseline_path.display(),
                 baseline.surfaces.len()
             ),
@@ -221,7 +234,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     }
 
     world.tick = baseline.tick;
-    Ok(Replay { world, baseline, no_op_events: 0, applied_events: 0 })
+    Ok(Replay { world, baseline, no_op_events: 0, applied_events: 0, skipped_segments: 0, out_of_order_batches: 0 })
 }
 
 /// Walk the event log forward, calling `emit` with the world at each frame
@@ -262,6 +275,7 @@ where
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("warning: skipping unreadable event segment {}: {e}", segment.display());
+                replay.skipped_segments += 1;
                 continue;
             }
         };
@@ -351,6 +365,14 @@ pub fn write_all_terrain(world: &World, tick: u64, out: &Path) -> io::Result<()>
 /// Apply one tick's events together, then clear the buffer for reuse rather
 /// than allocating a new one per tick.
 fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
+    // All events in one batch share a tick (see `run`'s grouping), so the
+    // first is representative. Less than the running max is never
+    // legitimate within one continuous capture: see `Replay::out_of_order_batches`.
+    if let Some(first) = pending.first() {
+        if first.tick < replay.world.tick {
+            replay.out_of_order_batches += 1;
+        }
+    }
     for logged in pending.iter() {
         if replay.world.apply(Some(logged.surface.as_str()), &logged.event) {
             replay.applied_events += 1;
@@ -489,7 +511,8 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("baseline.json");
         fs::write(&path, r#"{"tick":5,"surfaces":["gone"]}"#).unwrap();
-        assert!(load_baseline(&path).is_err());
+        let err = load_baseline(&path).unwrap_err();
+        assert!(err.to_string().contains("/timelapse-reset-capture"), "got: {err}");
     }
 
     #[test]
@@ -685,6 +708,27 @@ mod tests {
 
         assert!(emitted >= 1, "replay must still complete rather than aborting on the bad segment");
         assert_eq!(replay.world.entity_count(), 2, "the good segment's event must still apply");
+        assert_eq!(replay.skipped_segments, 1);
+        let _dir = dir;
+    }
+
+    /// The documented failure this guards: a stale-header segment recreated
+    /// after files were deleted by hand can land within a readable file,
+    /// sharing tick territory with a real one, rather than always failing
+    /// to open outright.
+    #[test]
+    fn run_counts_a_batch_whose_tick_regresses_relative_to_the_running_max() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        log.tick(500).add_entity("nauvis", "pipe", 5.5, 5.5, 0);
+        log.tick(200).add_entity("nauvis", "transport-belt", 6.5, 5.5, 0);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        assert_eq!(replay.out_of_order_batches, 1);
         let _dir = dir;
     }
 

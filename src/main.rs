@@ -460,6 +460,34 @@ fn run_live_capture() -> io::Result<PathBuf> {
     }
     println!("\r{emitted} frames written to {}\n", out.display());
 
+    // Both counters are already computed by `replay::run`; surfacing them
+    // (and pausing so the message can't be missed the way a mid-run
+    // eprintln! can, especially in a double-clicked .exe with no persistent
+    // console) is the whole point, not the counting itself.
+    let mut warned = false;
+    if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
+        println!(
+            "warning: {} segment(s) could not be read and {} batch(es) were out of tick order. \
+             This capture may be missing history, see the warnings above, and run \
+             /timelapse-reset-capture in-game before your next capture if this session's \
+             files were ever deleted by hand.",
+            replay_state.skipped_segments, replay_state.out_of_order_batches
+        );
+        warned = true;
+    }
+    let total = replay_state.applied_events + replay_state.no_op_events;
+    if total >= 20 && replay_state.no_op_events * 2 > total {
+        println!(
+            "warning: {} of {total} events did nothing when replayed. This usually means \
+             the event log doesn't match this session's baseline.",
+            replay_state.no_op_events
+        );
+        warned = true;
+    }
+    if warned {
+        wait_for_enter();
+    }
+
     Ok(out)
 }
 

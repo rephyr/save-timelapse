@@ -52,12 +52,38 @@ local function excluded_types()
   return list
 end
 
+--- Whether a capture write has already failed this session (disk full,
+--- permissions, a program locking the file, the kind of thing a
+--- long-running live capture is exactly the workload to eventually hit).
+--- Plain module local, not `storage`: Factorio re-runs this file's top
+--- level on every load, so a transient failure doesn't wrongly disable
+--- capture forever across a reload, only for the rest of the session it
+--- actually happened in.
+local capture_write_failed = false
+
+--- Wraps helpers.write_file so a capture write that throws degrades the
+--- capture instead of crashing the whole game with an uncaught mod error.
+--- Once one write fails, every later capture write no-ops for the rest of
+--- this session rather than retrying (and re-warning about) the same
+--- failure on every flush.
+local function safe_write_file(path, data, append)
+  if capture_write_failed then
+    return false
+  end
+  local ok, err = pcall(helpers.write_file, path, data, append)
+  if not ok then
+    capture_write_failed = true
+    game.print("[save-timelapse] capture write failed, capture stopped for this session: " .. tostring(err))
+  end
+  return ok
+end
+
 --- Pairs a write with folding the same bytes into a running checksum, so
 --- every frame-file writer accumulates one the same way rather than each
 --- repeating the two calls side by side. Returns the updated checksum,
 --- Lua-style, since there is no reference to update in place.
 local function checksummed_write(path, data, append, checksum)
-  helpers.write_file(path, data, append)
+  safe_write_file(path, data, append)
   return encode.checksum_update(checksum, data)
 end
 
@@ -457,7 +483,7 @@ local function ensure_capture_segment()
     capture_names = encode.new_dictionary()
     capture_surfaces = encode.new_dictionary()
     capture_last_written_tick = nil
-    helpers.write_file(capture_path, encode.event_header(), false)
+    safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
   end
 end
@@ -746,7 +772,7 @@ commands.add_command("timelapse-reset-capture",
 
 local function flush_capture()
   if capture_pending_count > 0 then
-    helpers.write_file(capture_path, table.concat(capture_pending), true)
+    safe_write_file(capture_path, table.concat(capture_pending), true)
     capture_pending, capture_pending_count = {}, 0
   end
 end
