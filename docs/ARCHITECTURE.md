@@ -374,7 +374,7 @@ The version byte gives a reader the same "format I don't understand" signal
 the frame format's does, but there is deliberately no checksum trailer to
 go with it, unlike that format. A segment is append only and grows for as
 long as capture stays on, and is simply abandoned, not closed, when a
-rollover starts a new one (see `next_capture_segment` above), so there is no
+rollover starts a new one (see `is_capture_rollback` above), so there is no
 "this segment is now finished" moment to checksum against without inventing
 one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of
@@ -430,8 +430,87 @@ large fraction means the log and baseline came from different playthroughs.
 Events are applied in whole-tick batches, so a frame is never cut halfway
 through a tick — a blueprint landing 400 entities appears whole or not at all.
 
+A frame is also pinned to its own tick rather than to whenever the next event
+happens to arrive. The two only look the same when events are dense: across a
+gap (a long stretch of research or walking with nothing built), every frame
+boundary inside the gap has to be emitted before the event that ends the gap
+is folded into the world, or all of them render with that event's changes
+already visible, showing something built at the end of a gap as though it had
+been standing there since the start of it. `replay::run` therefore flushes up
+to the tick *before* each incoming event, not up to the batch it just applied.
+
+### Reloading an earlier save
+
+Going back in time is ordinary play: a player reloads to undo a mistake or
+recover from a biter breach. The mod reacts by starting a fresh segment at the
+tick play resumed from (`is_capture_rollback`), but it cannot delete or
+truncate the segment it just abandoned — Factorio's Lua sandbox offers
+`write_file` and `remove_path` and nothing finer, and removing the file
+outright would also throw away the part of it that is still real history. So
+the abandoned file keeps its records for a future that, from the player's
+perspective, never happened, and bounding it is the Rust side's job.
+
+`event::log_segments` does that. Each segment carries an `end_tick`, and
+events at or past it are dropped (counted as `Replay::superseded_events`,
+reported but deliberately not warned about: a nonzero count is just what a
+reloaded playthrough looks like when it replays correctly).
+
+Two things make that bound correct. First, segments are ordered by **mtime,
+not by the tick in the filename**, because start tick stops being
+chronological the moment a playthrough reloads twice: reload from 5000 back to
+3000, play to 8000, then reload again back to 1000, and the segments were
+created in the order 0, 3000, 1000. Sorting those by tick replays the second
+reload's log before the first reload's, which is backwards. mtime recovers the
+real order, since a segment is appended to for exactly as long as it is the
+live one and is never touched again once a rollover abandons it, so segments
+finish being written in the same order they were created.
+
+Second, a segment ends at the **smallest** start tick among all segments
+created after it, not simply the next one's: in that same example the second
+reload reaches back past where the first reload's segment began, so it
+invalidates part of that segment too. A suffix minimum over the creation order
+expresses exactly that. It also keeps the returned segments in ascending tick
+order despite being sorted by mtime, since a segment's events all fall below
+its `end_tick`, which is at most the following segment's `start_tick`.
+
+Two segments sharing an mtime (a capture folder copied in a way that flattened
+its timestamps, or a filesystem too coarse to separate two rollovers) fall
+back to ascending start tick, then to the rollover sequence in the filename,
+which stitches them together with the overlaps trimmed. That is still strictly
+better than replaying the overlaps twice.
+
+#### Reloading the *same* save twice
+
+Retrying something means loading the same save again, which resumes at exactly
+the tick the live segment already started at. Rollover used to be inferred
+downstream, by checking whether the tick play resumed at differed from the
+current segment's start; those are equal here, so it read as "no rollback" and
+the second attempt was appended straight onto the first attempt's records, in
+one file, with nothing marking the boundary. `is_capture_rollback` now answers
+that question directly from the tick comparison that actually defines it, and
+`capture_segment_name` takes a rollover sequence so two segments starting at
+the same tick get different filenames (`events_<tick>_<seq>.stev`, with the
+suffix omitted at 0 so nothing that never reloaded changes name).
+
+Captures recorded before that fix still have both attempts in one file, so
+`event::segment_run_bounds` splits a segment into **append runs** at every
+point its ticks jump backwards, and bounds them by the same suffix minimum
+used across segments. That is the same rule one level down, and it is correct
+for the same reason: records within a file are in append order, which is real
+chronological order. A capture the fixed mod wrote always has exactly one run
+per segment, so the two mechanisms compose rather than overlapping.
+
+`Replay::restarted_segments` counts files that held more than one run. It is
+kept separate from `superseded_events` because ticks jumping backwards inside
+one file is also, in principle, what a segment corrupted by deleting
+`script-output` by hand would look like, and the two are indistinguishable
+from the file alone. In practice that corruption produces a header-less file
+that fails to open outright (counted as `skipped_segments`), so treating a
+regression as a reload boundary is the reading that matches what players
+actually do.
+
 A session can also legitimately span more than one segment file (a save
-reload rolls over to a fresh one; see `next_capture_segment` above), and the
+reload rolls over to a fresh one; see `is_capture_rollback` above), and the
 mod has no way to notice or clean up a segment orphaned by deleting capture
 files by hand without running `/timelapse-reset-capture` first: its next
 flush recreates the file via a plain append, with no magic header, under the

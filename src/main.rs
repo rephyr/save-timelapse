@@ -467,6 +467,30 @@ fn run_live_capture() -> io::Result<PathBuf> {
         );
     }
 
+    // Informational, deliberately not grouped with the warnings below: this
+    // is what a playthrough that was reloaded from an earlier save looks like
+    // when it replays correctly, so it reports rather than warns.
+    if replay_state.superseded_events > 0 {
+        println!(
+            "{} event(s) skipped from timeline(s) you reloaded away from; the timelapse follows \
+             what you actually played\n",
+            replay_state.superseded_events
+        );
+    }
+
+    // Its own line rather than folded into the message above, since unlike a
+    // plain reload this one is worth naming: it only happens in captures
+    // recorded before the mod rolled over on a same-save reload, and it is
+    // also the shape a hand-deleted script-output would leave behind.
+    if replay_state.restarted_segments > 0 {
+        println!(
+            "{} segment(s) contained more than one attempt at the same stretch of play, from \
+             reloading the same save more than once before this version; only the last attempt \
+             at each was used\n",
+            replay_state.restarted_segments
+        );
+    }
+
     // Both counters are already computed by `replay::run`; surfacing them
     // (and pausing so the message can't be missed the way a mid-run
     // eprintln! can, especially in a double-clicked .exe with no persistent

@@ -201,19 +201,27 @@ do
   check("event_add_tile: a second, already defined surface is referenced by its id", record, expected)
 end
 
--- next_capture_segment
+-- is_capture_rollback
 
-check("next_capture_segment: normal forward play keeps the segment",
-  encode.next_capture_segment(5000, 5010, 100),
-  100)
+check("is_capture_rollback: normal forward play is not a rollback",
+  encode.is_capture_rollback(5000, 5010),
+  false)
 
-check("next_capture_segment: resuming exactly where recording left off keeps the segment",
-  encode.next_capture_segment(5000, 5000, 100),
-  100)
+check("is_capture_rollback: resuming exactly where recording left off is not a rollback",
+  encode.is_capture_rollback(5000, 5000),
+  false)
 
-check("next_capture_segment: loading an older save starts a new segment at the resumed tick",
-  encode.next_capture_segment(5000, 3000, 100),
-  3000)
+check("is_capture_rollback: loading an older save is a rollback",
+  encode.is_capture_rollback(5000, 3000),
+  true)
+
+-- Reloading the same save twice in a row resumes at a tick the current
+-- segment already starts at, so this has to report a rollback on the tick
+-- comparison alone. Reading it back off the segment start would find them
+-- equal and append the second attempt into the first attempt's file.
+check("is_capture_rollback: replaying from the same save again is still a rollback",
+  encode.is_capture_rollback(21000, 20000),
+  true)
 
 -- checksums
 
@@ -284,6 +292,20 @@ check("baseline_manifest_name: lives inside the session's own folder",
 check("capture_segment_name: tick only, folder already scopes it to one session",
   encode.capture_segment_name(0x1a2b3c, 22760790),
   "001a2b3c/events_22760790.stev")
+
+check("capture_segment_name: an explicit seq of 0 still gets the plain name",
+  encode.capture_segment_name(0x1a2b3c, 22760790, 0),
+  "001a2b3c/events_22760790.stev")
+
+-- Reloading the same save twice: same start tick, so only the seq keeps the
+-- second attempt out of the first attempt's file.
+check("capture_segment_name: a rollover past the first is distinguished by seq",
+  encode.capture_segment_name(0x1a2b3c, 22760790, 2),
+  "001a2b3c/events_22760790_2.stev")
+
+check("capture_segment_basename: no session folder, same naming rule",
+  encode.capture_segment_basename(22760790, 1),
+  "events_22760790_1.stev")
 
 check("player_log_name: lives inside the session's own folder",
   encode.player_log_name(0x1a2b3c),

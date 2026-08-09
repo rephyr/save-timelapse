@@ -52,6 +52,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::wire::ByteReader;
 
@@ -249,35 +250,164 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
     Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None })
 }
 
-/// Every `events_<tick>.stev` segment in `dir`, ordered by start tick.
+/// One segment file, plus the half-open tick range replay should actually
+/// take from it.
+///
+/// `end_tick` is what makes reloading an earlier save replayable. The mod
+/// starts a fresh segment whenever play resumes at a tick it has already
+/// recorded past (see `mod/encode.lua`'s `is_capture_rollback`), but it
+/// cannot delete or truncate the segment it just abandoned: Factorio's Lua
+/// sandbox offers `write_file` and `remove_path` and nothing finer, and
+/// removing the file outright would also throw away the part of it that is
+/// still real history. So the abandoned file keeps its records for a future
+/// the player reloaded away from, and bounding it is this side's job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub path: PathBuf,
+    /// The tick in the filename: where capture began writing this file.
+    pub start_tick: u64,
+    /// Exclusive. Events at or past this tick were superseded by a later
+    /// reload. `u64::MAX` for a segment nothing superseded, which in a
+    /// capture that never reloaded is the only segment there is.
+    pub end_tick: u64,
+}
+
+/// Every `events_<tick>.stev` segment in `dir`, in the order play actually
+/// happened, each bounded at the tick a later reload superseded it.
 ///
 /// `dir` is expected to already be one playthrough's own session folder (see
 /// `replay::discover_sessions`); there is no session to filter by here
 /// anymore, since two playthroughs can no longer share a directory to get
 /// confused in.
 ///
-/// Ordered numerically, not lexicographically: segment names carry a raw
-/// game tick with no zero padding, so `events_9000` would otherwise sort
-/// after `events_10000`.
-pub fn log_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut segments: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)?
+/// Ordered by mtime rather than by the tick in the filename, because start
+/// tick is not chronological once a playthrough reloads more than once.
+/// Reload from tick 5000 back to 3000, play to 8000, then reload again back
+/// to 1000, and the segments were created in the order 0, 3000, 1000: sorting
+/// by tick would replay the second reload's log before the first reload's,
+/// which is backwards. mtime recovers the real order, since a segment is
+/// appended to for exactly as long as it is the live one and never touched
+/// again after a rollover abandons it, so segments finish being written in
+/// the same order they were created.
+///
+/// Given that order, each segment ends where the next one to be created
+/// begins: a reload rewinds the world to the tick the new segment starts at,
+/// so every record at or past that tick, in every earlier segment, describes
+/// a timeline that no longer happened. `end_tick` is therefore the smallest
+/// start tick among all segments created later, computed as a suffix minimum
+/// below (the smallest, not simply the next one's, so a second reload
+/// reaching further back also invalidates what the first reload's segment
+/// recorded past that point).
+///
+/// That bound is also what keeps the returned segments in ascending tick
+/// order despite being sorted by mtime: a segment's events all fall below its
+/// `end_tick`, which is at most the following segment's `start_tick`, so no
+/// segment can contribute an event later than the next one's first.
+///
+/// Two segments with the same mtime fall back to ascending start tick, then
+/// to the rollover sequence in the filename (see `segment_tick`). That is the
+/// degenerate case (a copied capture folder whose timestamps were all
+/// flattened to the copy time, or a filesystem too coarse to separate two
+/// rollovers), and it degrades to stitching the segments together in tick
+/// order with overlaps trimmed, which is still no worse than replaying the
+/// overlaps twice.
+pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
+    let mut found: Vec<(SystemTime, u64, u32, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter_map(|path| segment_tick(&path).map(|tick| (tick, path)))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let (start_tick, seq) = segment_tick(&path)?;
+            // A segment whose mtime cannot be read sorts oldest, which puts
+            // it before everything readable rather than silently last.
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((modified, start_tick, seq, path))
+        })
         .collect();
-    segments.sort();
-    Ok(segments.into_iter().map(|(_, path)| path).collect())
+    found.sort();
+
+    let mut segments: Vec<Segment> = found
+        .into_iter()
+        .map(|(_, start_tick, _, path)| Segment { path, start_tick, end_tick: u64::MAX })
+        .collect();
+
+    let mut superseded_at = u64::MAX;
+    for segment in segments.iter_mut().rev() {
+        segment.end_tick = superseded_at;
+        superseded_at = superseded_at.min(segment.start_tick);
+    }
+
+    Ok(segments)
 }
 
-/// Parses the decimal tick out of `events_<tick>.stev`. `None` for anything
-/// else (a differently-named file sharing this session's folder, or the
-/// wrong extension), so a stray file is silently ignored rather than
-/// crashing discovery.
-fn segment_tick(path: &Path) -> Option<u64> {
+/// The exclusive tick bound for each *append run* inside one segment file,
+/// given the bound the segment as a whole already carries.
+///
+/// A run is a stretch of records whose ticks do not go backwards. A single
+/// segment normally holds exactly one, and every capture the current mod
+/// writes always does, since a rollback now always rolls over to a new file
+/// (`mod/encode.lua`'s `is_capture_rollback`). Captures recorded before that
+/// fix can hold more than one: reloading the same save twice in a row resumed
+/// at exactly the tick the live segment had started at, which the old
+/// rollover check read as "no rollback", so the second attempt was appended
+/// straight onto the first attempt's records. Nothing separates the two
+/// attempts except that the ticks jump backwards where the second begins.
+///
+/// Bounding runs is the same problem as bounding segments, one level down,
+/// and gets the same answer: records within a file are in append order, which
+/// is real chronological order, so a run ends at the smallest start tick
+/// among the runs appended after it (and at the segment's own bound, which is
+/// where the suffix minimum below starts from). A capture with one run per
+/// segment gets a single bound equal to the segment's own, which is why this
+/// costs nothing but the scan for everything the fixed mod writes.
+///
+/// Streams the file a second time rather than buffering the first pass: a
+/// bound cannot be known until every later run's start tick has been seen, so
+/// something has to be held until the end, and holding a tick per run is
+/// bounded by how many times a save was reloaded, where holding decoded
+/// events is bounded by how much was built.
+pub fn segment_run_bounds(path: &Path, segment_end: u64) -> io::Result<Vec<u64>> {
+    let mut starts: Vec<u64> = Vec::new();
+    let mut previous: Option<u64> = None;
+    for logged in stream_log(path)? {
+        if previous.is_none_or(|p| logged.tick < p) {
+            starts.push(logged.tick);
+        }
+        previous = Some(logged.tick);
+    }
+
+    let mut bounds = vec![segment_end; starts.len()];
+    let mut superseded_at = segment_end;
+    for (index, start) in starts.iter().enumerate().rev() {
+        bounds[index] = superseded_at;
+        superseded_at = superseded_at.min(*start);
+    }
+    Ok(bounds)
+}
+
+/// Parses `events_<tick>.stev` or `events_<tick>_<seq>.stev` into its start
+/// tick and rollover sequence, `seq` defaulting to 0 for the plain form.
+/// `None` for anything else (a differently-named file sharing this session's
+/// folder, or the wrong extension), so a stray file is silently ignored
+/// rather than crashing discovery.
+///
+/// `seq` exists because a start tick alone does not name a segment uniquely:
+/// reloading the same save twice in a row resumes at the same tick both
+/// times, and without it the mod would append the second attempt into the
+/// first attempt's file (see `mod/encode.lua`'s `capture_segment_basename`).
+/// It is only ever a tiebreak for ordering, never the primary key: mtime
+/// stays that, since it is the one signal that also orders segments written
+/// before `seq` existed, and segments left behind by a reset whose file
+/// deletion failed (which restarts `seq` from 0 while older files keep
+/// theirs).
+fn segment_tick(path: &Path) -> Option<(u64, u32)> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {
         return None;
     }
-    path.file_stem()?.to_str()?.strip_prefix("events_")?.parse().ok()
+    let rest = path.file_stem()?.to_str()?.strip_prefix("events_")?;
+    match rest.split_once('_') {
+        Some((tick, seq)) => Some((tick.parse().ok()?, seq.parse().ok()?)),
+        None => Some((rest.parse().ok()?, 0)),
+    }
 }
 
 #[cfg(test)]
@@ -426,21 +556,139 @@ mod tests {
         assert!(err.to_string().contains("version 99"), "got: {err}");
     }
 
+    /// Stamps `name`'s mtime, which is how `log_segments` recovers the order
+    /// segments were created in: higher `rank` means created later, and an
+    /// equal `rank` means an exact tie.
+    ///
+    /// Anchored to a fixed instant rather than `SystemTime::now()` so a tie
+    /// is genuinely a tie (two `now()` calls moments apart are not equal, and
+    /// a test asking for one would quietly get an order instead) and so
+    /// nothing here depends on the wall clock at all. Writing the files back
+    /// to back and letting the filesystem timestamp them would not work
+    /// either: Windows' clock granularity is coarser than the gap between two
+    /// consecutive writes, so their order would be a coin flip.
+    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
+        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
+        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
+    }
+
+    fn segment_names(dir: &Path) -> Vec<String> {
+        log_segments(dir)
+            .unwrap()
+            .iter()
+            .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// With no reload in the picture, mtime order and tick order agree, and
+    /// the tick must be read as a number: `events_9000` would sort after
+    /// `events_10000` lexicographically.
     #[test]
     fn segments_order_by_tick_not_filename() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["events_10000.stev", "events_9000.stev", "events_100.stev"] {
+        for (rank, name) in ["events_100.stev", "events_9000.stev", "events_10000.stev"].iter().enumerate() {
             std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank as u64);
         }
         // Files that are not segments must not be picked up.
         std::fs::write(dir.path().join("frame_1_nauvis.stfr"), "").unwrap();
         std::fs::write(dir.path().join("baseline.json"), "{}").unwrap();
 
-        let names: Vec<String> = log_paths(dir.path())
-            .unwrap()
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, vec!["events_100.stev", "events_9000.stev", "events_10000.stev"]);
+        assert_eq!(
+            segment_names(dir.path()),
+            vec!["events_100.stev", "events_9000.stev", "events_10000.stev"]
+        );
+    }
+
+    /// Two reloads, the second reaching further back than the first. Start
+    /// tick alone cannot order these: the segment created last has the
+    /// middle tick of the three.
+    #[test]
+    fn segments_order_by_creation_not_start_tick_when_reloads_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        // Played from 0, reloaded back to 1000, then reloaded back to 500.
+        for (rank, name) in ["events_0.stev", "events_1000.stev", "events_500.stev"].iter().enumerate() {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank as u64);
+        }
+
+        assert_eq!(
+            segment_names(dir.path()),
+            vec!["events_0.stev", "events_1000.stev", "events_500.stev"]
+        );
+    }
+
+    /// A segment ends where the earliest later-created one begins, so the
+    /// second reload above also invalidates what the first reload's segment
+    /// recorded past tick 500, not just what the original segment did.
+    #[test]
+    fn each_segment_ends_at_the_earliest_start_tick_created_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (rank, name) in ["events_0.stev", "events_1000.stev", "events_500.stev"].iter().enumerate() {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank as u64);
+        }
+
+        let bounds: Vec<(u64, u64)> =
+            log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
+        assert_eq!(bounds, vec![(0, 500), (1000, 500), (500, u64::MAX)]);
+    }
+
+    /// The name the mod gives a segment when a reload resumed at the tick the
+    /// live segment already started at, which the plain `events_<tick>.stev`
+    /// form cannot distinguish from the segment already there.
+    #[test]
+    fn a_sequence_suffixed_segment_parses_and_keeps_its_start_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_20000.stev"), MAGIC).unwrap();
+        std::fs::write(dir.path().join("events_20000_1.stev"), MAGIC).unwrap();
+        set_mtime_rank(dir.path(), "events_20000.stev", 0);
+        set_mtime_rank(dir.path(), "events_20000_1.stev", 1);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(
+            segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(),
+            vec![(20000, 20000), (20000, u64::MAX)],
+            "the first attempt is superseded from the tick the second one restarts at"
+        );
+    }
+
+    /// A `.stev` whose name is neither form must be ignored rather than
+    /// parsed into a bogus tick.
+    #[test]
+    fn a_segment_name_that_is_not_a_tick_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["events_.stev", "events_abc.stev", "events_100_x.stev", "notevents_100.stev"] {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+        }
+        assert!(log_segments(dir.path()).unwrap().is_empty());
+    }
+
+    /// The ordinary case: one segment, never reloaded, so nothing bounds it.
+    #[test]
+    fn a_lone_segment_is_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_100.stev"), MAGIC).unwrap();
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_tick, 100);
+        assert_eq!(segments[0].end_tick, u64::MAX);
+    }
+
+    /// The degenerate case (a copied capture folder whose mtimes all
+    /// flattened to one value): ordering falls back to ascending start tick,
+    /// which still trims the overlaps rather than replaying them twice.
+    #[test]
+    fn segments_sharing_an_mtime_fall_back_to_start_tick_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["events_5000.stev", "events_100.stev", "events_900.stev"] {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, 0);
+        }
+
+        let bounds: Vec<(u64, u64)> =
+            log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
+        assert_eq!(bounds, vec![(100, 900), (900, 5000), (5000, u64::MAX)]);
     }
 }

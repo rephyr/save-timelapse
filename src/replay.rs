@@ -173,7 +173,7 @@ fn discover_catch_up_baselines(dir: &Path, baseline: &Baseline) -> io::Result<Ve
 pub struct Session {
     pub session_id: u32,
     /// This session's own subfolder: pass this, not the shared top-level
-    /// capture directory, to [`run`] and [`event::log_paths`].
+    /// capture directory, to [`run`] and [`event::log_segments`].
     pub session_dir: PathBuf,
     pub baseline_path: PathBuf,
     pub baseline: Baseline,
@@ -214,9 +214,9 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
 
         let mut last_modified =
             baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Ok(segments) = event::log_paths(&session_dir) {
+        if let Ok(segments) = event::log_segments(&session_dir) {
             for segment in segments {
-                if let Ok(modified) = segment.metadata().and_then(|m| m.modified()) {
+                if let Ok(modified) = segment.path.metadata().and_then(|m| m.modified()) {
                     last_modified = last_modified.max(modified);
                 }
             }
@@ -262,6 +262,21 @@ pub struct Replay {
     /// segment that causes `skipped_segments` can also land within a
     /// readable file, sharing tick territory with a real one.
     pub out_of_order_batches: usize,
+    /// Events dropped for belonging to a timeline the player reloaded away
+    /// from (see `event::Segment`'s `end_tick`). Unlike every other counter
+    /// here this is not a health signal: any nonzero value just means the
+    /// playthrough was reloaded from an earlier save at some point, and
+    /// dropping these is what makes the replay match what actually happened.
+    pub superseded_events: usize,
+    /// Segments holding more than one append run (see
+    /// `event::segment_run_bounds`): a capture recorded before the mod
+    /// started rolling over on a same-save-twice reload, so one file holds
+    /// two attempts at the same stretch of play. Split and bounded rather
+    /// than replayed on top of each other. Kept as its own counter because
+    /// this shape is also, in principle, what a segment corrupted by
+    /// deleting `script-output` by hand would look like, and the two are
+    /// indistinguishable from the file alone.
+    pub restarted_segments: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -331,6 +346,8 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         applied_events: 0,
         skipped_segments: 0,
         out_of_order_batches: 0,
+        superseded_events: 0,
+        restarted_segments: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -352,9 +369,12 @@ pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<
         replay.world.surface_names().into_iter().map(String::from).collect();
     surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
 
-    for segment in event::log_paths(session_dir)? {
-        if let Ok(stream) = event::stream_log(&segment) {
-            surfaces.extend(stream.map(|logged| logged.surface));
+    // Bounded the same way `run` bounds them, so a surface that exists only
+    // in a timeline the player reloaded away from is not offered as a choice
+    // that would then replay to an empty timelapse.
+    for segment in event::log_segments(session_dir)? {
+        if let Ok(stream) = event::stream_log(&segment.path) {
+            surfaces.extend(stream.filter(|l| l.tick < segment.end_tick).map(|logged| logged.surface));
         }
     }
 
@@ -364,7 +384,10 @@ pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<
 /// Walk the event log forward, calling `emit` with the world at each frame
 /// boundary. Events are applied in whole-tick groups, so a frame is never cut
 /// halfway through a tick's changes: a blueprint landing 400 entities on one
-/// tick shows up whole or not at all.
+/// tick shows up whole or not at all. Each frame shows the world as of its own
+/// tick, including across a long gap with no events in it (see the
+/// `flush_until` call below), and a segment superseded by a reload to an
+/// earlier save is bounded rather than replayed (see [`event::Segment`]).
 ///
 /// `emit` receives the tick rather than a materialised frame so the caller
 /// decides what to do with the world: write every surface, one surface, or
@@ -387,28 +410,63 @@ where
         }
     };
 
-    for segment in event::log_paths(dir)? {
+    for segment in event::log_segments(dir)? {
         // A session can legitimately span more than one segment (a save
-        // reload rolls over to a fresh one; see `next_capture_segment`), and
+        // reload rolls over to a fresh one; see `is_capture_rollback`), and
         // the mod has no way to notice or clean up an orphaned segment left
         // behind by deleting capture files without running
         // `/timelapse-reset-capture` first (its next flush recreates one via
         // a plain append, with no magic header, under the same session tag).
         // One bad segment losing its own events is a much smaller problem
         // than it sinking replay of an otherwise complete session.
-        let stream = match event::stream_log(&segment) {
+        let stream = match event::stream_log(&segment.path) {
             Ok(stream) => stream,
             Err(e) => {
-                eprintln!("warning: skipping unreadable event segment {}: {e}", segment.display());
+                eprintln!("warning: skipping unreadable event segment {}: {e}", segment.path.display());
                 replay.skipped_segments += 1;
                 continue;
             }
         };
 
+        // One bound per append run (see `event::segment_run_bounds`). A
+        // capture written by the current mod always has exactly one run per
+        // segment; more than one means this file was recorded before the
+        // same-save-twice rollover fix and holds two attempts at the same
+        // stretch of play. A scan that fails leaves the segment on its own
+        // single bound, which is what it had before runs were considered at
+        // all, rather than dropping the segment.
+        let run_bounds = event::segment_run_bounds(&segment.path, segment.end_tick).unwrap_or_default();
+        if run_bounds.len() > 1 {
+            replay.restarted_segments += 1;
+        }
+        let mut run = 0usize;
+        let mut previous_tick: Option<u64> = None;
+
         let mut pending: Vec<LoggedEvent> = Vec::new();
         let mut pending_tick = None;
 
         for logged in stream {
+            // Which append run this record belongs to, tracked over every
+            // record the file holds rather than only the kept ones: a run
+            // boundary is a fact about append order, so skipping a record
+            // must not change where the next boundary is seen.
+            if previous_tick.is_some_and(|p| logged.tick < p) {
+                run += 1;
+            }
+            previous_tick = Some(logged.tick);
+
+            // Events at or past this run's bound describe a timeline the
+            // player reloaded away from (see `event::Segment` for the reload
+            // that starts a new file, `event::segment_run_bounds` for the one
+            // that used to continue the same file). Skipped one by one rather
+            // than breaking out of the stream, since what follows a
+            // superseded stretch is the replacement for it, not the end of
+            // the useful data.
+            let bound = run_bounds.get(run).copied().unwrap_or(segment.end_tick);
+            if logged.tick >= bound {
+                replay.superseded_events += 1;
+                continue;
+            }
             // Events before the baseline describe a world we did not capture.
             if logged.tick < replay.baseline.tick {
                 continue;
@@ -454,9 +512,19 @@ where
 
             if pending_tick != Some(logged.tick) {
                 apply_batch(replay, &mut pending);
-                if let Some(tick) = pending_tick {
-                    flush_until(replay, tick, &mut next_emit, &mut emitted);
-                }
+                // Flush every boundary strictly before this new tick, not
+                // just up to the batch just applied. Those two only look
+                // equivalent when events are dense: across a gap (a long
+                // stretch of research or walking with nothing built) the
+                // boundaries inside it would otherwise stay unflushed until
+                // whatever event ends the gap had already been folded into
+                // the world, and each one would then render with that
+                // event's changes already visible, showing something built
+                // at the end of the gap as though it had been there from the
+                // start of it. Bounding the flush by the incoming tick
+                // instead pins every frame in the gap to the world as it
+                // stood while the gap was happening.
+                flush_until(replay, logged.tick.saturating_sub(1), &mut next_emit, &mut emitted);
                 pending_tick = Some(logged.tick);
             }
             pending.push(logged);
@@ -599,6 +667,7 @@ mod tests {
     use crate::wire::ByteWriter;
     use std::collections::HashMap;
     use std::fs;
+    use std::time::SystemTime;
 
     /// The session id every test capture uses, as both the raw value and the
     /// hex name its session folder carries.
@@ -694,6 +763,16 @@ mod tests {
         fn write(self, dir: &Path, name: &str) {
             fs::write(dir.join(name), self.w.into_vec()).unwrap();
         }
+    }
+
+    /// Stamps a segment's mtime, which is how `event::log_segments` recovers
+    /// the order segments were created in: higher `rank` means created later.
+    /// Set it explicitly wherever a test depends on that order, since writing
+    /// two files back to back does not reliably give them distinguishable
+    /// mtimes. See `event::tests::set_mtime_rank`, which this mirrors.
+    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
+        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
+        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
     }
 
     #[test]
@@ -825,6 +904,15 @@ mod tests {
         earlier.tick(200).add_entity("nauvis", "pipe", 1.5, 0.5, 0);
         earlier.write(session_dir, "events_200.stev");
 
+        // Written to the directory newest first above, but played in the
+        // other order: the tick-200 segment is the one capture started with,
+        // and the tick-9000 one is where play resumed after a reload later
+        // on. Stamped rather than inferred, since which segment came first is
+        // exactly what ordering depends on and a bare write order would be
+        // asserting the opposite of the truth here.
+        set_mtime_rank(session_dir, "events_200.stev", 0);
+        set_mtime_rank(session_dir, "events_9000.stev", 1);
+
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
         // Add at tick 200 then remove at 9000 nets out; replayed the other
@@ -941,12 +1029,27 @@ mod tests {
         let _dir = dir;
     }
 
-    /// The documented failure this guards: a stale-header segment recreated
-    /// after files were deleted by hand can land within a readable file,
-    /// sharing tick territory with a real one, rather than always failing
-    /// to open outright.
+    /// Ticks going backwards inside one segment file, which is what a
+    /// capture recorded before the mod's same-save-twice rollover fix looks
+    /// like: reloading the same save resumed at exactly the tick the live
+    /// segment started at, the old rollover check read that as "no
+    /// rollback", and the second attempt was appended onto the first
+    /// attempt's records in the same file.
+    ///
+    /// Read as a run boundary rather than as damage: the tick-500 pipe
+    /// belongs to the attempt that was reloaded away from, so it is
+    /// superseded, and only the tick-200 belt from the second attempt
+    /// survives. This used to be counted as an out-of-order batch and
+    /// applied anyway, which left both attempts' entities in the world at
+    /// once.
+    ///
+    /// The same shape could in principle come from a segment corrupted by
+    /// deleting `script-output` by hand, which is indistinguishable from the
+    /// file alone (though that normally produces a header-less file that
+    /// fails to open outright, counted as `skipped_segments` instead). That
+    /// is what `restarted_segments` stays visible for.
     #[test]
-    fn run_counts_a_batch_whose_tick_regresses_relative_to_the_running_max() {
+    fn ticks_regressing_inside_one_segment_supersede_the_attempt_before_them() {
         let (dir, baseline_path) = capture_dir();
         let session_dir = baseline_path.parent().unwrap();
         let mut log = TestLog::new();
@@ -957,7 +1060,202 @@ mod tests {
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
-        assert_eq!(replay.out_of_order_batches, 1);
+        assert_eq!(replay.restarted_segments, 1);
+        assert_eq!(replay.superseded_events, 1, "the tick-500 pipe, from the abandoned attempt");
+        assert_eq!(replay.applied_events, 1, "the tick-200 belt, from the attempt that stuck");
+        assert_eq!(replay.out_of_order_batches, 0, "the split means nothing regresses at apply time");
+        assert_eq!(replay.world.entity_count(), 2, "the baseline's pipe plus the surviving belt");
+        let _dir = dir;
+    }
+
+    /// The whole point of splitting a segment into runs: the second attempt
+    /// replaces the first rather than piling on top of it. Both attempts
+    /// build at the same tick and the same spot, so a replay that applied
+    /// both would still end with one entity there and look fine; the
+    /// distinct position built only in the abandoned attempt is what makes
+    /// the difference observable.
+    #[test]
+    fn a_same_save_reload_inside_one_segment_does_not_leak_the_abandoned_attempt() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        // First attempt from tick 1000: built a belt, then a furnace.
+        log.tick(1000).add_entity("nauvis", "transport-belt", 5.5, 5.5, 10);
+        log.tick(1200).add_entity("nauvis", "stone-furnace", 40.5, 40.5, 11);
+        // Reloaded the same save and tried again: same belt, no furnace.
+        log.tick(1000).add_entity("nauvis", "transport-belt", 5.5, 5.5, 20);
+        log.tick(1300).add_entity("nauvis", "chemical-plant", 60.5, 60.5, 21);
+        log.write(session_dir, "events_1000.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        let names: std::collections::BTreeSet<String> = replay
+            .world
+            .surface("nauvis")
+            .unwrap()
+            .entities()
+            .map(|e| replay.world.names().name(e.name).to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
+            "the abandoned attempt's furnace must not survive"
+        );
+        assert_eq!(replay.restarted_segments, 1);
+        let _dir = dir;
+    }
+
+    /// The scenario `is_capture_rollback` (mod/encode.lua) exists for: the
+    /// player reloads an older save mid playthrough. `ensure_capture_segment`
+    /// reacts by starting a fresh segment at the tick play resumed from, but
+    /// the OLD segment is simply abandoned on disk (control.lua has no API to
+    /// delete or truncate it), so it still contains events for ticks beyond
+    /// the reload point describing a future that, from the player's
+    /// perspective, never actually happened.
+    ///
+    /// `events_100.stev` here plays out as if the player never reloaded:
+    /// something real at tick 200, then an assembling machine at tick 4000
+    /// that only exists in that abandoned future. `events_3000.stev` is what
+    /// the player actually did after reloading their tick-3000 save: build a
+    /// second belt at tick 3500. A correct replay must never show the
+    /// assembling machine, at any tick, since the reload erased it before it
+    /// was ever built for real.
+    #[test]
+    fn a_reload_to_an_earlier_save_must_not_leak_the_abandoned_futures_events() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+
+        let mut old = TestLog::new();
+        old.tick(200).add_entity("nauvis", "transport-belt", 2.5, 0.5, 10);
+        old.tick(4000).add_entity("nauvis", "assembling-machine-1", 9.5, 9.5, 20);
+        old.write(session_dir, "events_100.stev");
+
+        let mut new = TestLog::new();
+        new.tick(3500).add_entity("nauvis", "transport-belt", 5.5, 0.5, 30);
+        new.write(session_dir, "events_3000.stev");
+
+        // The reload's segment was created second, so it is the newer file.
+        set_mtime_rank(session_dir, "events_100.stev", 0);
+        set_mtime_rank(session_dir, "events_3000.stev", 1);
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        let options = Options { interval: 100, max_frames: 1000 };
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        run(&mut replay, session_dir, &options, |world, tick| {
+            seen.push((tick, world.entity_count()));
+        })
+        .unwrap();
+
+        // The real timeline: the baseline's pipe alone until the belt lands
+        // at tick 200, both of them until the post-reload belt lands at 3500,
+        // all three after that. The assembling machine the reload erased has
+        // no tick at which it may appear.
+        for &(tick, count) in &seen {
+            let expected = if tick < 200 {
+                1
+            } else if tick < 3500 {
+                2
+            } else {
+                3
+            };
+            assert_eq!(count, expected, "tick {tick} shows {count} entities");
+        }
+
+        let abandoned_survived =
+            replay.world.surface("nauvis").unwrap().entities().any(|e| e.x == 9.5 && e.y == 9.5);
+        assert!(!abandoned_survived, "the abandoned future's entity must not survive the reload");
+        // baseline's pipe + the tick-200 belt (before the reload point) + the
+        // real tick-3500 belt (after it) = 3; never 4, which would mean the
+        // erased assembling machine is still there.
+        assert_eq!(replay.world.entity_count(), 3);
+        let _dir = dir;
+    }
+
+    /// Two reloads, the second reaching further back than the first, which is
+    /// the case start-tick ordering cannot express: the segment created last
+    /// (`events_500`) has the middle start tick of the three, so ordering by
+    /// tick would replay it before `events_1000` and let the first reload's
+    /// abandoned events land on top of the second reload's real ones.
+    ///
+    /// Played from tick 0 and built a belt at 300. Reloaded to tick 1000,
+    /// built an assembling machine at 1500. Reloaded again, further back, to
+    /// tick 500, and built a chemical plant at 800. Only the belt (before
+    /// every reload point) and the chemical plant (after the last one) are
+    /// real; the assembling machine belongs to a timeline erased by the
+    /// second reload, and the original segment's own tick-2000 furnace was
+    /// erased by the first.
+    #[test]
+    fn a_second_reload_reaching_further_back_supersedes_the_first_reloads_events() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+
+        let mut first = TestLog::new();
+        first.tick(300).add_entity("nauvis", "transport-belt", 3.5, 0.5, 10);
+        first.tick(2000).add_entity("nauvis", "stone-furnace", 20.5, 0.5, 11);
+        first.write(session_dir, "events_0.stev");
+
+        let mut second = TestLog::new();
+        second.tick(1500).add_entity("nauvis", "assembling-machine-1", 30.5, 0.5, 20);
+        second.write(session_dir, "events_1000.stev");
+
+        let mut third = TestLog::new();
+        third.tick(800).add_entity("nauvis", "chemical-plant", 40.5, 0.5, 30);
+        third.write(session_dir, "events_500.stev");
+
+        set_mtime_rank(session_dir, "events_0.stev", 0);
+        set_mtime_rank(session_dir, "events_1000.stev", 1);
+        set_mtime_rank(session_dir, "events_500.stev", 2);
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
+
+        let surviving: std::collections::BTreeSet<String> = replay
+            .world
+            .surface("nauvis")
+            .unwrap()
+            .entities()
+            .map(|e| replay.world.names().name(e.name).to_string())
+            .collect();
+        assert_eq!(
+            surviving,
+            ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
+            "only the baseline's pipe, the pre-reload belt, and the post-reload chemical plant are real"
+        );
+        // The tick-2000 furnace and the tick-1500 assembling machine.
+        assert_eq!(replay.superseded_events, 2);
+        let _dir = dir;
+    }
+
+    /// Nothing to do with reloads: a plain forward capture where the player
+    /// built something, idled a long time (researching, running around), then
+    /// built again. Every frame boundary in that gap must show the world as
+    /// it stood at that boundary, not the world as it stood once the gap
+    /// ended.
+    #[test]
+    fn frames_in_a_gap_between_events_show_the_state_at_their_own_tick() {
+        let (dir, baseline_path) = capture_dir();
+        let session_dir = baseline_path.parent().unwrap();
+        let mut log = TestLog::new();
+        log.tick(200).add_entity("nauvis", "transport-belt", 2.5, 0.5, 10);
+        log.tick(5000).add_entity("nauvis", "assembling-machine-1", 9.5, 9.5, 20);
+        log.write(session_dir, "events_100.stev");
+
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        let options = Options { interval: 100, max_frames: 1000 };
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        run(&mut replay, session_dir, &options, |world, tick| {
+            seen.push((tick, world.entity_count()));
+        })
+        .unwrap();
+
+        // Between tick 200 and tick 5000 the world holds exactly the
+        // baseline's pipe plus the tick-200 belt.
+        for &(tick, count) in &seen {
+            if (200..5000).contains(&tick) {
+                assert_eq!(count, 2, "tick {tick} sits in the idle gap but shows {count} entities");
+            }
+        }
         let _dir = dir;
     }
 

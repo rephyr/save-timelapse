@@ -140,11 +140,11 @@ end
 --- See baseline_manifest_path above for why a nil session_id (a save whose
 --- capture state predates this feature) falls back to the untagged name
 --- instead of erroring.
-local function capture_segment_path(session_id, start_tick)
+local function capture_segment_path(session_id, start_tick, seq)
   if not session_id then
-    return string.format("%sevents_%d.stev", export.EXPORT_DIR, start_tick)
+    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick, seq)
   end
-  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
+  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, seq)
 end
 
 --- A playthrough's identity, for tagging files written into the shared,
@@ -185,6 +185,13 @@ end
 --- predates `segment_initialized` existing has it as `nil`, which is
 --- correctly falsy here, so upgrading mid save self-heals on the very next
 --- check rather than producing a header-less file a reader can't recognize.
+---
+--- Note that `state.last_tick` tracks the last tick an event was actually
+--- logged at, not the last tick played, which is what makes the rollback
+--- check below neither trigger-happy nor blind. Reloading past a stretch
+--- where nothing was built discards no recorded history, so it correctly
+--- reports no rollback and keeps one segment; reloading past anything that
+--- was recorded correctly reports one.
 local function ensure_capture_segment()
   local state = storage.timelapse_capture
 
@@ -194,18 +201,24 @@ local function ensure_capture_segment()
       last_tick = game.tick,
       segment_initialized = false,
       session_id = compute_session_id(),
+      segment_seq = 0,
     }
     storage.timelapse_capture = state
-  else
-    local next_start = encode.next_capture_segment(state.last_tick, game.tick, state.segment_start_tick)
-    if next_start ~= state.segment_start_tick then
-      state.segment_start_tick = next_start
-      state.last_tick = game.tick
-      state.segment_initialized = false
-    end
+  elseif encode.is_capture_rollback(state.last_tick, game.tick) then
+    -- Bumped on every rollover rather than only when the resumed tick
+    -- collides with the current segment's start: the counter's job is to
+    -- keep segment filenames unique, and one that only sometimes advances
+    -- would have to reason about which past segment it might collide with.
+    -- A save from before this existed has no seq (nil, read as 0 by
+    -- capture_segment_basename), so it keeps writing the name it already
+    -- was until its first rollover after upgrading.
+    state.segment_seq = (state.segment_seq or 0) + 1
+    state.segment_start_tick = game.tick
+    state.last_tick = game.tick
+    state.segment_initialized = false
   end
 
-  capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
+  capture_path = capture_segment_path(state.session_id, state.segment_start_tick, state.segment_seq)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()

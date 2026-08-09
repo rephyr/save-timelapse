@@ -316,15 +316,25 @@ function M.event_remove_tile(surfaces, surface, x, y)
 end
 
 --- Given the tick already recorded up to and the tick play resumed at,
---- decide whether this is a reload of an older save, something an
---- append-only log can't represent as one timeline, and if so, what
---- segment to start. Pure: plain values in and out, no Factorio state, so
---- the decision is testable without a save/load cycle to actually trigger.
-function M.next_capture_segment(last_tick, resumed_tick, current_segment_start)
-  if resumed_tick < last_tick then
-    return resumed_tick -- rolled back: start a fresh segment here
-  end
-  return current_segment_start -- keep appending to the existing segment
+--- whether this is a reload of an older save, something an append-only log
+--- can't represent as one timeline. Pure: plain values in and out, no
+--- Factorio state, so the decision is testable without a save/load cycle to
+--- actually trigger.
+---
+--- Answers only "did we go back in time," deliberately not "what tick should
+--- the next segment start at." Those look like the same question and are
+--- not: the caller already knows the answer to the second one (`game.tick`,
+--- where play resumed), and an earlier version of this returned that tick
+--- and left the caller to notice a rollback by comparing it against the
+--- current segment's start. Reloading the *same save twice in a row*, which
+--- is what retrying something looks like, resumes at exactly the tick the
+--- current segment started at, so that comparison found them equal and
+--- reported no rollback, and the second attempt was appended into the first
+--- attempt's file with no boundary between them. Nothing reading that file
+--- back can separate two attempts sharing one tick range, so the rollback
+--- has to be detected here rather than inferred from the tick downstream.
+function M.is_capture_rollback(last_tick, resumed_tick)
+  return resumed_tick < last_tick
 end
 
 -- Checksums
@@ -342,7 +352,7 @@ end
 -- stays on has no "finished" moment to checksum against.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- next_capture_segment above.
+--- is_capture_rollback above.
 function M.checksum_init()
   return 5381
 end
@@ -373,7 +383,7 @@ end
 -- each folder only ever contains one playthrough's files to begin with.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- next_capture_segment above, with no save/load cycle to trigger them.
+--- is_capture_rollback above, with no save/load cycle to trigger them.
 function M.session_dir(session_id)
   return string.format("%08x/", session_id)
 end
@@ -382,8 +392,28 @@ function M.baseline_manifest_name(session_id)
   return M.session_dir(session_id) .. "baseline.json"
 end
 
-function M.capture_segment_name(session_id, start_tick)
-  return M.session_dir(session_id) .. string.format("events_%d.stev", start_tick)
+--- `seq` counts how many times this playthrough has rolled over to a fresh
+--- segment, so two segments starting at the same tick (reloading the same
+--- save twice; see `is_capture_rollback`) get different filenames instead of
+--- the second attempt appending into the first attempt's file.
+---
+--- Left out of the name entirely at 0, which keeps every capture that never
+--- reloaded on exactly the name it already used, and keeps a save upgraded
+--- mid playthrough (whose stored state has no seq yet, so it reads as 0)
+--- appending to the segment it was already writing rather than orphaning it
+--- and starting a header-less one alongside.
+function M.capture_segment_name(session_id, start_tick, seq)
+  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick, seq)
+end
+
+--- Split out from `capture_segment_name` so a save with no session_id (one
+--- whose capture state predates session folders) can build the same name
+--- without one. See capture.lua's `capture_segment_path`.
+function M.capture_segment_basename(start_tick, seq)
+  if not seq or seq == 0 then
+    return string.format("events_%d.stev", start_tick)
+  end
+  return string.format("events_%d_%d.stev", start_tick, seq)
 end
 
 function M.player_log_name(session_id)
