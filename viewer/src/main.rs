@@ -248,26 +248,51 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
             let path = std::path::Path::new(path);
             let paths = viewer::frame_paths(path).expect("failed to enumerate frames");
 
+            // A single frame file's terrain (if it even has one) would sit
+            // beside it in its parent directory, same as a real capture's.
+            let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+            let terrain_file_paths = viewer::terrain_paths(terrain_dir).unwrap_or_default();
+
             // Reading and parsing each file is independent work, so it happens
             // across every available core rather than one file at a time. On a
             // real megabase capture this is the dominant cost of opening the
             // viewer. Converting to a RenderFrame needs a single, consistently
             // numbered TypeRegistry, so that part stays sequential below.
-            progress.total = paths.len();
+            //
+            // Terrain starts loading here too, not after the regular frames
+            // finish: it's a separate set of files with nothing shared until
+            // both are done, discovered straight from the directory (see
+            // `terrain_paths`) rather than waited on until grouping below
+            // learns the surface list from the (unrelated) frame files. Two
+            // independent waits back to back would cost their sum; started
+            // together, the wait is bounded by whichever is slower.
+            progress.total = paths.len() + terrain_file_paths.len();
             progress.detail = format!(
                 "{} core(s)",
                 std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
             );
             let load = viewer::ParallelFrameLoad::start(paths);
-            let loaded = loop {
-                progress.done = load.done();
+            let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
+            let mut loaded_frames = None;
+            let mut loaded_terrain = None;
+            let (loaded, loaded_terrain) = loop {
+                progress.done = load.done() + terrain_load.done();
                 redraw_progress(&progress, &mut last, true).await;
-                if let Some(loaded) = load.poll() {
-                    break loaded;
+                // `poll` only ever yields its result once, so each is only
+                // ever called again while still waiting on that one; the
+                // other's own result, once captured, is left alone even
+                // while this loop keeps running for whichever is slower.
+                loaded_frames = loaded_frames.or_else(|| load.poll());
+                loaded_terrain = loaded_terrain.or_else(|| terrain_load.poll());
+                if let (Some(_), Some(_)) = (&loaded_frames, &loaded_terrain) {
+                    break (loaded_frames.take().unwrap(), loaded_terrain.take().unwrap());
                 }
             };
             progress.done = progress.total;
             redraw_progress(&progress, &mut last, true).await;
+
+            let mut terrain_by_surface: std::collections::HashMap<String, save_timelapse::frame::Frame> =
+                loaded_terrain.into_iter().map(|frame| (frame.surface.clone(), frame)).collect();
 
             // Grouped before converting, not after: the mod's raw baseline
             // output writes every surface at the same tick, and grouping is
@@ -282,13 +307,10 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                 }
             }
 
-            // A single frame file's terrain (if it even has one) would sit
-            // beside it in its parent directory, same as a real capture's.
-            let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
             grouped
                 .into_iter()
                 .map(|(name, frames)| {
-                    let terrain = viewer::load_terrain(terrain_dir, &name);
+                    let terrain = terrain_by_surface.remove(&name);
                     (name, frames, terrain)
                 })
                 .collect()

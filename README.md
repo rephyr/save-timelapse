@@ -13,6 +13,7 @@ Save Timelapse is a Factorio mod and companion desktop application for creating 
 
 - 📦 Build timelapses from **existing save files**
 - 🎮 Live capture mode with minimal performance impact
+- 🎛️ In-game panel to control live capture: start/stop, choose which surfaces are recorded, and reset
 - 🗺 Interactive viewer with pan, zoom and timeline scrubbing
 - 🌍 Multi-surface support (Nauvis, platforms, planets)
 - ⚡ Chunked renderer with automatic level-of-detail rendering
@@ -114,8 +115,24 @@ Whenever you want to view the replay, simply launch Save Timelapse. If more
 than one playthrough has capture data waiting, it asks which one to build
 the timelapse from.
 
+Click the Save Timelapse shortcut in the top toolbar (or press
+Control+Shift+T) to open the in-game control panel: toggle live capture,
+exclude individual surfaces from recording (including planets you haven't
+visited yet), or reset capture. Excluding a surface skips its baseline
+entirely, not just its ongoing events, so a huge base you don't care about
+tracking (a sprawling Nauvis factory, say, while you only want a smaller
+Gleba outpost recorded) doesn't cost anything to capture. Checking a box
+only records the choice; press **Generate** to actually take a catch-up
+baseline for whatever you just included, so ticking several surfaces first
+batches into one freeze instead of one per box, without touching any other
+surface's already-recorded history. Resetting (behind a confirmation
+dialog, since it's permanent) deletes this playthrough's own capture files
+and retakes the baseline, so files no longer need to be deleted by hand
+first.
+
 > Upgrading from an older version? Run `/timelapse-reset-capture` once
-> in-game so your current playthrough starts a freshly tagged capture.
+> in-game (or use the panel's reset button) so your current playthrough
+> starts a freshly tagged capture.
 
 Terrain works differently here, since save-timelapse.exe only reads a
 baseline after the mod already took it, not before: enable the
@@ -185,62 +202,53 @@ The Lua mod requires no build step.
 - [x] Live capture
 - [x] Interactive replay
 - [x] Timeline scrubbing
-- [x] Chunk renderer
+- [x] Chunked renderer
 - [x] Sprite rendering
 - [x] LOD rendering
 
 ### v0.2
 
-- [x] Checksums (corrupted frame/event files are detected, not silently misread)
-- [x] Versioning (the binary formats carry a version byte)
+- [x] Checksums and format versioning
 - [x] Adjustable playback speed
-- [x] Better documentation
-- [x] Add screenshots and gifs to README.md of the working project
-
-Bonus, not originally planned for v0.2 but delivered along the way:
-- [x] Terrain and terrain-scatter rendering (grass, water, trees, cliffs), opt-in given its export cost
-- [x] Player position tracking, shown as a marker in the viewer
-- [x] Camera auto-follow: gradually pans and zooms out to keep the whole growing base in frame, with smooth transitions (originally planned for v1.0)
-
-Video export moved out of this release see v1.0.
+- [x] Documentation, screenshots, and GIFs
+- [x] Terrain and terrain-scatter rendering
+- [x] Player position tracking
+- [x] Camera auto-follow
 
 ### v0.3
 
-- [x] Fix terrain being redundantly re-included in every frame instead of captured once (terrain is now captured to its own one-time file per surface instead of being duplicated into every replayed frame)
-- [x] Entity rotation tracking (square-footprint entities render rotated; see the known limitation in the Viewer section for non-square ones)
-- [x] Robust interrupted capture recovery (a failed capture write now degrades gracefully instead of crashing the game, and the CLI now warns about skipped segments, out-of-order events, and high no-op rates instead of staying silent; `/timelapse-reset-capture` remains necessary for files deleted by hand, since a mod has no way to detect that on its own)
-- [ ] Backward compatibility with previous capture versions
-- [ ] Broader modded-game compatibility (curated terrain/resource colors and auto-follow's exclusion lists are hardcoded to vanilla/Space Age names)
+- [x] Terrain capture optimization
+- [x] Entity rotation tracking
+- [x] Robust capture recovery and diagnostics
+- [x] In-game live capture control panel
+- [x] Safer capture reset
+- [x] Per-surface capture selection
+- [x] Mid-playthrough surface baselines
+- [x] Improved baseline warnings
 
 ### v0.4
 
-- [ ] Timeline timestamps
-- [ ] Timeline hover information
-- [ ] Timeline markers
-- [ ] Milestone/bookmark support
+- [ ] Timeline timestamps and hover information
+- [ ] Milestones, bookmarks, and event indicators
 - [ ] Better timeline navigation
-- [ ] Event/milestone indicators
-- [ ] Improved multi-surface navigation
 
 ### v0.5
 
 - [ ] First-run setup
-- [ ] Capture management (deleting/organizing old captures; selecting between them already works)
-- [ ] Settings/preferences (saved between runs, instead of asking fresh every time)
-- [ ] Better error recovery
-- [ ] More complete tile change tracking (landfill removal doesn't yet revert to the terrain underneath, see the known limitation above)
+- [ ] Capture management
+- [ ] Persistent settings and preferences
+- [ ] Complete tile change tracking
 - [ ] Polished Windows packaging
 
 ### v1.0
 
-- [ ] Smarter auto-follow (favor whichever site is actively being built, or nearest the player, instead of always framing the whole base)
-- [ ] Camera keyframes
-- [ ] Cinematic camera controls
-- [ ] Export resolution/FPS controls
-- [ ] MP4 export
+- [ ] Broader modded-game compatibility
+- [ ] Smarter camera auto-follow
+- [ ] Camera keyframes and cinematic controls
+- [ ] Export resolution and FPS controls
+- [ ] MP4 video export
 - [ ] Polished export workflow
-- [ ] Stable capture format
-- [ ] Migration between format versions
+- [ ] Stable capture format and format migration
 
 ---
 

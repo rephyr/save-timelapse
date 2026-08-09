@@ -25,7 +25,7 @@ pub use construction::{growing_bounds_per_frame, GrowingBounds};
 pub use draw_calls::DrawCallCounter;
 pub use loading::{
     frame_paths, group_by_surface, load_frame, load_sequence, load_terrain, order_by_tick,
-    synthetic_frame, synthetic_tiles, terrain_path, ParallelFrameLoad,
+    synthetic_frame, synthetic_tiles, terrain_path, terrain_paths, ParallelFrameLoad,
 };
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};

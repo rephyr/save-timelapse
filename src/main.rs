@@ -381,7 +381,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         replay_state.world.entity_count(),
         replay_state.world.tile_count()
     );
-    let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state.world)?;
+    let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
     println!("surfaces: {}\n", surfaces.join(", "));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;
@@ -459,6 +459,13 @@ fn run_live_capture() -> io::Result<PathBuf> {
         return Err(e);
     }
     println!("\r{emitted} frames written to {}\n", out.display());
+
+    if replay_state.catch_ups_applied > 0 {
+        println!(
+            "{} catch-up baseline(s) applied for surface(s) added to tracking after capture started\n",
+            replay_state.catch_ups_applied
+        );
+    }
 
     // Both counters are already computed by `replay::run`; surfacing them
     // (and pausing so the message can't be missed the way a mid-run

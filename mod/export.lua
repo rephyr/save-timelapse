@@ -269,19 +269,69 @@ local function sample_all_players(tick, session_id)
   end
 end
 
+--- Exports exactly `surface_names` (already filtered by the caller: see
+--- capture.lua's baseline-gap scan), each to its own
+--- frame_<tick>_<surface>.stfr in the same shape `M.export_all_to`'s own
+--- loop produces, but writes no manifest of any kind.
+---
+--- Why no manifest: `baseline.json`'s tick/surfaces describe the original,
+--- once-per-session baseline. A catch-up covers a different surface at a
+--- different (later) tick that has nothing to do with what `baseline.json`
+--- already says about every surface it doesn't mention; overwriting it
+--- here would corrupt that meaning for every surface it already covers.
+--- Rust instead discovers a catch-up by finding an extra
+--- frame_<tick>_<surface>.stfr file the manifest doesn't already account
+--- for (see replay.rs's `discover_catch_up_baselines`), so there is
+--- deliberately no separate manifest for catch-ups either: `baseline.json`
+--- keeps its original, simple meaning intact no matter how many later
+--- catch-ups a session accumulates.
+---
+--- Still samples players, the same as `M.export_all_to`: an accurate
+--- "where was everyone" line for the tick this happened at is exactly as
+--- useful here as for any other export.
+---
+--- Trusts `surface_names` outright, no inhabited/exclusion re-check: the
+--- caller already computed exactly that gap a moment ago, in this same
+--- tick.
+function M.export_surfaces_to(tick, session_id, surface_names)
+  sample_all_players(tick, session_id)
+  local total, tile_total, exported = 0, 0, {}
+  for _, name in ipairs(surface_names) do
+    local surface = game.surfaces[name]
+    if surface then
+      local entities, tiles = export_surface(surface, tick, session_id)
+      total = total + entities
+      tile_total = tile_total + tiles
+      exported[#exported + 1] = name
+    end
+  end
+  return total, tile_total, exported
+end
+
 --- Every surface, synchronously, in whatever tick this is called from. Used
 --- for /timelapse-export, headless scan, and the once-per-save baseline
 --- (capture.lua), three callers wanting the exact same "everything, right
---- now" export, differing only in what manifest path names the result and,
---- for the baseline, in tagging its output with the playthrough's
---- session_id. Also where all three record where the player(s) were, one
---- line, alongside the entities and tiles.
-function M.export_all_to(tick, manifest_path, session_id)
+--- now" export, differing only in what manifest path names the result,
+--- for the baseline in tagging its output with the playthrough's
+--- session_id, and for the baseline alone in `is_excluded`. Also where all
+--- three record where the player(s) were, one line, alongside the entities
+--- and tiles.
+---
+--- `is_excluded`, when given, skips a surface entirely instead of exporting
+--- it: a surface the player has opted out of recording (see capture.lua's
+--- per-surface exclusion) shouldn't pay the baseline's cost either, which
+--- is the single most expensive part of capture (tens of seconds on a
+--- large base) and the whole reason exclusion exists in the first place,
+--- not just something incremental events already skip after the fact.
+--- `/timelapse-export` and the headless scan pass nothing (`nil`): neither
+--- has any concept of exclusion, and both always mean "everything, right
+--- now."
+function M.export_all_to(tick, manifest_path, session_id, is_excluded)
   sample_all_players(tick, session_id)
   local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do
-    if M.is_inhabited(surface) then
+    if M.is_inhabited(surface) and not (is_excluded and is_excluded(surface.name)) then
       local entities, tiles = export_surface(surface, tick, session_id)
       total = total + entities
       tile_total = tile_total + tiles

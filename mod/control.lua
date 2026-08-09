@@ -1,10 +1,11 @@
 -- save-timelapse
 -- Two independent ways to get data out of a save for timelapse rendering,
 -- each its own module: one-shot export (export.lua) and live capture
--- (capture.lua), plus a periodic test-snapshot debug feature (snapshot.lua).
--- This file is just the glue that wires all three into Factorio's event
--- system: which events/timers are subscribed and when, and the single
--- on_tick dispatcher every feature's pending work runs through.
+-- (capture.lua), plus a periodic test-snapshot debug feature (snapshot.lua)
+-- and an in-game control panel for live capture (gui.lua). This file is
+-- just the glue that wires all of them into Factorio's event system: which
+-- events/timers are subscribed and when, and the single on_tick dispatcher
+-- every feature's pending work runs through.
 --
 -- Both export.lua and capture.lua share their binary-encoding logic via
 -- encode.lua, which has no Factorio dependency and is unit tested
@@ -13,6 +14,7 @@
 local export = require("export")
 local capture = require("capture")
 local snapshot = require("snapshot")
+local gui = require("gui")
 
 -- Timers
 --
@@ -95,6 +97,27 @@ local function on_tick(event)
   snapshot.run_pending_tick_work(event.tick)
 end
 script.on_event(defines.events.on_tick, on_tick)
+
+-- GUI
+--
+-- The shortcut-bar button and its hotkey both just toggle the panel for
+-- whichever player triggered them. Unlike capture's handlers above, these
+-- are registered unconditionally, the same as on_tick: the panel has to
+-- work (in particular, to let a player turn live capture ON in the first
+-- place) regardless of whether capture happens to be running right now, so
+-- gating it behind a setting the way sync_subscriptions gates capture's
+-- hot-path handlers would be actively wrong here, not just unnecessary.
+script.on_event(defines.events.on_lua_shortcut, function(event)
+  if event.prototype_name == "save-timelapse-panel" then
+    gui.toggle(event.player_index)
+  end
+end)
+script.on_event("save-timelapse-toggle-panel", function(event)
+  gui.toggle(event.player_index)
+end)
+script.on_event(defines.events.on_gui_click, gui.on_gui_click)
+script.on_event(defines.events.on_gui_checked_state_changed, gui.on_gui_checked_state_changed)
+script.on_event(defines.events.on_gui_closed, gui.on_gui_closed)
 
 script.on_init(sync_subscriptions)
 script.on_load(sync_subscriptions)
