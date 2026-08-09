@@ -180,6 +180,71 @@ pub struct Session {
     pub last_modified: SystemTime,
 }
 
+impl Session {
+    /// A name the user gave this playthrough, if any.
+    ///
+    /// Stored as a plain `label.txt` inside the session folder rather than in
+    /// config somewhere else, so it travels with the capture it names: a
+    /// capture copied to another machine keeps its name, and one deleted (by
+    /// the tool here, or by `/timelapse-reset-capture` in game, which removes
+    /// the whole folder) takes its name with it rather than leaving an
+    /// orphaned entry behind.
+    ///
+    /// Unreadable or empty is the same as unset. There is nothing to
+    /// recover from a corrupt one-line text file, and a capture with no name
+    /// is the ordinary case anyway.
+    pub fn label(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.session_dir.join("label.txt")).ok()?;
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    /// Sets or clears the name. An empty label removes the file rather than
+    /// leaving a blank one, so "unset" has one representation.
+    pub fn set_label(&self, label: &str) -> io::Result<()> {
+        let path = self.session_dir.join("label.txt");
+        if label.trim().is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            };
+        }
+        std::fs::write(path, format!("{}
+", label.trim()))
+    }
+
+    /// How much disk this capture occupies, for showing what deleting it
+    /// would actually free.
+    ///
+    /// Unreadable entries count as nothing rather than failing the whole
+    /// walk: a size shown next to a delete prompt is guidance, and refusing
+    /// to list a capture because one file inside it could not be stat'd
+    /// would be worse than showing a slightly low number.
+    pub fn size_on_disk(&self) -> u64 {
+        fn walk(dir: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => walk(&entry.path()),
+                    _ => entry.metadata().map(|m| m.len()).unwrap_or(0),
+                })
+                .sum()
+        }
+        walk(&self.session_dir)
+    }
+
+    /// Permanently removes this playthrough's capture: baseline, event log,
+    /// player and milestone logs, and its name.
+    ///
+    /// Takes `self` by value because the session cannot be used afterwards,
+    /// so a caller holding a stale one is a compile error rather than a
+    /// runtime surprise.
+    pub fn delete(self) -> io::Result<()> {
+        std::fs::remove_dir_all(&self.session_dir)
+    }
+}
+
 /// Every playthrough with a finished baseline among `dir`'s session
 /// subfolders, newest first.
 ///
@@ -964,6 +1029,68 @@ mod tests {
         assert_eq!(emitted, 1);
         assert_eq!(count, 1);
         let _dir = dir;
+    }
+
+    #[test]
+    fn a_capture_starts_unnamed_and_keeps_a_name_once_given_one() {
+        let (dir, baseline_path) = capture_dir();
+        let session = &discover_sessions(dir.path()).unwrap()[0];
+
+        assert_eq!(session.label(), None, "a fresh capture has no name");
+        session.set_label("Gleba run").unwrap();
+        assert_eq!(session.label(), Some("Gleba run".to_string()));
+
+        // Re-discovered from disk, since the name has to outlive the process
+        // that set it.
+        let again = &discover_sessions(dir.path()).unwrap()[0];
+        assert_eq!(again.label(), Some("Gleba run".to_string()));
+        let _ = baseline_path;
+    }
+
+    #[test]
+    fn an_empty_name_clears_it_rather_than_storing_a_blank() {
+        let (dir, _) = capture_dir();
+        let session = &discover_sessions(dir.path()).unwrap()[0];
+        session.set_label("temporary").unwrap();
+        session.set_label("   ").unwrap();
+        assert_eq!(session.label(), None);
+        // Clearing an already-unset name is not an error.
+        session.set_label("").unwrap();
+    }
+
+    /// The label file sits inside the session folder, so it must not be
+    /// mistaken for capture data by anything scanning it.
+    #[test]
+    fn a_named_capture_still_discovers_and_replays_normally() {
+        let (dir, baseline_path) = capture_dir();
+        discover_sessions(dir.path()).unwrap()[0].set_label("Named").unwrap();
+
+        let sessions = discover_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let mut replay = load_baseline(&baseline_path).unwrap();
+        run(&mut replay, &sessions[0].session_dir, &Options::default(), |_, _| {}).unwrap();
+        assert_eq!(replay.world.entity_count(), 1, "the label must not disturb replay");
+    }
+
+    #[test]
+    fn size_on_disk_counts_the_whole_capture() {
+        let (dir, _) = capture_dir();
+        let session = &discover_sessions(dir.path()).unwrap()[0];
+        let before = session.size_on_disk();
+        assert!(before > 0, "a capture with a baseline is not zero bytes");
+
+        std::fs::write(session.session_dir.join("players.jsonl"), vec![b'x'; 512]).unwrap();
+        assert!(session.size_on_disk() >= before + 512, "a new sidecar must be counted");
+    }
+
+    #[test]
+    fn deleting_a_capture_removes_it_from_discovery() {
+        let (dir, _) = capture_dir();
+        let mut sessions = discover_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+
+        sessions.remove(0).delete().unwrap();
+        assert!(discover_sessions(dir.path()).unwrap().is_empty(), "the capture is gone");
     }
 
     #[test]

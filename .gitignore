@@ -5,6 +5,10 @@
 # Scan output / renders
 /scans/
 /frames/
+# Rendered output from a comparison or one-off run, e.g. frames-match,
+# frames-one. Globbed rather than listed so a new one does not have to be
+# added here before it stops cluttering `git status`.
+/frames-*/
 *.mp4
 *.webm
 *.gif
