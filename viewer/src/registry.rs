@@ -152,6 +152,20 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(107, 84, 60));
     }
 
+    // Enemies, red so clearing a nest reads at a glance against a base
+    // that is otherwise a rainbow of hashed hues. Worms are the lighter
+    // shade purely so a nest and the worms around it stay distinguishable
+    // when they sit in one cluster, which is how they usually generate.
+    if is_enemy(name) {
+        // Checked before the nest shade below, so a name that is somehow
+        // both lands on one deterministically rather than by branch order
+        // being read the other way round later.
+        if name.ends_with("-worm-turret") {
+            return Some(rgb(220, 74, 60));
+        }
+        return Some(rgb(168, 34, 30));
+    }
+
     // Terrain scatter: cliffs read as bare rock; live trees green, with
     // "dead"/"dry" variants (including desert trees) a dead-wood brown
     // rather than green, since that's the biggest visual distinction
@@ -167,6 +181,46 @@ fn known_color(name: &str) -> Option<Color> {
     }
 
     None
+}
+
+/// Whether `name` is an enemy structure: a nest or a worm turret.
+///
+/// Matched by name because that is all the wire format carries. The mod
+/// knows each entity's prototype *type* while capturing (`unit-spawner`,
+/// `turret`) but never writes it, since a type is worth nothing to the
+/// renderer for the thousands of ordinary entities that make up a base, and
+/// this is the one place it would have helped.
+///
+/// Substring matching rather than an exact list of the vanilla worms and
+/// nests: modded enemies conventionally follow the same `spawner` naming, and
+/// getting a modded nest colored as an enemy for free is worth more than the
+/// precision of a list that would silently miss it. Substring rather than
+/// suffix specifically because Space Age ships `gleba-spawner-small`, so even
+/// within vanilla the word is not always last.
+///
+/// The exception is why this needs to be a function at all.
+/// `captive-biter-spawner` contains `spawner` but is a Space Age
+/// *assembling-machine*, a factory building the player crafts and places to
+/// make biter eggs, so painting it enemy red would mislabel part of the
+/// player's own base as something to be cleared. Checked against the real
+/// prototype in `space-age/prototypes/entity/entities.lua`.
+///
+/// The other names carrying `spawner` (`biter-spawner-corpse`,
+/// `captive-spawner-explosion-1`, `guts-entrails-particle-spawner`) need no
+/// exception: every one is a corpse, explosion, or particle source, all of
+/// which `EXCLUDED_TYPES` already keeps out of a capture entirely, so they
+/// never reach a color lookup.
+///
+/// Individual biters and spitters are deliberately absent, and not because
+/// of color: they are excluded from capture entirely (`mod/encode.lua`'s
+/// `EXCLUDED_TYPES`), since the event log records construction and
+/// destruction but never movement, so a captured biter would sit frozen
+/// wherever it was first logged while the real one walked away.
+pub fn is_enemy(name: &str) -> bool {
+    if name == "captive-biter-spawner" {
+        return false;
+    }
+    name.contains("spawner") || name.ends_with("-worm-turret")
 }
 
 /// Whether `name` is a tree or cliff prototype: decorative terrain scatter
@@ -341,6 +395,56 @@ mod tests {
     fn known_color_falls_back_to_none_for_ordinary_factory_entities() {
         for name in ["transport-belt", "assembling-machine-1", "electric-furnace"] {
             assert!(known_color(name).is_none(), "{name} should use the hash fallback, not a curated color");
+        }
+    }
+
+    /// Every vanilla nest and worm, taken from the real prototype names in
+    /// base/ and space-age/ rather than from memory.
+    #[test]
+    fn every_vanilla_nest_and_worm_is_recognized_as_an_enemy() {
+        for name in [
+            "biter-spawner",
+            "spitter-spawner",
+            "gleba-spawner",
+            "gleba-spawner-small",
+            "small-worm-turret",
+            "medium-worm-turret",
+            "big-worm-turret",
+            "behemoth-worm-turret",
+        ] {
+            assert!(is_enemy(name), "{name} should be an enemy");
+            assert!(known_color(name).is_some(), "{name} should be colored red, not hashed");
+        }
+    }
+
+    /// The trap this exists for: a Space Age assembling-machine the player
+    /// crafts and places, which matches the `-spawner` suffix but is part of
+    /// their own base, not something to clear.
+    #[test]
+    fn the_player_built_captive_biter_spawner_is_not_an_enemy() {
+        assert!(!is_enemy("captive-biter-spawner"));
+        assert!(
+            known_color("captive-biter-spawner").is_none(),
+            "it must fall through to the ordinary hash palette like any other building"
+        );
+    }
+
+    #[test]
+    fn ordinary_buildings_and_terrain_are_not_enemies() {
+        for name in ["transport-belt", "assembling-machine-1", "gun-turret", "laser-turret", "tree-01", "water"] {
+            assert!(!is_enemy(name), "{name} must not be an enemy");
+        }
+    }
+
+    /// Nests and worms are told apart by shade, since they generally
+    /// generate together in one cluster.
+    #[test]
+    fn nests_and_worms_are_distinguishable_reds() {
+        let nest = known_color("biter-spawner").unwrap();
+        let worm = known_color("big-worm-turret").unwrap();
+        assert_ne!((nest.r, nest.g, nest.b), (worm.r, worm.g, worm.b));
+        for c in [nest, worm] {
+            assert!(c.r > c.g && c.r > c.b, "an enemy color must read as red");
         }
     }
 

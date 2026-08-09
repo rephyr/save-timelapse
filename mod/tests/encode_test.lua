@@ -362,12 +362,28 @@ check("EXCLUDED_TYPES: contains character", excluded["character"], true)
 check("EXCLUDED_TYPES: does not contain tree", excluded["tree"], nil)
 check("EXCLUDED_TYPES: does not contain cliff", excluded["cliff"], nil)
 check("EXCLUDED_TYPES: still contains the generic decorative scatter type", excluded["simple-entity"], true)
--- Enemies are wildlife, not factory, and their deaths would otherwise flood
--- live capture with removals unrelated to construction. Regression: a real
--- capture showed ~6% of exported entities were biters/spitters/spawners
--- before these were added.
+-- Every flying robot type. These are the highest-volume mobile entity in the
+-- game: a megabase mid construction job has tens of thousands airborne, each
+-- one a record in the baseline and in every from-saves frame, pinned wherever
+-- it happened to be since the format cannot update a position.
+check("EXCLUDED_TYPES: contains construction-robot", excluded["construction-robot"], true)
+check("EXCLUDED_TYPES: contains logistic-robot", excluded["logistic-robot"], true)
+check("EXCLUDED_TYPES: contains combat-robot", excluded["combat-robot"], true)
+-- The stationary infrastructure that flies them stays: it is the part that
+-- actually shows the factory growing.
+check("EXCLUDED_TYPES: does not contain roboport", excluded["roboport"], nil)
+-- Mobile enemies stay excluded: their combat deaths would flood live capture
+-- with removals unrelated to construction, and since this format records
+-- construction and destruction but never movement, a captured biter would sit
+-- frozen wherever it was first logged. Regression: a real capture showed ~6%
+-- of exported entities were biters/spitters/spawners before these were added,
+-- and that bulk was the mobile units rather than the nests that spawn them.
 check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true)
-check("EXCLUDED_TYPES: contains unit-spawner", excluded["unit-spawner"], true)
+-- Nests are deliberately captured despite being enemies: stationary, so the
+-- format represents them honestly, few enough to cost little, and watching
+-- them get cleared is how expansion actually reads in a timelapse. The viewer
+-- colors them red (see viewer/src/registry.rs's is_enemy).
+check("EXCLUDED_TYPES: does not contain unit-spawner", excluded["unit-spawner"], nil)
 
 local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILES")
 check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)

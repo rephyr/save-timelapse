@@ -19,14 +19,36 @@ local M = {}
 -- find_entities_filtered with invert, so these never cross the API boundary.
 M.EXCLUDED_TYPES = {
   -- actors and their remains
-  "character", "corpse", "combat-robot", "fish",
-  -- enemies: wildlife rather than factory, and their deaths in combat would
-  -- otherwise flood live capture with removal events unrelated to
-  -- construction. Worm turrets are left in: they share the "turret" type
-  -- with player turrets, and are stationary and comparatively few, so
-  -- filtering them would risk excluding a real player entity by name-sniffing
-  -- instead of type.
-  "unit", "unit-spawner",
+  "character", "corpse", "fish",
+  -- Flying robots, all of them. Same reasoning as the mobile enemies below:
+  -- an airborne bot is an entity with a position that this format has no way
+  -- to update, so it would be pinned wherever it happened to be at capture
+  -- time while the real one flew on. Worse than the biter case for volume,
+  -- though, and that is the main reason these are here: a megabase running a
+  -- large construction job has tens of thousands of bots in the air at once,
+  -- every one of them a record in the baseline snapshot and in every frame of
+  -- a from-saves export, describing nothing about how the factory grew.
+  --
+  -- Roboports and the logistics network they form are of course kept: those
+  -- are stationary infrastructure, and they are the part that actually shows
+  -- the factory growing.
+  "combat-robot", "construction-robot", "logistic-robot",
+  -- Mobile enemies only. Biters and spitters are excluded for two reasons
+  -- that both still hold: their combat deaths would flood live capture with
+  -- removal events unrelated to construction, and this format records
+  -- construction and destruction but never movement, so a captured biter
+  -- would sit frozen wherever it was first logged while the real one walked
+  -- away, which is worse than not drawing it at all.
+  --
+  -- Nests ("unit-spawner") are NOT excluded, despite being enemies too:
+  -- they are stationary, so the format represents them honestly, and they
+  -- are few enough to cost nothing. Clearing them is one of the things a
+  -- player most wants to watch happen in a timelapse, since the front line
+  -- moving outward is how expansion actually looks. Worm turrets are in for
+  -- the same reason, and additionally could not be filtered safely anyway:
+  -- they share the "turret" type with player turrets, so excluding them
+  -- would mean name-sniffing and risking a real player entity.
+  "unit",
   -- generic decorative/rock scatter, kept out for now: unlike trees and
   -- cliffs (rendered as ground context, see export.lua's terrain capture),
   -- this catch-all covers whatever else Space Age uses it for, which is

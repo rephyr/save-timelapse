@@ -179,16 +179,37 @@ human readable for debugging the handshake between the mod and the Rust side.
 Filtering happens in the `find_entities_filtered` query rather than in Lua, so
 excluded types are never returned across the API boundary.
 
-Excluded by default: characters, corpses, particles, projectiles, trees, rocks,
-cliffs, fish, fire, smoke, explosions, ghosts, dropped items, combat robots,
-streams, stickers and beams. Also excluded: biters, spitters and their
-spawners (`unit`, `unit-spawner`)  wildlife rather than factory, and without
-this a live-capture log fills with combat-death removals indistinguishable
-from the player mining something. Confirmed against a real capture, where
-these types were ~6% of exported entities. Worm turrets are left in: they
-share Factorio's `turret` type with player-built turrets, and filtering them
-out would mean matching by name instead of type, which risks catching a real
-player entity by pattern rather than excluding by what it actually is.
+Excluded by default: characters, corpses, particles, projectiles, fish, fire,
+smoke, explosions, ghosts, dropped items, streams, stickers and beams. Trees,
+rocks and cliffs are excluded only while `save-timelapse-capture-terrain` is
+off, since with it on they are wanted as ground context.
+
+The rest of the exclusions are all one idea: **this format records that
+something was built or destroyed, never that it moved.** A frame carries a
+position per entity and the event log carries add and remove records, and
+neither has any way to say "the thing you already know about is now
+somewhere else". Anything mobile is therefore pinned wherever it happened to
+be when it was captured, while the real one carries on, so drawing it is
+worse than leaving it out.
+
+- **Flying robots** (`construction-robot`, `logistic-robot`, `combat-robot`).
+  The highest-volume case by far: a megabase running a large construction job
+  has tens of thousands airborne at once, each one a record in the baseline
+  and in every frame of a from-saves export. Roboports stay, being the
+  stationary infrastructure that actually shows the network growing.
+- **Biters and spitters** (`unit`). Additionally, their combat deaths would
+  fill a live-capture log with removals indistinguishable from the player
+  mining something. Confirmed against a real capture, where enemies were ~6%
+  of exported entities.
+
+Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
+being enemies, because they are stationary and so the format represents them
+honestly. Watching the front line move outward as nests are cleared is a real
+part of how expansion looks, and the viewer colors both red so it reads at a
+glance (`viewer/src/registry.rs`'s `is_enemy`). Worms additionally could not
+be filtered safely even if wanted: they share Factorio's `turret` type with
+player-built turrets, so excluding them would mean matching by name rather
+than by what the entity actually is, risking a real player entity.
 
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
