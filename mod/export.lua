@@ -109,49 +109,115 @@ local function export_surface(surface, tick, session_id)
 
   local pending, pending_count, written = {}, 0, 0
 
+  -- Records are grouped by name into runs (see encode.frame_entity_run), so
+  -- entities are collected into a batch and grouped when it fills, rather
+  -- than encoded one at a time as they are scanned.
+  --
+  -- Grouped per batch and not per frame deliberately: buffering a whole
+  -- megabase to group it would reintroduce exactly the stall the incremental
+  -- exporter exists to avoid. A batch of FLUSH_EVERY across the few dozen
+  -- distinct names on a surface still leaves runs long enough for the name id
+  -- and count to amortize, which is where the saving is.
+  local function flush_entities()
+    if pending_count == 0 then
+      return
+    end
+    local order, groups = {}, {}
+    for i = 1, pending_count do
+      local item = pending[i]
+      local group = groups[item.name]
+      if not group then
+        group = { w = item.w, h = item.h, items = {} }
+        groups[item.name] = group
+        order[#order + 1] = item.name
+      end
+      group.items[#group.items + 1] = item
+    end
+
+    local parts = {}
+    for i = 1, #order do
+      local name = order[i]
+      local group = groups[name]
+      parts[i] = encode.frame_entity_run(dict, name, group.w, group.h, group.items)
+    end
+    checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
+    pending, pending_count = {}, 0
+  end
+
   for _, entity in pairs(surface.find_entities_filtered({
     type = M.excluded_types(),
     invert = true,
   })) do
     if entity.valid then
+      -- Read out of the API once into a plain table: every field below
+      -- crosses the mod/game boundary, and the grouping above would
+      -- otherwise re-read them.
+      local pos = entity.position
       pending_count = pending_count + 1
       written = written + 1
-      pending[pending_count] = encode.frame_entity_record(dict, entity)
-      encode.grow_bbox(bbox, entity.position.x, entity.position.y)
+      pending[pending_count] = {
+        name = entity.name,
+        x = pos.x,
+        y = pos.y,
+        d = entity.direction,
+        w = entity.tile_width,
+        h = entity.tile_height,
+      }
+      encode.grow_bbox(bbox, pos.x, pos.y)
 
       -- Each write_file call is a separate file append, so flushing per entity
       -- would make export time track syscalls rather than entity count.
       if pending_count >= FLUSH_EVERY then
-        checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-        pending, pending_count = {}, 0
+        flush_entities()
       end
     end
   end
 
-  if pending_count > 0 then
-    checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-  end
+  flush_entities()
 
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
   pending, pending_count = {}, 0
   local tiles_written = 0
 
+  -- Same batching as the entity section above, for the same reason.
+  local function flush_tiles()
+    if pending_count == 0 then
+      return
+    end
+    local order, groups = {}, {}
+    for i = 1, pending_count do
+      local item = pending[i]
+      local group = groups[item.name]
+      if not group then
+        group = {}
+        groups[item.name] = group
+        order[#order + 1] = item.name
+      end
+      group[#group + 1] = item
+    end
+
+    local parts = {}
+    for i = 1, #order do
+      parts[i] = encode.frame_tile_run(dict, order[i], groups[order[i]])
+    end
+    checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
+    pending, pending_count = {}, 0
+  end
+
   for _, tile in pairs(surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })) do
+    local pos = tile.position
     pending_count = pending_count + 1
     tiles_written = tiles_written + 1
-    pending[pending_count] = encode.frame_tile_record(dict, tile)
-    encode.grow_bbox(bbox, tile.position.x, tile.position.y)
+    pending[pending_count] = { name = tile.name, x = pos.x, y = pos.y }
+    encode.grow_bbox(bbox, pos.x, pos.y)
 
     if pending_count >= FLUSH_EVERY then
-      checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-      pending, pending_count = {}, 0
+      flush_tiles()
     end
   end
 
-  if pending_count > 0 then
-    checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-  end
+  flush_tiles()
 
   -- Natural terrain (grass, water, sand, ...) covers every generated tile,
   -- not just where the player built, so it is capped to a margin around
@@ -169,19 +235,17 @@ local function export_surface(surface, tick, session_id)
       name = encode.PLACED_FLOOR_TILES,
       invert = true,
     })) do
+      local pos = tile.position
       pending_count = pending_count + 1
       tiles_written = tiles_written + 1
-      pending[pending_count] = encode.frame_tile_record(dict, tile)
+      pending[pending_count] = { name = tile.name, x = pos.x, y = pos.y }
 
       if pending_count >= FLUSH_EVERY then
-        checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-        pending, pending_count = {}, 0
+        flush_tiles()
       end
     end
 
-    if pending_count > 0 then
-      checksum = M.checksummed_write(path, table.concat(pending), true, checksum)
-    end
+    flush_tiles()
   end
 
   -- Not itself folded into the checksum: nothing needs a checksum of the

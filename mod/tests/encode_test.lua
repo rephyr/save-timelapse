@@ -74,40 +74,66 @@ end
 -- frame format
 
 check("frame_header: magic, version, tick, surface", encode.frame_header(100, "nauvis"),
-  "STF1" .. bytes(1) .. encode.u64le(100) .. encode.str("nauvis"))
+  "STF1" .. bytes(2) .. encode.u64le(100) .. encode.str("nauvis"))
+
+-- varints
+
+check("varint: a small value is one byte", encode.varint(0), bytes(0))
+check("varint: the largest one byte value", encode.varint(127), bytes(127))
+check("varint: 128 rolls into two bytes", encode.varint(128), bytes(128, 1))
+check("varint: seven bits per byte", encode.varint(300), bytes(172, 2))
+check("varint: two byte maximum", encode.varint(16383), bytes(255, 127))
+check("varint: 16384 rolls into three", encode.varint(16384), bytes(128, 128, 1))
+
+-- Zigzag keeps a small negative small: without it, -1 would set every high
+-- bit and take ten bytes. No shifts or xor needed, which matters because
+-- Factorio's Lua 5.2 has neither.
+check("zigzag: zero", encode.zigzag(0), 0)
+check("zigzag: positives double", encode.zigzag(1), 2)
+check("zigzag: negatives interleave", encode.zigzag(-1), 1)
+check("zigzag: -64 still fits one varint byte", encode.zigzag(-64), 127)
+check("zigzag: -65 needs a second", encode.zigzag(-65), 129)
+check("varint_i32: a negative delta is one byte", encode.varint_i32(-1), bytes(1))
+
+-- Runs replace the old per-entity records: the name id and count are written
+-- once for a group, and each position is a delta from the one before it.
 
 do
   local dict = encode.new_dictionary()
-  local record = encode.frame_entity_record(dict, {
-    name = "transport-belt",
-    position = { x = -80.5, y = 28.5 },
-    direction = 4,
+  local run = encode.frame_entity_run(dict, "transport-belt", 1, 1, {
+    { x = -80.5, y = 28.5, d = 4 },
+    { x = -79.5, y = 28.5, d = 6 },
   })
-  local expected = bytes(0) .. encode.str("transport-belt") -- DefineName, first use
-    .. bytes(1) .. encode.u16le(0) .. encode.i32le(-805) .. encode.i32le(285) .. bytes(4) .. bytes(1) .. bytes(1)
-  check("frame_entity_record: direction present, defaults w/h to 1x1", record, expected)
+  local expected = bytes(0) .. encode.str("transport-belt") .. bytes(1) .. bytes(1) -- DefineName carries the footprint
+    .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(1) -- run: id, count, directions flag
+    .. encode.varint_i32(-805) .. encode.varint_i32(285) .. bytes(4) -- first item, delta from origin
+    .. encode.varint_i32(10) .. encode.varint_i32(0) .. bytes(6) -- second, delta from the first
+  check("frame_entity_run: footprint in the definition, positions as deltas", run, expected)
 end
 
 do
   local dict = encode.new_dictionary()
-  encode.dictionary_id(dict, "assembling-machine-1", 0) -- pre-seed so this record doesn't redefine it
-  local record = encode.frame_entity_record(dict, {
-    name = "assembling-machine-1",
-    position = { x = 5, y = 5 },
-    direction = 0,
-    tile_width = 3,
-    tile_height = 3,
+  -- Nothing in this run rotates, so the flag is clear and no direction
+  -- bytes are written at all.
+  local run = encode.frame_entity_run(dict, "wooden-chest", 1, 1, {
+    { x = 0.5, y = 0.5, d = 0 },
+    { x = 1.5, y = 0.5 },
   })
-  local expected = bytes(1) .. encode.u16le(0) .. encode.i32le(50) .. encode.i32le(50) .. bytes(0) .. bytes(3) .. bytes(3)
-  check("frame_entity_record: an already defined name is not redefined", record, expected)
+  local expected = bytes(0) .. encode.str("wooden-chest") .. bytes(1) .. bytes(1)
+    .. bytes(1) .. encode.varint(0) .. encode.varint(2) .. bytes(0)
+    .. encode.varint_i32(5) .. encode.varint_i32(5)
+    .. encode.varint_i32(10) .. encode.varint_i32(0)
+  check("frame_entity_run: a run that never rotates spends nothing on direction", run, expected)
 end
 
 do
   local dict = encode.new_dictionary()
-  local record = encode.frame_tile_record(dict, { name = "concrete", position = { x = -5, y = -12 } })
-  local expected = bytes(0) .. encode.str("concrete")
-    .. bytes(2) .. encode.u16le(0) .. encode.i32le(-5) .. encode.i32le(-12)
-  check("frame_tile_record: integer coordinates, no rounding", record, expected)
+  encode.frame_define_name(dict, "concrete", 1, 1) -- pre-seed, so the run does not redefine it
+  local run = encode.frame_tile_run(dict, "concrete", { { x = -5, y = 12 }, { x = -4, y = 12 } })
+  local expected = bytes(2) .. encode.varint(0) .. encode.varint(2)
+    .. encode.varint_i32(-5) .. encode.varint_i32(12)
+    .. encode.varint_i32(1) .. encode.varint_i32(0)
+  check("frame_tile_run: integer coordinates, also delta encoded", run, expected)
 end
 
 check("frame_end_entities: tag 9, no payload", encode.frame_end_entities(), bytes(9))
