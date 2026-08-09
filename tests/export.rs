@@ -37,8 +37,25 @@ fn fake_install(root: &Path) -> PathBuf {
 
     let exe = bin.join(format!("factorio{}", std::env::consts::EXE_SUFFIX));
     fs::copy(built_binary("fake-factorio"), &exe).unwrap();
+    make_executable(&exe);
     exe
 }
+
+/// `fs::copy` doesn't reliably carry the execute bit over on every platform,
+/// and `Command::new` needs it set to actually run the copy. Windows has no
+/// such bit at all (a `.exe` is executable by extension alone), which is
+/// exactly why this was never needed to make this test pass on a Windows dev
+/// machine, only surfacing on Linux CI.
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
 
 /// A mods folder holding an unrelated mod and its settings, so tests can prove
 /// those survive staging.
