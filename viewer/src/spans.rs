@@ -18,8 +18,6 @@
 //! emits items already grouped by type, which is the order the renderer
 //! batches by. Nothing has to sort per seek.
 
-use std::collections::HashMap;
-
 use crate::registry::TypeId;
 use crate::render_frame::Run;
 
@@ -104,18 +102,43 @@ impl<T: Copy> SpanSet<T> {
 /// holding every frame at once. Holding them all is exactly what this type
 /// exists to avoid, so building from a `&[Frame]` would defeat the purpose at
 /// load time even though the result is small.
+///
+/// Sorted vectors and a merge walk rather than the hash map this obviously
+/// wants, for the same reason `activity::analyze_activity` does: this runs on
+/// the load path against every item of every frame, tens of millions of times
+/// on a real capture. A `HashMap` there is 30 million random-access probes
+/// into a table far larger than cache, and the cost is the probing, not the
+/// hashing. Sorting and merging touches the same data almost entirely
+/// sequentially and needs no allocation per frame once the buffers have
+/// grown. Measured on a 150-frame, 400k-entity capture (see `bench` below):
+/// 2.50s with the map, 1.91s with this.
+///
+/// A smaller win than the same change bought in `activity.rs` (2.26s to
+/// 1.07s), and for a visible reason: that one sorts bare `u64` keys, where
+/// this sorts `(key, type, item)` tuples three times the size, so the sort
+/// itself is now the floor. Sorting an index array instead would shrink what
+/// moves but scatter the reads, which is the trade this already went through
+/// once in the other direction.
 pub struct SpanBuilder<T> {
     spans: Vec<Span<T>>,
-    /// Key to index-into-`spans` for everything still standing.
-    open: HashMap<u64, usize>,
+    /// Everything still standing, as `(key, span index)` sorted by key, which
+    /// is what lets the next frame merge against it in one pass.
+    open: Vec<(u64, u32)>,
     /// Reused across frames so a frame costs no allocation of its own.
-    seen: Vec<u64>,
+    current: Vec<(u64, TypeId, T)>,
+    next_open: Vec<(u64, u32)>,
     frames: u32,
 }
 
 impl<T: Copy> Default for SpanBuilder<T> {
     fn default() -> Self {
-        SpanBuilder { spans: Vec::new(), open: HashMap::new(), seen: Vec::new(), frames: 0 }
+        SpanBuilder {
+            spans: Vec::new(),
+            open: Vec::new(),
+            current: Vec::new(),
+            next_open: Vec::new(),
+            frames: 0,
+        }
     }
 }
 
@@ -134,32 +157,52 @@ impl<T: Copy> SpanBuilder<T> {
     /// not there.
     pub fn push_frame(&mut self, items: impl IntoIterator<Item = (u64, TypeId, T)>) {
         let frame = self.frames;
-        self.seen.clear();
 
-        for (key, type_id, item) in items {
-            self.seen.push(key);
-            match self.open.get(&key) {
-                Some(&index) if self.spans[index].type_id == type_id => {
-                    self.spans[index].last = frame + 1;
+        self.current.clear();
+        self.current.extend(items);
+        self.current.sort_unstable_by_key(|&(key, _, _)| key);
+        // Two items on one key would make the merge below ambiguous about
+        // which span continues. Positions are unique in practice, so this is
+        // a guard rather than a real case.
+        self.current.dedup_by_key(|&mut (key, _, _)| key);
+
+        self.next_open.clear();
+        let mut open_at = 0usize;
+
+        for &(key, type_id, item) in &self.current {
+            // Both sides are sorted by key, so this pointer only ever moves
+            // forward: anything it steps over was standing last frame and is
+            // absent from this one, which ends its span. Nothing needs doing
+            // to close it, since `last` is exclusive and was already set to
+            // the frame after the one it was last seen in.
+            while open_at < self.open.len() && self.open[open_at].0 < key {
+                open_at += 1;
+            }
+
+            let continues = self
+                .open
+                .get(open_at)
+                .filter(|&&(open_key, index)| open_key == key && self.spans[index as usize].type_id == type_id);
+
+            match continues {
+                Some(&(_, index)) => {
+                    self.spans[index as usize].last = frame + 1;
+                    self.next_open.push((key, index));
                 }
-                _ => {
+                None => {
                     // Either brand new, or the same tile now holding a
-                    // different type, which is a different thing: close the
-                    // old span by leaving it, and open one here.
-                    self.open.insert(key, self.spans.len());
+                    // different type, which is a different thing: leave the
+                    // old span closed where it ended and open one here.
+                    let index = self.spans.len() as u32;
                     self.spans.push(Span { item, type_id, first: frame, last: frame + 1 });
+                    self.next_open.push((key, index));
                 }
             }
         }
 
-        // Anything still open that this frame did not mention is gone. Its
-        // span already ends at the frame it was last seen in, since `last` is
-        // exclusive and was set then, so closing is just forgetting the key.
-        if self.open.len() != self.seen.len() {
-            let present: std::collections::HashSet<u64> = self.seen.iter().copied().collect();
-            self.open.retain(|key, _| present.contains(key));
-        }
-
+        // `current` was sorted, so `next_open` came out sorted too and is
+        // ready to be merged against directly next frame.
+        std::mem::swap(&mut self.open, &mut self.next_open);
         self.frames += 1;
     }
 
@@ -322,5 +365,91 @@ mod layout {
             "expected at least a 100x reduction, got {}x",
             per_frame_storage / span_storage
         );
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::registry::TypeRegistry;
+    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
+
+    /// What the span layout actually costs and saves, on a sequence shaped
+    /// like a real capture: a base growing to 400k entities over 150 frames.
+    ///
+    /// `#[ignore]`d because it builds every frame the old way first, which is
+    /// the peak this exists to remove, so it needs the memory it is measuring
+    /// against. Run in release:
+    ///
+    /// ```text
+    /// cargo test --release -p viewer --lib gains -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn gains() {
+        let frames_n = 150usize;
+        let peak_entities = 400_000usize;
+        let mut registry = TypeRegistry::new();
+        let types: Vec<_> = (0..40).map(|i| registry.intern(&format!("type-{i}"))).collect();
+
+        let mut frames = Vec::with_capacity(frames_n);
+        let mut per_frame_items = 0usize;
+        for f in 0..frames_n {
+            // Grows steadily, and everything already built stays built, which
+            // is what a factory does and what makes frames so redundant.
+            let n = peak_entities * (f + 1) / frames_n;
+            per_frame_items += n;
+            let mut entities = Vec::with_capacity(n);
+            let mut runs = Vec::with_capacity(types.len());
+            for (t, &type_id) in types.iter().enumerate() {
+                let start = entities.len() as u32;
+                for i in (t..n).step_by(types.len()) {
+                    entities.push(RenderEntity {
+                        x: (i % 2000) as f32 + 0.5,
+                        y: (i / 2000) as f32 + 0.5,
+                        w: 1,
+                        h: 1,
+                        d: 0,
+                    });
+                }
+                runs.push(Run { type_id, start, end: entities.len() as u32 });
+            }
+            let mut frame = RenderFrame::empty();
+            frame.tick = f as u64 * 3600;
+            frame.count = entities.len();
+            frame.entities = entities;
+            frame.entity_runs = runs;
+            frames.push(frame);
+        }
+
+        let entity_bytes = std::mem::size_of::<RenderEntity>();
+        let span_bytes = std::mem::size_of::<Span<RenderEntity>>();
+        let old_bytes = per_frame_items * entity_bytes;
+
+        let start = std::time::Instant::now();
+        let mut sequence = FrameSequence::new(frames).unwrap();
+        let build = start.elapsed();
+
+        let new_bytes = sequence.span_estimate() * span_bytes;
+
+        let start = std::time::Instant::now();
+        for i in 0..frames_n {
+            sequence.goto(i);
+        }
+        let seeks = start.elapsed();
+
+        let start = std::time::Instant::now();
+        sequence.for_each_frame(|_, _| {});
+        let walk = start.elapsed();
+
+        println!("GAINS frames={frames_n} peak_entities={peak_entities}");
+        println!("GAINS per-frame item copies : {per_frame_items}");
+        println!("GAINS distinct spans        : {}", sequence.span_estimate());
+        println!("GAINS memory old            : {:.1} MB", old_bytes as f64 / 1e6);
+        println!("GAINS memory new            : {:.1} MB", new_bytes as f64 / 1e6);
+        println!("GAINS reduction             : {:.1}x", old_bytes as f64 / new_bytes as f64);
+        println!("GAINS build spans           : {build:?}");
+        println!("GAINS {frames_n} sequential seeks : {seeks:?} ({:?}/seek)", seeks / frames_n as u32);
+        println!("GAINS full walk (load pass) : {walk:?}");
     }
 }

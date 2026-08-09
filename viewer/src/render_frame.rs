@@ -9,6 +9,7 @@ use macroquad::math::Vec2;
 use save_timelapse::frame::Frame;
 
 use crate::registry::{TypeId, TypeRegistry};
+use crate::spans::{SpanBuilder, SpanSet};
 
 /// A contiguous span of one type within a [`RenderFrame`]'s entity or tile
 /// array. Draws iterate runs rather than individual items, so the texture is
@@ -310,6 +311,24 @@ fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usiz
 }
 
 impl RenderFrame {
+    /// A frame with nothing in it, used as the buffer `FrameSequence`
+    /// materializes into and reuses, so seeking allocates nothing once the
+    /// vectors have grown to the largest frame seen.
+    pub fn empty() -> RenderFrame {
+        RenderFrame {
+            tick: 0,
+            count: 0,
+            entities: Vec::new(),
+            entity_runs: Vec::new(),
+            tiles: Vec::new(),
+            tile_runs: Vec::new(),
+            tile_lod: Vec::new(),
+            tile_lod_runs: Vec::new(),
+            entity_lod: Vec::new(),
+            entity_lod_runs: Vec::new(),
+        }
+    }
+
     /// Consumes the parsed frame: keeping both representations alive would
     /// defeat the point, since the `frame::Frame` is the expensive one.
     pub fn from_frame(frame: Frame, registry: &mut TypeRegistry) -> RenderFrame {
@@ -358,36 +377,134 @@ impl RenderFrame {
     }
 }
 
+/// Position key for span identity, matching the tenth-of-a-tile grid
+/// entities are aligned to and `save_timelapse::world::pos_key` keys by.
+fn span_key(x: f32, y: f32) -> u64 {
+    let qx = ((x as f64) * 10.0).round() as i32;
+    let qy = ((y as f64) * 10.0).round() as i32;
+    ((qx as u32 as u64) << 32) | (qy as u32 as u64)
+}
+
 /// A loaded sequence of frames with a current position. Always non-empty:
 /// construction from zero frames is rejected rather than leaving every
 /// accessor to guard against it.
+///
+/// Stores the whole run as spans (see `spans`) rather than one materialized
+/// `RenderFrame` per frame, since consecutive frames of a real capture are
+/// nearly identical and keeping every copy is what put a ceiling on how long
+/// a capture could be. The frame being displayed is materialized into
+/// `current`, and only when the position actually moves: rendering reads it
+/// once per drawn frame, seeking rebuilds it a few times a second.
 pub struct FrameSequence {
-    frames: Vec<RenderFrame>,
+    entities: SpanSet<RenderEntity>,
+    tiles: SpanSet<RenderTile>,
+    entity_lod: SpanSet<LodCell>,
+    tile_lod: SpanSet<LodCell>,
+    /// Per frame, and tiny next to the item data, so these stay plain vecs.
+    ticks: Vec<u64>,
+    counts: Vec<usize>,
+    /// The frame at `index`, rebuilt by `goto`. Handed out by `current` so
+    /// the renderer keeps taking an ordinary `&RenderFrame`.
+    current: RenderFrame,
     index: usize,
 }
 
 impl FrameSequence {
+    /// Folds `frames` into spans, dropping each one as it goes.
+    ///
+    /// Takes them all at once for the convenience of tests and of callers
+    /// that already have a vec; a loader wanting the memory win at load time
+    /// too should fold frame by frame as it parses, since this still sees
+    /// every frame alive at once.
     pub fn new(frames: Vec<RenderFrame>) -> Option<Self> {
         if frames.is_empty() {
             return None;
         }
-        Some(Self { frames, index: 0 })
+
+        let mut entities = SpanBuilder::new();
+        let mut tiles = SpanBuilder::new();
+        let mut entity_lod = SpanBuilder::new();
+        let mut tile_lod = SpanBuilder::new();
+        let mut ticks = Vec::with_capacity(frames.len());
+        let mut counts = Vec::with_capacity(frames.len());
+
+        for frame in frames {
+            ticks.push(frame.tick);
+            counts.push(frame.count);
+            entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
+            tiles.push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
+            entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
+            tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
+        }
+
+        let mut sequence = Self {
+            entities: entities.finish(),
+            tiles: tiles.finish(),
+            entity_lod: entity_lod.finish(),
+            tile_lod: tile_lod.finish(),
+            ticks,
+            counts,
+            current: RenderFrame::empty(),
+            index: 0,
+        };
+        sequence.rebuild_current();
+        Some(sequence)
+    }
+
+    fn rebuild_current(&mut self) {
+        let frame = &mut self.current;
+        frame.tick = self.ticks[self.index];
+        frame.count = self.counts[self.index];
+        self.entities.materialize(self.index, &mut frame.entities, &mut frame.entity_runs);
+        self.tiles.materialize(self.index, &mut frame.tiles, &mut frame.tile_runs);
+        self.entity_lod.materialize(self.index, &mut frame.entity_lod, &mut frame.entity_lod_runs);
+        self.tile_lod.materialize(self.index, &mut frame.tile_lod, &mut frame.tile_lod_runs);
     }
 
     pub fn current(&self) -> &RenderFrame {
-        &self.frames[self.index]
+        &self.current
     }
 
-    pub fn frames(&self) -> &[RenderFrame] {
-        &self.frames
+    /// The in-game tick of any frame, without materializing it: the timeline
+    /// labels every position on the bar and needs nothing else about them.
+    pub fn tick_at(&self, index: usize) -> Option<u64> {
+        self.ticks.get(index).copied()
+    }
+
+    /// Walks every frame in order, materializing each into a scratch buffer
+    /// that is reused throughout, for the load-time passes that need to see
+    /// the whole run once (camera fit, growing bounds, activity).
+    ///
+    /// A callback rather than an iterator because each frame is a temporary:
+    /// there is no per-frame storage left to hand out a borrow of, which is
+    /// the entire point.
+    pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame)) {
+        let mut scratch = RenderFrame::empty();
+        for index in 0..self.len() {
+            scratch.tick = self.ticks[index];
+            scratch.count = self.counts[index];
+            self.entities.materialize(index, &mut scratch.entities, &mut scratch.entity_runs);
+            self.tiles.materialize(index, &mut scratch.tiles, &mut scratch.tile_runs);
+            self.entity_lod.materialize(index, &mut scratch.entity_lod, &mut scratch.entity_lod_runs);
+            self.tile_lod.materialize(index, &mut scratch.tile_lod, &mut scratch.tile_lod_runs);
+            visit(index, &scratch);
+        }
     }
 
     pub fn index(&self) -> usize {
         self.index
     }
 
+    /// Total spans across all four sets, for measuring what the layout costs.
+    pub fn span_estimate(&self) -> usize {
+        self.entities.span_count()
+            + self.tiles.span_count()
+            + self.entity_lod.span_count()
+            + self.tile_lod.span_count()
+    }
+
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.ticks.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -396,7 +513,11 @@ impl FrameSequence {
 
     /// Clamps at the sequence's ends rather than wrapping.
     pub fn goto(&mut self, index: usize) {
-        self.index = index.min(self.frames.len() - 1);
+        let index = index.min(self.len() - 1);
+        if index != self.index {
+            self.index = index;
+            self.rebuild_current();
+        }
     }
 
     pub fn step_forward(&mut self) {
@@ -406,6 +527,24 @@ impl FrameSequence {
     pub fn step_back(&mut self) {
         self.goto(self.index.saturating_sub(1));
     }
+}
+
+/// Pairs each item with the type of the run it belongs to, which is how the
+/// span builder wants a frame: runs carry the type, items carry the rest.
+fn runs_with_items<'a, T: Copy + 'a>(
+    runs: &'a [Run],
+    items: &'a [T],
+    key: &'a impl Fn(&T) -> u64,
+) -> impl Iterator<Item = (u64, TypeId, T)> + 'a {
+    // `key` is taken by reference so the inner closure can capture a Copy
+    // shared borrow: capturing the closure itself by move would have it
+    // escape the outer `FnMut`, which `flat_map` will not allow.
+    runs.iter()
+        .flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
+}
+
+fn cell_key(cell: &LodCell) -> u64 {
+    ((cell.cx as u32 as u64) << 32) | (cell.cy as u32 as u64)
 }
 
 #[cfg(test)]

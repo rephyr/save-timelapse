@@ -43,6 +43,53 @@ impl Camera {
     /// captured around it. Real bases are almost never near world origin, so
     /// an empty/degenerate input falls back to a sane default rather than
     /// opening on empty space.
+    ///
+    /// The whole-run fit, over a sequence rather than a slice of frames,
+    /// since frames are no longer all resident at once (see `FrameSequence`).
+    /// Every frame is materialized once into a shared scratch buffer as this
+    /// walks, which is why it takes corners as it goes rather than collecting
+    /// them: the frames do not outlive the walk.
+    pub fn fit_sequence(
+        frames: &crate::render_frame::FrameSequence,
+        terrain: Option<&RenderFrame>,
+        screen_width: f32,
+        screen_height: f32,
+    ) -> Camera {
+        let mut bounds: Option<(Vec2, Vec2)> = None;
+        let mut take = |point: Vec2| {
+            bounds = Some(match bounds {
+                Some((min, max)) => (min.min(point), max.max(point)),
+                None => (point, point),
+            });
+        };
+
+        frames.for_each_frame(|_, frame| {
+            for entity in &frame.entities {
+                let half = Vec2::new(entity.w as f32, entity.h as f32) / 2.0;
+                let center = Vec2::new(entity.x, entity.y);
+                take(center - half);
+                take(center + half);
+            }
+            for tile in &frame.tiles {
+                take(Vec2::new(tile.x as f32, tile.y as f32));
+                take(Vec2::new(tile.x as f32 + 1.0, tile.y as f32 + 1.0));
+            }
+        });
+        if let Some(terrain) = terrain {
+            for tile in &terrain.tiles {
+                take(Vec2::new(tile.x as f32, tile.y as f32));
+                take(Vec2::new(tile.x as f32 + 1.0, tile.y as f32 + 1.0));
+            }
+        }
+
+        match bounds {
+            Some((min, max)) => {
+                Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
+            }
+            None => Camera { offset: Vec2::ZERO, zoom: 1.0 },
+        }
+    }
+
     pub fn fit_frames(
         frames: &[RenderFrame],
         terrain: Option<&RenderFrame>,

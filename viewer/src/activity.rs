@@ -13,7 +13,7 @@
 //! positions ever occupied.
 
 use crate::registry::{is_resource, is_terrain_scatter, TypeRegistry};
-use crate::render_frame::RenderFrame;
+use crate::render_frame::FrameSequence;
 
 /// Entity positions are aligned to a tenth of a tile, the same fixed point
 /// `save_timelapse::world::pos_key` keys by on the replay side. Comparing the
@@ -91,7 +91,7 @@ pub struct Activity {
 /// allocation per frame once the two buffers have grown: 1.07s for the same
 /// sequence, which is the sort itself and close enough to the unavoidable
 /// walk to stop optimizing.
-pub fn analyze_activity(frames: &[RenderFrame], registry: &TypeRegistry) -> Activity {
+pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Activity {
     let mut counts = vec![0usize; frames.len()];
     let mut cells: Vec<Vec<HeatCell>> = vec![Vec::new(); frames.len()];
     let mut peak_cell = 0;
@@ -99,7 +99,7 @@ pub fn analyze_activity(frames: &[RenderFrame], registry: &TypeRegistry) -> Acti
     let (mut previous, mut current): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
     let mut built: Vec<u64> = Vec::new();
 
-    for (index, frame) in frames.iter().enumerate() {
+    frames.for_each_frame(|index, frame| {
         current.clear();
         for run in &frame.entity_runs {
             let name = registry.name(run.type_id);
@@ -121,7 +121,7 @@ pub fn analyze_activity(frames: &[RenderFrame], registry: &TypeRegistry) -> Acti
             peak_cell = peak_cell.max(cells[index].iter().map(|c| c.built).max().unwrap_or(0));
         }
         std::mem::swap(&mut previous, &mut current);
-    }
+    });
 
     Activity { counts, cells, peak_cell }
 }
@@ -288,7 +288,7 @@ pub fn activity_heights(activity: &[usize]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_frame::{RenderEntity, Run};
+    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
     /// Builds a frame holding `positions` of one type, which is all this
     /// module looks at.
@@ -310,11 +310,17 @@ mod tests {
         }
     }
 
+    /// Wraps built frames into the sequence the pass now reads, which owns
+    /// them as spans rather than keeping the vec.
+    fn seq(frames: Vec<RenderFrame>) -> FrameSequence {
+        FrameSequence::new(frames).expect("tests always build at least one frame")
+    }
+
     #[test]
     fn the_first_frame_is_never_activity() {
         let mut registry = TypeRegistry::new();
         let frames = vec![frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (1.5, 0.5)])];
-        assert_eq!(analyze_activity(&frames, &registry).counts, vec![0]);
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0]);
     }
 
     #[test]
@@ -325,7 +331,7 @@ mod tests {
             // One carried over, two new.
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (1.5, 0.5), (2.5, 0.5)]),
         ];
-        assert_eq!(analyze_activity(&frames, &registry).counts, vec![0, 2]);
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 2]);
     }
 
     /// Tearing something down is not construction, so a frame that only lost
@@ -337,7 +343,7 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (1.5, 0.5), (2.5, 0.5)]),
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5)]),
         ];
-        assert_eq!(analyze_activity(&frames, &registry).counts, vec![0, 0]);
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 0]);
     }
 
     /// Diffing against the previous frame rather than against everything ever
@@ -350,7 +356,7 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[]),
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5)]),
         ];
-        assert_eq!(analyze_activity(&frames, &registry).counts, vec![0, 0, 1]);
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 0, 1]);
     }
 
     /// The bug this guards: with terrain capture on, a frame that merely
@@ -363,7 +369,7 @@ mod tests {
             frame_of(&mut registry, "tree-01", &[(50.5, 50.5), (51.5, 50.5)]),
             frame_of(&mut registry, "iron-ore", &[(60.5, 60.5), (61.5, 60.5)]),
         ];
-        assert_eq!(analyze_activity(&frames, &registry).counts, vec![0, 0, 0]);
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 0, 0]);
     }
 
     /// Everything built in one 8-tile square collapses to a single cell
@@ -376,7 +382,7 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[]),
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (1.5, 0.5), (7.5, 7.5)]),
         ];
-        let activity = analyze_activity(&frames, &registry);
+        let activity = analyze_activity(&seq(frames), &registry);
         assert_eq!(activity.cells[1], vec![HeatCell { x: 0, y: 0, built: 3 }]);
         assert_eq!(activity.peak_cell, 3);
     }
@@ -391,7 +397,7 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[]),
             frame_of(&mut registry, "transport-belt", &[(-0.5, -0.5), (0.5, 0.5)]),
         ];
-        let cells = &analyze_activity(&frames, &registry).cells[1];
+        let cells = &analyze_activity(&seq(frames), &registry).cells[1];
         assert_eq!(cells.len(), 2, "got {cells:?}");
         assert!(cells.contains(&HeatCell { x: -1, y: -1, built: 1 }));
         assert!(cells.contains(&HeatCell { x: 0, y: 0, built: 1 }));
@@ -404,7 +410,7 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[]),
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (100.5, 0.5)]),
         ];
-        let cells = &analyze_activity(&frames, &registry).cells[1];
+        let cells = &analyze_activity(&seq(frames), &registry).cells[1];
         assert_eq!(cells.len(), 2, "got {cells:?}");
         assert!(cells.iter().all(|c| c.built == 1));
     }
@@ -415,7 +421,7 @@ mod tests {
     fn the_first_frame_contributes_no_heat() {
         let mut registry = TypeRegistry::new();
         let frames = vec![frame_of(&mut registry, "transport-belt", &[(0.5, 0.5), (9.5, 9.5)])];
-        let activity = analyze_activity(&frames, &registry);
+        let activity = analyze_activity(&seq(frames), &registry);
         assert!(activity.cells[0].is_empty());
         assert_eq!(activity.peak_cell, 0);
     }
@@ -543,7 +549,7 @@ mod tests {
         let render: Vec<RenderFrame> =
             frames.into_iter().map(|frame| RenderFrame::from_frame(frame, &mut registry)).collect();
 
-        let activity = analyze_activity(&render, &registry).counts;
+        let activity = analyze_activity(&seq(render), &registry).counts;
         assert_eq!(activity[0], 0, "the first frame is the starting state, not construction");
         assert!(
             activity[1..].iter().any(|&count| count > 0),
@@ -560,7 +566,7 @@ mod tests {
 mod bench {
     use super::*;
     use crate::registry::TypeRegistry;
-    use crate::render_frame::{RenderEntity, Run};
+    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
     /// Where the numbers quoted on `analyze_activity` come from, kept so
     /// they can be re-checked rather than trusted. Prints rather than
@@ -602,11 +608,12 @@ mod bench {
             });
         }
         let total: usize = frames.iter().map(|f| f.entities.len()).sum();
+        let sequence = FrameSequence::new(frames).unwrap();
         let start = std::time::Instant::now();
-        let activity = analyze_activity(&frames, &registry).counts;
+        let activity = analyze_activity(&sequence, &registry).counts;
         let ours = start.elapsed();
         let start = std::time::Instant::now();
-        let bounds = crate::construction::growing_bounds_per_frame(&frames, &registry);
+        let bounds = crate::construction::growing_bounds_per_frame(&sequence, &registry);
         let theirs = start.elapsed();
         println!("BENCH {frames_n} frames, {total} entity-visits");
         println!("BENCH analyze_activity:         {ours:?}");

@@ -990,7 +990,7 @@ const HOVER_TOOLTIP_OFFSET: f32 = PLAYHEAD_LABEL_OFFSET + 10.0;
 /// emitted at (see `replay::run`), so this is the capture's own clock rather
 /// than anything derived from frame numbering.
 fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
-    sequence.frames().get(index).map(|frame| format_game_time(frame.tick)).unwrap_or_default()
+    sequence.tick_at(index).map(format_game_time).unwrap_or_default()
 }
 
 /// The construction heatmap: where building happened over the last
@@ -1248,9 +1248,9 @@ async fn main() {
         .into_iter()
         .map(|(name, sequence, terrain)| {
             let camera =
-                Camera::fit_frames(sequence.frames(), terrain.as_ref(), screen_width(), screen_height());
-            let growing_bounds = growing_bounds_per_frame(sequence.frames(), &registry);
-            let measured = analyze_activity(sequence.frames(), &registry);
+                Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
+            let growing_bounds = growing_bounds_per_frame(&sequence, &registry);
+            let measured = analyze_activity(&sequence, &registry);
             let activity = activity_heights(&measured.counts);
             let (heat, heat_peak) = (measured.cells, measured.peak_cell);
             // On by default: opening straight into the fully-zoomed-out
