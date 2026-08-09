@@ -478,15 +478,13 @@ fn run_live_capture() -> io::Result<PathBuf> {
         );
     }
 
-    // Its own line rather than folded into the message above, since unlike a
-    // plain reload this one is worth naming: it only happens in captures
-    // recorded before the mod rolled over on a same-save reload, and it is
-    // also the shape a hand-deleted script-output would leave behind.
+    // Its own line rather than folded into the message above, since this one
+    // names a different thing: not events dropped, but files that turned out
+    // to hold more than one attempt at the same stretch of play.
     if replay_state.restarted_segments > 0 {
         println!(
-            "{} segment(s) contained more than one attempt at the same stretch of play, from \
-             reloading the same save more than once before this version; only the last attempt \
-             at each was used\n",
+            "{} segment(s) held more than one attempt at the same stretch of play, which is what \
+             reloading a save mid-capture looks like; only the last attempt at each was used\n",
             replay_state.restarted_segments
         );
     }

@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! magic   4 bytes, "STE1", written once when the segment is created
-//! version u8, must equal CURRENT_VERSION, written right after the magic
+//! version u8, 1 or 2; written right after the magic
 //!
 //! then a sequence of tagged records:
 //!   tag 0  DefineName     string                    (id implicit, next in order)
@@ -22,6 +22,7 @@
 //!   tag 4  RemoveEntity   i32 x10, i32 y10, u64 id, u16 surface_id
 //!   tag 5  AddTile        u16 name_id, i32 x, i32 y, u16 surface_id
 //!   tag 6  RemoveTile     i32 x, i32 y, u16 surface_id
+//!   tag 7  ResetDictionaries (no payload, version 2 and later)
 //! ```
 //!
 //! `DefineName`/`DefineSurface` give the next sequential id to a not yet seen
@@ -44,7 +45,7 @@
 //!
 //! Unlike the frame format (see `frame.rs`), a segment has no trailing
 //! checksum: it grows for as long as capture stays on and is simply
-//! abandoned, not closed, when a rollover starts a new one, so there is no
+//! abandoned, not closed, when a reset starts a new one, so there is no
 //! "this segment is finished" moment to checksum against. The version byte
 //! still lets a reader tell "this is a format I don't understand" apart
 //! from a generic parse failure, same as the frame format.
@@ -57,7 +58,12 @@ use std::time::SystemTime;
 use crate::wire::ByteReader;
 
 const MAGIC: &[u8; 4] = b"STE1";
-const CURRENT_VERSION: u8 = 1;
+/// Versions this reader understands. Version 1 predates the
+/// dictionary-reset record (tag 7) and is still accepted, since captures in
+/// that format exist and are readable; they simply carry the mislabeling bug
+/// that record was added to fix, which nothing on this side can undo.
+const CURRENT_VERSION: u8 = 2;
+const MIN_SUPPORTED_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -120,6 +126,21 @@ impl Iterator for EventStream {
                 }
                 2 => {
                     self.current_tick = Some(r.u64()?);
+                }
+                // Tag 7, ResetDictionaries. Written when the mod resumes a
+                // segment across a save load, at which point Factorio has
+                // re-run the mod and emptied the writer's dictionaries while
+                // this file kept every name defined before that point. Ids
+                // after it start from 0 again on both sides.
+                //
+                // Version 1 has no such record, so a version 1 file that was
+                // ever resumed silently mislabels everything logged after the
+                // resume. That cannot be repaired from this side: the record
+                // that would have said where it happened is exactly what is
+                // missing.
+                7 => {
+                    self.names.clear();
+                    self.surfaces.clear();
                 }
                 3 => {
                     let name_id = r.u16()? as usize;
@@ -232,12 +253,12 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
         ));
     }
     match bytes.get(4) {
-        Some(&v) if v == CURRENT_VERSION => {}
+        Some(&v) if (MIN_SUPPORTED_VERSION..=CURRENT_VERSION).contains(&v) => {}
         Some(&v) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{}: unsupported event log version {v} (this build only understands version {CURRENT_VERSION})",
+                    "{}: unsupported event log version {v} (this build understands                      versions {MIN_SUPPORTED_VERSION} through {CURRENT_VERSION})",
                     path.display()
                 ),
             ));
@@ -255,7 +276,7 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
 ///
 /// `end_tick` is what makes reloading an earlier save replayable. The mod
 /// starts a fresh segment whenever play resumes at a tick it has already
-/// recorded past (see `mod/encode.lua`'s `is_capture_rollback`), but it
+/// recorded past, but it
 /// cannot delete or truncate the segment it just abandoned: Factorio's Lua
 /// sandbox offers `write_file` and `remove_path` and nothing finer, and
 /// removing the file outright would also throw away the part of it that is
@@ -345,7 +366,8 @@ pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
 /// A run is a stretch of records whose ticks do not go backwards. A single
 /// segment normally holds exactly one, and every capture the current mod
 /// writes always does, since a rollback now always rolls over to a new file
-/// (`mod/encode.lua`'s `is_capture_rollback`). Captures recorded before that
+/// Reloads land inside a segment rather than starting a new one, since the
+/// mod cannot detect a reload at all (see `mod/encode.lua`). Captures
 /// fix can hold more than one: reloading the same save twice in a row resumed
 /// at exactly the tick the live segment had started at, which the old
 /// rollover check read as "no rollback", so the second attempt was appended
@@ -532,6 +554,73 @@ mod tests {
         assert_eq!(events[0].event, Event::AddEntity {
             name: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(1),
         });
+    }
+
+    /// What a plain quit-and-reload does to a segment that stays open across
+    /// it.
+    ///
+    /// Factorio re-runs `capture.lua`'s top level on every load, which resets
+    /// the writer's name and surface dictionaries to empty, but the segment
+    /// file is appended to rather than restarted. The writer's next new name
+    /// therefore gets id 0 again, while this reader has been assigning ids by
+    /// encounter order and is already past 0. Every record written after the
+    /// reload then names the wrong prototype.
+    ///
+    /// `docs/ARCHITECTURE.md` claims this is harmless on the grounds that a
+    /// name defined twice "just gets two ids that both resolve to the same
+    /// string". That holds only if the writer keeps counting; once it resets,
+    /// the two sides disagree about what id 0 means.
+    #[test]
+    fn a_dictionary_reset_mid_segment_does_not_mislabel_later_records() {
+        let bytes = segment(|w| {
+            // Before the reload.
+            w.u8(1).string("nauvis"); // DefineSurface -> writer id 0
+            w.u8(0).string("iron-chest"); // DefineName -> writer id 0
+            w.u8(2).u64(100); // SetTick
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity id 0
+
+            // Reload. The writer's dictionaries are empty again, so the next
+            // new name and surface are handed id 0 a second time; the reset
+            // record is what tells this reader to start counting from 0 too.
+            w.u8(7); // ResetDictionaries
+            w.u8(1).string("nauvis"); // DefineSurface -> writer id 0 again
+            w.u8(0).string("transport-belt"); // DefineName -> writer id 0 again
+            w.u8(2).u64(200); // SetTick
+            w.u8(3).u16(0).i32(15).i32(5).u8(0).u8(1).u8(1).u64(2).u16(0); // AddEntity id 0
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
+
+        assert_eq!(events.len(), 2);
+        match &events[1].event {
+            Event::AddEntity { name, .. } => assert_eq!(
+                name, "transport-belt",
+                "the post-reload record must decode as what the writer meant"
+            ),
+            other => panic!("expected an add, got {other:?}"),
+        }
+    }
+
+    /// Captures written before the reset record exist and must keep working:
+    /// version 1 is still a supported read, just without the fix.
+    #[test]
+    fn a_version_1_segment_still_reads() {
+        let mut bytes = segment(|w| {
+            w.u8(2).u64(7);
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0);
+        });
+        bytes[4] = 1; // the version byte, right after the 4 byte magic
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].event, Event::AddEntity { name, .. } if name == "pipe"));
     }
 
     #[test]

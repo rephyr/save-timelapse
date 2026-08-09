@@ -60,6 +60,16 @@ local capture_surfaces = encode.new_dictionary()
 --- alongside the dictionaries above.
 local capture_last_written_tick = nil
 
+--- Whether this session has already reconciled its (empty, freshly re-run)
+--- dictionaries with whatever the segment file on disk already contains.
+---
+--- A plain module local specifically because Factorio resets these on every
+--- load, which is exactly the event that needs detecting. Nothing in
+--- `storage` can serve here: `storage` is saved inside the save file, so it
+--- rewinds along with it and can never tell "this save was just loaded" from
+--- "this save has been running a while".
+local capture_dictionaries_synced = false
+
 local excluded_type_set = nil
 --- Same filter as snapshot export, so a captured event never logs something
 --- a snapshot wouldn't have shown (biter deaths, tree fires, and so on).
@@ -140,11 +150,11 @@ end
 --- See baseline_manifest_path above for why a nil session_id (a save whose
 --- capture state predates this feature) falls back to the untagged name
 --- instead of erroring.
-local function capture_segment_path(session_id, start_tick, seq)
+local function capture_segment_path(session_id, start_tick)
   if not session_id then
-    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick, seq)
+    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick)
   end
-  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, seq)
+  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
 end
 
 --- A playthrough's identity, for tagging files written into the shared,
@@ -201,24 +211,11 @@ local function ensure_capture_segment()
       last_tick = game.tick,
       segment_initialized = false,
       session_id = compute_session_id(),
-      segment_seq = 0,
     }
     storage.timelapse_capture = state
-  elseif encode.is_capture_rollback(state.last_tick, game.tick) then
-    -- Bumped on every rollover rather than only when the resumed tick
-    -- collides with the current segment's start: the counter's job is to
-    -- keep segment filenames unique, and one that only sometimes advances
-    -- would have to reason about which past segment it might collide with.
-    -- A save from before this existed has no seq (nil, read as 0 by
-    -- capture_segment_basename), so it keeps writing the name it already
-    -- was until its first rollover after upgrading.
-    state.segment_seq = (state.segment_seq or 0) + 1
-    state.segment_start_tick = game.tick
-    state.last_tick = game.tick
-    state.segment_initialized = false
   end
 
-  capture_path = capture_segment_path(state.session_id, state.segment_start_tick, state.segment_seq)
+  capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()
@@ -226,7 +223,20 @@ local function ensure_capture_segment()
     capture_last_written_tick = nil
     export.safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
+  elseif not capture_dictionaries_synced then
+    -- Resuming a segment this save was already writing before it was loaded.
+    -- The module locals above were reset to empty by Factorio re-running
+    -- this file, while the segment on disk still holds every name defined
+    -- before the load, so the two sides now disagree about what id 0 means.
+    -- The record says so explicitly; see encode.event_reset_dictionaries for
+    -- why this cannot instead be solved by persisting the dictionary or by
+    -- starting a fresh segment.
+    export.safe_write_file(capture_path, encode.event_reset_dictionaries(), true)
   end
+
+  -- Set after both branches, so the very first call of a session takes one
+  -- of them and every later call in the same session takes neither.
+  capture_dictionaries_synced = true
 end
 
 --- Take the baseline once per save, then never again: everything after it is

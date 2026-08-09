@@ -369,12 +369,27 @@ pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<
         replay.world.surface_names().into_iter().map(String::from).collect();
     surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
 
-    // Bounded the same way `run` bounds them, so a surface that exists only
-    // in a timeline the player reloaded away from is not offered as a choice
-    // that would then replay to an empty timelapse.
+    // Bounded exactly the way `run` bounds them, per append run and not just
+    // per segment, so a surface that exists only in a timeline the player
+    // reloaded away from is not offered as a choice that would then replay to
+    // an empty timelapse. Bounding by `segment.end_tick` alone missed that:
+    // reloads land inside a segment rather than starting a new one (see
+    // `event::segment_run_bounds`), so the per-run bound is the one that
+    // actually fires.
     for segment in event::log_segments(session_dir)? {
+        let run_bounds = event::segment_run_bounds(&segment.path, segment.end_tick).unwrap_or_default();
         if let Ok(stream) = event::stream_log(&segment.path) {
-            surfaces.extend(stream.filter(|l| l.tick < segment.end_tick).map(|logged| logged.surface));
+            let mut run = 0usize;
+            let mut previous_tick: Option<u64> = None;
+            for logged in stream {
+                if previous_tick.is_some_and(|p| logged.tick < p) {
+                    run += 1;
+                }
+                previous_tick = Some(logged.tick);
+                if logged.tick < run_bounds.get(run).copied().unwrap_or(segment.end_tick) {
+                    surfaces.insert(logged.surface);
+                }
+            }
         }
     }
 
@@ -412,7 +427,7 @@ where
 
     for segment in event::log_segments(dir)? {
         // A session can legitimately span more than one segment (a save
-        // reload rolls over to a fresh one; see `is_capture_rollback`), and
+        // reset starts a fresh one), and
         // the mod has no way to notice or clean up an orphaned segment left
         // behind by deleting capture files without running
         // `/timelapse-reset-capture` first (its next flush recreates one via
@@ -1106,7 +1121,7 @@ mod tests {
         let _dir = dir;
     }
 
-    /// The scenario `is_capture_rollback` (mod/encode.lua) exists for: the
+    /// The cross-segment half of reload handling: the
     /// player reloads an older save mid playthrough. `ensure_capture_segment`
     /// reacts by starting a fresh segment at the tick play resumed from, but
     /// the OLD segment is simply abandoned on disk (control.lua has no API to

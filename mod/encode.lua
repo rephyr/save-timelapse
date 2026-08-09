@@ -124,7 +124,12 @@ M.EVENT_MAGIC = "STE1"
 --- own schedules: a frame-only tweak has no reason to also bump the event
 --- version, and vice versa.
 M.FRAME_VERSION = 1
-M.EVENT_VERSION = 1
+--- Version 2 adds the dictionary-reset record (tag 7, see
+--- `event_reset_dictionaries`). A version 1 reader hitting that record stops
+--- the stream rather than misreading it, since an unknown tag ends parsing,
+--- so the bump is what turns "silently wrong from the reload onward" into a
+--- refusal an older build can explain.
+M.EVENT_VERSION = 2
 
 --- JSON string quoting, still needed for the manifest files
 --- (baseline.json, frame_<tick>_manifest.json): those stay JSON since
@@ -291,6 +296,29 @@ function M.event_set_tick(tick)
   return M.u8(2) .. M.u64le(tick)
 end
 
+--- Tells a reader to forget every name and surface id defined so far in this
+--- segment, so the ids that follow are read against a fresh dictionary.
+---
+--- Needed because Factorio re-runs the whole mod on every load, which resets
+--- the writer's dictionaries to empty, while the segment file it is appending
+--- to keeps every `DefineName` written before that point. Without this record
+--- the writer hands out id 0 again for its next new name while the reader is
+--- still counting up from the ids already in the file, and every entity and
+--- tile logged after the reload decodes as whichever name happened to be
+--- defined first. That was silent: nothing about the file looks damaged, the
+--- names are simply wrong.
+---
+--- Cheaper than the alternatives. Persisting the dictionary in `storage` does
+--- not work, since `storage` is saved inside the save file and so rewinds
+--- with it, leaving it describing fewer names than the file already has.
+--- Starting a fresh segment per load does not work either, for the same
+--- reason: every counter available to name that segment lives in `storage`,
+--- so loading one save twice would reuse a filename and overwrite the
+--- sibling branch's history.
+function M.event_reset_dictionaries()
+  return M.u8(7)
+end
+
 --- `id` of nil or 0 means the add carries no unit_number (some entity kinds
 --- have none); `w`/`h` default to 1 and `direction` to 0, the same as the
 --- frame format.
@@ -337,27 +365,26 @@ function M.event_remove_tile(surfaces, surface, x, y)
   return define_surface .. M.u8(6) .. M.i32le(x) .. M.i32le(y) .. M.u16le(surface_id)
 end
 
---- Given the tick already recorded up to and the tick play resumed at,
---- whether this is a reload of an older save, something an append-only log
---- can't represent as one timeline. Pure: plain values in and out, no
---- Factorio state, so the decision is testable without a save/load cycle to
---- actually trigger.
----
---- Answers only "did we go back in time," deliberately not "what tick should
---- the next segment start at." Those look like the same question and are
---- not: the caller already knows the answer to the second one (`game.tick`,
---- where play resumed), and an earlier version of this returned that tick
---- and left the caller to notice a rollback by comparing it against the
---- current segment's start. Reloading the *same save twice in a row*, which
---- is what retrying something looks like, resumes at exactly the tick the
---- current segment started at, so that comparison found them equal and
---- reported no rollback, and the second attempt was appended into the first
---- attempt's file with no boundary between them. Nothing reading that file
---- back can separate two attempts sharing one tick range, so the rollback
---- has to be detected here rather than inferred from the tick downstream.
-function M.is_capture_rollback(last_tick, resumed_tick)
-  return resumed_tick < last_tick
-end
+-- Detecting a reload from inside the mod is deliberately not attempted.
+--
+-- Every version of this file has had some form of "compare the tick play
+-- resumed at against the last tick we recorded, and start a fresh segment if
+-- it went backwards". That check can never fire. Both values come out of the
+-- save being loaded: the recorded tick lives in `storage`, which Factorio
+-- serializes into the save file, so a save made at tick T restores a recorded
+-- tick no greater than T while `game.tick` is exactly T. The comparison is
+-- always false, and the rollover it guarded never happened.
+--
+-- Nothing else in the Lua sandbox helps, since anything durable enough to
+-- survive a load is also inside the save and rewinds with it.
+--
+-- So reloads are not handled here at all. They are handled where the evidence
+-- actually exists, on the reading side: ticks that jump backwards inside one
+-- segment mark where a reload happened, and `event::segment_run_bounds`
+-- (src/event.rs) splits the segment there and discards the superseded
+-- stretch. The one thing this side must still do is announce that its name
+-- dictionaries were reset by the load, which `event_reset_dictionaries`
+-- below covers.
 
 -- Checksums
 --
@@ -374,7 +401,7 @@ end
 -- stays on has no "finished" moment to checksum against.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- is_capture_rollback above.
+--- event_reset_dictionaries above.
 function M.checksum_init()
   return 5381
 end
@@ -405,7 +432,7 @@ end
 -- each folder only ever contains one playthrough's files to begin with.
 
 --- Pure: plain values in and out, so these are testable the same way as
---- is_capture_rollback above, with no save/load cycle to trigger them.
+--- event_reset_dictionaries above, with no save/load cycle to trigger them.
 function M.session_dir(session_id)
   return string.format("%08x/", session_id)
 end
@@ -414,28 +441,15 @@ function M.baseline_manifest_name(session_id)
   return M.session_dir(session_id) .. "baseline.json"
 end
 
---- `seq` counts how many times this playthrough has rolled over to a fresh
---- segment, so two segments starting at the same tick (reloading the same
---- save twice; see `is_capture_rollback`) get different filenames instead of
---- the second attempt appending into the first attempt's file.
----
---- Left out of the name entirely at 0, which keeps every capture that never
---- reloaded on exactly the name it already used, and keeps a save upgraded
---- mid playthrough (whose stored state has no seq yet, so it reads as 0)
---- appending to the segment it was already writing rather than orphaning it
---- and starting a header-less one alongside.
-function M.capture_segment_name(session_id, start_tick, seq)
-  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick, seq)
+function M.capture_segment_name(session_id, start_tick)
+  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick)
 end
 
 --- Split out from `capture_segment_name` so a save with no session_id (one
 --- whose capture state predates session folders) can build the same name
 --- without one. See capture.lua's `capture_segment_path`.
-function M.capture_segment_basename(start_tick, seq)
-  if not seq or seq == 0 then
-    return string.format("events_%d.stev", start_tick)
-  end
-  return string.format("events_%d_%d.stev", start_tick, seq)
+function M.capture_segment_basename(start_tick)
+  return string.format("events_%d.stev", start_tick)
 end
 
 function M.player_log_name(session_id)
