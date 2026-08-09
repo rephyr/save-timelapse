@@ -11,6 +11,7 @@ use std::time::Instant;
 use macroquad::prelude::*;
 use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
+use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
     activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size,
     entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect,
@@ -59,14 +60,14 @@ const BATCH_QUAD_CAPACITY: usize = 4096;
 const BATCH_VERTEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 4;
 const BATCH_INDEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 6;
 
-/// How often loading pauses to draw the progress bar. Yielding per item would
-/// pace loading to the display's refresh rate; this keeps the bar responsive
-/// while leaving loading effectively at full speed.
 /// Frame files parsed at once before being folded into spans and dropped.
 /// Bounds peak load memory at roughly this many frames, while still being
 /// wide enough to keep every core busy parsing (see `load_batch`).
 const LOAD_BATCH_FRAMES: usize = 16;
 
+/// How often loading pauses to draw the progress bar. Yielding per item would
+/// pace loading to the display's refresh rate; this keeps the bar responsive
+/// while leaving loading effectively at full speed.
 const PROGRESS_REDRAW: std::time::Duration = std::time::Duration::from_millis(33);
 
 fn window_conf() -> macroquad::conf::Conf {
@@ -203,9 +204,9 @@ fn draw_loading(progress: &LoadProgress) {
     } else {
         progress.phase.to_string()
     };
-    draw_text(&headline, bar.left, bar.top - 14.0, 24.0, WHITE);
+    draw_text_legible(&headline, bar.left, bar.top - 14.0, 24.0, WHITE);
     if !progress.detail.is_empty() {
-        draw_text(&progress.detail, bar.left, bar.top + bar.height + 26.0, 18.0, Color::new(1.0, 1.0, 1.0, 0.6));
+        draw_text_legible(&progress.detail, bar.left, bar.top + bar.height + 26.0, 18.0, Color::new(1.0, 1.0, 1.0, 0.85));
     }
 }
 
@@ -874,8 +875,12 @@ fn draw_hud(
     let terrain_suffix =
         if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
     let total_items = frame.entities.len() + frame.tiles.len() + terrain_tiles;
-    draw_text(
-        format!(
+    // Each line reports the height it used, so the next one stacks under it
+    // wherever it ended up: a line that had to wrap pushes the rest down
+    // rather than being drawn over.
+    let mut hud_y = 20.0;
+    hud_y += draw_hud_line(
+        &format!(
             "[{} {}/{}]  frame {}/{}  |  {} entities  |  {} tiles{terrain_suffix}  |  zoom {:.2}x  |  follow {}  |  {} fps  |  {:.1} ms",
             world_name,
             current + 1,
@@ -889,11 +894,11 @@ fn draw_hud(
             get_fps(),
             get_frame_time() * 1000.0,
         ),
-        10.0,
-        20.0,
-        20.0,
+        hud_y,
+        HUD_TEXT_SIZE,
         WHITE,
     );
+
     // The profiling readout: draw calls against quads actually submitted,
     // and how much culling threw away. Counts this viewer's own geometry
     // only; macroquad's text rendering adds a few calls of its own.
@@ -918,27 +923,113 @@ fn draw_hud(
             if use_sprites { "on" } else { "off" },
         )
     };
-    draw_text(
-        format!("{} draw calls  |  {detail_text}", counter.calls),
-        10.0,
-        42.0,
-        20.0,
-        Color::new(0.6, 0.9, 1.0, 1.0),
+    hud_y += draw_hud_line(
+        &format!("{} draw calls  |  {detail_text}", counter.calls),
+        hud_y + 2.0,
+        HUD_TEXT_SIZE,
+        Color::new(0.65, 0.92, 1.0, 1.0),
     );
+
     let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
-    draw_text(
-        format!(
+    draw_hud_line(
+        &format!(
             "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({}x)  |  s toggles sprites, l toggles LOD  |  h build heatmap ({})  |  f auto-follows the growing base ({})  |  drag the bar below to scrub{tab_hint}",
             if state.playing { "pause" } else { "play" },
             state.play_speed,
             if state.heatmap_enabled { "on" } else { "off" },
             if follow_enabled { "on" } else { "off" },
         ),
-        10.0,
-        64.0,
-        20.0,
+        hud_y + 4.0,
+        HUD_TEXT_SIZE,
         WHITE,
     );
+}
+
+/// Draws text with a dark backing so it stays legible over whatever the world
+/// happens to be behind it.
+///
+/// The HUD and the timeline's labels are painted straight onto the rendered
+/// world, which is dark ground in one place and a bright concrete pad or a
+/// white space platform in the next, so a single text colour cannot be
+/// readable everywhere. Raising the alpha alone does not fix it: the problem
+/// is that light thin glyphs have no edge against a light background.
+///
+/// A one pixel offset shadow in near black gives every glyph that edge, which
+/// costs a second `draw_text` per label and nothing else. Cardinal offsets
+/// rather than a full outline: at these sizes the difference is invisible and
+/// this is half the draw calls.
+fn draw_text_legible(text: &str, x: f32, y: f32, size: f32, color: Color) {
+    let shadow = Color::new(0.0, 0.0, 0.0, 0.85);
+    draw_text(text, x + 1.0, y + 1.0, size, shadow);
+    draw_text(text, x - 1.0, y + 1.0, size, shadow);
+    draw_text(text, x, y, size, color);
+}
+
+/// Smallest the HUD is allowed to shrink to before it starts wrapping
+/// instead.
+///
+/// Deliberately close to the full size, so shrinking only ever absorbs a
+/// small overflow and anything worse wraps. Set low, a 1920 wide window
+/// squeezed the controls line down to 15px to keep it on one line, which is
+/// the wrong trade: two lines at a readable size beat one line nobody can
+/// read, and the whole reason this exists is that the HUD was hard to read.
+const HUD_MIN_TEXT_SIZE: f32 = 16.0;
+
+/// Left margin the HUD is drawn at, and the gap left on the right so text
+/// never runs to the window edge.
+const HUD_MARGIN: f32 = 10.0;
+
+/// Draws one HUD line so it actually fits the window, and returns the height
+/// it used so the caller can stack the next one under it.
+///
+/// The HUD lines are long, and their length is not a design choice: they name
+/// every key binding and every live statistic. At 1920 wide they fit at full
+/// size; on a smaller or scaled display they used to run straight off the
+/// right edge, taking the last few readouts with them.
+///
+/// So the size is chosen from the window rather than fixed. Shrinking is
+/// tried first, down to `HUD_MIN_TEXT_SIZE`, since one line at 15px reads
+/// better than two at 21px. Past that it wraps, splitting on the `|` the HUD
+/// already separates its fields with, so a break never lands mid-phrase.
+fn draw_hud_line(text: &str, y: f32, size: f32, color: Color) -> f32 {
+    let available = (screen_width() - HUD_MARGIN * 2.0).max(1.0);
+    let width_at = |s: f32| measure_text(text, None, s as u16, 1.0).width;
+
+    let full = width_at(size);
+    if full <= available {
+        draw_text_legible(text, HUD_MARGIN, y, size, color);
+        return size + 2.0;
+    }
+
+    // Shrink, but never below the floor.
+    let fitted = (size * available / full).max(HUD_MIN_TEXT_SIZE);
+    if width_at(fitted) <= available {
+        draw_text_legible(text, HUD_MARGIN, y, fitted, color);
+        return fitted + 2.0;
+    }
+
+    // Still too wide at the floor: wrap on the field separator.
+    let mut used = 0.0;
+    let mut line = String::new();
+    let flush = |line: &mut String, used: &mut f32| {
+        if !line.is_empty() {
+            draw_text_legible(line, HUD_MARGIN, y + *used, HUD_MIN_TEXT_SIZE, color);
+            *used += HUD_MIN_TEXT_SIZE + 2.0;
+            line.clear();
+        }
+    };
+    for field in text.split('|') {
+        let field = field.trim();
+        let candidate = if line.is_empty() { field.to_string() } else { format!("{line}  |  {field}") };
+        if measure_text(&candidate, None, HUD_MIN_TEXT_SIZE as u16, 1.0).width > available && !line.is_empty() {
+            flush(&mut line, &mut used);
+            line.push_str(field);
+        } else {
+            line = candidate;
+        }
+    }
+    flush(&mut line, &mut used);
+    used
 }
 
 /// Text size for the bar's own labels, a step below the HUD's 20.0: these
@@ -1054,6 +1145,7 @@ fn draw_timeline_bar(
     timeline: &Timeline,
     sequence: &FrameSequence,
     activity: &[f32],
+    milestones: &[Milestone],
     mouse: Vec2,
     scrubbing: bool,
 ) {
@@ -1075,7 +1167,12 @@ fn draw_timeline_bar(
     draw_timeline_endpoint_labels(timeline, sequence);
     draw_timeline_playhead_label(timeline, sequence, playhead_x);
 
-    if timeline.contains(mouse) || scrubbing {
+    // A hovered marker replaces the frame readout rather than stacking with
+    // it: both want the same slot above the bar, and pointing at a milestone
+    // is a request to read the milestone. The label carries the time anyway,
+    // which is most of what the frame readout would have said.
+    let on_milestone = draw_milestone_markers(timeline, sequence, milestones, mouse);
+    if !on_milestone && (timeline.contains(mouse) || scrubbing) {
         draw_timeline_hover(timeline, sequence, mouse);
     }
 }
@@ -1126,21 +1223,164 @@ fn draw_activity_graph(timeline: &Timeline, sequence: &FrameSequence, activity: 
     }
 }
 
+/// How close the cursor has to get to a milestone marker, in pixels, before
+/// its label appears. Generous relative to the marker, which is only a few
+/// pixels wide: the label is the point of the marker, and hunting for a
+/// pixel-perfect hover on a bar you are also dragging is miserable.
+/// HUD text size. Nudged up from 20: the readouts sit over the rendered
+/// world at whatever brightness it happens to be, and a slightly larger glyph
+/// carries the shadow in `draw_text_legible` better than a thin one does.
+const HUD_TEXT_SIZE: f32 = 21.0;
+
+const MILESTONE_HOVER_SLOP: f32 = 9.0;
+
+/// Marker geometry, in pixels below the track. Sized against
+/// `draw_timeline_endpoint_labels`, whose text starts 12px above its +22
+/// baseline: the diamond has to clear +10 or it collides with the end times.
+const MILESTONE_MARKER_Y: f32 = 6.0;
+const MILESTONE_MARKER_RADIUS: f32 = 3.0;
+
+/// The color a milestone reads as, by kind.
+///
+/// Science borrows Factorio's own pack colors, since that association is
+/// already in a player's head from the lab and the tech tree, and a row of
+/// them along the bar then reads as progress through the game rather than as
+/// a row of identical pins.
+fn milestone_color(milestone: &Milestone) -> Color {
+    let rgb = |r: u8, g: u8, b: u8| Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+    match &milestone.kind {
+        Kind::Science => match milestone.id.as_str() {
+            "automation-science-pack" => rgb(220, 60, 50),
+            "logistic-science-pack" => rgb(90, 200, 80),
+            "military-science-pack" => rgb(120, 130, 140),
+            "chemical-science-pack" => rgb(80, 170, 230),
+            "production-science-pack" => rgb(190, 90, 220),
+            "utility-science-pack" => rgb(230, 200, 70),
+            "space-science-pack" => rgb(235, 235, 235),
+            "metallurgic-science-pack" => rgb(220, 120, 50),
+            "electromagnetic-science-pack" => rgb(70, 110, 220),
+            "agricultural-science-pack" => rgb(140, 200, 60),
+            "cryogenic-science-pack" => rgb(120, 220, 220),
+            "promethium-science-pack" => rgb(200, 60, 140),
+            // A modded pack this build has never heard of still gets a
+            // stable color of its own, rather than defaulting into one of
+            // the vanilla ones and reading as the wrong pack.
+            other => color_for(other, 0.65, 0.9),
+        },
+        Kind::Rocket => rgb(255, 255, 255),
+        Kind::Planet => rgb(255, 165, 60),
+        Kind::Other(_) => rgb(180, 180, 180),
+    }
+}
+
+/// Milestone markers: a small diamond under the bar at each notable moment,
+/// with its label on hover.
+///
+/// Placed by frame index rather than by interpolating the tick across the
+/// bar, so a marker sits exactly where clicking would take you. The bar snaps
+/// to whole frames, so a tick-interpolated marker would sit slightly off from
+/// the frame it names, which is worst precisely when frames are sparse.
+///
+/// Below the bar rather than above it: the activity graph, playhead label and
+/// hover tooltip already stack upward, and markers want to be near the track
+/// they annotate rather than on the far side of a graph.
+fn draw_milestone_markers(
+    timeline: &Timeline,
+    sequence: &FrameSequence,
+    milestones: &[Milestone],
+    mouse: Vec2,
+) -> bool {
+    // A sequence is never empty (see `FrameSequence`), so only the milestone
+    // list needs guarding.
+    if milestones.is_empty() {
+        return false;
+    }
+
+    // Tucked into the gap between the track and the endpoint time labels
+    // below it. The band is only a few pixels tall, so the diamond is sized
+    // to fit rather than the other way round: at its first size a marker
+    // landing near either end of the bar overlapped "0m" or the end time.
+    let marker_y = timeline.y + MILESTONE_MARKER_Y;
+    let mut hovered: Option<(&Milestone, f32)> = None;
+
+    for milestone in milestones {
+        let index = frame_index_for_tick(sequence, milestone.tick);
+        let x = timeline.x_for_index(index, sequence.len());
+        let color = milestone_color(milestone);
+
+        // A diamond, drawn as two triangles: distinct at a glance from the
+        // bar's own square frame ticks and from the round playhead.
+        let r = MILESTONE_MARKER_RADIUS;
+        draw_triangle(vec2(x, marker_y - r), vec2(x - r, marker_y), vec2(x + r, marker_y), color);
+        draw_triangle(vec2(x, marker_y + r), vec2(x - r, marker_y), vec2(x + r, marker_y), color);
+
+        if (mouse.x - x).abs() <= MILESTONE_HOVER_SLOP && (mouse.y - marker_y).abs() <= MILESTONE_HOVER_SLOP {
+            // Nearest wins, so overlapping markers resolve to one label
+            // rather than painting several on top of each other.
+            let distance = (mouse.x - x).abs();
+            if hovered.is_none_or(|(_, best)| distance < best) {
+                hovered = Some((milestone, distance));
+            }
+        }
+    }
+
+    let Some((milestone, _)) = hovered else { return false };
+
+    let index = frame_index_for_tick(sequence, milestone.tick);
+    let x = timeline.x_for_index(index, sequence.len());
+    let label = format!("{}  ({})", milestone.label(), format_game_time(milestone.tick));
+    let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+
+    // Above the bar, in the frame readout's slot. Below the marker would be
+    // the obvious place, but the bar sits close to the window's bottom edge
+    // and there is not room for a box down there: it clipped straight off
+    // the screen.
+    let padding = 6.0;
+    let box_width = width + padding * 2.0;
+    let box_height = TIMELINE_LABEL_SIZE + padding * 2.0;
+    let box_left = Timeline::tooltip_left(x, box_width, screen_width());
+    let box_top = timeline.y - HOVER_TOOLTIP_OFFSET - box_height;
+
+    draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.9));
+    draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, milestone_color(milestone));
+    draw_text_legible(&label, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE - 3.0, TIMELINE_LABEL_SIZE, WHITE);
+
+    // A line from the box down to the marker it belongs to, since the two
+    // are now on opposite sides of the bar.
+    draw_line(x, box_top + box_height, x, marker_y - 5.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.25));
+    true
+}
+
+/// The frame a tick belongs to: the last one at or before it, so a milestone
+/// lands on the frame that was showing when it happened rather than the one
+/// after. Clamped to the ends, since a capture can start after or stop before
+/// a milestone the log still records.
+fn frame_index_for_tick(sequence: &FrameSequence, tick: u64) -> usize {
+    let mut index = 0;
+    for i in 0..sequence.len() {
+        match sequence.tick_at(i) {
+            Some(t) if t <= tick => index = i,
+            _ => break,
+        }
+    }
+    index
+}
+
 /// Where the capture starts and ends, anchored under the bar's two ends.
 /// These bound everything else on the bar: without them the playhead's time
 /// is a number with nothing to be a fraction of.
 fn draw_timeline_endpoint_labels(timeline: &Timeline, sequence: &FrameSequence) {
-    let dim = Color::new(1.0, 1.0, 1.0, 0.55);
-    let baseline = timeline.y + 22.0;
+    let dim = Color::new(1.0, 1.0, 1.0, 0.9);
+    let baseline = timeline.y + 24.0;
 
     let start = frame_time_label(sequence, 0);
-    draw_text(&start, timeline.left, baseline, TIMELINE_LABEL_SIZE, dim);
+    draw_text_legible(&start, timeline.left, baseline, TIMELINE_LABEL_SIZE, dim);
 
     // Right-aligned so it ends flush with the bar rather than starting at
     // it and overhanging into the window edge as the label grows.
     let end = frame_time_label(sequence, sequence.len().saturating_sub(1));
     let end_width = measure_text(&end, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
-    draw_text(&end, timeline.left + timeline.width - end_width, baseline, TIMELINE_LABEL_SIZE, dim);
+    draw_text_legible(&end, timeline.left + timeline.width - end_width, baseline, TIMELINE_LABEL_SIZE, dim);
 }
 
 /// The current frame's time, centered over the playhead and clamped the same
@@ -1150,7 +1390,7 @@ fn draw_timeline_playhead_label(timeline: &Timeline, sequence: &FrameSequence, p
     let label = format_game_time(sequence.current().tick);
     let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
     let left = Timeline::tooltip_left(playhead_x, width, screen_width());
-    draw_text(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
+    draw_text_legible(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
 }
 
 /// A guide line at the hovered position plus a boxed readout of the time and
@@ -1179,15 +1419,15 @@ fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec
     let box_left = Timeline::tooltip_left(hover_x, box_width, screen_width());
     let box_top = timeline.y - HOVER_TOOLTIP_OFFSET - box_height;
 
-    draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.8));
-    draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, Color::new(1.0, 1.0, 1.0, 0.35));
-    draw_text(&time, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE, TIMELINE_LABEL_SIZE, WHITE);
-    draw_text(
+    draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.9));
+    draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, Color::new(1.0, 1.0, 1.0, 0.5));
+    draw_text_legible(&time, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE, TIMELINE_LABEL_SIZE, WHITE);
+    draw_text_legible(
         &counter,
         box_left + padding,
         box_top + padding + TIMELINE_LABEL_SIZE * 2.0 + 4.0,
         TIMELINE_LABEL_SIZE,
-        Color::new(1.0, 1.0, 1.0, 0.6),
+        Color::new(1.0, 1.0, 1.0, 0.85),
     );
 }
 
@@ -1200,7 +1440,7 @@ fn draw_player_markers(player_track: &PlayerTrack, world_name: &str, tick: u64, 
         let color = color_for(name, 0.7, 0.95);
         draw_circle(screen.x, screen.y, 9.0, Color::new(0.0, 0.0, 0.0, 0.6));
         draw_circle(screen.x, screen.y, 6.0, color);
-        draw_text(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
+        draw_text_legible(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
     }
 }
 
@@ -1222,6 +1462,19 @@ async fn main() {
         .and_then(|p| save_timelapse::player_log::read_jsonl(&p).ok())
         .unwrap_or_default();
     let player_track = PlayerTrack::new(players);
+
+    // Alongside the frames, same as the player log: milestones belong to a
+    // live capture, so a from-saves timelapse simply has no file and gets an
+    // empty list rather than an error.
+    let milestones = args
+        .path
+        .as_deref()
+        .map(|p| std::path::Path::new(p).join("milestones.jsonl"))
+        .and_then(|p| save_timelapse::milestone::read(&p).ok())
+        .unwrap_or_default();
+    if !milestones.is_empty() {
+        println!("{} milestone(s) loaded", milestones.len());
+    }
 
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
@@ -1346,7 +1599,14 @@ async fn main() {
             use_sprites,
             &counter,
         );
-        draw_timeline_bar(&timeline, sequence, activity, mouse_position().into(), state.dragging_timeline);
+        draw_timeline_bar(
+            &timeline,
+            sequence,
+            activity,
+            &milestones,
+            mouse_position().into(),
+            state.dragging_timeline,
+        );
         draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
 
         next_frame().await;

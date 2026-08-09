@@ -6,6 +6,7 @@
 
 local encode = require("encode")
 local export = require("export")
+local milestones = require("milestones")
 
 local M = {}
 
@@ -407,6 +408,9 @@ function M.reset_capture(player)
 
   storage.timelapse_capture = nil
   capture_checked_rollover = false
+  -- The milestone file goes with the session folder, so the record of which
+  -- milestones already fired has to go too, or none would ever be rewritten.
+  milestones.reset()
 
   if settings.global["save-timelapse-live-capture"].value then
     if player then
@@ -545,6 +549,7 @@ function M.periodic_flush(tick)
   capture_checked_rollover = true
   flush_capture()
   export.sample_connected_players(tick, storage.timelapse_capture.session_id)
+  milestones.poll(tick, storage.timelapse_capture.session_id)
 end
 
 --- Run when the save-timelapse-live-capture setting is turned on: baselines

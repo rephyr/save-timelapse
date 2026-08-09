@@ -552,6 +552,10 @@ function M.capture_segment_basename(start_tick)
   return string.format("events_%d.stev", start_tick)
 end
 
+function M.milestone_name(session_id)
+  return M.session_dir(session_id) .. "milestones.jsonl"
+end
+
 function M.player_log_name(session_id)
   return M.session_dir(session_id) .. "players.jsonl"
 end
@@ -567,6 +571,37 @@ function M.frame_name(session_id, tick, surface)
     return name
   end
   return M.session_dir(session_id) .. name
+end
+
+-- Milestones
+--
+-- Notable moments worth marking on the timeline: the first of each science
+-- pack, the first rocket, the first visit to each planet. Plain
+-- newline-delimited JSON for the same reason the player log below is: a
+-- whole playthrough produces on the order of a dozen of these, nowhere near
+-- the volume that justified a binary format for frames and events, and a
+-- format that can be read by eye is worth more here than the few hundred
+-- bytes packing it would save.
+
+--- One milestone: `{"tick":T,"kind":K,"id":I}`.
+---
+--- `kind` says what sort of thing happened ("science", "rocket", "planet")
+--- and `id` which one, rather than a prebaked sentence, so the viewer decides
+--- the wording and can filter by kind without parsing prose.
+function M.milestone_line(tick, kind, id)
+  return string.format('{"tick":%d,"kind":%s,"id":%s}\n', tick, M.quote(kind), M.quote(id))
+end
+
+--- Whether `name` is a science pack, by suffix rather than by a fixed list,
+--- so a modded pack is picked up for free.
+---
+--- Only ever asked about names that came out of *item* production
+--- statistics, which is what makes the suffix safe: the two other
+--- science-pack-ish prototype names in the game, the `science-pack` item
+--- subgroup and the `signal-science-pack` virtual signal, are not items and
+--- so can never appear there.
+function M.is_science_pack(name)
+  return name:sub(-13) == "-science-pack"
 end
 
 -- Player position log

@@ -404,14 +404,7 @@ fn run_live_capture() -> io::Result<PathBuf> {
         Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
     }
 
-    // A straight copy, not a re-parse: the mod's raw log and what the
-    // viewer reads are the exact same shape by design (see
-    // src/player_log.rs), so there's nothing to convert. Absent entirely
-    // is normal, not an error, e.g. nobody was connected during capture.
-    let players_log = chosen.session_dir.join("players.jsonl");
-    if players_log.exists() {
-        std::fs::copy(&players_log, out.join("players.jsonl"))?;
-    }
+    copy_session_sidecars(&chosen.session_dir, &out)?;
 
     let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
     let mut written = 0usize;
@@ -638,6 +631,28 @@ fn run() -> io::Result<PathBuf> {
 /// and nothing else. Waiting for Enter is what actually gives a double-click
 /// user, who never typed a command to begin with, a chance to read what went
 /// wrong.
+/// Copies the plain-JSON sidecar logs a live capture writes alongside its
+/// frames into the rendered output, so the viewer finds them next to the
+/// frames it is pointed at.
+///
+/// A straight copy, not a re-parse: the mod's raw logs and what the viewer
+/// reads are the exact same shape by design (see `player_log.rs` and
+/// `milestone.rs`), so there is nothing to convert. Each one being absent is
+/// normal rather than an error: nobody was connected during the capture, or
+/// nothing milestone-worthy happened yet, or the capture predates the file
+/// existing at all.
+fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
+    let mut copied = Vec::new();
+    for name in ["players.jsonl", "milestones.jsonl"] {
+        let source = session_dir.join(name);
+        if source.exists() {
+            std::fs::copy(&source, out.join(name))?;
+            copied.push(name);
+        }
+    }
+    Ok(copied)
+}
+
 fn wait_for_enter() {
     print!("\nPress Enter to close this window...");
     io::stdout().flush().ok();
@@ -682,6 +697,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both sidecars a live capture writes have to land next to the frames,
+    /// or the viewer never sees them: it looks for them beside the frames it
+    /// was pointed at, not in the capture folder they came from.
+    #[test]
+    fn both_session_sidecars_are_copied_next_to_the_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, out) = (dir.path().join("session"), dir.path().join("out"));
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(session.join("players.jsonl"), "{\"tick\":1,\"players\":[]}
+").unwrap();
+        std::fs::write(
+            session.join("milestones.jsonl"),
+            "{\"tick\":9,\"kind\":\"rocket\",\"id\":\"rocket-launched\"}
+",
+        )
+        .unwrap();
+
+        let copied = copy_session_sidecars(&session, &out).unwrap();
+        assert_eq!(copied, ["players.jsonl", "milestones.jsonl"]);
+
+        // Copied verbatim, not re-encoded: the mod's shape and the reader's
+        // are the same by design, so the reader must accept it unchanged.
+        let milestones = save_timelapse::milestone::read(&out.join("milestones.jsonl")).unwrap();
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].label(), "First rocket launched");
+    }
+
+    /// Every combination of the two being absent is ordinary, not an error:
+    /// nobody connected, or nothing notable happened yet, or the capture
+    /// predates either file existing.
+    #[test]
+    fn missing_sidecars_are_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, out) = (dir.path().join("session"), dir.path().join("out"));
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+
+        assert!(copy_session_sidecars(&session, &out).unwrap().is_empty());
+
+        std::fs::write(session.join("milestones.jsonl"), "").unwrap();
+        assert_eq!(copy_session_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
+    }
 
     #[test]
     fn parse_yes_no_accepts_short_and_long_forms_case_insensitively() {

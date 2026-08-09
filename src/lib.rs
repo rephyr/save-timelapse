@@ -5,6 +5,7 @@ pub mod event;
 pub mod export;
 pub mod frame;
 pub mod locate;
+pub mod milestone;
 pub mod names;
 pub mod player_log;
 pub mod replay;
