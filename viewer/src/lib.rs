@@ -16,6 +16,7 @@ mod player_track;
 mod progress;
 mod registry;
 mod render_frame;
+mod spans;
 mod sprites;
 mod timecode;
 
@@ -37,5 +38,6 @@ pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, LOD_CELL_TILES,
     LOD_MAX_TILE_PIXELS,
 };
+pub use spans::{Span, SpanBuilder, SpanSet};
 pub use sprites::{icon_candidates, icon_path, icon_source_rect};
 pub use timecode::{format_game_time, TICKS_PER_SECOND};
