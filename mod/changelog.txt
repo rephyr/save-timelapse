@@ -1,4 +1,18 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.6.0
+Date: 2026-08-11
+  Features:
+    - Save a timelapse as a video file you can share. Nothing to install: no FFmpeg, no command line tools, no separate encoder. Pick a resolution and a frame rate and the finished video lands in a videos folder next to the program
+    - Export a numbered image per frame instead, at any resolution, for editing the result yourself. Both are independent of the window size, so a 1080p export comes out of a small window unchanged
+  Bugfixes:
+    - The camera framed the outermost thing you had built rather than your factory. A wall on the far perimeter or a signal at the end of a rail line to an outpost decided the shot, leaving the factory small and off centre in a mostly empty frame. It now aims at where the buildings actually are
+    - Biter nests no longer drag the camera. They are generated across every explored chunk, so counting them as construction stretched the view across the whole revealed map. They are still recorded and still drawn in red, they just no longer decide where to look
+  Changes:
+    - Videos are rendered at full detail rather than the simplified drawing used while browsing, and oversampled before being written. The viewer simplifies to hold a frame rate; an export has no frame rate to hold, so it does not have to. On a large factory this is the difference between belts being visible and a paved area reading as a grey block
+    - Nothing that moves is recorded any more, not just biters and robots. Gleba's pentapods and Vulcanus's demolishers were being captured because Space Age gave its enemies new prototype types that the old filter did not cover, and cars, tanks, Spidertron and trains had never been excluded at all. Every one of them was pinned wherever it happened to be while the real one carried on. Rails, signals, stations and roboports stay, being the stationary infrastructure that shows a network growing
+    - Terrain capture is measured from what you built. It was measured from everything exported, which included trees and nests scattered across every generated chunk, so a margin around your factory was really a margin around the whole explored map. That is where most of terrain capture's cost came from
+    - Captures made with 0.5 keep working and need no reset. Nothing about the capture format changed in this release
+---------------------------------------------------------------------------------------------------
 Version: 0.5.1
 Date: 2026-08-10
   Bugfixes:
