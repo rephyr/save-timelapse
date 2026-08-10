@@ -264,7 +264,6 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
 - [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
 - [x] Bookmarks and jumping between milestones and busy stretches
-- [ ] Single binary, so the tool and viewer cannot be separated
 - [ ] Linux and macOS builds
 
 ### v1.0
@@ -275,6 +274,7 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [ ] Export resolution and FPS controls
 - [ ] MP4 video export
 - [ ] Polished export workflow
+- [ ] Single binary, so the tool and viewer cannot be separated
 - [ ] Stable capture format and format migration
 
 ---
