@@ -6,8 +6,9 @@
 #
 #   git tag v0.5.0 && git push origin v0.5.0
 #
-# Produces one archive per platform plus the mod portal zip, all built from
-# the same commit, which is the property a hand-uploaded build cannot offer.
+# Produces a Windows and a Linux archive plus the mod portal zip, all built
+# from the same commit, which is the property a hand-uploaded build cannot
+# offer.
 name: Release
 
 on:
@@ -31,11 +32,13 @@ jobs:
           - os: windows-latest
             label: windows
             archive: zip
+          # macOS is deliberately absent rather than forgotten. The code still
+          # carries its paths (see `locate.rs` and `settings.rs`), so adding
+          # it later is one entry here, but nobody has ever run this project
+          # on a Mac and shipping a binary nobody has tried is worse than
+          # shipping none.
           - os: ubuntu-latest
             label: linux
-            archive: tar.gz
-          - os: macos-latest
-            label: macos
             archive: tar.gz
 
     steps:
