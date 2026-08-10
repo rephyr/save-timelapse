@@ -197,9 +197,7 @@ fn group_by_type<T: Copy + Default + Send + Sync>(ids: &[TypeId], items: &[T], t
         let handles: Vec<_> = ids
             .chunks(chunk_size)
             .zip(items.chunks(chunk_size))
-            .map(|(id_chunk, item_chunk)| {
-                scope.spawn(move || group_by_type_sequential(id_chunk, item_chunk, type_count))
-            })
+            .map(|(id_chunk, item_chunk)| scope.spawn(move || group_by_type_sequential(id_chunk, item_chunk, type_count)))
             .collect();
         handles.into_iter().map(|h| h.join().expect("group_by_type worker thread panicked")).collect()
     });
@@ -352,8 +350,7 @@ impl RenderFrame {
 
         // Computed from the pre-grouped ids/positions, so this doesn't need
         // the full-detail grouping to have happened first.
-        let entity_chunks: Vec<(i32, i32)> =
-            entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
+        let entity_chunks: Vec<(i32, i32)> = entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
         let (entity_lod, entity_lod_runs) = build_chunk_lod(&entity_ids, &entity_chunks, type_count);
 
         let tile_chunks: Vec<(i32, i32)> = tiles.iter().map(|t| chunk_of(t.x, t.y)).collect();
@@ -403,6 +400,10 @@ pub struct FrameSequence {
     /// Per frame, and tiny next to the item data, so these stay plain vecs.
     ticks: Vec<u64>,
     counts: Vec<usize>,
+    /// Which frames the loader reconstructed rather than read (see
+    /// `is_repeat`). A `Vec<bool>` rather than a bitset: one byte per frame
+    /// against megabytes of item data is not where this pays attention.
+    repeats: Vec<bool>,
     /// The frame at `index`, rebuilt by `goto`. Handed out by `current` so
     /// the renderer keeps taking an ordinary `&RenderFrame`.
     current: RenderFrame,
@@ -444,6 +445,22 @@ impl FrameSequence {
         &self.current
     }
 
+    /// Spans across all four layers, which is what this sequence's memory is
+    /// proportional to. An item standing through a thousand frames is one
+    /// span, not a thousand copies, so this staying flat while the frame
+    /// count grows is the whole property the layout exists for.
+    /// Whether this frame was reconstructed rather than read: the export
+    /// omitted it because nothing on this surface changed (see
+    /// `replay::write_all_surfaces`), and the loader put it back.
+    ///
+    /// Worth carrying forward rather than recomputing, because it is the
+    /// premise the load-time passes short-circuit on: a frame identical to
+    /// the one before it cannot have new construction in it and cannot extend
+    /// a bounding box, so both answers are known without looking.
+    pub fn is_repeat(&self, index: usize) -> bool {
+        self.repeats.get(index).copied().unwrap_or(false)
+    }
+
     /// The in-game tick of any frame, without materializing it: the timeline
     /// labels every position on the bar and needs nothing else about them.
     pub fn tick_at(&self, index: usize) -> Option<u64> {
@@ -457,16 +474,29 @@ impl FrameSequence {
     /// A callback rather than an iterator because each frame is a temporary:
     /// there is no per-frame storage left to hand out a borrow of, which is
     /// the entire point.
-    pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame)) {
+    ///
+    /// A repeat frame is **not re-materialized**. The scratch buffer already
+    /// holds the previous frame's contents, and a repeat is by definition
+    /// identical to it, so the callback still sees exactly the right data
+    /// having done no work to get it. On a long capture most frames are
+    /// repeats, so this is the difference between the load-time passes
+    /// costing one walk per file and one per reconstructed frame.
+    ///
+    /// The third argument says which kind this is, so a caller whose answer
+    /// is also known in advance for a repeat can skip its own work too.
+    pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame, bool)) {
         let mut scratch = RenderFrame::empty();
         for index in 0..self.len() {
+            let repeat = self.is_repeat(index);
             scratch.tick = self.ticks[index];
             scratch.count = self.counts[index];
-            self.entities.materialize(index, &mut scratch.entities, &mut scratch.entity_runs);
-            self.tiles.materialize(index, &mut scratch.tiles, &mut scratch.tile_runs);
-            self.entity_lod.materialize(index, &mut scratch.entity_lod, &mut scratch.entity_lod_runs);
-            self.tile_lod.materialize(index, &mut scratch.tile_lod, &mut scratch.tile_lod_runs);
-            visit(index, &scratch);
+            if !repeat {
+                self.entities.materialize(index, &mut scratch.entities, &mut scratch.entity_runs);
+                self.tiles.materialize(index, &mut scratch.tiles, &mut scratch.tile_runs);
+                self.entity_lod.materialize(index, &mut scratch.entity_lod, &mut scratch.entity_lod_runs);
+                self.tile_lod.materialize(index, &mut scratch.tile_lod, &mut scratch.tile_lod_runs);
+            }
+            visit(index, &scratch, repeat);
         }
     }
 
@@ -476,10 +506,7 @@ impl FrameSequence {
 
     /// Total spans across all four sets, for measuring what the layout costs.
     pub fn span_estimate(&self) -> usize {
-        self.entities.span_count()
-            + self.tiles.span_count()
-            + self.entity_lod.span_count()
-            + self.tile_lod.span_count()
+        self.entities.span_count() + self.tiles.span_count() + self.entity_lod.span_count() + self.tile_lod.span_count()
     }
 
     pub fn len(&self) -> usize {
@@ -524,6 +551,11 @@ pub struct SequenceBuilder {
     tile_lod: SpanBuilder<LodCell>,
     ticks: Vec<u64>,
     counts: Vec<usize>,
+    /// Which frames were reconstructed rather than read. Recorded here
+    /// because this is the only place that knows: by the time a
+    /// `FrameSequence` exists, a repeat is indistinguishable from a frame
+    /// that happened to be identical.
+    repeats: Vec<bool>,
 }
 
 impl SequenceBuilder {
@@ -536,14 +568,42 @@ impl SequenceBuilder {
     pub fn push(&mut self, frame: &RenderFrame) {
         self.ticks.push(frame.tick);
         self.counts.push(frame.count);
-        self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| {
-            span_key(e.x, e.y)
-        }));
-        self.tiles.push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| {
-            span_key(t.x as f32, t.y as f32)
-        }));
+        self.repeats.push(false);
+        self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
+        self.tiles
+            .push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
         self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
         self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
+    }
+
+    /// Repeats the frame just pushed at each of `ticks`, without that frame's
+    /// contents having to be read, parsed or folded in again.
+    ///
+    /// An export omits a surface's file entirely for a moment when nothing on
+    /// that surface changed, so a surface's files carry only the ticks it
+    /// actually moved at. The timeline is index-addressed and every surface
+    /// has to agree on how many moments there were, so the omitted ones are
+    /// put back here.
+    ///
+    /// The cheap half of the saving: the file was never written, never read
+    /// and never parsed, and restoring it costs one pass over what is
+    /// standing per gap rather than per frame (see
+    /// `SpanBuilder::push_repeats`).
+    ///
+    /// A no-op before any frame has been pushed, since there is nothing to
+    /// repeat: a surface's own first frame is always present.
+    pub fn push_repeats(&mut self, ticks: &[u64]) {
+        let Some(&count) = self.counts.last() else { return };
+        if ticks.is_empty() {
+            return;
+        }
+        self.ticks.extend_from_slice(ticks);
+        self.counts.extend(std::iter::repeat_n(count, ticks.len()));
+        self.repeats.extend(std::iter::repeat_n(true, ticks.len()));
+        self.entities.push_repeats(ticks.len());
+        self.tiles.push_repeats(ticks.len());
+        self.entity_lod.push_repeats(ticks.len());
+        self.tile_lod.push_repeats(ticks.len());
     }
 
     pub fn len(&self) -> usize {
@@ -567,6 +627,7 @@ impl SequenceBuilder {
             tile_lod: self.tile_lod.finish(),
             ticks: self.ticks,
             counts: self.counts,
+            repeats: self.repeats,
             current: RenderFrame::empty(),
             index: 0,
         };
@@ -585,8 +646,7 @@ fn runs_with_items<'a, T: Copy + 'a>(
     // `key` is taken by reference so the inner closure can capture a Copy
     // shared borrow: capturing the closure itself by move would have it
     // escape the outer `FnMut`, which `flat_map` will not allow.
-    runs.iter()
-        .flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
+    runs.iter().flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
 }
 
 fn cell_key(cell: &LodCell) -> u64 {
@@ -608,6 +668,76 @@ mod tests {
 
     fn sample_frame(tick: u64) -> RenderFrame {
         render(Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() })
+    }
+
+    /// The equivalence the whole skip-unchanged-frames scheme rests on.
+    ///
+    /// An export omits a surface's frame when nothing on that surface
+    /// changed, and the loader restores it with `push_repeats`. That is only
+    /// safe if the restored sequence is indistinguishable from the one an
+    /// export that wrote every frame would have produced, index for index,
+    /// contents and ticks alike. If it ever stops being, the saving is being
+    /// paid for with a subtly different timelapse.
+    #[test]
+    fn repeats_produce_the_same_sequence_as_writing_every_frame() {
+        // Frame contents at each moment: one entity until tick 40, two after.
+        let at = |tick: u64, wide: bool| {
+            let mut entities = vec![entity("pipe", 1.0, 2.0)];
+            if wide {
+                entities.push(entity("belt", 3.0, 2.0));
+            }
+            Frame { tick, surface: "nauvis".to_string(), count: entities.len(), entities, tiles: Vec::new() }
+        };
+        let ticks = [10u64, 20, 30, 40];
+
+        // What an export that wrote every surface every frame produced.
+        let mut every = FrameSequence::builder();
+        for &tick in &ticks {
+            every.push(&render(at(tick, tick >= 40)));
+        }
+        let every = every.finish().unwrap();
+
+        // What an export that skips unchanged surfaces produces: files only
+        // at ticks 10 and 40, with 20 and 30 restored by the loader.
+        let mut skipped = FrameSequence::builder();
+        skipped.push(&render(at(10, false)));
+        skipped.push_repeats(&[20, 30]);
+        skipped.push(&render(at(40, true)));
+        let mut skipped = skipped.finish().unwrap();
+        let mut every = every;
+
+        assert_eq!(skipped.len(), every.len(), "same number of moments");
+        for index in 0..every.len() {
+            every.goto(index);
+            skipped.goto(index);
+            let (a, b) = (every.current(), skipped.current());
+            assert_eq!(a.tick, b.tick, "frame {index}: tick");
+            assert_eq!(a.count, b.count, "frame {index}: count");
+            assert_eq!(a.entities, b.entities, "frame {index}: entities");
+            assert_eq!(a.entity_runs, b.entity_runs, "frame {index}: runs");
+        }
+    }
+
+    /// A gap that runs to the end of the capture, which is the common case:
+    /// a surface stops changing and the playthrough carries on elsewhere.
+    #[test]
+    fn trailing_repeats_keep_a_surface_present_for_the_rest_of_the_capture() {
+        let mut builder = FrameSequence::builder();
+        builder.push(&sample_frame(10));
+        builder.push_repeats(&[20, 30, 40]);
+        let sequence = builder.finish().unwrap();
+
+        assert_eq!(sequence.len(), 4);
+        assert_eq!(sequence.tick_at(3), Some(40), "the last moment is the timeline's, not the surface's");
+    }
+
+    /// Nothing to repeat before a first frame exists. A surface's own first
+    /// frame is always written, so this is a guard rather than a real case.
+    #[test]
+    fn repeats_before_any_frame_are_ignored() {
+        let mut builder = FrameSequence::builder();
+        builder.push_repeats(&[1, 2, 3]);
+        assert!(builder.is_empty());
     }
 
     #[test]
@@ -709,14 +839,11 @@ mod tests {
         let chunk_coords: Vec<(i32, i32)> = (0..n).map(|i| ((i % 3) as i32, 0)).collect();
 
         let (parallel_cells, parallel_runs) = build_chunk_lod(&ids, &chunk_coords, type_count);
-        let (sequential_cells, sequential_runs) =
-            finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
+        let (sequential_cells, sequential_runs) = finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
 
         let content = |cells: &[LodCell], runs: &[Run]| {
-            let mut pairs: Vec<(TypeId, i32, i32)> = runs
-                .iter()
-                .flat_map(|r| cells[r.range()].iter().map(move |c| (r.type_id, c.cx, c.cy)))
-                .collect();
+            let mut pairs: Vec<(TypeId, i32, i32)> =
+                runs.iter().flat_map(|r| cells[r.range()].iter().map(move |c| (r.type_id, c.cx, c.cy))).collect();
             pairs.sort();
             pairs
         };

@@ -12,10 +12,7 @@ use macroquad::math::Rect;
 /// building this), and no reliable convention for third-party mod icons:
 /// a lookup miss just means falling back to a colored shape, never an error.
 pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
-    ["base", "space-age"]
-        .iter()
-        .map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png")))
-        .collect()
+    ["base", "space-age"].iter().map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png"))).collect()
 }
 
 pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {

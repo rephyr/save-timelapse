@@ -44,16 +44,8 @@ fn calls(order: &[Option<TypeId>], max_indices: usize) -> usize {
 /// allocation per name string. Approximate: it ignores allocator overhead,
 /// which makes it an underestimate of the real cost, not an overestimate.
 fn parsed_bytes(frame: &Frame) -> usize {
-    let entities: usize = frame
-        .entities
-        .iter()
-        .map(|e| std::mem::size_of::<save_timelapse::frame::Entity>() + e.n.len())
-        .sum();
-    let tiles: usize = frame
-        .tiles
-        .iter()
-        .map(|t| std::mem::size_of::<save_timelapse::frame::Tile>() + t.n.len())
-        .sum();
+    let entities: usize = frame.entities.iter().map(|e| std::mem::size_of::<save_timelapse::frame::Entity>() + e.n.len()).sum();
+    let tiles: usize = frame.tiles.iter().map(|t| std::mem::size_of::<save_timelapse::frame::Tile>() + t.n.len()).sum();
     entities + tiles
 }
 
@@ -70,11 +62,8 @@ fn synthetic_report(count: usize) {
     let frame = viewer::synthetic_frame(count);
     let mut registry = TypeRegistry::new();
     let rendered = RenderFrame::from_frame(frame, &mut registry);
-    let order: Vec<Option<TypeId>> = rendered
-        .entity_runs
-        .iter()
-        .flat_map(|run| std::iter::repeat_n(Some(run.type_id), run.len()))
-        .collect();
+    let order: Vec<Option<TypeId>> =
+        rendered.entity_runs.iter().flat_map(|run| std::iter::repeat_n(Some(run.type_id), run.len())).collect();
 
     println!("synthetic: {count} entities across {} types\n", registry.len());
     println!("  grouped, default capacity (833 quads/call) : {:>7} draw calls", calls(&order, DEFAULT_INDEX_CAPACITY));
@@ -88,10 +77,7 @@ fn main() {
         return;
     }
 
-    let path = args
-        .first()
-        .map(String::as_str)
-        .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
+    let path = args.first().map(String::as_str).unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
 
     // Loaded once, in parallel: this used to also call load_sequence just to
     // fail fast on an empty/invalid directory, then reload and reparse every

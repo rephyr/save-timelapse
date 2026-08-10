@@ -35,17 +35,25 @@ pub struct ExportOutcome {
     /// The mod's one-shot player-position sample, if it found anyone with a
     /// valid position to record (see mod/control.lua's `sample_all_players`).
     pub players_log: Option<PathBuf>,
+    /// What this save knows about milestones, read out of the manifest the
+    /// mod writes beside the frames.
+    ///
+    /// `None` for a manifest written by a mod predating milestone state,
+    /// which costs markers and nothing else. One save's state cannot place a
+    /// marker by itself; see `milestone::from_saves`, which compares them.
+    pub milestones: Option<crate::milestone::State>,
 }
 
 /// Read the version from the executable rather than assuming one.
+///
+/// Reads stdout and stderr together. Which stream a program writes a version
+/// banner to is a per-build detail nobody should have to know, and searching
+/// both costs one concatenation against silently returning `None` and
+/// reporting no version at all.
 pub fn factorio_version(exe: &Path) -> Option<Version> {
     let output = Command::new(exe).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let field = text
-        .lines()
-        .find(|line| line.contains("Version:"))?
-        .split_whitespace()
-        .find(|token| token.contains('.'))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let field = text.lines().find(|line| line.contains("Version:"))?.split_whitespace().find(|token| token.contains('.'))?;
 
     let parts: Vec<u16> = field.split('.').filter_map(|p| p.parse().ok()).collect();
     match parts.as_slice() {
@@ -81,9 +89,9 @@ fn enable_in_mod_list(list: &Path) -> io::Result<()> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| serde_json::json!({ "mods": [] }));
 
-    let entries = doc["mods"].as_array_mut().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "mod-list.json has no mods array")
-    })?;
+    let entries = doc["mods"]
+        .as_array_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mod-list.json has no mods array"))?;
 
     match entries.iter_mut().find(|m| m["name"].as_str() == Some(MOD_NAME)) {
         Some(found) => found["enabled"] = serde_json::Value::Bool(true),
@@ -172,21 +180,21 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
 
     let mods = stage_mods(staged, config)?;
 
-    let data = install_data_dir(&config.factorio).ok_or_else(|| {
-        io::Error::other("cannot locate the Factorio data directory from the executable path")
-    })?;
+    let data = install_data_dir(&config.factorio)
+        .ok_or_else(|| io::Error::other("cannot locate the Factorio data directory from the executable path"))?;
 
     let config_file = staged.join("config.ini");
-    std::fs::write(
-        &config_file,
-        format!("[path]\nread-data={}\nwrite-data={}\n", data.display(), staged.display()),
-    )?;
+    std::fs::write(&config_file, format!("[path]\nread-data={}\nwrite-data={}\n", data.display(), staged.display()))?;
 
     let run = Command::new(&config.factorio)
-        .arg("--benchmark").arg(save)
-        .arg("--benchmark-ticks").arg("3")
-        .arg("--config").arg(&config_file)
-        .arg("--mod-directory").arg(&mods)
+        .arg("--benchmark")
+        .arg(save)
+        .arg("--benchmark-ticks")
+        .arg("3")
+        .arg("--config")
+        .arg(&config_file)
+        .arg("--mod-directory")
+        .arg(&mods)
         .arg("--disable-audio")
         .output()?;
 
@@ -205,9 +213,9 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
         .filter_map(Result::ok)
         .map(|item| item.path())
         .filter(|path| {
-            path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
-                name.starts_with("frame_") && name.ends_with(".stfr") && !name.contains("manifest")
-            })
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with("frame_") && name.ends_with(".stfr") && !name.contains("manifest"))
         })
         .collect();
 
@@ -224,5 +232,26 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
 
     let players_log = Some(written_to.join("players.jsonl")).filter(|p| p.exists());
 
-    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log })
+    // The manifest the mod writes beside the frames, which is what carries
+    // this save's milestone state. Deliberately best-effort: a missing or
+    // unreadable manifest costs markers, never the export, since the frames
+    // are the thing actually being asked for here.
+    let milestones = std::fs::read_dir(&written_to)
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(Result::ok).map(|item| item.path()).find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("frame_") && name.ends_with("_manifest.json"))
+            })
+        })
+        .and_then(|path| match crate::milestone::State::from_manifest(&path) {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("warning: could not read milestone state from {}: {e}", path.display());
+                None
+            }
+        });
+
+    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log, milestones })
 }

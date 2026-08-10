@@ -63,11 +63,8 @@ fn user_mods(root: &Path) -> PathBuf {
     let mods = root.join("mods");
     fs::create_dir_all(&mods).unwrap();
     fs::write(mods.join("SomeOtherMod_1.2.3.zip"), b"not really a zip").unwrap();
-    fs::write(
-        mods.join("mod-list.json"),
-        br#"{"mods":[{"name":"base","enabled":true},{"name":"SomeOtherMod","enabled":true}]}"#,
-    )
-    .unwrap();
+    fs::write(mods.join("mod-list.json"), br#"{"mods":[{"name":"base","enabled":true},{"name":"SomeOtherMod","enabled":true}]}"#)
+        .unwrap();
 
     let mut settings = settings_dat::SettingsFile::blank([2, 0, 77, 0]);
     settings.put("startup", "some-other-mod-option", Entry::flag(true));
@@ -91,7 +88,26 @@ fn config_for(root: &Path) -> ExportConfig {
 fn version_is_read_from_the_executable() {
     let tmp = tempfile::tempdir().unwrap();
     let exe = fake_install(tmp.path());
-    assert_eq!(export::factorio_version(&exe), Some([2, 0, 77, 0]));
+
+    // Reports what the process actually did when this fails, rather than only
+    // that the answer was `None`. Every way this can break (the copy not
+    // being executable, the binary refusing to start, the banner arriving on
+    // a stream nobody read) produces the identical `None`, and a bare
+    // assertion on it sends whoever hits it back to guessing. That is not
+    // hypothetical: it failed exactly this way the first time CI ran on
+    // Linux, having always passed on Windows.
+    let ran = std::process::Command::new(&exe).arg("--version").output();
+    let detail = match &ran {
+        Ok(out) => format!(
+            "exit {:?}\n  stdout: {:?}\n  stderr: {:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => format!("could not run {} at all: {e}", exe.display()),
+    };
+
+    assert_eq!(export::factorio_version(&exe), Some([2, 0, 77, 0]), "running --version gave:\n  {detail}");
 }
 
 #[test]
@@ -102,13 +118,33 @@ fn exporting_produces_a_frame() {
     let save = tmp.path().join("MyBase.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    let outcome = export::export_save(&save, &tmp.path().join("staged"), &config)
-        .expect("export should produce a frame");
+    let outcome = export::export_save(&save, &tmp.path().join("staged"), &config).expect("export should produce a frame");
 
     assert_eq!(outcome.frames.len(), 1);
     let frame = save_timelapse::frame::read_binary(&fs::read(&outcome.frames[0]).unwrap()).unwrap();
     assert_eq!(frame.surface, "nauvis");
     assert_eq!(frame.count, 4);
+}
+
+/// A save's milestone state comes back out of the manifest the mod writes
+/// beside the frames, which is the only route it has: no single save knows
+/// when anything first happened, so `milestone::from_saves` needs one of
+/// these per save to compare.
+#[test]
+fn exporting_reads_the_saves_milestone_state_from_its_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_for(tmp.path());
+
+    let save = tmp.path().join("MyBase.zip");
+    fs::write(&save, b"pretend save").unwrap();
+
+    let outcome = export::export_save(&save, &tmp.path().join("staged"), &config).expect("export should produce a frame");
+
+    let state = outcome.milestones.expect("the manifest carries milestone state");
+    assert_eq!(state.tick, 216_000);
+    assert_eq!(state.science, ["automation-science-pack"]);
+    assert_eq!(state.planets, ["nauvis"]);
+    assert_eq!(state.rockets, 1);
 }
 
 #[test]
@@ -121,9 +157,7 @@ fn staging_preserves_other_mods_settings() {
     let staged = tmp.path().join("staged");
     export::export_save(&save, &staged, &config).expect("export");
 
-    let listing = settings_dat::decode(&fs::read(staged.join("mods").join("mod-settings.dat")).unwrap())
-        .unwrap()
-        .listing();
+    let listing = settings_dat::decode(&fs::read(staged.join("mods").join("mod-settings.dat")).unwrap()).unwrap().listing();
 
     // The unrelated mod's settings must survive untouched.
     assert_eq!(
@@ -137,10 +171,7 @@ fn staging_preserves_other_mods_settings() {
         "staging destroyed another mod's runtime-global setting"
     );
     // And ours must have been added.
-    assert_eq!(
-        listing.get(&("startup".into(), "save-timelapse-headless-scan".into())),
-        Some(&Payload::Flag(true))
-    );
+    assert_eq!(listing.get(&("startup".into(), "save-timelapse-headless-scan".into())), Some(&Payload::Flag(true)));
 }
 
 #[test]
@@ -158,11 +189,7 @@ fn the_users_mods_folder_is_never_modified() {
     export::export_save(&save, &tmp.path().join("staged"), &config).expect("export");
 
     assert_eq!(fs::read(&list_path).unwrap(), list_before, "mod-list.json was modified");
-    assert_eq!(
-        fs::read(&settings_path).unwrap(),
-        settings_before,
-        "the user's mod-settings.dat was modified"
-    );
+    assert_eq!(fs::read(&settings_path).unwrap(), settings_before, "the user's mod-settings.dat was modified");
 }
 
 #[test]
@@ -175,15 +202,9 @@ fn our_mod_is_enabled_in_the_staged_list() {
     let staged = tmp.path().join("staged");
     export::export_save(&save, &staged, &config).expect("export");
 
-    let list: serde_json::Value =
-        serde_json::from_slice(&fs::read(staged.join("mods").join("mod-list.json")).unwrap())
-            .unwrap();
-    let entry = list["mods"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["name"] == export::MOD_NAME)
-        .expect("our mod should be listed");
+    let list: serde_json::Value = serde_json::from_slice(&fs::read(staged.join("mods").join("mod-list.json")).unwrap()).unwrap();
+    let entry =
+        list["mods"].as_array().unwrap().iter().find(|m| m["name"] == export::MOD_NAME).expect("our mod should be listed");
     assert_eq!(entry["enabled"], true);
 
     // The pre-existing entries must still be there.
@@ -199,8 +220,7 @@ fn a_missing_executable_fails_rather_than_reporting_success() {
     let save = tmp.path().join("MyBase.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    export::export_save(&save, &tmp.path().join("staged"), &config)
-        .expect_err("a missing executable must be an error");
+    export::export_save(&save, &tmp.path().join("staged"), &config).expect_err("a missing executable must be an error");
 }
 
 /// The failure this project exists to prevent: the game runs, exits cleanly,
@@ -215,10 +235,6 @@ fn a_clean_run_that_writes_nothing_is_an_error() {
     let save = tmp.path().join("MyBase-silent.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    let err = export::export_save(&save, &tmp.path().join("staged"), &config)
-        .expect_err("no frame written must be an error");
-    assert!(
-        err.to_string().contains("startup setting"),
-        "the error should explain the startup-setting requirement, got: {err}"
-    );
+    let err = export::export_save(&save, &tmp.path().join("staged"), &config).expect_err("no frame written must be an error");
+    assert!(err.to_string().contains("startup setting"), "the error should explain the startup-setting requirement, got: {err}");
 }

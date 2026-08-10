@@ -94,17 +94,29 @@ the actual CPU and I/O cost of a big export, not something incidental to it.
 Wire format, all integers little endian:
 
     magic     4 bytes, "STF1"
-    version   u8, must equal the reader's CURRENT_VERSION
+    version   u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
     tick      u64
     surface   string (u16 length, then that many UTF-8 bytes)
     entity section, a sequence of:
-      tag 0  DefineName    string
-      tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
+      tag 0     DefineName  string name, u8 w, u8 h
+      tag 1     EntityRun   varint name_id, varint count, u8 flags,
+                            then per item varint dx, varint dy, and a u8
+                            direction when flags has bit 0; then, when flags
+                            has bit 1, varint len and that many bytes
+      tag >=128 Extension   varint len, then that many bytes
     tag 9  EndEntities (no payload), marking the start of the tile section
     tile section, a sequence of:
-      tag 0  DefineName    string
-      tag 2  TileRecord    u16 name_id, i32 x, i32 y
+      tag 0     DefineName  string name, u8 w, u8 h
+      tag 2     TileRun     varint name_id, varint count, then per item
+                            varint dx, varint dy
+      tag >=128 Extension   varint len, then that many bytes
     checksum  u32, djb2 of every byte before it (magic and version included)
+
+Coordinates within a run are zigzag varint deltas against the previous item,
+starting from the origin. Grouping entities into per-name runs and delta
+encoding their positions is what took a real megabase surface export from
+200 MB to 38 MB. Version 1 predates runs entirely, writing one fixed width
+record per entity or tile, and is still read by a separate function.
 
 The version byte lets a reader tell "this is a format I don't understand"
 apart from a generic parse failure. This project has already changed this
@@ -129,6 +141,56 @@ trailer and will not parse under the current reader, consistent with this
 project's precedent of clean breaks over carrying old formats forward at
 this alpha stage (see "Live capture and replay" below, which made the same
 call for session tagging).
+
+## Format stability and the extension contract
+
+Version 3 of both formats is where that precedent ends. From it onward the
+core layout does not change; anything added is an extension record, and both
+formats use the same rule: **a tag of 128 or above carries a varint byte
+length, then that many bytes.** A reader that does not recognise the tag skips
+exactly that many bytes and carries on, so a capture written by a newer mod
+still loads in an older tool, minus whatever the new record described. Core
+tags stay below 128 so the two kinds can never collide.
+
+Entity runs have a second, cheaper extension point: bit 1 of a run's flags
+means a length prefixed block follows the run's coordinates. That is the
+natural home for a future per-entity column (quality, say, or health), since a
+top level record would have to restate a dictionary and a coordinate list to
+re-associate itself with the entities it describes.
+
+Extension payloads are never interleaved with the data they annotate. This is
+the rule that makes the whole thing work, and `RUN_FLAG_DIRECTIONS` is the
+counter-example that shows why: it *is* interleaved, so a reader that did not
+know the column was there could not find where the run ended. A trailing,
+length prefixed block has no such problem. Anything added later has to keep to
+that shape.
+
+A length that runs past the end of the file is still an error. Not
+understanding a record is fine; a record that does not fit means damage.
+
+### Why this matters more than it looks
+
+Factorio updates mods from the portal on its own. The desktop tool does not
+update itself. **The mod being newer than the tool is therefore the normal
+state of anyone who installed once and kept playing**, not an edge case.
+
+Before extension records that combination had only two possible outcomes, both
+bad. If the new mod bumped the version, the old tool refused the whole capture.
+If it added a tag without bumping, the event reader's unknown-tag arm returned
+`None`, which an iterator reports as end of stream, so the replay silently
+stopped partway through with nothing to say about why. Skipping replaces both
+with a capture that loads and a count of what was stepped over, which
+`Replay::unknown_extensions` carries up to a message telling the user their
+tool is behind their mod.
+
+### What holds it in place
+
+`tests/format_compatibility.rs` opens one real frame in all three released
+encodings (v1 through v0.3, v2 in v0.4, v3 from v0.5) and asserts they agree.
+Those fixtures are committed bytes, not generated at test time, so the check
+is against what older builds actually wrote rather than against this build's
+idea of what they wrote. A failure there is not a test to adjust; it means
+somebody's existing capture stopped loading.
 
 `DefineName` writes a prototype name the first time it is used and gives it
 the next sequential id; every later reference is just the two byte id, which
@@ -371,17 +433,19 @@ forward stream of tagged records from the magic to whatever the last flush
 wrote.
 
     magic   4 bytes, "STE1", written once when the segment is created
-    version u8, must equal the reader's CURRENT_VERSION
+    version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
 
     then a sequence of tagged records:
-      tag 0  DefineName    string
-      tag 1  DefineSurface string
-      tag 2  SetTick       u64 tick
-      tag 3  AddEntity     u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h,
-                           u64 id, u16 surface_id
-      tag 4  RemoveEntity  i32 x10, i32 y10, u64 id, u16 surface_id
-      tag 5  AddTile       u16 name_id, i32 x, i32 y, u16 surface_id
-      tag 6  RemoveTile    i32 x, i32 y, u16 surface_id
+      tag 0     DefineName        string
+      tag 1     DefineSurface     string
+      tag 2     SetTick           u64 tick
+      tag 3     AddEntity         u16 name_id, i32 x10, i32 y10, u8 d,
+                                  u8 w, u8 h, u64 id, u16 surface_id
+      tag 4     RemoveEntity      i32 x10, i32 y10, u64 id, u16 surface_id
+      tag 5     AddTile           u16 name_id, i32 x, i32 y, u16 surface_id
+      tag 6     RemoveTile        i32 x, i32 y, u16 surface_id
+      tag 7     ResetDictionaries (no payload, version 2 and later)
+      tag >=128 Extension         varint len, then that many bytes
 
 `DefineName`/`DefineSurface` name dictionaries work the same way as the frame
 format's, just as two separate dictionaries sharing the same tagged stream
@@ -404,6 +468,16 @@ one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of
 partial/orphaned file), which covers what a checksum would otherwise be
 protecting against here.
+
+Extension records work exactly as in the frame format, under the same rule
+and for the same reason (see "Format stability and the extension contract"
+above). They matter more here, though, because of how the old failure looked.
+An unrecognised tag used to fall through to `next` returning `None`, and an
+iterator reports `None` as end of stream, so a segment written by a newer mod
+did not error: the replay just stopped partway through and said nothing.
+`EventStream::unknown_extensions` counts what was stepped over instead, and
+`replay::run` sums it across segments so the difference is visible rather than
+silent.
 
 `id` on `AddEntity`/`RemoveEntity` uses `0` to mean "no id" (Factorio's
 `unit_number` is documented to start at 1, and `control.lua` already
@@ -617,6 +691,181 @@ entities but not all: `frame_0000.stfr` holds a
 at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
+
+## What the tool remembers
+
+Four things, in plain JSON under the user's own config directory
+(`%APPDATA%\save-timelapse\settings.json` on Windows, the platform
+equivalent elsewhere): where Factorio's folder is, where its executable is,
+seconds per emitted frame, and whether to include natural terrain.
+
+Beside the executable would have been the more obvious home for a tool that
+ships as a zip, and is exactly wrong: replacing the zip on update wipes it,
+which is when somebody least wants to redo their setup.
+
+Three rules keep it from becoming a liability:
+
+**Absent means never asked, not a default.** Every field is an `Option`. That
+distinction is what lets the first run explain itself once and never again,
+and it is why no field carries a baked-in value.
+
+**Remembered paths are validated, never trusted.** A Factorio folder that has
+since moved, been renamed, or lived on a drive that is not plugged in falls
+through to auto-detection rather than being handed downstream to fail
+confusingly later. The point of remembering it is to save the user work, not
+to invent a new way to waste it.
+
+**Nothing it does is fatal.** A missing file is the first run. A corrupt file
+is one warning and a fresh start, because a tool that refuses to launch until
+you find and delete a file you never knew about is worse than one that forgets
+your preferences. A failed write is a warning too: not remembering an answer
+costs one prompt next time, which is no reason to abandon a build.
+
+Surface choice is deliberately **not** remembered. Which surfaces a capture
+has changes as a playthrough reaches new planets, so a remembered answer would
+quietly pick a stale one, and being shown the wrong world is more annoying than
+being asked. The terrain choice is remembered but still asked every time, since
+it is a real cost decision rather than a preference; what is remembered is only
+which way Enter goes.
+
+## Tile reverts
+
+Removing a placed tile has to restore what it was covering. Mining landfill
+should put the water back, not leave a hole where a lake used to be.
+
+Neither side can work that out alone. `RemoveTile` carries only a position, and
+nothing on the reading side can recover what was underneath: a baseline taken
+while the landfill was already down never saw the water, so the information was
+never captured. The obvious fix, extending `RemoveTile` to carry the uncovered
+name, is a core layout change and therefore off the table after the version 3
+freeze.
+
+The mod does it instead, and needs no new record type to. `on_player_mined_tile`
+and `on_robot_mined_tile` fire **after** the tiles have been replaced, so
+`capture.lua` reads `surface.get_tile` at that position and logs an ordinary
+`AddTile` for what is now there, immediately after the `RemoveTile`. Applied in
+order, the position ends up holding the revealed ground. The reader has never
+cared whether an `AddTile` names a placed floor or natural ground, so this is
+additive in the strongest sense: no format change, no version bump, and an
+older tool replaying a newer capture gets the fix for free.
+
+Gated on the terrain capture setting, because that is precisely the opt-out it
+would otherwise violate. With terrain off the timelapse deliberately shows no
+natural ground, and uncovering a patch of water or grass under a removed tile
+would put some back.
+
+## Only writing surfaces that changed
+
+An export used to write every surface at every frame. A playthrough only ever
+builds on one surface at a time, so the rest were re-serialized and re-written
+byte for byte unchanged. Measured on a real nine-surface Space Age capture over
+13 minutes of play, at the tool's 60s default: **86% of the files written were
+byte-identical to that surface's own previous file, and 93% of the bytes were.**
+Nauvis alone accounted for 219.7 MB of which 211.5 MB was duplication, because
+the player was on Gleba the whole time.
+
+`World` therefore keeps a **per-surface revision counter**, bumped by every
+mutation that actually changes that surface and by nothing else, and
+`replay::write_all_surfaces` skips a surface whose revision matches the one it
+last wrote for it. A counter rather than a hash of the frame, because the whole
+point is never to materialise the frame: hashing to detect the duplicate would
+mean doing the expensive half of the work and then discarding it.
+
+Precision matters more than it looks, since a spurious bump costs a whole
+redundant file. `Surface::insert` therefore checks whether an add lands on
+exactly what is already there and leaves the revision alone if so. Those are
+not rare: the baseline smear (a snapshot taken slightly after the events
+describing the same construction) produces them by design.
+
+**The gap in the numbering is the record.** Files stay named
+`frame_<index>_<surface>.stfr` against a global frame index, so a surface that
+did not change simply has no file at that index. Nothing about the format or
+the naming changes and there is no sidecar to keep in sync. This is also not a
+new shape: `write_all_surfaces` has always skipped a surface with nothing on
+it, so the viewer already groups by surface into independently ordered
+timelines.
+
+The viewer puts the omitted frames back. `loading::timeline_ticks` takes the
+union of every surface's ticks, which is the set of moments the export covers
+and cannot be read off any single surface, and the loader fills each surface's
+gaps against it with `SequenceBuilder::push_repeats`. That matters because
+`Timeline` is index-addressed: every surface has to agree on how many moments
+there were, or switching surfaces would scrub at a different rate.
+
+Restoring a gap costs **one pass over what is standing per gap, not per
+frame**. Nothing changed across the gap by definition, so every span open when
+it started is still open when it ends and each one's `last` jumps straight to
+the far side. On a megabase surface idling through a long stretch that is one
+walk over ~900k spans instead of dozens. The frame itself was never written,
+never read and never parsed, so the load-time saving comes free with the disk
+one.
+
+`render_frame.rs` asserts the equivalence this all rests on: a sequence built
+with gaps and repeats is identical, index for index and tick for tick, to one
+built from an export that wrote every frame. Without that, the saving would be
+paid for with a subtly different timelapse.
+
+## Milestones
+
+Three moments worth marking on a timeline rather than watching for: the first
+time each science pack is produced, the first rocket launch, and each planet
+reached. Both capture paths produce the same `milestones.jsonl`
+(`{"tick":T,"kind":K,"id":I}` per line), so the viewer cannot tell which one
+built a given timelapse. They arrive by completely different routes, though,
+because the two paths have completely different evidence available.
+
+### Live capture watches them happen
+
+`mod/milestones.lua` polls on the capture flush that already runs every few
+seconds. Science is polled rather than evented because the game exposes no "an
+assembling machine finished an item" event (`on_player_crafted_item` covers
+hand crafting only, which is not how science gets made past the first hour), so
+production statistics are the only source. A planet counts as reached when a
+player is standing on a surface with `planet` set, swept over connected players
+rather than hooked to `on_player_changed_surface` alone, since nobody changes
+surface to arrive on Nauvis at the start. Every milestone fires once, tracked in
+`storage.timelapse_milestones`, which is a sibling of `storage.timelapse_capture`
+rather than nested inside it so that a capture reset wipes both together: the
+file recording them is deleted by that reset, and a survivor key would believe
+every milestone had already fired while the record of them was gone.
+
+Ticks from this path are exact.
+
+### From saves, they are recovered by comparison
+
+A save has no history of its own. It knows that a science pack has been
+produced, never when it first was. So the mod reports **state** rather than
+events: `export.milestone_state` collects the science packs with nonzero
+production, the inhabited planet surfaces, and `force.rockets_launched`, and
+`export_all_to` writes them into the per-save manifest it already produces.
+Riding in the manifest rather than a file of its own is deliberate, since it
+describes the same instant the manifest describes and every consumer that wants
+one wants the other; being JSON, an older reader ignores the field, which is
+what lets `baseline.json` carry it too without disturbing live capture.
+
+`milestone::from_saves` then sorts the per-save states by tick and walks them,
+emitting a milestone the first time each id appears. Rockets are carried as a
+count rather than a flag precisely so that walk can distinguish a first launch
+from launches that had been happening before the earliest save.
+
+Two consequences worth being explicit about, both inherent rather than
+implementation shortcomings:
+
+**Precision is bounded by save cadence.** The earliest tick at which something
+can be *proved* to have happened is the tick of the first save reporting it, so
+that is the tick used. Interpolating between saves would invent a moment no
+evidence supports.
+
+**An established base opens with a cluster.** Everything already true in the
+earliest save is emitted at that save's tick, because it genuinely happened at
+or before then. This matches what live capture does when switched on
+mid-playthrough, where the first poll records every pack already produced.
+
+"Planet reached" uses `is_inhabited` rather than mere surface existence,
+because the game creates a planet's surface before anybody goes there. That
+also keeps the marker honest against the timelapse it annotates: a surface only
+appears in frames once inhabited, so a planet is marked reached exactly when it
+starts being shown.
 
 ## Rendering
 

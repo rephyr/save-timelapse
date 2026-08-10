@@ -33,7 +33,7 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua run viewer drawcalls check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls stress stress-save check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -43,6 +43,8 @@ help:
 	@echo "  run          save-timelapse: interactive, asks what to do and opens the viewer"
 	@echo "  viewer       open the interactive viewer on FRAMES"
 	@echo "  drawcalls    headless draw-call report on FRAMES"
+	@echo "  stress       benchmark the whole pipeline against the saved baseline"
+	@echo "  stress-save  run the benchmark and record it as the new baseline"
 	@echo "  install-mod  copy mod/ into MOD_INSTALL (your Factorio mods folder)"
 	@echo "  package      zip mod/ into dist/$(PACKAGE_NAME).zip, ready for the mod portal"
 	@echo "  clean        cargo clean"
@@ -77,8 +79,21 @@ test:
 #   string.pack,       not syntax, just absent: the call parses fine and
 #   math.type          fails only when that line actually runs, so this
 #                      catches it only where a test covers that path.
-test-lua:
+test-lua: check-mod-syntax
 	$(LUA) mod/tests/encode_test.lua
+
+# Compiles every shipped Lua file without running it. The unit suite above
+# only dofile()s encode.lua, so a syntax error anywhere else would otherwise
+# surface for the first time as Factorio refusing to load the mod, and a mod
+# that will not load at all is a far worse failure than any one feature being
+# wrong. `loadfile` compiles without executing, which is what makes this work
+# for files like capture.lua that reference `game` and `defines` and could
+# never actually be run outside the game.
+check-mod-syntax:
+	@for f in $(addprefix mod/,$(MOD_LUA)); do \
+	  $(LUA) -e "local c,e=loadfile('$$f'); if not c then io.stderr:write('syntax error: '..tostring(e)..'\n'); os.exit(1) end" || exit 1; \
+	  echo "ok   $$f parses"; \
+	done
 
 run:
 	cargo run --release --bin save-timelapse
@@ -88,6 +103,27 @@ viewer:
 
 drawcalls:
 	cargo run -p viewer --release --bin drawcalls -- $(FRAMES)
+
+# Development benchmark: run the whole pipeline at megabase scale and compare
+# every number against a saved baseline, to answer "did the change I just made
+# help or hurt". Take a baseline first, edit, then re-run:
+#
+#   make stress-save     # record the current code as the baseline
+#   ...edit...
+#   make stress          # current vs baseline, with deltas
+#
+# Sizes and counts are exact, so any delta there is real. Timings swing a few
+# percent between identical runs and are marked as noise below 10%.
+#
+# A baseline is only comparable against the same shape, so re-record after
+# changing any dimension:
+#
+#   make stress STRESS_ARGS="--surfaces 1 --entities 2000000"
+stress:
+	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS)
+
+stress-save:
+	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS) --save
 
 # Fails if mod/ holds a .lua that neither list names, which is exactly how a
 # newly added, required file would otherwise reach a player: control.lua

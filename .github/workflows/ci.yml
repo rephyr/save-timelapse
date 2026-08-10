@@ -24,7 +24,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -37,20 +37,36 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Against rustfmt.toml, not rustfmt's defaults. The settings there
+      # describe how this code is already written; the defaults would reformat
+      # it into something narrower and harder to read for no benefit.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
   mod:
-    name: Lua unit tests (mod/encode.lua)
+    name: Lua tests and syntax (mod/)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Lua
-        run: sudo apt-get update && sudo apt-get install -y lua5.3
+      # 5.2 specifically, the version Factorio's modding API is, and NOT
+      # whichever Lua is newest. This job used to install 5.3, which made it
+      # green for the wrong reason: the suite passes under 5.1 through 5.5
+      # alike, so a newer interpreter accepts syntax (`//`, `&`, `~`) and
+      # library functions (`string.pack`, `math.type`) that Factorio will
+      # refuse to run, and those are exactly what mod/encode.lua works around
+      # by hand. A CI that cannot fail on the thing it exists to catch is
+      # worse than no CI, because it is trusted.
+      - name: Install Lua 5.2
+        run: sudo apt-get update && sudo apt-get install -y lua5.2
 
-      # Deliberately its own job, not folded into `cargo test`: encode_test.lua's
-      # own header notes that cargo test's "needs nothing but the Rust
-      # toolchain" promise shouldn't start silently depending on lua. Running
-      # it here as a separate CI check gets real coverage of the Lua side
-      # (otherwise unverifiable without a live Factorio install) without
-      # touching that.
-      - name: Run mod/tests/encode_test.lua
-        run: lua5.3 mod/tests/encode_test.lua
+      # Through the Makefile rather than calling the interpreter directly, so
+      # CI runs what a developer runs. That also picks up `check-mod-syntax`,
+      # which compiles every shipped Lua file: the unit suite only loads
+      # encode.lua, so a syntax error in control.lua or capture.lua would
+      # otherwise reach a player as "Factorio refuses to load the mod".
+      #
+      # Deliberately its own job rather than folded into `cargo test`, whose
+      # whole promise is needing nothing beyond the Rust toolchain.
+      - name: Run the mod test suite
+        run: make test-lua LUA=lua5.2

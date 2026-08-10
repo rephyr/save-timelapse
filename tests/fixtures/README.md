@@ -21,6 +21,35 @@ rather than synthetic noise.
     frame_0003.stfr  10,234 entities    141 KiB
     frame_0004.stfr  22,971 entities    315 KiB
 
+All five are version 1 files, written by the mod as it shipped through v0.3.
+
+### compat_v2.stfr, compat_v3.stfr
+
+The same frame as `frame_0001.stfr`, in the two later encodings:
+
+    compat_v2.stfr    589 entities    2.5 KiB    written by v0.4
+    compat_v3.stfr    589 entities    2.5 KiB    written by v0.5 onward
+
+Together with `frame_0001.stfr` these are the compatibility set: one frame in
+every version of the format this project has released.
+`tests/format_compatibility.rs` opens all three and asserts they agree, which
+is the check behind the promise that a capture made with an older Save
+Timelapse still loads in a newer one.
+
+Version 2 and 3 have identical bodies. Version 3 exists only to declare that a
+file may contain extension records (see the extension contract in
+`src/frame.rs`), so the two fixtures differ in their version byte and the
+checksum that covers it, and nowhere else. That is not a redundancy to clean
+up: it is the thing being asserted.
+
+Regenerate with the ignored test that produced them, and only for a real
+format change:
+
+    cargo test --lib regenerate_compatibility_fixtures -- --ignored
+
+Regenerating these to make a failing test pass would defeat their purpose.
+They are valuable precisely because they are bytes an older build wrote.
+
 ## real-mod-settings.dat
 
 A `mod-settings.dat` written by Factorio 2.0.77, holding 179 settings across

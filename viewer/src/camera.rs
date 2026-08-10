@@ -63,7 +63,7 @@ impl Camera {
             });
         };
 
-        frames.for_each_frame(|_, frame| {
+        frames.for_each_frame(|_, frame, _| {
             for entity in &frame.entities {
                 let half = Vec2::new(entity.w as f32, entity.h as f32) / 2.0;
                 let center = Vec2::new(entity.x, entity.y);
@@ -83,19 +83,12 @@ impl Camera {
         }
 
         match bounds {
-            Some((min, max)) => {
-                Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
-            }
+            Some((min, max)) => Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN),
             None => Camera { offset: Vec2::ZERO, zoom: 1.0 },
         }
     }
 
-    pub fn fit_frames(
-        frames: &[RenderFrame],
-        terrain: Option<&RenderFrame>,
-        screen_width: f32,
-        screen_height: f32,
-    ) -> Camera {
+    pub fn fit_frames(frames: &[RenderFrame], terrain: Option<&RenderFrame>, screen_width: f32, screen_height: f32) -> Camera {
         // Each entity contributes its two footprint corners, not just its
         // center point. For a small cluster of large buildings, ignoring
         // footprint here would zoom in as if they were 1x1, and a real
@@ -134,11 +127,16 @@ impl Camera {
     /// fixed constant, since a one-time static view and a continuously
     /// re-fitting auto-follow camera want different amounts of it (see
     /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
-    pub fn fit_bounds(center: Vec2, size: Vec2, screen_width: f32, screen_height: f32, min_size_tiles: f32, margin: f32) -> Camera {
+    pub fn fit_bounds(
+        center: Vec2,
+        size: Vec2,
+        screen_width: f32,
+        screen_height: f32,
+        min_size_tiles: f32,
+        margin: f32,
+    ) -> Camera {
         let size = size.max(Vec2::splat(min_size_tiles));
-        let zoom = (screen_width / (size.x * BASE_PIXELS_PER_TILE))
-            .min(screen_height / (size.y * BASE_PIXELS_PER_TILE))
-            * margin;
+        let zoom = (screen_width / (size.x * BASE_PIXELS_PER_TILE)).min(screen_height / (size.y * BASE_PIXELS_PER_TILE)) * margin;
         Camera { offset: center, zoom: zoom.clamp(0.01, 50.0) }
     }
 }
@@ -435,8 +433,7 @@ mod tests {
             800.0,
             600.0,
         );
-        let via_fit_bounds =
-            Camera::fit_bounds(Vec2::new(5.0, 5.0), Vec2::new(11.0, 11.0), 800.0, 600.0, 1.0, FIT_MARGIN);
+        let via_fit_bounds = Camera::fit_bounds(Vec2::new(5.0, 5.0), Vec2::new(11.0, 11.0), 800.0, 600.0, 1.0, FIT_MARGIN);
         assert_eq!(via_fit_frames.offset, via_fit_bounds.offset);
         assert!((via_fit_frames.zoom - via_fit_bounds.zoom).abs() < 1e-6);
     }
@@ -445,7 +442,10 @@ mod tests {
     fn fit_bounds_floors_a_tiny_box_to_the_minimum_size() {
         let tight = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(0.1), 800.0, 600.0, 24.0, 1.0);
         let at_floor = Camera::fit_bounds(Vec2::ZERO, Vec2::splat(24.0), 800.0, 600.0, 24.0, 1.0);
-        assert!((tight.zoom - at_floor.zoom).abs() < 1e-6, "a box smaller than the floor should zoom as if it were exactly the floor size");
+        assert!(
+            (tight.zoom - at_floor.zoom).abs() < 1e-6,
+            "a box smaller than the floor should zoom as if it were exactly the floor size"
+        );
     }
 
     #[test]

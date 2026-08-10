@@ -84,6 +84,18 @@ fn is_placed_floor(name: &str) -> bool {
             | "brown-refined-concrete"
             | "cyan-refined-concrete"
             | "acid-refined-concrete"
+            // Aquilo's frozen twins of the same floors. Placed by the player
+            // exactly like the unfrozen ones, so they belong in the tracked
+            // layer rather than in the terrain that is captured once and
+            // never revisited. The game generates these seven only, not one
+            // per coloured refined concrete.
+            | "frozen-stone-path"
+            | "frozen-concrete"
+            | "frozen-hazard-concrete-left"
+            | "frozen-hazard-concrete-right"
+            | "frozen-refined-concrete"
+            | "frozen-refined-hazard-concrete-left"
+            | "frozen-refined-hazard-concrete-right"
     )
 }
 
@@ -109,11 +121,34 @@ pub struct Surface {
     /// made every emitted frame file redundantly balloon to the same huge,
     /// unchanging size.
     terrain: HashMap<PosKey, NameId>,
+    /// Bumped by every mutation that actually changes this surface, and by
+    /// nothing else.
+    ///
+    /// What `replay::write_all_surfaces` compares against to decide whether a
+    /// surface needs writing at all. A counter rather than a hash of the
+    /// frame, because the entire point is to never materialise the frame: on
+    /// a nine-surface save, measured over 13 minutes of real play, 86% of the
+    /// files written were byte-identical to that surface's previous one and
+    /// 93% of the bytes were, since you can only build on one surface at a
+    /// time but every surface was written every frame. Hashing to detect that
+    /// would mean doing the expensive work first and then throwing it away.
+    ///
+    /// Precision matters more than it looks: a spurious bump costs a whole
+    /// duplicate file, which is why `insert` below checks for a genuinely
+    /// unchanged re-add rather than blindly overwriting.
+    revision: u64,
 }
 
 impl Surface {
     pub fn entity_count(&self) -> usize {
         self.by_pos.len()
+    }
+
+    /// See the field's own comment. Only ever compared against a previously
+    /// observed value from the same surface; the absolute number means
+    /// nothing.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Both layers together: what a baseline's "tiles" count means to
@@ -142,6 +177,15 @@ impl Surface {
         // Idempotent: an add for a position already occupied updates it in
         // place rather than creating a second entity on the same tile.
         if let Some(&slot) = self.by_pos.get(&key) {
+            // An add landing on exactly what is already there changed
+            // nothing, so it must not bump `revision`. Checked rather than
+            // assumed because a spurious bump costs a whole redundant frame
+            // file, and re-adds are not rare: the baseline smear (a snapshot
+            // taken slightly after the events describing the same
+            // construction) produces them by design.
+            if self.slots[slot] == Some(entity) {
+                return;
+            }
             if let Some(existing) = self.slots[slot].take() {
                 if let Some(id) = existing.id {
                     self.by_id.remove(&id);
@@ -151,6 +195,7 @@ impl Surface {
                 self.by_id.insert(id, slot);
             }
             self.slots[slot] = Some(entity);
+            self.revision += 1;
             return;
         }
 
@@ -168,6 +213,7 @@ impl Surface {
         if let Some(id) = entity.id {
             self.by_id.insert(id, slot);
         }
+        self.revision += 1;
     }
 
     fn remove_slot(&mut self, slot: usize) {
@@ -177,6 +223,7 @@ impl Surface {
             self.by_id.remove(&id);
         }
         self.free.push(slot);
+        self.revision += 1;
     }
 
     fn remove_by_id(&mut self, id: u64) -> bool {
@@ -272,6 +319,13 @@ impl World {
             }
         }
 
+        // Bumped once for the whole load rather than per tile above, and
+        // unconditionally: a catch-up baseline landing mid-replay is a change
+        // to this surface however much of it happens to match what was
+        // already there, and the entity loop's own bumps do not cover a
+        // baseline that is only tiles.
+        surface.revision += 1;
+
         self.tick = self.tick.max(frame.tick);
     }
 
@@ -287,8 +341,7 @@ impl World {
         match event {
             Event::AddEntity { name, x, y, d, w, h, id } => {
                 let name = self.names.intern(name);
-                let entity =
-                    WorldEntity { name, x: *x, y: *y, d: *d, w: *w, h: *h, id: *id };
+                let entity = WorldEntity { name, x: *x, y: *y, d: *d, w: *w, h: *h, id: *id };
                 match self.target(surface) {
                     Some(s) => {
                         s.insert(entity);
@@ -318,21 +371,37 @@ impl World {
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
                 match self.target(surface) {
-                    Some(s) => s.tiles.insert((*x, *y), name) != Some(name),
+                    Some(s) => {
+                        let changed = s.tiles.insert((*x, *y), name) != Some(name);
+                        if changed {
+                            s.revision += 1;
+                        }
+                        changed
+                    }
                     None => false,
                 }
             }
-            // Known gap, not fixed here: removing landfill fires this the
-            // same as any other tile removal, but `tiles` only ever holds
-            // placed floor now (see `Surface::terrain`) and still has no
-            // idea what was there before the removed tile, e.g. the water a
-            // baseline captured underneath it. The position just goes empty
-            // instead of reverting to water. A real fix needs the mod to
-            // capture what a removed placed-floor tile is replacing at
-            // removal time, which this event does not carry.
-            Event::RemoveTile { x, y } => {
-                self.target(surface).is_some_and(|s| s.tiles.remove(&(*x, *y)).is_some())
-            }
+            // Clears the position rather than reverting it, because this
+            // record cannot say what was underneath and nothing on this side
+            // can know: a baseline taken while landfill was already down
+            // never saw the water it covered.
+            //
+            // The revert is the mod's job instead, and it does it without
+            // needing a record type for it (see `capture.lua`'s
+            // `log_tile_change`): these events fire after the tiles have
+            // already been replaced, so it reads the uncovered ground and
+            // logs an ordinary `AddTile` for it immediately after this one.
+            // Applied in order, the position ends up holding what was
+            // revealed. Only when terrain capture is on, since with it off
+            // there is deliberately no natural ground in the timelapse to
+            // reveal.
+            Event::RemoveTile { x, y } => self.target(surface).is_some_and(|s| {
+                let changed = s.tiles.remove(&(*x, *y)).is_some();
+                if changed {
+                    s.revision += 1;
+                }
+                changed
+            }),
         }
     }
 
@@ -346,27 +415,14 @@ impl World {
     /// loaded it. Use `terrain_frame` to get that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame {
-                tick,
-                surface: surface_name.to_string(),
-                entities: Vec::new(),
-                count: 0,
-                tiles: Vec::new(),
-            };
+            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
         };
 
         let names = self.name_table();
 
         let entities: Vec<Entity> = surface
             .entities()
-            .map(|e| Entity {
-                n: Arc::clone(&names[e.name as usize]),
-                x: e.x,
-                y: e.y,
-                d: e.d,
-                w: e.w,
-                h: e.h,
-            })
+            .map(|e| Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
             .collect();
 
         let tiles = Self::materialize_tiles(&surface.tiles, &names);
@@ -382,13 +438,7 @@ impl World {
     /// per replayed frame.
     pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame {
-                tick,
-                surface: surface_name.to_string(),
-                entities: Vec::new(),
-                count: 0,
-                tiles: Vec::new(),
-            };
+            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
         };
 
         let names = self.name_table();
@@ -409,10 +459,8 @@ impl World {
     /// `HashMap` iterates in an order that depends on allocation and
     /// hashing rather than on its contents.
     fn materialize_tiles(tiles: &HashMap<PosKey, NameId>, names: &[Arc<str>]) -> Vec<Tile> {
-        let mut out: Vec<Tile> = tiles
-            .iter()
-            .map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y })
-            .collect();
+        let mut out: Vec<Tile> =
+            tiles.iter().map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y }).collect();
         out.sort_by_key(|t| (t.y, t.x));
         out
     }
@@ -423,13 +471,7 @@ mod tests {
     use super::*;
 
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
-        Frame {
-            tick: 100,
-            surface: "nauvis".to_string(),
-            count: entities.len(),
-            entities,
-            tiles,
-        }
+        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles }
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
@@ -457,10 +499,7 @@ mod tests {
     fn entities_a_tenth_of_a_tile_apart_stay_distinct() {
         let mut world = World::new();
         world.load_baseline(&baseline(
-            vec![
-                entity("logistic-train-stop-lamp-control", 326.9, -843.0),
-                entity("logistic-train-stop", 327.0, -843.0),
-            ],
+            vec![entity("logistic-train-stop-lamp-control", 326.9, -843.0), entity("logistic-train-stop", 327.0, -843.0)],
             Vec::new(),
         ));
         assert_eq!(world.entity_count(), 2);
@@ -484,6 +523,44 @@ mod tests {
         world.load_baseline(&frame);
         assert_eq!(world.entity_count(), expected, "entities lost loading a real frame");
         assert_eq!(world.to_frame("nauvis", 0).count, expected);
+    }
+
+    /// Mining landfill has to put the water back, not leave a hole.
+    ///
+    /// The mod logs the removal and then an add for whatever the removal
+    /// uncovered (see `capture.lua`'s `log_tile_change`), because only it can
+    /// see that: a baseline taken while the landfill was already down never
+    /// saw the water underneath, so nothing on this side could reconstruct
+    /// it. This pins the pair applying in order to the right result, which is
+    /// the behaviour the two halves only have together.
+    #[test]
+    fn a_removed_tile_reverts_to_whatever_the_mod_says_was_uncovered() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(Vec::new(), vec![Tile { n: "landfill".into(), x: 5, y: 5 }]));
+        assert_eq!(world.to_frame("nauvis", 0).tiles.len(), 1);
+
+        assert!(world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 }));
+        assert!(world.to_frame("nauvis", 0).tiles.is_empty(), "the landfill is gone");
+
+        assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "water".to_string(), x: 5, y: 5 }));
+        let tiles = world.to_frame("nauvis", 0).tiles;
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((tiles[0].n.as_ref(), tiles[0].x, tiles[0].y), ("water", 5, 5));
+    }
+
+    /// The revert is a real change to the surface, so it has to mark the
+    /// surface dirty. Otherwise `write_all_surfaces` would skip the very
+    /// frame that shows the water coming back.
+    #[test]
+    fn revealing_a_tile_bumps_the_surface_revision() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(Vec::new(), vec![Tile { n: "landfill".into(), x: 5, y: 5 }]));
+        let before = world.surface("nauvis").unwrap().revision();
+
+        world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 });
+        world.apply(Some("nauvis"), &Event::AddTile { name: "water".to_string(), x: 5, y: 5 });
+
+        assert!(world.surface("nauvis").unwrap().revision() > before, "the surface changed twice over");
     }
 
     #[test]
@@ -535,10 +612,7 @@ mod tests {
         // A real unit_number Factorio assigned long before capture started,
         // so replay's by_id map was never told about it.
         let unrecognized_id = 999_999;
-        assert!(world.apply(
-            Some("nauvis"),
-            &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }
-        ));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }));
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
@@ -579,10 +653,14 @@ mod tests {
         world.load_baseline(&baseline(Vec::new(), Vec::new()));
 
         assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }));
-        assert!(!world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }),
-            "re-adding the same tile changes nothing");
-        assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "stone-path".into(), x: -5, y: 12 }),
-            "a different tile on the same spot is a change");
+        assert!(
+            !world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }),
+            "re-adding the same tile changes nothing"
+        );
+        assert!(
+            world.apply(Some("nauvis"), &Event::AddTile { name: "stone-path".into(), x: -5, y: 12 }),
+            "a different tile on the same spot is a change"
+        );
         assert_eq!(world.tile_count(), 1);
 
         assert!(world.apply(Some("nauvis"), &Event::RemoveTile { x: -5, y: 12 }));
@@ -688,11 +766,23 @@ mod tests {
             "brown-refined-concrete",
             "cyan-refined-concrete",
             "acid-refined-concrete",
+            // Aquilo's frozen twins. Without these an entire Aquilo base's
+            // paving is invisible to live capture, since the mod would never
+            // log it as a tile the player placed.
+            "frozen-stone-path",
+            "frozen-concrete",
+            "frozen-hazard-concrete-left",
+            "frozen-hazard-concrete-right",
+            "frozen-refined-concrete",
+            "frozen-refined-hazard-concrete-left",
+            "frozen-refined-hazard-concrete-right",
         ] {
             assert!(is_placed_floor(name), "{name} should be placed floor");
         }
 
-        for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3"] {
+        // Aquilo's own natural ground, which must not be mistaken for floor
+        // just because everything on that planet is frozen.
+        for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3", "snow-flat", "ice-smooth", "ammoniacal-ocean"] {
             assert!(!is_placed_floor(name), "{name} should be natural terrain");
         }
     }
@@ -726,10 +816,7 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(
             Vec::new(),
-            vec![
-                Tile { n: "concrete".into(), x: 0, y: 0 },
-                Tile { n: "grass-1".into(), x: 1, y: 0 },
-            ],
+            vec![Tile { n: "concrete".into(), x: 0, y: 0 }, Tile { n: "grass-1".into(), x: 1, y: 0 }],
         ));
 
         let frame = world.to_frame("nauvis", 10);

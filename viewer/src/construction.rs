@@ -88,12 +88,19 @@ fn union_min_max(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2) {
 pub fn growing_bounds_per_frame(frames: &FrameSequence, registry: &TypeRegistry) -> Vec<Option<GrowingBounds>> {
     let mut result = Vec::with_capacity(frames.len());
     let mut running: Option<(Vec2, Vec2)> = None;
-    frames.for_each_frame(|_, frame| {
-        running = match (running, frame_bounds(frame, registry)) {
-            (Some(r), Some(f)) => Some(union_min_max(r, f)),
-            (Some(r), None) => Some(r),
-            (None, other) => other,
-        };
+    frames.for_each_frame(|_, frame, repeat| {
+        // A repeat holds exactly what the previous frame held, so its box is
+        // the box already running and unioning it in cannot move it. Skipping
+        // the scan is the whole saving: on a long capture most frames are
+        // repeats, and each one otherwise walks every entity on the surface
+        // to rediscover a box it already has.
+        if !repeat {
+            running = match (running, frame_bounds(frame, registry)) {
+                (Some(r), Some(f)) => Some(union_min_max(r, f)),
+                (Some(r), None) => Some(r),
+                (None, other) => other,
+            };
+        }
         result.push(running.map(|(min, max)| GrowingBounds { center: (min + max) / 2.0, half_extent: (max - min) / 2.0 }));
     });
     result
@@ -127,8 +134,7 @@ mod tests {
     #[test]
     fn growing_bounds_covers_the_first_frames_entities() {
         let mut registry = TypeRegistry::new();
-        let frames =
-            vec![render(vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)], Vec::new(), &mut registry)];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(5.0, 5.0));
     }
@@ -164,11 +170,7 @@ mod tests {
     #[test]
     fn growing_bounds_ignores_tiles_entirely() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![render(
-            vec![entity("a", 0.0, 0.0)],
-            vec![Tile { n: "grass".into(), x: 5000, y: 5000 }],
-            &mut registry,
-        )];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0)], vec![Tile { n: "grass".into(), x: 5000, y: 5000 }], &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the far away terrain tile must not affect the box");
     }
@@ -211,11 +213,7 @@ mod tests {
     #[test]
     fn growing_bounds_ignores_resource_deposits() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![render(
-            vec![entity("a", 0.0, 0.0), entity("crude-oil", -151.0, -195.0)],
-            Vec::new(),
-            &mut registry,
-        )];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("crude-oil", -151.0, -195.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant oil deposit must not affect the box");
     }
@@ -223,10 +221,8 @@ mod tests {
     #[test]
     fn growing_bounds_becomes_some_once_something_is_finally_built() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![
-            render(Vec::new(), Vec::new(), &mut registry),
-            render(vec![entity("a", 1.0, 1.0)], Vec::new(), &mut registry),
-        ];
+        let frames =
+            vec![render(Vec::new(), Vec::new(), &mut registry), render(vec![entity("a", 1.0, 1.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert!(bounds[0].is_none());
         assert!(bounds[1].is_some());

@@ -13,11 +13,11 @@ use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
-    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size,
-    entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect,
-    is_rotation_allowed, recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, Camera, CameraTransition,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar,
-    RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
+    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians,
+    format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed, recent_heat, synthetic_frame,
+    synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, HeatCell,
+    LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES,
+    LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -107,6 +107,22 @@ struct WorldView {
     /// The busiest single cell of the run, so heat brightness stays anchored
     /// to a fixed reference rather than to whatever is currently on screen.
     heat_peak: u32,
+    /// Frames worth jumping to with `[` and `]`: every milestone, plus
+    /// whatever the viewer has bookmarked. Sorted, and rebuilt whenever a
+    /// bookmark is added or removed.
+    jump_targets: Vec<usize>,
+    /// The busiest frame of each stretch of sustained construction, for
+    /// PageUp and PageDown. Fixed at load, since the activity it derives
+    /// from is.
+    busy: Vec<usize>,
+    /// Just the bookmarked frames, for drawing them on the bar. Kept beside
+    /// `jump_targets` rather than derived from it, because that list has
+    /// milestones mixed in and they are already drawn their own way.
+    bookmark_frames: Vec<usize>,
+    /// Bookmarked *ticks*, not frames. See `viewer::marks`: a rebuild at a
+    /// different seconds-per-frame renumbers every index, so a bookmark that
+    /// meant an index would silently come back pointing somewhere else.
+    bookmarks: Vec<u64>,
     follow: FollowState,
     /// This surface's natural-terrain layer, loaded once (not per frame:
     /// terrain never changes after the baseline, see
@@ -157,8 +173,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut result =
-        Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None };
+    let mut result = Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None };
 
     let mut i = 0;
     while i < args.len() {
@@ -190,13 +205,7 @@ fn draw_loading(progress: &LoadProgress) {
 
     let bar = ProgressBar::centered(screen_width(), screen_height());
     draw_rectangle(bar.left, bar.top, bar.width, bar.height, Color::new(1.0, 1.0, 1.0, 0.12));
-    draw_rectangle(
-        bar.left,
-        bar.top,
-        bar.filled_width(progress),
-        bar.height,
-        Color::new(0.45, 0.75, 1.0, 0.9),
-    );
+    draw_rectangle(bar.left, bar.top, bar.filled_width(progress), bar.height, Color::new(0.45, 0.75, 1.0, 0.9));
     draw_rectangle_lines(bar.left, bar.top, bar.width, bar.height, 2.0, Color::new(1.0, 1.0, 1.0, 0.35));
 
     let headline = if progress.total > 0 {
@@ -233,8 +242,7 @@ async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: boo
 /// happened to be busiest.
 async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence, Option<RenderFrame>)> {
     let mut last = Instant::now();
-    let mut progress =
-        LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
+    let mut progress = LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
 
     // Single-frame paths (synthetic, or the default fixture) share the tail
     // of this function; only a real directory can have more than one world.
@@ -287,8 +295,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         // terrain file per surface, so it is bounded by surface count rather
         // than by capture length.
         progress.total = paths.len() + terrain_file_paths.len();
-        progress.detail =
-            format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        progress.detail = format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
 
         // Grouped from headers rather than from parsed frames, which is what
@@ -298,12 +305,20 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         progress.phase = "reading frame headers";
         redraw_progress(&progress, &mut last, true).await;
         let grouped = viewer::group_paths_by_surface(paths);
+        // Every moment the export covers. An export omits a surface's file at
+        // a moment nothing on that surface changed, so no single surface's
+        // files describe the whole timeline and the union has to stand in for
+        // it. See `viewer::timeline_ticks`.
+        let timeline = viewer::timeline_ticks(&grouped);
 
         progress.phase = "loading frames";
         let mut done = 0usize;
         for (name, paths) in grouped {
             let mut builder = FrameSequence::builder();
-            for chunk in paths.chunks(LOAD_BATCH_FRAMES) {
+            // How far through `timeline` this surface has been filled in.
+            let mut filled = 0usize;
+            let only_paths: Vec<std::path::PathBuf> = paths.iter().map(|(_, p)| p.clone()).collect();
+            for chunk in only_paths.chunks(LOAD_BATCH_FRAMES) {
                 // One batch is parsed across every core, folded into spans,
                 // and dropped before the next is read, so peak memory is a
                 // batch plus the spans rather than the whole capture.
@@ -311,12 +326,27 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                     if let Some(n) = args.synthetic_tile_count {
                         frame.tiles = synthetic_tiles(n);
                     }
+                    // Put back the moments this surface sat unchanged, so
+                    // every surface still has one frame per moment and the
+                    // index-addressed timeline means the same thing whichever
+                    // one is being shown.
+                    //
+                    // Keyed on the parsed frame's own tick rather than the
+                    // path's, because `load_batch` drops a file it cannot
+                    // parse and the two would then be misaligned.
+                    if let Some(offset) = timeline[filled..].iter().position(|&t| t == frame.tick) {
+                        builder.push_repeats(&timeline[filled..filled + offset]);
+                        filled += offset + 1;
+                    }
                     builder.push(&RenderFrame::from_frame(frame, registry));
                 }
                 done += chunk.len();
                 progress.done = done + terrain_load.done();
                 redraw_progress(&progress, &mut last, false).await;
             }
+            // A surface that stopped changing before the capture ended still
+            // exists for the rest of it.
+            builder.push_repeats(&timeline[filled..]);
             if let Some(sequence) = builder.finish() {
                 result.push((name, sequence, None));
             }
@@ -371,12 +401,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
     };
 
     let mut last = Instant::now();
-    let mut progress = LoadProgress {
-        phase: "loading sprites",
-        detail: String::new(),
-        done: 0,
-        total: registry.len(),
-    };
+    let mut progress = LoadProgress { phase: "loading sprites", detail: String::new(), done: 0, total: registry.len() };
 
     for (id, name) in registry.names().iter().enumerate() {
         progress.done = id;
@@ -406,12 +431,7 @@ fn draw_entity(center: Vec2, size: Vec2, rotation: f32, color: Color, sprite: Op
             top_left.x,
             top_left.y,
             WHITE,
-            DrawTextureParams {
-                dest_size: Some(size),
-                source: Some(sprite.icon_rect),
-                rotation,
-                ..Default::default()
-            },
+            DrawTextureParams { dest_size: Some(size), source: Some(sprite.icon_rect), rotation, ..Default::default() },
         ),
         None => draw_rectangle_ex(
             center.x,
@@ -432,11 +452,7 @@ fn draw_tile(screen: Vec2, size: f32, color: Color, sprite: Option<&Sprite>) {
             screen.x,
             screen.y,
             WHITE,
-            DrawTextureParams {
-                dest_size: Some(Vec2::splat(size)),
-                source: Some(sprite.icon_rect),
-                ..Default::default()
-            },
+            DrawTextureParams { dest_size: Some(Vec2::splat(size)), source: Some(sprite.icon_rect), ..Default::default() },
         ),
         None => draw_rectangle(screen.x, screen.y, size, size, color),
     }
@@ -529,6 +545,7 @@ fn draw_tile_lod_layer(
 
 /// Mouse and keyboard input for the active world: panning, zooming,
 /// timeline scrubbing, and every playback/display toggle.
+#[allow(clippy::too_many_arguments)]
 fn handle_input(
     camera: &mut Camera,
     sequence: &mut FrameSequence,
@@ -536,6 +553,8 @@ fn handle_input(
     state: &mut ViewerState,
     timeline: &Timeline,
     screen_center: Vec2,
+    jump_targets: &[usize],
+    busy: &[usize],
 ) {
     let mouse: Vec2 = mouse_position().into();
 
@@ -578,6 +597,47 @@ fn handle_input(
         state.playing = false;
         follow.enabled = false;
     }
+    // Jumping between marked moments. Both pairs stop playback and drop
+    // auto-follow for the same reason stepping does: a deliberate move to a
+    // specific point should stay there rather than be dragged onward.
+    //
+    // A jump with nowhere to go is silently nothing, not a wrap to the other
+    // end: wrapping from the last milestone back to the first would look like
+    // the key had jumped somewhere at random.
+    let jump = |targets: &[usize], sequence: &mut FrameSequence, forward: bool| -> bool {
+        let found =
+            if forward { viewer::next_mark(targets, sequence.index()) } else { viewer::previous_mark(targets, sequence.index()) };
+        match found {
+            Some(frame) => {
+                sequence.goto(frame);
+                true
+            }
+            None => false,
+        }
+    };
+
+    // Letters, with shift for the reverse direction, rather than brackets or
+    // PageUp/PageDown. Bracket keys sit somewhere different on every non-US
+    // layout, and plenty of compact keyboards have no page keys at all, so
+    // both would have been a shortcut that silently does not exist for some
+    // people. A letter is in the same place everywhere, and shift is the one
+    // modifier every keyboard has.
+    //
+    // `m` for mark and `c` for construction, so the mnemonic survives not
+    // having read the key list recently.
+    let back = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    let mut jumped = false;
+    if is_key_pressed(KeyCode::M) {
+        jumped |= jump(jump_targets, sequence, !back);
+    }
+    if is_key_pressed(KeyCode::C) {
+        jumped |= jump(busy, sequence, !back);
+    }
+    if jumped {
+        state.playing = false;
+        follow.enabled = false;
+    }
+
     if is_key_pressed(KeyCode::Home) {
         sequence.goto(0);
         state.playing = false;
@@ -756,16 +816,7 @@ fn draw_world(
                 counter,
             );
         }
-        draw_tile_lod_layer(
-            &frame.tile_lod,
-            &frame.tile_lod_runs,
-            camera,
-            screen_center,
-            view_min,
-            view_max,
-            registry,
-            counter,
-        );
+        draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
         let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
@@ -872,8 +923,7 @@ fn draw_hud(
     // meaning: how much is this frame doing), with the terrain backdrop
     // (loaded once, not per frame) called out separately rather than
     // folded into the same number.
-    let terrain_suffix =
-        if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
+    let terrain_suffix = if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
     let total_items = frame.entities.len() + frame.tiles.len() + terrain_tiles;
     // Each line reports the height it used, so the next one stacks under it
     // wherever it ended up: a line that had to wrap pushes the rest down
@@ -1089,13 +1139,7 @@ fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
 /// the window slides: cell lists are a few hundred entries each and only
 /// `HEAT_WINDOW_FRAMES` of them are ever touched, so this is a few thousand
 /// operations, unlike the per-entity pass that produced them.
-fn draw_construction_heat(
-    heat: &[Vec<HeatCell>],
-    peak: u32,
-    index: usize,
-    camera: &Camera,
-    screen_center: Vec2,
-) {
+fn draw_construction_heat(heat: &[Vec<HeatCell>], peak: u32, index: usize, camera: &Camera, screen_center: Vec2) {
     let size = HEAT_CELL_TILES as f32;
 
     // Culled to the screen before spreading, grown by the spread radius so
@@ -1110,9 +1154,7 @@ fn draw_construction_heat(
     );
 
     let pixels = size * camera.pixels_per_tile();
-    for (cx, cy, intensity) in
-        recent_heat(heat, index, HEAT_WINDOW_FRAMES, HEAT_SPREAD_CELLS, peak, Some(view))
-    {
+    for (cx, cy, intensity) in recent_heat(heat, index, HEAT_WINDOW_FRAMES, HEAT_SPREAD_CELLS, peak, Some(view)) {
         let world = Vec2::new(cx as f32 * size, cy as f32 * size);
         let screen = camera.world_to_screen(world, screen_center);
         draw_rectangle(screen.x, screen.y, pixels, pixels, heat_color(intensity));
@@ -1141,15 +1183,33 @@ fn heat_color(intensity: f32) -> Color {
 /// box, since dragging a scrubber pulls the pointer off it vertically almost
 /// immediately, and losing the readout at exactly that moment would take it
 /// away whenever it is being used most deliberately.
+/// A bookmark's mark on the bar: a thin upright tick above the track.
+///
+/// Deliberately unlike the milestone diamonds below the bar and the round
+/// playhead. A bookmark is somebody's own mark rather than something the
+/// capture found, and telling the two apart at a glance is the whole reason
+/// they are not drawn the same.
+fn draw_bookmark_markers(timeline: &Timeline, sequence: &FrameSequence, bookmark_frames: &[usize]) {
+    for &frame in bookmark_frames {
+        let x = timeline.x_for_index(frame, sequence.len());
+        // A warm yellow, distinct from every milestone color and from the
+        // activity graph behind it.
+        draw_line(x, timeline.y - 9.0, x, timeline.y - 2.0, 2.0, Color::new(1.0, 0.84, 0.35, 1.0));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_timeline_bar(
     timeline: &Timeline,
     sequence: &FrameSequence,
     activity: &[f32],
     milestones: &[Milestone],
+    bookmark_frames: &[usize],
     mouse: Vec2,
     scrubbing: bool,
 ) {
     draw_activity_graph(timeline, sequence, activity);
+    draw_bookmark_markers(timeline, sequence, bookmark_frames);
 
     // Track, filled up to the current frame, a tick per frame when
     // there are few enough to read, and a playhead on top.
@@ -1273,6 +1333,20 @@ fn milestone_color(milestone: &Milestone) -> Color {
     }
 }
 
+/// Every frame `[` and `]` should stop at, and separately the frames the
+/// bookmarks alone sit on for drawing.
+///
+/// Milestones and bookmarks share one jump list because "take me to the next
+/// interesting thing" is one gesture rather than two. Both are stored as
+/// ticks and resolved here rather than kept as indices, since the same tick
+/// lands on a different frame depending on how coarsely the timelapse was
+/// built.
+fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    let bookmark_frames = viewer::frames_for_ticks(bookmarks, frame_ticks);
+    let ticks: Vec<u64> = milestones.iter().map(|m| m.tick).chain(bookmarks.iter().copied()).collect();
+    (viewer::frames_for_ticks(&ticks, frame_ticks), bookmark_frames)
+}
+
 /// Milestone markers: a small diamond under the bar at each notable moment,
 /// with its label on hover.
 ///
@@ -1284,12 +1358,7 @@ fn milestone_color(milestone: &Milestone) -> Color {
 /// Below the bar rather than above it: the activity graph, playhead label and
 /// hover tooltip already stack upward, and markers want to be near the track
 /// they annotate rather than on the far side of a graph.
-fn draw_milestone_markers(
-    timeline: &Timeline,
-    sequence: &FrameSequence,
-    milestones: &[Milestone],
-    mouse: Vec2,
-) -> bool {
+fn draw_milestone_markers(timeline: &Timeline, sequence: &FrameSequence, milestones: &[Milestone], mouse: Vec2) -> bool {
     // A sequence is never empty (see `FrameSequence`), so only the milestone
     // list needs guarding.
     if milestones.is_empty() {
@@ -1476,6 +1545,12 @@ async fn main() {
         println!("{} milestone(s) loaded", milestones.len());
     }
 
+    // Bookmarks live beside the frames, like every other sidecar. `None` for
+    // a single-file or synthetic load, which has no directory to keep them
+    // in; bookmarking is simply unavailable there rather than a special case
+    // threaded through everything below.
+    let frames_dir: Option<std::path::PathBuf> = args.path.as_deref().map(std::path::PathBuf::from).filter(|p| p.is_dir());
+
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
         Some(dir) => println!("factorio data: {}", dir.display()),
@@ -1492,8 +1567,7 @@ async fn main() {
     let mut worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence, terrain)| {
-            let camera =
-                Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
+            let camera = Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
             let growing_bounds = growing_bounds_per_frame(&sequence, &registry);
             let measured = analyze_activity(&sequence, &registry);
             let activity = activity_heights(&measured.counts);
@@ -1506,7 +1580,32 @@ async fn main() {
             // base actually starts. `f` still toggles it off for anyone who
             // wants full manual control from the start.
             let follow = FollowState { enabled: true, ..Default::default() };
-            WorldView { name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain }
+
+            let busy = viewer::busy_stretches(&measured.counts);
+            // Milestones and bookmarks share one list because "take me to the
+            // next interesting thing" is one gesture, not two. Busy stretches
+            // stay separate: they are derived rather than chosen, and there
+            // are far more of them, so mixing them in would bury the handful
+            // of moments somebody actually marked.
+            let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
+            let bookmarks = frames_dir.as_deref().map(viewer::read_bookmarks).unwrap_or_default();
+            let (jump_targets, bookmark_frames) = marks_for(&milestones, &bookmarks, &frame_ticks);
+
+            WorldView {
+                name,
+                sequence,
+                camera,
+                growing_bounds,
+                activity,
+                heat,
+                heat_peak,
+                jump_targets,
+                busy,
+                bookmark_frames,
+                bookmarks,
+                follow,
+                terrain,
+            }
         })
         .collect();
     let mut current = 0usize;
@@ -1550,14 +1649,44 @@ async fn main() {
             current = (current + 1) % world_count;
         }
         let WorldView {
-            name: world_name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain
-        } =
-            &mut worlds[current];
+            name: world_name,
+            sequence,
+            camera,
+            growing_bounds,
+            activity,
+            heat,
+            heat_peak,
+            jump_targets,
+            busy,
+            bookmark_frames,
+            bookmarks,
+            follow,
+            terrain,
+        } = &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let timeline = Timeline::for_screen(screen_width(), screen_height());
 
-        handle_input(camera, sequence, follow, &mut state, &timeline, screen_center);
+        handle_input(camera, sequence, follow, &mut state, &timeline, screen_center, jump_targets, busy);
+
+        // Toggling a bookmark at the frame on screen. Stored as that frame's
+        // tick, and written straight away rather than on exit, since the
+        // viewer is a window somebody closes rather than a program that
+        // shuts down tidily.
+        if is_key_pressed(KeyCode::B) {
+            if let (Some(dir), Some(tick)) = (frames_dir.as_deref(), sequence.tick_at(sequence.index())) {
+                match bookmarks.iter().position(|&t| t == tick) {
+                    Some(at) => {
+                        bookmarks.remove(at);
+                    }
+                    None => bookmarks.push(tick),
+                }
+                bookmarks.sort_unstable();
+                viewer::write_bookmarks(dir, bookmarks);
+                let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
+                (*jump_targets, *bookmark_frames) = marks_for(&milestones, bookmarks, &frame_ticks);
+            }
+        }
         advance_playback(sequence, &mut state);
         update_auto_follow(camera, follow, growing_bounds, sequence.index(), screen_width(), screen_height());
 
@@ -1569,8 +1698,7 @@ async fn main() {
         let frame = sequence.current();
         counter.reset();
 
-        let heat_layer =
-            state.heatmap_enabled.then(|| (heat.as_slice(), *heat_peak, sequence.index()));
+        let heat_layer = state.heatmap_enabled.then(|| (heat.as_slice(), *heat_peak, sequence.index()));
         draw_world(
             frame,
             terrain.as_ref(),
@@ -1604,6 +1732,7 @@ async fn main() {
             sequence,
             activity,
             &milestones,
+            bookmark_frames,
             mouse_position().into(),
             state.dragging_timeline,
         );

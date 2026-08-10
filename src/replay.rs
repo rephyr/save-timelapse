@@ -79,8 +79,7 @@ impl Baseline {
                 ),
             )
         })?;
-        let mut baseline: Baseline =
-            serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut baseline: Baseline = serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         baseline.session_id = path.parent().and_then(parse_session_dir_name).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -155,8 +154,7 @@ impl CatchUpBaseline {
 /// deterministically, so anything else matching the general frame shape is
 /// definitionally a catch-up.
 fn discover_catch_up_baselines(dir: &Path, baseline: &Baseline) -> io::Result<Vec<CatchUpBaseline>> {
-    let known: std::collections::HashSet<PathBuf> =
-        baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
+    let known: std::collections::HashSet<PathBuf> = baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
 
     let mut catch_ups: Vec<CatchUpBaseline> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -209,8 +207,14 @@ impl Session {
                 other => other,
             };
         }
-        std::fs::write(path, format!("{}
-", label.trim()))
+        std::fs::write(
+            path,
+            format!(
+                "{}
+",
+                label.trim()
+            ),
+        )
     }
 
     /// How much disk this capture occupies, for showing what deleting it
@@ -277,8 +281,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
             }
         };
 
-        let mut last_modified =
-            baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut last_modified = baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
         if let Ok(segments) = event::log_segments(&session_dir) {
             for segment in segments {
                 if let Ok(modified) = segment.path.metadata().and_then(|m| m.modified()) {
@@ -342,6 +345,12 @@ pub struct Replay {
     /// deleting `script-output` by hand would look like, and the two are
     /// indistinguishable from the file alone.
     pub restarted_segments: usize,
+    /// Records stepped over because their tag postdates this build (see the
+    /// extension contract in `event.rs`). Not a health signal and not
+    /// corruption: it means the mod writing the capture is newer than the
+    /// tool reading it, and the replay is correct as far as it goes but is
+    /// missing whatever those records described.
+    pub unknown_extensions: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -361,8 +370,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     let baseline = Baseline::read_at(baseline_path)?;
     let dir = baseline_path.parent().unwrap_or_else(|| Path::new("."));
 
-    let mut paths: Vec<PathBuf> =
-        baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
+    let mut paths: Vec<PathBuf> = baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
     paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
 
     let mut world = World::new();
@@ -413,6 +421,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         out_of_order_batches: 0,
         superseded_events: 0,
         restarted_segments: 0,
+        unknown_extensions: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -430,8 +439,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
 /// built there before capture stopped) would otherwise be invisible to both
 /// checks, so `replay.pending_catch_ups` is checked directly too.
 pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<String>> {
-    let mut surfaces: std::collections::BTreeSet<String> =
-        replay.world.surface_names().into_iter().map(String::from).collect();
+    let mut surfaces: std::collections::BTreeSet<String> = replay.world.surface_names().into_iter().map(String::from).collect();
     surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
 
     // Bounded exactly the way `run` bounds them, per append run and not just
@@ -499,7 +507,7 @@ where
         // a plain append, with no magic header, under the same session tag).
         // One bad segment losing its own events is a much smaller problem
         // than it sinking replay of an otherwise complete session.
-        let stream = match event::stream_log(&segment.path) {
+        let mut stream = match event::stream_log(&segment.path) {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("warning: skipping unreadable event segment {}: {e}", segment.path.display());
@@ -525,7 +533,7 @@ where
         let mut pending: Vec<LoggedEvent> = Vec::new();
         let mut pending_tick = None;
 
-        for logged in stream {
+        for logged in &mut stream {
             // Which append run this record belongs to, tracked over every
             // record the file holds rather than only the kept ones: a run
             // boundary is a fact about append order, so skipping a record
@@ -610,6 +618,10 @@ where
             pending.push(logged);
         }
 
+        // Asked after the walk, not during: the count is of what iteration
+        // actually stepped over, so it is only complete once the stream is.
+        replay.unknown_extensions += stream.unknown_extensions();
+
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {
             flush_until(replay, tick, &mut next_emit, &mut emitted);
@@ -682,16 +694,62 @@ fn apply_due_catch_ups(replay: &mut Replay, tick: u64) {
 ///
 /// Used by `save-timelapse.exe`'s live-capture flow when the user asks for
 /// every surface rather than picking one busiest.
-pub fn write_all_surfaces(world: &World, tick: u64, out: &Path, index: usize) -> io::Result<()> {
+///
+/// **A surface unchanged since its own last written frame is skipped too**,
+/// which is where nearly all of a multi-surface export's output went. Callers
+/// keep `written`, mapping surface name to the revision last written for it,
+/// across the whole run; it starts empty and this updates it.
+///
+/// That leaves gaps in a surface's indices, which is not a new situation:
+/// the "nothing on it" skip above has always produced them, so the viewer
+/// already groups by surface into independently ordered timelines. A gap
+/// means "unchanged since the last file present", and
+/// `viewer::loading::group_by_surface` expands it back out. Nothing about
+/// the file format or the naming changes, and the gap itself is the record,
+/// so there is no sidecar to keep in sync.
+///
+/// Returns how many files were actually written, so a caller can report the
+/// saving rather than implying every surface was output.
+pub fn write_all_surfaces(
+    world: &World,
+    tick: u64,
+    out: &Path,
+    index: usize,
+    written: &mut std::collections::HashMap<String, u64>,
+) -> io::Result<usize> {
+    let mut files = 0;
     for surface in world.surface_names() {
+        let revision = match world.surface(surface) {
+            Some(s) => s.revision(),
+            None => continue,
+        };
+
+        // The saving this exists for. Every surface used to be written at
+        // every frame, but a playthrough only ever builds on one surface at a
+        // time, so the rest were re-serialized and re-written unchanged. On a
+        // real nine-surface capture that was 93% of the bytes.
+        //
+        // Compared against this surface's own last written revision rather
+        // than a global one: "did anything change anywhere" is near always
+        // true on a multi-surface save and would skip nothing at all.
+        //
+        // Checked before `to_frame`, which is the point: materialising the
+        // frame to discover it is unchanged would still pay the expensive
+        // half of the work.
+        if written.get(surface) == Some(&revision) {
+            continue;
+        }
+
         let frame = world.to_frame(surface, tick);
         if frame.entities.is_empty() && frame.tiles.is_empty() {
             continue;
         }
         let path = out.join(format!("frame_{index:04}_{surface}.stfr"));
         std::fs::write(&path, frame::write_binary(&frame.as_out()))?;
+        written.insert(surface.to_string(), revision);
+        files += 1;
     }
-    Ok(())
+    Ok(files)
 }
 
 /// Writes `surface_name`'s natural-terrain layer to `terrain_<surface>.stfr`
@@ -739,6 +797,146 @@ fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
         replay.world.tick = replay.world.tick.max(logged.tick);
     }
     pending.clear();
+}
+
+/// Sizing the "skip unchanged frames" idea against a real capture, which no
+/// fixture can stand in for: the whole answer is a property of how somebody
+/// actually played, not of the code.
+#[cfg(test)]
+mod idle_study {
+    use super::*;
+
+    /// Reports how much of an export is frames identical to the one before
+    /// them.
+    ///
+    /// Ignored and environment driven so it never runs in CI and no local
+    /// path is ever committed:
+    ///
+    /// ```text
+    /// SAVE_TIMELAPSE_CAPTURE='<...>/script-output/save-timelapse/<session>' \
+    ///   cargo test --lib measure_unchanged_frames -- --ignored --nocapture
+    /// ```
+    ///
+    /// `SAVE_TIMELAPSE_FRAME_SECONDS` overrides the 60 seconds of game time
+    /// per frame the tool defaults to. Worth sweeping, because the ratio
+    /// moves with it in the obvious direction: the coarser the interval, the
+    /// more chance each frame has of containing at least one change, so a
+    /// fine interval flatters this optimization and a coarse one buries it.
+    ///
+    /// Measures per surface, because that is what an export writes: one file
+    /// per surface per frame. A global "did anything change anywhere" check
+    /// is near always true on a multi-surface save and would report almost no
+    /// duplication while 86% of the files written were byte-identical to that
+    /// surface's own previous one.
+    #[test]
+    #[ignore]
+    fn measure_unchanged_frames() {
+        let dir = std::env::var("SAVE_TIMELAPSE_CAPTURE")
+            .expect("set SAVE_TIMELAPSE_CAPTURE to one session folder under script-output");
+        let dir = Path::new(&dir);
+        let frame_seconds: u64 = std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+
+        let mut replay = load_baseline(&dir.join("baseline.json")).expect("baseline must load");
+        let surfaces: Vec<String> = replay.world.surface_names().iter().map(|s| s.to_string()).collect();
+        assert!(!surfaces.is_empty(), "a capture with no surfaces has nothing to measure");
+
+        let options = Options { interval: frame_seconds * 60, max_frames: 100_000 };
+
+        // Every surface, because that is what an export writes: one file per
+        // surface per frame (`replay::write_all_surfaces`). Measuring a single
+        // surface understates the opportunity badly on a multi-surface save,
+        // where most surfaces sit idle while one is being worked on.
+        //
+        // Serialized for real rather than estimated: the question is how many
+        // bytes an export actually writes, and `write_binary` decides that.
+        // The comparison skips the 8 byte tick at offset 5 and the 4 byte
+        // trailing checksum, which is precisely "same surface, same entities,
+        // same tiles, different moment".
+        let mut totals = vec![(0usize, 0usize, 0usize); surfaces.len()]; // files, bytes, duplicate files
+        let mut duplicate_bytes = vec![0usize; surfaces.len()];
+        let mut previous: Vec<Option<Vec<u8>>> = vec![None; surfaces.len()];
+
+        let emitted = run(&mut replay, dir, &options, |world, tick| {
+            for (i, surface) in surfaces.iter().enumerate() {
+                let bytes = crate::frame::write_binary(&world.to_frame(surface, tick).as_out());
+                let body = |b: &[u8]| b[13..b.len() - 4].to_vec();
+                if previous[i].as_deref().map(|p| body(p) == body(&bytes)).unwrap_or(false) {
+                    totals[i].2 += 1;
+                    duplicate_bytes[i] += bytes.len();
+                }
+                totals[i].0 += 1;
+                totals[i].1 += bytes.len();
+                previous[i] = Some(bytes);
+            }
+        })
+        .expect("replay must run");
+
+        let pct = |part: usize, whole: usize| if whole == 0 { 0.0 } else { part as f64 * 100.0 / whole as f64 };
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+
+        println!("\nIDLE STUDY  {frame_seconds}s per frame, {emitted} frames, {} surfaces", surfaces.len());
+        println!("  {:<14} {:>7} {:>9} {:>10} {:>9}", "surface", "files", "dup", "written", "wasted");
+        for (i, surface) in surfaces.iter().enumerate() {
+            let (files, bytes, dups) = totals[i];
+            println!(
+                "  {:<14} {:>7} {:>8.1}% {:>8.1} MB {:>6.1} MB",
+                surface,
+                files,
+                pct(dups, files),
+                mb(bytes),
+                mb(duplicate_bytes[i])
+            );
+        }
+        let files: usize = totals.iter().map(|t| t.0).sum();
+        let bytes: usize = totals.iter().map(|t| t.1).sum();
+        let dups: usize = totals.iter().map(|t| t.2).sum();
+        let wasted: usize = duplicate_bytes.iter().sum();
+        println!("  {:<14} {:>7} {:>8.1}% {:>8.1} MB {:>6.1} MB", "TOTAL", files, pct(dups, files), mb(bytes), mb(wasted));
+        println!("  bytes wasted: {:.1}%", pct(wasted, bytes));
+        println!("  applied events {}  no-op {}", replay.applied_events, replay.no_op_events);
+    }
+
+    /// What the export actually writes, against what it would have written
+    /// before a surface could be skipped.
+    ///
+    /// Runs the real `write_all_surfaces` into a scratch directory rather
+    /// than a model of it, so this measures the shipped path and not an idea
+    /// of it. Same environment variables as the study above.
+    #[test]
+    #[ignore]
+    fn measure_export_size() {
+        let dir = std::env::var("SAVE_TIMELAPSE_CAPTURE")
+            .expect("set SAVE_TIMELAPSE_CAPTURE to one session folder under script-output");
+        let dir = Path::new(&dir);
+        let frame_seconds: u64 = std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+
+        let mut replay = load_baseline(&dir.join("baseline.json")).expect("baseline must load");
+        let out = tempfile::tempdir().unwrap();
+        let options = Options { interval: frame_seconds * 60, max_frames: 100_000 };
+
+        let mut revisions = std::collections::HashMap::new();
+        let (mut index, mut files) = (0usize, 0usize);
+        run(&mut replay, dir, &options, |world, tick| {
+            files += write_all_surfaces(world, tick, out.path(), index, &mut revisions).expect("write");
+            index += 1;
+        })
+        .expect("replay must run");
+
+        let bytes: u64 = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+
+        let surfaces = replay.world.surface_names().len();
+        let mb = |b: f64| b / (1024.0 * 1024.0);
+        println!("\nEXPORT SIZE  {frame_seconds}s per frame");
+        println!("  frames             {index}");
+        println!("  surfaces           {surfaces}");
+        println!("  files written      {files}   (every surface every frame would be {})", index * surfaces);
+        println!("  bytes on disk      {:.1} MB", mb(bytes as f64));
+    }
 }
 
 #[cfg(test)]
@@ -950,10 +1148,7 @@ mod tests {
         run(&mut replay, session_dir, &options, |world, _| counts.push(world.entity_count())).unwrap();
 
         // No frame may show a partial tick: counts jump from 1 to 51.
-        assert!(
-            counts.iter().all(|&c| c == 1 || c == 51),
-            "a frame caught mid-tick: {counts:?}"
-        );
+        assert!(counts.iter().all(|&c| c == 1 || c == 51), "a frame caught mid-tick: {counts:?}");
         assert_eq!(*counts.last().unwrap(), 51);
         let _dir = dir;
     }
@@ -1098,8 +1293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join(TEST_SESSION_HEX);
         fs::create_dir_all(&session_dir).unwrap();
-        fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#)
-            .unwrap();
+        fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
         // The shape every capture used before playthroughs got their own
         // folder: a plain file, not a directory, sitting at the top level.
         fs::write(dir.path().join("baseline.json"), r#"{"tick":1,"surfaces":[]}"#).unwrap();
@@ -1232,13 +1426,8 @@ mod tests {
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
-        let names: std::collections::BTreeSet<String> = replay
-            .world
-            .surface("nauvis")
-            .unwrap()
-            .entities()
-            .map(|e| replay.world.names().name(e.name).to_string())
-            .collect();
+        let names: std::collections::BTreeSet<String> =
+            replay.world.surface("nauvis").unwrap().entities().map(|e| replay.world.names().name(e.name).to_string()).collect();
         assert_eq!(
             names,
             ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
@@ -1304,8 +1493,7 @@ mod tests {
             assert_eq!(count, expected, "tick {tick} shows {count} entities");
         }
 
-        let abandoned_survived =
-            replay.world.surface("nauvis").unwrap().entities().any(|e| e.x == 9.5 && e.y == 9.5);
+        let abandoned_survived = replay.world.surface("nauvis").unwrap().entities().any(|e| e.x == 9.5 && e.y == 9.5);
         assert!(!abandoned_survived, "the abandoned future's entity must not survive the reload");
         // baseline's pipe + the tick-200 belt (before the reload point) + the
         // real tick-3500 belt (after it) = 3; never 4, which would mean the
@@ -1352,13 +1540,8 @@ mod tests {
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
-        let surviving: std::collections::BTreeSet<String> = replay
-            .world
-            .surface("nauvis")
-            .unwrap()
-            .entities()
-            .map(|e| replay.world.names().name(e.name).to_string())
-            .collect();
+        let surviving: std::collections::BTreeSet<String> =
+            replay.world.surface("nauvis").unwrap().entities().map(|e| replay.world.names().name(e.name).to_string()).collect();
         assert_eq!(
             surviving,
             ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
@@ -1421,12 +1604,7 @@ mod tests {
     fn catch_up_baseline_surface_appears_only_from_its_own_tick_onward() {
         let (dir, baseline_path) = capture_dir();
         let session_dir = baseline_path.parent().unwrap();
-        write_catch_up_frame(
-            session_dir,
-            500,
-            "vulcanus",
-            vec![vulcanus_entity(1.5, 1.5), vulcanus_entity(2.5, 1.5)],
-        );
+        write_catch_up_frame(session_dir, 500, "vulcanus", vec![vulcanus_entity(1.5, 1.5), vulcanus_entity(2.5, 1.5)]);
 
         let mut log = TestLog::new();
         // Before the catch-up: logged (the mod starts logging the instant a
@@ -1455,11 +1633,7 @@ mod tests {
             2,
             "the catch-up snapshot's own 2 entities, nothing from the dropped tick-300 event"
         );
-        assert_eq!(
-            seen.last().unwrap().1,
-            3,
-            "the snapshot's 2 plus the tick-600 event's 1"
-        );
+        assert_eq!(seen.last().unwrap().1, 3, "the snapshot's 2 plus the tick-600 event's 1");
         assert_eq!(replay.catch_ups_applied, 1);
         let _dir = dir;
     }
@@ -1577,13 +1751,97 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().unwrap();
-        write_all_surfaces(&world, 100, dir.path(), 7).unwrap();
+        write_all_surfaces(&world, 100, dir.path(), 7, &mut Default::default()).unwrap();
 
-        let written: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let written: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
+    }
+
+    /// The saving itself. A playthrough only ever builds on one surface at a
+    /// time, so on a real nine-surface capture 93% of the bytes written were
+    /// a surface being re-serialized unchanged. Only what moved gets written
+    /// now, and the gap it leaves in that surface's indices is the record
+    /// that it did not.
+    #[test]
+    fn an_unchanged_surface_is_not_written_again() {
+        let entity = |x: f32, y: f32| crate::frame::Entity { n: "pipe".into(), x, y, d: 0, w: 1, h: 1 };
+        let baseline = |surface: &str, x: f32| crate::frame::Frame {
+            tick: 100,
+            surface: surface.to_string(),
+            entities: vec![entity(x, 2.0)],
+            count: 1,
+            tiles: Vec::new(),
+        };
+
+        let mut world = crate::world::World::new();
+        world.load_baseline(&baseline("nauvis", 1.0));
+        world.load_baseline(&baseline("gleba", 50.0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut revisions = std::collections::HashMap::new();
+
+        assert_eq!(
+            write_all_surfaces(&world, 100, dir.path(), 0, &mut revisions).unwrap(),
+            2,
+            "both surfaces are new at the first frame"
+        );
+        assert_eq!(
+            write_all_surfaces(&world, 200, dir.path(), 1, &mut revisions).unwrap(),
+            0,
+            "a world where nothing happened writes nothing at all"
+        );
+
+        world.apply(
+            Some("gleba"),
+            &crate::event::Event::AddEntity { name: "inserter".to_string(), x: 51.0, y: 2.0, d: 0, w: 1, h: 1, id: Some(1) },
+        );
+        assert_eq!(
+            write_all_surfaces(&world, 300, dir.path(), 2, &mut revisions).unwrap(),
+            1,
+            "only the surface that actually changed"
+        );
+
+        let mut files: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            ["frame_0000_gleba.stfr", "frame_0000_nauvis.stfr", "frame_0002_gleba.stfr"],
+            "nauvis stops at index 0 and gleba skips index 1"
+        );
+    }
+
+    /// A re-add of exactly what is already there must not count as a change.
+    /// The baseline smear produces these by design (a snapshot taken just
+    /// after the events describing the same construction), so treating one as
+    /// a change would write a duplicate file for every surface every time it
+    /// happened.
+    #[test]
+    fn re_adding_an_identical_entity_does_not_force_a_write() {
+        let mut world = crate::world::World::new();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            entities: vec![crate::frame::Entity { n: "pipe".into(), x: 1.0, y: 2.0, d: 0, w: 1, h: 1 }],
+            count: 1,
+            tiles: Vec::new(),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut revisions = std::collections::HashMap::new();
+        write_all_surfaces(&world, 100, dir.path(), 0, &mut revisions).unwrap();
+
+        world.apply(
+            Some("nauvis"),
+            &crate::event::Event::AddEntity { name: "pipe".to_string(), x: 1.0, y: 2.0, d: 0, w: 1, h: 1, id: None },
+        );
+
+        assert_eq!(
+            write_all_surfaces(&world, 200, dir.path(), 1, &mut revisions).unwrap(),
+            0,
+            "re-adding what was already there changed nothing"
+        );
     }
 
     #[test]
@@ -1612,10 +1870,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_all_terrain(&world, 100, dir.path()).unwrap();
 
-        let written: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let written: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(written, vec!["terrain_nauvis.stfr"], "vulcanus has no terrain, so it gets no file");
 
         let bytes = fs::read(dir.path().join("terrain_nauvis.stfr")).unwrap();

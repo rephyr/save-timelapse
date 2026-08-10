@@ -9,6 +9,10 @@ pub mod milestone;
 pub mod names;
 pub mod player_log;
 pub mod replay;
+/// What the tool remembers between runs. Distinct from [`settings_dat`],
+/// which is Factorio's own `mod-settings.dat` format and nothing to do with
+/// this tool's preferences.
+pub mod settings;
 pub mod settings_dat;
 pub mod wire;
 pub mod world;

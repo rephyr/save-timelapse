@@ -42,6 +42,17 @@ impl<'a> ByteReader<'a> {
         Some(slice)
     }
 
+    /// Steps over `n` bytes without interpreting them.
+    ///
+    /// This is what makes an extension record skippable: a reader that does
+    /// not recognise a tag still knows how many bytes the record occupies, so
+    /// it can resume at the next one instead of desynchronising. `None` means
+    /// the record claimed more bytes than the file has left, which is a
+    /// truncated file rather than merely an unfamiliar feature.
+    pub fn skip(&mut self, n: usize) -> Option<()> {
+        self.take(n).map(|_| ())
+    }
+
     pub fn magic(&mut self, expected: &[u8; 4]) -> Option<()> {
         let got = self.take(4)?;
         (got == expected).then_some(())

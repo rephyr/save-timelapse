@@ -74,6 +74,19 @@ M.PLACED_FLOOR_TILES = {
   "orange-refined-concrete", "yellow-refined-concrete", "pink-refined-concrete",
   "purple-refined-concrete", "black-refined-concrete", "brown-refined-concrete",
   "cyan-refined-concrete", "acid-refined-concrete",
+  -- Aquilo freezes placed floor into a `frozen-` twin of the same tile.
+  -- These are still floor the player laid, placeable and blueprintable, so
+  -- without them here an entire Aquilo base's paving is invisible to live
+  -- capture: it would only ever appear if terrain capture happened to be on,
+  -- and then only in the baseline, never as it was built.
+  --
+  -- Seven of them, not one per floor type: the game only generates frozen
+  -- variants for stone path, concrete, refined concrete and the two hazard
+  -- pairs, not for the coloured refined concretes.
+  "frozen-stone-path", "frozen-concrete",
+  "frozen-hazard-concrete-left", "frozen-hazard-concrete-right",
+  "frozen-refined-concrete",
+  "frozen-refined-hazard-concrete-left", "frozen-refined-hazard-concrete-right",
 }
 
 -- Terrain capture bounding box
@@ -126,13 +139,26 @@ M.EVENT_MAGIC = "STE1"
 --- Version 2 groups records into per-name runs and stores coordinates as
 --- zigzag varint deltas, measured 4.7x smaller than version 1 on a real
 --- frame. See src/frame.rs, which reads both.
-M.FRAME_VERSION = 2
+---
+--- Version 3 writes byte for byte what version 2 does. It exists only to
+--- declare "this file may contain extension records" (see the extension
+--- contract in src/frame.rs), so a tool predating them refuses it up front
+--- with a clear message instead of desynchronising on the first record it
+--- cannot skip. Additions from here on are extension records, not a fourth
+--- version, so this is meant to be the last time this number moves.
+M.FRAME_VERSION = 3
 --- Version 2 adds the dictionary-reset record (tag 7, see
 --- `event_reset_dictionaries`). A version 1 reader hitting that record stops
 --- the stream rather than misreading it, since an unknown tag ends parsing,
 --- so the bump is what turns "silently wrong from the reload onward" into a
 --- refusal an older build can explain.
-M.EVENT_VERSION = 2
+---
+--- Version 3 is the same story as the frame format's: identical records, and
+--- the bump only declares that extension records may appear. That record
+--- shape is the standing fix for the problem the version 2 bump could only
+--- paper over, since an unknown tag is now skippable rather than the end of
+--- the stream.
+M.EVENT_VERSION = 3
 
 --- JSON string quoting, still needed for the manifest files
 --- (baseline.json, frame_<tick>_manifest.json): those stay JSON since
@@ -602,6 +628,32 @@ end
 --- so can never appear there.
 function M.is_science_pack(name)
   return name:sub(-13) == "-science-pack"
+end
+
+--- What one save can say about milestones, as a JSON object for the export
+--- manifest: `{"science":[...],"planets":[...],"rockets":N}`.
+---
+--- State, not events, and that difference is the whole reason this exists.
+--- Live capture watches milestones happen and can write the exact tick
+--- (milestones.lua). A save file has no history of its own: it knows only
+--- that a pack has been produced at some point, never when. So this reports
+--- what is true as of this save, and recovering *when* each thing first
+--- became true is left to the Rust side, which has every save's state and
+--- can diff consecutive ones (see src/milestone.rs).
+---
+--- Rockets is a count rather than a flag so the diff can tell "the first
+--- rocket flew between these two saves" from "some rockets flew, as they had
+--- been all along."
+function M.milestone_state(science, planets, rockets)
+  local quoted_science, quoted_planets = {}, {}
+  for i, name in ipairs(science) do
+    quoted_science[i] = M.quote(name)
+  end
+  for i, name in ipairs(planets) do
+    quoted_planets[i] = M.quote(name)
+  end
+  return string.format('{"science":[%s],"planets":[%s],"rockets":%d}',
+    table.concat(quoted_science, ","), table.concat(quoted_planets, ","), rockets)
 end
 
 -- Player position log

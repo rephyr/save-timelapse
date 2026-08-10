@@ -99,7 +99,19 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
     let (mut previous, mut current): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
     let mut built: Vec<u64> = Vec::new();
 
-    frames.for_each_frame(|index, frame| {
+    frames.for_each_frame(|index, frame, repeat| {
+        // A repeat is identical to the frame before it, so nothing was built
+        // between them: the count is zero and the heat is empty, both known
+        // without looking. `previous` is deliberately left alone, since it
+        // already holds this frame's positions too, which is what lets the
+        // next real frame diff correctly across the whole gap.
+        //
+        // Everything below (materialise, sort, dedup, merge over every entity
+        // on the surface) would otherwise run per repeat to reach the same
+        // answer, and on a long capture repeats are most of the frames.
+        if repeat {
+            return;
+        }
         current.clear();
         for run in &frame.entity_runs {
             let name = registry.name(run.type_id);
@@ -294,8 +306,7 @@ mod tests {
     /// module looks at.
     fn frame_of(registry: &mut TypeRegistry, name: &str, positions: &[(f32, f32)]) -> RenderFrame {
         let type_id = registry.intern(name);
-        let entities: Vec<RenderEntity> =
-            positions.iter().map(|&(x, y)| RenderEntity { x, y, w: 1, h: 1, d: 0 }).collect();
+        let entities: Vec<RenderEntity> = positions.iter().map(|&(x, y)| RenderEntity { x, y, w: 1, h: 1, d: 0 }).collect();
         RenderFrame {
             tick: 0,
             count: entities.len(),
@@ -429,10 +440,7 @@ mod tests {
     /// Builds a per-frame heat list directly, so the spreading tests state
     /// their input rather than deriving it from frames.
     fn heat_of(frames: &[&[(i32, i32, u32)]]) -> Vec<Vec<HeatCell>> {
-        frames
-            .iter()
-            .map(|cells| cells.iter().map(|&(x, y, built)| HeatCell { x, y, built }).collect())
-            .collect()
+        frames.iter().map(|cells| cells.iter().map(|&(x, y, built)| HeatCell { x, y, built }).collect()).collect()
     }
 
     fn intensity_at(field: &[(i32, i32, f32)], x: i32, y: i32) -> f32 {
@@ -456,8 +464,7 @@ mod tests {
     fn heat_falls_off_with_distance_from_the_construction() {
         let heat = heat_of(&[&[], &[(0, 0, 9)]]);
         let field = recent_heat(&heat, 1, 4, 3, 9, None);
-        let (core, near, far) =
-            (intensity_at(&field, 0, 0), intensity_at(&field, 1, 0), intensity_at(&field, 3, 0));
+        let (core, near, far) = (intensity_at(&field, 0, 0), intensity_at(&field, 1, 0), intensity_at(&field, 3, 0));
         assert!(core > near && near > far, "expected a falloff, got {core} {near} {far}");
     }
 
@@ -546,15 +553,11 @@ mod tests {
         let frames = crate::loading::load_sequence(std::path::Path::new(dir)).unwrap();
 
         let mut registry = TypeRegistry::new();
-        let render: Vec<RenderFrame> =
-            frames.into_iter().map(|frame| RenderFrame::from_frame(frame, &mut registry)).collect();
+        let render: Vec<RenderFrame> = frames.into_iter().map(|frame| RenderFrame::from_frame(frame, &mut registry)).collect();
 
         let activity = analyze_activity(&seq(render), &registry).counts;
         assert_eq!(activity[0], 0, "the first frame is the starting state, not construction");
-        assert!(
-            activity[1..].iter().any(|&count| count > 0),
-            "no construction found across five real frames: {activity:?}"
-        );
+        assert!(activity[1..].iter().any(|&count| count > 0), "no construction found across five real frames: {activity:?}");
 
         let heights = activity_heights(&activity);
         assert!(heights.iter().all(|h| (0.0..=1.0).contains(h)), "heights escaped 0..1: {heights:?}");
@@ -602,9 +605,12 @@ mod bench {
                 count: entities.len(),
                 entity_runs: vec![Run { type_id, start: 0, end: entities.len() as u32 }],
                 entities,
-                tiles: Vec::new(), tile_runs: Vec::new(),
-                tile_lod: Vec::new(), tile_lod_runs: Vec::new(),
-                entity_lod: Vec::new(), entity_lod_runs: Vec::new(),
+                tiles: Vec::new(),
+                tile_runs: Vec::new(),
+                tile_lod: Vec::new(),
+                tile_lod_runs: Vec::new(),
+                entity_lod: Vec::new(),
+                entity_lod_runs: Vec::new(),
             });
         }
         let total: usize = frames.iter().map(|f| f.entities.len()).sum();

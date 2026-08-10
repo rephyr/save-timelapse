@@ -57,13 +57,7 @@ mod tests {
 
     #[test]
     fn load_progress_fraction_is_bounded_and_safe_at_zero_total() {
-        let at = |done, total| LoadProgress {
-            phase: "frames",
-            detail: String::new(),
-            done,
-            total,
-        }
-        .fraction();
+        let at = |done, total| LoadProgress { phase: "frames", detail: String::new(), done, total }.fraction();
         assert_eq!(at(0, 0), 0.0, "an empty job must not divide by zero");
         assert_eq!(at(0, 4), 0.0);
         assert_eq!(at(2, 4), 0.5);

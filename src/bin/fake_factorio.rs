@@ -46,17 +46,13 @@ fn default_frame_bytes() -> Vec<u8> {
 }
 
 fn flag_value(file: &settings_dat::SettingsFile, name: &str) -> bool {
-    matches!(
-        file.listing().get(&("startup".to_string(), name.to_string())),
-        Some(Payload::Flag(true))
-    )
+    matches!(file.listing().get(&("startup".to_string(), name.to_string())), Some(Payload::Flag(true)))
 }
 
 /// Pull `write-data` out of a Factorio config.ini.
 fn write_data_dir(config: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config).ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("write-data=").map(|v| PathBuf::from(v.trim())))
+    text.lines().find_map(|line| line.strip_prefix("write-data=").map(|v| PathBuf::from(v.trim())))
 }
 
 fn arg_after(args: &[String], flag: &str) -> Option<PathBuf> {
@@ -138,9 +134,16 @@ fn main() -> ExitCode {
         eprintln!("fake-factorio: cannot write frame: {err}");
         return ExitCode::FAILURE;
     }
+    // Milestone state included because the real mod includes it (see
+    // mod/export.lua's `export_all_to`), and it is the only thing on the
+    // from-saves path that a single save cannot answer for itself: the Rust
+    // side recovers timings by comparing consecutive saves, so the pickup
+    // being exercised here is what makes that possible at all.
     let _ = std::fs::write(
         out_dir.join(format!("frame_{tick}_manifest.json")),
-        format!(r#"{{"tick":{tick},"entities":4,"surfaces":["nauvis"]}}"#),
+        format!(
+            r#"{{"tick":{tick},"entities":4,"surfaces":["nauvis"],"milestones":{{"science":["automation-science-pack"],"planets":["nauvis"],"rockets":1}}}}"#
+        ),
     );
 
     if flag_value(&settings, RESOURCES) {

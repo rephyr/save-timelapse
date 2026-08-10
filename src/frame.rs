@@ -9,12 +9,18 @@
 //! tick      u64
 //! surface   string (u16 length, then that many UTF-8 bytes)
 //! entity section, a sequence of:
-//!   tag 0  DefineName    string
-//!   tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
+//!   tag 0     DefineName  string name, u8 w, u8 h
+//!   tag 1     EntityRun   varint name_id, varint count, u8 flags,
+//!                         then per item varint dx, varint dy, and a u8
+//!                         direction when flags has bit 0; then, when flags
+//!                         has bit 1, varint len and that many bytes
+//!   tag >=128 Extension   varint len, then that many bytes
 //! tag 9  EndEntities (no payload), marking the start of the tile section
 //! tile section, a sequence of:
-//!   tag 0  DefineName    string
-//!   tag 2  TileRecord    u16 name_id, i32 x, i32 y
+//!   tag 0     DefineName  string name, u8 w, u8 h
+//!   tag 2     TileRun     varint name_id, varint count, then per item
+//!                         varint dx, varint dy
+//!   tag >=128 Extension   varint len, then that many bytes
 //! checksum  u32, djb2 (see `checksum` below) of every byte before it,
 //!           magic and version included
 //! ```
@@ -30,6 +36,40 @@
 //! will not parse, consistent with this project's existing precedent of
 //! clean breaks over carrying old formats forward at this alpha stage (see
 //! the session-tagging change earlier).
+//!
+//! Coordinates within a run are zigzag varint deltas against the previous
+//! item, starting from the origin. Version 1 predates runs entirely, writing
+//! one fixed width record per entity or tile, and `read_binary` keeps a
+//! separate function for it.
+//!
+//! # The extension contract
+//!
+//! Version 3 is where this format stops changing shape. Everything added
+//! after it goes in an extension record: a tag of 128 or above, a varint byte
+//! length, then that many bytes. A reader that does not recognise the tag
+//! skips exactly that many bytes and carries on, so a capture written by a
+//! newer mod still loads in an older tool, minus whatever the new record
+//! described.
+//!
+//! That property is the point, because of how this project is actually
+//! installed. Factorio updates mods from the portal on its own; the desktop
+//! tool does not update itself. The mod being newer than the tool is
+//! therefore the normal state of anyone who installed once and kept playing,
+//! not an edge case, and before extension records that combination could only
+//! produce a hard refusal.
+//!
+//! Two rules keep it working:
+//!
+//! - Core tags stay below 128, so the two kinds never collide.
+//! - Extension payloads are never interleaved with the data they annotate.
+//!   `RUN_FLAG_DIRECTIONS` is interleaved, and that is precisely why an
+//!   unknown column of that shape is unskippable: without knowing the column
+//!   is there, a reader cannot find where the run ends. A trailing,
+//!   length prefixed block has no such problem.
+//!
+//! A length that runs past the end of the file is still an error. Not
+//! understanding a record is fine; a record that does not fit means the file
+//! is damaged.
 //!
 //! There is no entity or tile count anywhere in the file. `find_entities_filtered`
 //! and `find_tiles_filtered` both return a full array, so a count would be
@@ -69,13 +109,25 @@ const MAGIC: &[u8; 4] = b"STF1";
 /// frame (see `format_study`). Version 1 is still read: a capture written by
 /// an older mod is worth keeping openable, and the shape is different enough
 /// that the two bodies are simply separate functions.
-const CURRENT_VERSION: u8 = 2;
+///
+/// Version 3 is version 2's body byte for byte. It changes nothing about how
+/// entities and tiles are written and exists only to declare "this file may
+/// contain extension records", so that a build predating them refuses it up
+/// front with a clear message instead of desynchronising on the first one it
+/// cannot skip. See the extension contract in this module's header: from
+/// version 3 onward additions go in extension records, so this constant is
+/// intended never to rise again.
+const CURRENT_VERSION: u8 = 3;
 const MIN_SUPPORTED_VERSION: u8 = 1;
 const TRAILER_LEN: usize = 4;
 const TAG_DEFINE_NAME: u8 = 0;
 const TAG_ENTITY: u8 = 1;
 const TAG_TILE: u8 = 2;
 const TAG_END_ENTITIES: u8 = 9;
+/// Tags from here up are extension records: a varint byte length, then that
+/// many bytes this reader is free not to understand. Core tags stay below it,
+/// so the two kinds can never collide as the format grows.
+const TAG_EXTENSION_MIN: u8 = 128;
 
 /// djb2, computed in one pass since `read_binary`/`write_binary` always hold
 /// the whole file in memory already, unlike `mod/encode.lua`'s incremental
@@ -179,7 +231,7 @@ fn round10_back(scaled: i32) -> f32 {
 }
 
 pub fn write_binary(frame: &FrameOut<'_>) -> Vec<u8> {
-    write_binary_v2(frame)
+    write_binary_grouped(frame)
 }
 
 /// The version 1 layout, kept only to generate fixtures for the reader's
@@ -225,6 +277,18 @@ fn truncated() -> io::Error {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Steps over one extension record's payload, its tag having already been
+/// read.
+///
+/// A record that runs off the end of the file is still an error: not
+/// understanding a feature is fine, but a length that points past the last
+/// byte means the file is damaged, and quietly accepting it would turn
+/// corruption into a silently short frame.
+fn skip_extension(r: &mut ByteReader<'_>) -> io::Result<()> {
+    let len = r.varint().ok_or_else(truncated)? as usize;
+    r.skip(len).ok_or_else(truncated)
 }
 
 /// The tick and surface from a frame file, without reading the rest of it.
@@ -301,7 +365,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     let surface = r.string().ok_or_else(truncated)?;
 
     if version >= 2 {
-        return read_v2_body(&mut r, payload_end, tick, surface);
+        return read_grouped_body(&mut r, payload_end, tick, surface);
     }
 
     // Arc<str>, not String: a name is defined once here but referenced by
@@ -353,6 +417,23 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
 /// same answer every time, and a run of chests then pays nothing at all.
 const RUN_FLAG_DIRECTIONS: u8 = 1;
 
+/// Bit 1: a varint length and that many bytes of extension payload follow the
+/// run's coordinates.
+///
+/// The top level extension record can already express anything, so this is
+/// purely the cheaper home for the likeliest kind of future addition: one more
+/// column alongside the existing per-entity ones (quality, say, or health).
+/// Putting it here costs a single flag bit on runs that do not use it, rather
+/// than a fresh dictionary and coordinate list to re-associate a top level
+/// record with the entities it describes.
+///
+/// The payload goes *after* the run, never interleaved with the coordinates.
+/// That is the whole reason it is skippable: `RUN_FLAG_DIRECTIONS` is
+/// interleaved, which is why an old reader meeting an unknown interleaved
+/// column could not find where the run ended. Anything added here must keep
+/// to a trailing block for the same reason.
+const RUN_FLAG_EXTENSION: u8 = 2;
+
 /// Groups items by name, preserving both the order names first appear and the
 /// order of items within each name.
 ///
@@ -377,7 +458,7 @@ fn group_by_name<'a, T>(items: &'a [T], name_of: impl Fn(&'a T) -> &'a str) -> V
     order.into_iter().map(|name| (name, groups.remove(name).expect("in order"))).collect()
 }
 
-fn write_binary_v2(frame: &FrameOut<'_>) -> Vec<u8> {
+fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
     let mut w = ByteWriter::new();
     w.magic(MAGIC).u8(CURRENT_VERSION).u64(frame.tick).string(frame.surface);
 
@@ -434,7 +515,7 @@ fn write_binary_v2(frame: &FrameOut<'_>) -> Vec<u8> {
     bytes
 }
 
-fn read_v2_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: String) -> io::Result<Frame> {
+fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: String) -> io::Result<Frame> {
     // Name, then the footprint every entity of that name shares.
     let mut names: Vec<(Arc<str>, u32, u32)> = Vec::new();
     let resolve = |names: &[(Arc<str>, u32, u32)], id: usize| {
@@ -463,17 +544,15 @@ fn read_v2_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: 
                     px += r.varint_i32().ok_or_else(truncated)?;
                     py += r.varint_i32().ok_or_else(truncated)?;
                     let d = if directions { r.u8().ok_or_else(truncated)? } else { 0 };
-                    entities.push(Entity {
-                        n: Arc::clone(&name),
-                        x: round10_back(px),
-                        y: round10_back(py),
-                        d,
-                        w,
-                        h,
-                    });
+                    entities.push(Entity { n: Arc::clone(&name), x: round10_back(px), y: round10_back(py), d, w, h });
+                }
+
+                if flags & RUN_FLAG_EXTENSION != 0 {
+                    skip_extension(r)?;
                 }
             }
             TAG_END_ENTITIES => break,
+            other if other >= TAG_EXTENSION_MIN => skip_extension(r)?,
             other => return Err(invalid(format!("unexpected tag {other} in entity section"))),
         }
     }
@@ -500,6 +579,7 @@ fn read_v2_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: 
                     tiles.push(Tile { n: Arc::clone(&name), x: px, y: py });
                 }
             }
+            other if other >= TAG_EXTENSION_MIN => skip_extension(r)?,
             other => return Err(invalid(format!("unexpected tag {other} in tile section"))),
         }
     }
@@ -634,16 +714,24 @@ mod tests {
         let mut expected = ByteWriter::new();
         expected
             .magic(b"STF1")
-            .u8(2) // version
+            .u8(3) // version
             .u64(100)
             .string("nauvis")
             // DefineName carries the prototype's footprint, so entities do not.
-            .u8(0).string("pipe").u8(1).u8(1)
+            .u8(0)
+            .string("pipe")
+            .u8(1)
+            .u8(1)
             // EntityRun: name id, count, flags (this one rotates, so each
             // item carries a direction byte).
-            .u8(1).varint(0).varint(1).u8(RUN_FLAG_DIRECTIONS)
+            .u8(1)
+            .varint(0)
+            .varint(1)
+            .u8(RUN_FLAG_DIRECTIONS)
             // First item's coordinates are deltas from the origin.
-            .varint_i32(-805).varint_i32(285).u8(4)
+            .varint_i32(-805)
+            .varint_i32(285)
+            .u8(4)
             .u8(9); // EndEntities, no tiles follow
         let payload = expected.into_vec();
 
@@ -655,6 +743,148 @@ mod tests {
         );
     }
 
+    /// Finishes a hand written payload the way the writer does, so a test can
+    /// spell out a byte layout without also restating the trailer rule.
+    fn sealed(payload: ByteWriter) -> Vec<u8> {
+        let mut bytes = payload.into_vec();
+        let trailer = checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        bytes
+    }
+
+    /// The whole point of the extension contract: a record this build has no
+    /// meaning for costs it nothing but the bytes it occupies. Covers both
+    /// section loops, since they are separate code paths, and both ends of a
+    /// section, since a record before the first run and one after the last
+    /// exercise different points in the loop.
+    #[test]
+    fn unknown_extension_records_are_skipped_rather_than_failing_the_parse() {
+        let mut w = ByteWriter::new();
+        w.magic(MAGIC)
+            .u8(CURRENT_VERSION)
+            .u64(7)
+            .string("nauvis")
+            .u8(TAG_EXTENSION_MIN)
+            .varint(3)
+            .u8(0xAA)
+            .u8(0xBB)
+            .u8(0xCC)
+            .u8(TAG_DEFINE_NAME)
+            .string("pipe")
+            .u8(1)
+            .u8(1)
+            .u8(TAG_ENTITY)
+            .varint(0)
+            .varint(1)
+            .u8(0)
+            .varint_i32(15)
+            .varint_i32(25)
+            // A different extension tag, and an empty one, between the last
+            // run and the end of the section.
+            .u8(TAG_EXTENSION_MIN + 40)
+            .varint(0)
+            .u8(TAG_END_ENTITIES)
+            // The tile section runs its own loop, so it needs its own.
+            .u8(TAG_EXTENSION_MIN)
+            .varint(2)
+            .u8(1)
+            .u8(2)
+            .u8(TAG_DEFINE_NAME)
+            .string("concrete")
+            .u8(1)
+            .u8(1)
+            .u8(TAG_TILE)
+            .varint(1)
+            .varint(1)
+            .varint_i32(-5)
+            .varint_i32(12);
+
+        let frame = read_binary(&sealed(w)).expect("an unknown extension must not fail the parse");
+        assert_eq!(frame.entities.len(), 1);
+        assert_eq!((frame.entities[0].x, frame.entities[0].y), (1.5, 2.5));
+        assert_eq!(frame.tiles, vec![Tile { n: "concrete".into(), x: -5, y: 12 }]);
+    }
+
+    /// The per-run extension point, which is the one a future per-entity
+    /// column would use. Written alongside `RUN_FLAG_DIRECTIONS` on purpose:
+    /// directions are interleaved and the extension block trails the run, and
+    /// a reader has to get both right in the same pass to land on the next
+    /// tag.
+    #[test]
+    fn a_run_extension_payload_is_skipped_and_the_run_still_decodes() {
+        let mut w = ByteWriter::new();
+        w.magic(MAGIC)
+            .u8(CURRENT_VERSION)
+            .u64(1)
+            .string("nauvis")
+            .u8(TAG_DEFINE_NAME)
+            .string("transport-belt")
+            .u8(1)
+            .u8(1)
+            .u8(TAG_ENTITY)
+            .varint(0)
+            .varint(2)
+            .u8(RUN_FLAG_DIRECTIONS | RUN_FLAG_EXTENSION)
+            .varint_i32(10)
+            .varint_i32(0)
+            .u8(4)
+            .varint_i32(10)
+            .varint_i32(0)
+            .u8(6)
+            // One byte per entity, of something this build has never heard of.
+            .varint(2)
+            .u8(0)
+            .u8(1)
+            .u8(TAG_END_ENTITIES);
+
+        let frame = read_binary(&sealed(w)).expect("a run extension must not fail the parse");
+        assert_eq!(frame.entities.len(), 2);
+        assert_eq!((frame.entities[0].x, frame.entities[0].d), (1.0, 4));
+        assert_eq!((frame.entities[1].x, frame.entities[1].d), (2.0, 6));
+    }
+
+    /// Skipping an unfamiliar record is tolerance; accepting a length that
+    /// points past the last byte would be swallowing corruption. The checksum
+    /// passes here, so only the length check can catch this.
+    #[test]
+    fn an_extension_claiming_more_bytes_than_the_file_holds_is_an_error() {
+        let mut w = ByteWriter::new();
+        w.magic(MAGIC).u8(CURRENT_VERSION).u64(1).string("nauvis").u8(TAG_EXTENSION_MIN).varint(9999).u8(TAG_END_ENTITIES);
+
+        let err = read_binary(&sealed(w)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Version 3 claims to have changed nothing except declaring that
+    /// extension records may appear. Asserted by relabelling a freshly
+    /// written file as version 2 and getting the same parse out: if the
+    /// bodies ever diverge, the promise that an old capture still loads (and
+    /// that an old tool still reads a new capture using no new features)
+    /// quietly stops holding.
+    #[test]
+    fn version_3_writes_the_same_body_as_version_2() {
+        let entities = vec![entity("transport-belt", -80.5, 28.5, 4, 1, 1), entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3)];
+        let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
+        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles };
+
+        let current = write_binary(&out);
+        assert_eq!(current[4], 3, "the writer stamps the current version");
+
+        let mut relabelled = current.clone();
+        relabelled[4] = 2;
+        // The trailer covers the version byte, so restamping it means
+        // recomputing the checksum rather than carrying the old one over.
+        let end = relabelled.len() - TRAILER_LEN;
+        let trailer = checksum(&relabelled[..end]);
+        relabelled[end..].copy_from_slice(&trailer.to_le_bytes());
+
+        let as_v2 = read_binary(&relabelled).expect("v2 must still read");
+        let as_v3 = read_binary(&current).expect("v3 must read");
+        assert_eq!(as_v2.tick, as_v3.tick);
+        assert_eq!(as_v2.entities, as_v3.entities);
+        assert_eq!(as_v2.tiles, as_v3.tiles);
+    }
+
     #[test]
     fn a_wrong_version_is_a_distinct_error_from_a_parse_failure() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
@@ -664,6 +894,55 @@ mod tests {
 
         let err = read_binary(&bytes).unwrap_err();
         assert!(err.to_string().contains("version 99"), "got: {err}");
+    }
+
+    /// Regenerates the committed compatibility fixtures that
+    /// `tests/format_compatibility.rs` reads. Ignored because it writes into
+    /// the source tree; run it deliberately with
+    /// `cargo test --lib regenerate_compatibility_fixtures -- --ignored`
+    /// and commit whatever changes.
+    ///
+    /// All three hold the same real captured entities and tiles, read back
+    /// out of a version 1 fixture, so what the compatibility test compares is
+    /// three encodings of one frame rather than three synthetic shapes that
+    /// each happen to round trip.
+    ///
+    /// Only ever run again if a genuine format change lands. Regenerating
+    /// these to make a failing test pass would be deleting the evidence: the
+    /// whole point is that they are bytes an older build wrote and this one
+    /// must keep reading.
+    #[test]
+    #[ignore]
+    fn regenerate_compatibility_fixtures() {
+        let source = load_fixture("frame_0001.stfr");
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames"));
+
+        // No v1 fixture is written: `frame_0001.stfr` is already one, and it
+        // is real mod output rather than anything reconstructed here. Asserted
+        // rather than assumed, because it is also what makes the v2 and v3
+        // fixtures below trustworthy: they carry that same real frame's
+        // contents, so if this writer ever stopped reproducing what the old
+        // mod actually wrote, they would silently stop representing a real
+        // capture too.
+        assert_eq!(
+            write_binary_v1(&source.as_out()),
+            std::fs::read(dir.join("frame_0001.stfr")).unwrap(),
+            "the v1 writer must still reproduce the real captured frame it stands in for"
+        );
+
+        let v3 = write_binary(&source.as_out());
+        std::fs::write(dir.join("compat_v3.stfr"), &v3).unwrap();
+
+        // Version 2's body is version 3's, byte for byte (see
+        // `version_3_writes_the_same_body_as_version_2`), so the v2 fixture
+        // is the same payload restamped, with the trailer recomputed because
+        // it covers the version byte.
+        let mut v2 = v3;
+        v2[4] = 2;
+        let end = v2.len() - TRAILER_LEN;
+        let trailer = checksum(&v2[..end]);
+        v2[end..].copy_from_slice(&trailer.to_le_bytes());
+        std::fs::write(dir.join("compat_v2.stfr"), &v2).unwrap();
     }
 
     #[test]

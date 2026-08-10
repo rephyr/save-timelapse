@@ -86,11 +86,7 @@ impl<T: Copy> SpanSet<T> {
                 // Spans are type-sorted, so a matching type is always the run
                 // being built and never one already closed.
                 Some(run) if run.type_id == span.type_id => run.end += 1,
-                _ => runs.push(Run {
-                    type_id: span.type_id,
-                    start: out.len() as u32,
-                    end: out.len() as u32 + 1,
-                }),
+                _ => runs.push(Run { type_id: span.type_id, start: out.len() as u32, end: out.len() as u32 + 1 }),
             }
             out.push(span.item);
         }
@@ -132,13 +128,7 @@ pub struct SpanBuilder<T> {
 
 impl<T: Copy> Default for SpanBuilder<T> {
     fn default() -> Self {
-        SpanBuilder {
-            spans: Vec::new(),
-            open: Vec::new(),
-            current: Vec::new(),
-            next_open: Vec::new(),
-            frames: 0,
-        }
+        SpanBuilder { spans: Vec::new(), open: Vec::new(), current: Vec::new(), next_open: Vec::new(), frames: 0 }
     }
 }
 
@@ -204,6 +194,32 @@ impl<T: Copy> SpanBuilder<T> {
         // ready to be merged against directly next frame.
         std::mem::swap(&mut self.open, &mut self.next_open);
         self.frames += 1;
+    }
+
+    /// Folds in `n` frames identical to the one just pushed.
+    ///
+    /// An export omits a surface's frame entirely when nothing on that
+    /// surface changed (see `replay::write_all_surfaces`), which on a
+    /// multi-surface save is most frames for most surfaces. This puts them
+    /// back, so every surface still has one frame per emitted moment and the
+    /// index-addressed timeline keeps working.
+    ///
+    /// One pass over what is standing however large `n` is, rather than `n`
+    /// passes. Nothing changed across the gap by definition, so every span
+    /// open when it started is still open when it ends, and each one's `last`
+    /// can jump straight to the far side. That is the whole reason this takes
+    /// a count instead of being called repeatedly: on a megabase surface
+    /// idling through a long stretch, the difference is one walk over ~900k
+    /// spans versus dozens of them.
+    pub fn push_repeats(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let last = self.frames + n as u32;
+        for &(_, index) in &self.open {
+            self.spans[index as usize].last = last;
+        }
+        self.frames = last;
     }
 
     /// Sorts by type and hands back the finished set.
@@ -404,13 +420,7 @@ mod bench {
             for (t, &type_id) in types.iter().enumerate() {
                 let start = entities.len() as u32;
                 for i in (t..n).step_by(types.len()) {
-                    entities.push(RenderEntity {
-                        x: (i % 2000) as f32 + 0.5,
-                        y: (i / 2000) as f32 + 0.5,
-                        w: 1,
-                        h: 1,
-                        d: 0,
-                    });
+                    entities.push(RenderEntity { x: (i % 2000) as f32 + 0.5, y: (i / 2000) as f32 + 0.5, w: 1, h: 1, d: 0 });
                 }
                 runs.push(Run { type_id, start, end: entities.len() as u32 });
             }
@@ -439,7 +449,7 @@ mod bench {
         let seeks = start.elapsed();
 
         let start = std::time::Instant::now();
-        sequence.for_each_frame(|_, _| {});
+        sequence.for_each_frame(|_, _, _| {});
         let walk = start.elapsed();
 
         println!("GAINS frames={frames_n} peak_entities={peak_entities}");
