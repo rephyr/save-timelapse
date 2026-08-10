@@ -126,13 +126,26 @@ M.EVENT_MAGIC = "STE1"
 --- Version 2 groups records into per-name runs and stores coordinates as
 --- zigzag varint deltas, measured 4.7x smaller than version 1 on a real
 --- frame. See src/frame.rs, which reads both.
-M.FRAME_VERSION = 2
+---
+--- Version 3 writes byte for byte what version 2 does. It exists only to
+--- declare "this file may contain extension records" (see the extension
+--- contract in src/frame.rs), so a tool predating them refuses it up front
+--- with a clear message instead of desynchronising on the first record it
+--- cannot skip. Additions from here on are extension records, not a fourth
+--- version, so this is meant to be the last time this number moves.
+M.FRAME_VERSION = 3
 --- Version 2 adds the dictionary-reset record (tag 7, see
 --- `event_reset_dictionaries`). A version 1 reader hitting that record stops
 --- the stream rather than misreading it, since an unknown tag ends parsing,
 --- so the bump is what turns "silently wrong from the reload onward" into a
 --- refusal an older build can explain.
-M.EVENT_VERSION = 2
+---
+--- Version 3 is the same story as the frame format's: identical records, and
+--- the bump only declares that extension records may appear. That record
+--- shape is the standing fix for the problem the version 2 bump could only
+--- paper over, since an unknown tag is now skippable rather than the end of
+--- the stream.
+M.EVENT_VERSION = 3
 
 --- JSON string quoting, still needed for the manifest files
 --- (baseline.json, frame_<tick>_manifest.json): those stay JSON since

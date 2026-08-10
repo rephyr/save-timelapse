@@ -484,6 +484,20 @@ fn run_live_capture() -> io::Result<PathBuf> {
         );
     }
 
+    // The one message here that names something the user can act on, and
+    // deliberately not phrased as corruption: a skipped extension record only
+    // means the mod that wrote this capture is newer than this build. The
+    // replay is correct as far as it goes, it just does not show whatever the
+    // newer records described, and updating the tool is what recovers them.
+    if replay_state.unknown_extensions > 0 {
+        println!(
+            "{} record(s) in this capture come from a newer version of the mod than this tool \
+             understands, and were skipped. The timelapse is complete apart from whatever they \
+             described. Updating Save Timelapse to match the mod will pick them up.\n",
+            replay_state.unknown_extensions
+        );
+    }
+
     // Both counters are already computed by `replay::run`; surfacing them
     // (and pausing so the message can't be missed the way a mid-run
     // eprintln! can, especially in a double-clicked .exe with no persistent

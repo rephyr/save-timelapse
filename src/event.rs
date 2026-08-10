@@ -11,7 +11,8 @@
 //!
 //! ```text
 //! magic   4 bytes, "STE1", written once when the segment is created
-//! version u8, 1 or 2; written right after the magic
+//! version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION; written right
+//!         after the magic
 //!
 //! then a sequence of tagged records:
 //!   tag 0  DefineName     string                    (id implicit, next in order)
@@ -23,6 +24,7 @@
 //!   tag 5  AddTile        u16 name_id, i32 x, i32 y, u16 surface_id
 //!   tag 6  RemoveTile     i32 x, i32 y, u16 surface_id
 //!   tag 7  ResetDictionaries (no payload, version 2 and later)
+//!   tag >=128 Extension    varint len, then that many bytes
 //! ```
 //!
 //! `DefineName`/`DefineSurface` give the next sequential id to a not yet seen
@@ -49,6 +51,26 @@
 //! "this segment is finished" moment to checksum against. The version byte
 //! still lets a reader tell "this is a format I don't understand" apart
 //! from a generic parse failure, same as the frame format.
+//!
+//! # The extension contract
+//!
+//! Version 3 is where this format stops changing shape. Anything added after
+//! it is an extension record: a tag of 128 or above, a varint byte length,
+//! then that many bytes. A reader that does not know the tag skips exactly
+//! that many bytes and keeps going, so a segment written by a newer mod still
+//! replays in an older tool, minus whatever the new record described.
+//!
+//! Skipping matters more here than the symmetry with `frame.rs` suggests.
+//! Factorio updates mods from the portal by itself and the desktop tool does
+//! not update itself, so the mod being ahead of the tool is the normal state
+//! of anyone who installed once and kept playing. Without a skippable record
+//! that combination has only ever had two outcomes, both bad: a hard refusal
+//! of the whole segment, or, for an unknown tag inside an accepted version,
+//! `next` returning `None` and the replay simply stopping early with no
+//! indication it had. `EventStream::unknown_extensions` reports what was
+//! stepped over so the difference is visible rather than silent.
+//!
+//! Core tags stay below 128 so the two kinds never collide.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -62,8 +84,18 @@ const MAGIC: &[u8; 4] = b"STE1";
 /// dictionary-reset record (tag 7) and is still accepted, since captures in
 /// that format exist and are readable; they simply carry the mislabeling bug
 /// that record was added to fix, which nothing on this side can undo.
-const CURRENT_VERSION: u8 = 2;
+///
+/// Version 3 writes exactly the same records as version 2. It exists only to
+/// declare "this file may contain extension records", so a build predating
+/// them refuses it with a clear message rather than stopping dead at the
+/// first one. See the extension contract in this module's header: from
+/// version 3 onward additions go in extension records, so this is meant to be
+/// the last time this constant moves.
+const CURRENT_VERSION: u8 = 3;
 const MIN_SUPPORTED_VERSION: u8 = 1;
+/// Tags from here up carry their own length and may be skipped. Core record
+/// tags stay below it so the two can never collide as the format grows.
+const TAG_EXTENSION_MIN: u8 = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -99,12 +131,25 @@ pub struct LoggedEvent {
 /// Streams one segment's records, rebuilding the name and surface
 /// dictionaries as `DefineName`/`DefineSurface` records are encountered, the
 /// same way the writer built them while logging.
-struct EventStream {
+pub struct EventStream {
     bytes: Vec<u8>,
     pos: usize,
     names: Vec<String>,
     surfaces: Vec<String>,
     current_tick: Option<u64>,
+    unknown_extensions: usize,
+}
+
+impl EventStream {
+    /// Extension records stepped over so far because this build does not
+    /// recognise their tag, which only means the capture was written by a
+    /// newer mod than the tool reading it.
+    ///
+    /// Only meaningful once the stream has been walked, since it counts what
+    /// iteration actually passed over.
+    pub fn unknown_extensions(&self) -> usize {
+        self.unknown_extensions
+    }
 }
 
 impl Iterator for EventStream {
@@ -230,6 +275,24 @@ impl Iterator for EventStream {
                     }
                     continue;
                 }
+                // An extension record: a tag this build has no meaning for,
+                // carrying its own length precisely so it can be stepped over
+                // rather than ending the stream. See the extension contract in
+                // this module's header.
+                //
+                // A length running past the end of the file falls out as
+                // `None` from `skip`, which ends the stream, the same
+                // treatment every other record gets when the game was killed
+                // mid write.
+                t if t >= TAG_EXTENSION_MIN => {
+                    let len = r.varint()? as usize;
+                    r.skip(len)?;
+                    self.unknown_extensions += 1;
+                }
+                // A core tag below the extension range that this build does
+                // not know can only come from a version whose layout differs,
+                // and `stream_log`'s version check has already refused those.
+                // Reaching here means a damaged file, so stop.
                 _ => return None,
             }
 
@@ -242,7 +305,11 @@ impl Iterator for EventStream {
 /// still has to be read into memory once (unlike the old line by line
 /// reader), but replay only ever walks forward through it, so there is no
 /// reason to also materialise every decoded event up front.
-pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> {
+///
+/// Returns the concrete [`EventStream`] rather than `impl Iterator` so a
+/// caller that wants [`EventStream::unknown_extensions`] afterwards can ask
+/// for it; iterate through `&mut` to keep the stream alive that long.
+pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
 
@@ -268,7 +335,14 @@ pub fn stream_log(path: &Path) -> io::Result<impl Iterator<Item = LoggedEvent>> 
         }
     }
 
-    Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None })
+    Ok(EventStream {
+        bytes,
+        pos: 5,
+        names: Vec::new(),
+        surfaces: Vec::new(),
+        current_tick: None,
+        unknown_extensions: 0,
+    })
 }
 
 /// One segment file, plus the half-open tick range replay should actually
@@ -621,6 +695,57 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0].event, Event::AddEntity { name, .. } if name == "pipe"));
+    }
+
+    /// The failure this record shape exists to prevent. Before it, an
+    /// unrecognised tag returned `None`, which an iterator reports as "the
+    /// stream ended", so a segment written by a newer mod replayed as a
+    /// timelapse that simply stopped partway with nothing to say about why.
+    /// Now the events after it still arrive.
+    #[test]
+    fn an_unknown_extension_record_is_skipped_and_the_stream_continues() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+            w.u8(1).string("nauvis"); // DefineSurface
+            w.u8(0).string("pipe"); // DefineName
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
+            // Something a later mod version writes and this build has never
+            // heard of, sitting between two records it does understand.
+            w.u8(TAG_EXTENSION_MIN).varint(4).u32(0xDEADBEEF);
+            w.u8(3).u16(0).i32(15).i32(5).u8(0).u8(1).u8(1).u64(2).u16(0); // AddEntity
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let mut stream = stream_log(&path).unwrap();
+        let events: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(events.len(), 2, "the record after the extension must still arrive");
+        assert_eq!(events[1].event, Event::AddEntity {
+            name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2),
+        });
+        assert_eq!(stream.unknown_extensions(), 1);
+    }
+
+    /// A segment is append only and can be cut off mid record by the game
+    /// being killed, which every other record type treats as a clean end of
+    /// stream rather than an error. An extension whose length runs past the
+    /// end is the same situation and gets the same treatment.
+    #[test]
+    fn an_extension_running_past_the_end_ends_the_stream_like_any_partial_write() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10);
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0);
+            w.u8(TAG_EXTENSION_MIN).varint(500); // claims far more than follows
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
+
+        assert_eq!(events.len(), 1, "the complete record before it still survives");
     }
 
     #[test]

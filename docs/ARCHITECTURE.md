@@ -94,17 +94,29 @@ the actual CPU and I/O cost of a big export, not something incidental to it.
 Wire format, all integers little endian:
 
     magic     4 bytes, "STF1"
-    version   u8, must equal the reader's CURRENT_VERSION
+    version   u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
     tick      u64
     surface   string (u16 length, then that many UTF-8 bytes)
     entity section, a sequence of:
-      tag 0  DefineName    string
-      tag 1  EntityRecord  u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h
+      tag 0     DefineName  string name, u8 w, u8 h
+      tag 1     EntityRun   varint name_id, varint count, u8 flags,
+                            then per item varint dx, varint dy, and a u8
+                            direction when flags has bit 0; then, when flags
+                            has bit 1, varint len and that many bytes
+      tag >=128 Extension   varint len, then that many bytes
     tag 9  EndEntities (no payload), marking the start of the tile section
     tile section, a sequence of:
-      tag 0  DefineName    string
-      tag 2  TileRecord    u16 name_id, i32 x, i32 y
+      tag 0     DefineName  string name, u8 w, u8 h
+      tag 2     TileRun     varint name_id, varint count, then per item
+                            varint dx, varint dy
+      tag >=128 Extension   varint len, then that many bytes
     checksum  u32, djb2 of every byte before it (magic and version included)
+
+Coordinates within a run are zigzag varint deltas against the previous item,
+starting from the origin. Grouping entities into per-name runs and delta
+encoding their positions is what took a real megabase surface export from
+200 MB to 38 MB. Version 1 predates runs entirely, writing one fixed width
+record per entity or tile, and is still read by a separate function.
 
 The version byte lets a reader tell "this is a format I don't understand"
 apart from a generic parse failure. This project has already changed this
@@ -129,6 +141,56 @@ trailer and will not parse under the current reader, consistent with this
 project's precedent of clean breaks over carrying old formats forward at
 this alpha stage (see "Live capture and replay" below, which made the same
 call for session tagging).
+
+## Format stability and the extension contract
+
+Version 3 of both formats is where that precedent ends. From it onward the
+core layout does not change; anything added is an extension record, and both
+formats use the same rule: **a tag of 128 or above carries a varint byte
+length, then that many bytes.** A reader that does not recognise the tag skips
+exactly that many bytes and carries on, so a capture written by a newer mod
+still loads in an older tool, minus whatever the new record described. Core
+tags stay below 128 so the two kinds can never collide.
+
+Entity runs have a second, cheaper extension point: bit 1 of a run's flags
+means a length prefixed block follows the run's coordinates. That is the
+natural home for a future per-entity column (quality, say, or health), since a
+top level record would have to restate a dictionary and a coordinate list to
+re-associate itself with the entities it describes.
+
+Extension payloads are never interleaved with the data they annotate. This is
+the rule that makes the whole thing work, and `RUN_FLAG_DIRECTIONS` is the
+counter-example that shows why: it *is* interleaved, so a reader that did not
+know the column was there could not find where the run ended. A trailing,
+length prefixed block has no such problem. Anything added later has to keep to
+that shape.
+
+A length that runs past the end of the file is still an error. Not
+understanding a record is fine; a record that does not fit means damage.
+
+### Why this matters more than it looks
+
+Factorio updates mods from the portal on its own. The desktop tool does not
+update itself. **The mod being newer than the tool is therefore the normal
+state of anyone who installed once and kept playing**, not an edge case.
+
+Before extension records that combination had only two possible outcomes, both
+bad. If the new mod bumped the version, the old tool refused the whole capture.
+If it added a tag without bumping, the event reader's unknown-tag arm returned
+`None`, which an iterator reports as end of stream, so the replay silently
+stopped partway through with nothing to say about why. Skipping replaces both
+with a capture that loads and a count of what was stepped over, which
+`Replay::unknown_extensions` carries up to a message telling the user their
+tool is behind their mod.
+
+### What holds it in place
+
+`tests/format_compatibility.rs` opens one real frame in all three released
+encodings (v1 through v0.3, v2 in v0.4, v3 from v0.5) and asserts they agree.
+Those fixtures are committed bytes, not generated at test time, so the check
+is against what older builds actually wrote rather than against this build's
+idea of what they wrote. A failure there is not a test to adjust; it means
+somebody's existing capture stopped loading.
 
 `DefineName` writes a prototype name the first time it is used and gives it
 the next sequential id; every later reference is just the two byte id, which
@@ -371,17 +433,19 @@ forward stream of tagged records from the magic to whatever the last flush
 wrote.
 
     magic   4 bytes, "STE1", written once when the segment is created
-    version u8, must equal the reader's CURRENT_VERSION
+    version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
 
     then a sequence of tagged records:
-      tag 0  DefineName    string
-      tag 1  DefineSurface string
-      tag 2  SetTick       u64 tick
-      tag 3  AddEntity     u16 name_id, i32 x10, i32 y10, u8 d, u8 w, u8 h,
-                           u64 id, u16 surface_id
-      tag 4  RemoveEntity  i32 x10, i32 y10, u64 id, u16 surface_id
-      tag 5  AddTile       u16 name_id, i32 x, i32 y, u16 surface_id
-      tag 6  RemoveTile    i32 x, i32 y, u16 surface_id
+      tag 0     DefineName        string
+      tag 1     DefineSurface     string
+      tag 2     SetTick           u64 tick
+      tag 3     AddEntity         u16 name_id, i32 x10, i32 y10, u8 d,
+                                  u8 w, u8 h, u64 id, u16 surface_id
+      tag 4     RemoveEntity      i32 x10, i32 y10, u64 id, u16 surface_id
+      tag 5     AddTile           u16 name_id, i32 x, i32 y, u16 surface_id
+      tag 6     RemoveTile        i32 x, i32 y, u16 surface_id
+      tag 7     ResetDictionaries (no payload, version 2 and later)
+      tag >=128 Extension         varint len, then that many bytes
 
 `DefineName`/`DefineSurface` name dictionaries work the same way as the frame
 format's, just as two separate dictionaries sharing the same tagged stream
@@ -404,6 +468,16 @@ one. `replay::run` already tolerates a segment that fails to open (skip and
 warn rather than aborting the whole replay, added for exactly this kind of
 partial/orphaned file), which covers what a checksum would otherwise be
 protecting against here.
+
+Extension records work exactly as in the frame format, under the same rule
+and for the same reason (see "Format stability and the extension contract"
+above). They matter more here, though, because of how the old failure looked.
+An unrecognised tag used to fall through to `next` returning `None`, and an
+iterator reports `None` as end of stream, so a segment written by a newer mod
+did not error: the replay just stopped partway through and said nothing.
+`EventStream::unknown_extensions` counts what was stepped over instead, and
+`replay::run` sums it across segments so the difference is visible rather than
+silent.
 
 `id` on `AddEntity`/`RemoveEntity` uses `0` to mean "no id" (Factorio's
 `unit_number` is documented to start at 1, and `control.lua` already

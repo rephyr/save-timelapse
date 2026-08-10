@@ -74,7 +74,7 @@ end
 -- frame format
 
 check("frame_header: magic, version, tick, surface", encode.frame_header(100, "nauvis"),
-  "STF1" .. bytes(2) .. encode.u64le(100) .. encode.str("nauvis"))
+  "STF1" .. bytes(3) .. encode.u64le(100) .. encode.str("nauvis"))
 
 -- varints
 
@@ -137,7 +137,7 @@ check("frame_end_entities: tag 9, no payload", encode.frame_end_entities(), byte
 
 -- live capture event format
 
-check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(2))
+check("event_header: magic and version", encode.event_header(), "STE1" .. bytes(3))
 -- Written when a load resumes a segment already on disk: Factorio has just
 -- emptied the writer's dictionaries while the file still holds every name
 -- defined before the load, so both sides restart their ids from 0 here.

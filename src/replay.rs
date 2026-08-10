@@ -342,6 +342,12 @@ pub struct Replay {
     /// deleting `script-output` by hand would look like, and the two are
     /// indistinguishable from the file alone.
     pub restarted_segments: usize,
+    /// Records stepped over because their tag postdates this build (see the
+    /// extension contract in `event.rs`). Not a health signal and not
+    /// corruption: it means the mod writing the capture is newer than the
+    /// tool reading it, and the replay is correct as far as it goes but is
+    /// missing whatever those records described.
+    pub unknown_extensions: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -413,6 +419,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         out_of_order_batches: 0,
         superseded_events: 0,
         restarted_segments: 0,
+        unknown_extensions: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -499,7 +506,7 @@ where
         // a plain append, with no magic header, under the same session tag).
         // One bad segment losing its own events is a much smaller problem
         // than it sinking replay of an otherwise complete session.
-        let stream = match event::stream_log(&segment.path) {
+        let mut stream = match event::stream_log(&segment.path) {
             Ok(stream) => stream,
             Err(e) => {
                 eprintln!("warning: skipping unreadable event segment {}: {e}", segment.path.display());
@@ -525,7 +532,7 @@ where
         let mut pending: Vec<LoggedEvent> = Vec::new();
         let mut pending_tick = None;
 
-        for logged in stream {
+        for logged in &mut stream {
             // Which append run this record belongs to, tracked over every
             // record the file holds rather than only the kept ones: a run
             // boundary is a fact about append order, so skipping a record
@@ -609,6 +616,10 @@ where
             }
             pending.push(logged);
         }
+
+        // Asked after the walk, not during: the count is of what iteration
+        // actually stepped over, so it is only complete once the stream is.
+        replay.unknown_extensions += stream.unknown_extensions();
 
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {
