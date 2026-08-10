@@ -1,0 +1,128 @@
+# Builds and publishes release artifacts when a version tag is pushed.
+#
+# Deliberately tag-triggered rather than run on every push: these are the
+# files people download, and building them on a schedule nobody asked for
+# would mean publishing artifacts nobody reviewed.
+#
+#   git tag v0.5.0 && git push origin v0.5.0
+#
+# Produces one archive per platform plus the mod portal zip, all built from
+# the same commit, which is the property a hand-uploaded build cannot offer.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not withhold the others: a release with
+      # two of three archives is still a usable release, and the gap is
+      # obvious.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+            archive: zip
+          - os: ubuntu-latest
+            label: linux
+            archive: tar.gz
+          - os: macos-latest
+            label: macos
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # macroquad/miniquad link against X11/GL/ALSA even for a build that
+      # never opens a window, so these are needed to produce a binary at all.
+      - name: Install the viewer's native dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      # The two binaries plus mod/, because save-timelapse.exe stages the mod
+      # itself when exporting from saves (see `mod_source_dir`) and looks for
+      # it beside the executable first. Shipping them apart is the one
+      # packaging mistake that makes the from-saves path fail with a message
+      # about a folder the user never knew they needed.
+      - name: Stage the archive
+        shell: bash
+        run: |
+          staged="save-timelapse-${{ matrix.label }}"
+          mkdir -p "$staged"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/save-timelapse.exe target/release/viewer.exe "$staged/"
+          else
+            cp target/release/save-timelapse target/release/viewer "$staged/"
+          fi
+          cp -r mod "$staged/mod"
+          rm -rf "$staged/mod/tests"
+          cp README.md LICENSE "$staged/"
+          echo "STAGED=$staged" >> "$GITHUB_ENV"
+
+      - name: Archive
+        shell: bash
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$STAGED.zip" "$STAGED"
+          else
+            tar czf "$STAGED.tar.gz" "$STAGED"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAGED }}
+          path: |
+            *.zip
+            *.tar.gz
+          if-no-files-found: error
+
+  mod:
+    name: mod portal zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Through the Makefile so the portal zip is built exactly as it is
+      # locally, including `check-mod-files`, which fails when mod/ holds a
+      # .lua neither list names. control.lua `require`s each of those, so a
+      # forgotten file is not a degraded mod but one Factorio refuses to load.
+      - name: Package
+        run: make package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mod-portal-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [build, mod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          draft: true
+          generate_release_notes: true

@@ -1,5 +1,7 @@
 # Save Timelapse
 
+[![CI](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml/badge.svg)](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml)
+
 Save Timelapse is a Factorio timelapse mod and companion desktop application for creating interactive, explorable timelapses of your Factorio factory.
 
 > Watch your Factorio factory grow. Record it live as you play, or build a timelapse from Factorio saves you already have.
@@ -23,6 +25,27 @@ The companion tool automatically detects your Factorio saves folder, so you can 
 - ⚡ Chunked renderer with automatic level-of-detail rendering
 - 🦀 Written in Rust for performance
 - 🔧 No Python, command-line tools or FFmpeg required
+
+---
+
+## Try it without owning Factorio
+
+The repository ships five real exported frames, so the viewer can be run
+against genuine captured data with nothing else installed:
+
+```bash
+cargo run -p viewer --release --bin viewer -- tests/fixtures/frames
+```
+
+A factory growing from 240 to 22,971 entities across 58 entity types,
+captured from a real 100 hour Space Age save. Scrub the timeline, zoom in far
+enough for sprites, press `h` for the construction heatmap.
+
+The exporter can be developed and tested without the game too. `fake-factorio`
+is a binary in this crate that implements enough of Factorio's command line to
+exercise the real export path, including reading back the staged
+`mod-settings.dat` so a test proves the settings staging actually worked
+rather than assuming it. See [tests/fixtures/README.md](tests/fixtures/README.md).
 
 ---
 
@@ -234,7 +257,7 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 
 - [x] Settled capture format: extension records make future additions skippable, so the mod and the tool no longer have to be updated in lockstep
 - [x] Milestones for timelapses built from existing saves, recovered by comparing consecutive saves
-- [ ] Skip writing frames that changed nothing (measured at a third of a default export, over half at fine intervals)
+- [x] Skip writing frames that changed nothing: a surface is only written at moments something on it changed, measured at 90% smaller on a real nine-surface megabase export
 - [ ] Complete tile change tracking
 - [ ] Settings persistence and first-run setup
 
@@ -274,7 +297,14 @@ Factorio Save
  Interactive Renderer
 ```
 
-More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+including the wire formats, the extension contract that keeps captures
+readable across versions, and why the mod cannot detect a reloaded save.
+
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) covers what was optimized, by how
+much, and how to re-measure all of it: 5x smaller frames, 90% smaller exports,
+37.7x less viewer memory. It also records what was measured and then
+**rejected**, which is the more useful half.
 
 ---
 
