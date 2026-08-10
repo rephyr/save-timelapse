@@ -40,7 +40,11 @@ impl TypeRegistry {
         let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
         self.names.push(name.to_string());
         let color = known_color(name);
-        self.entity_colors.push(color.unwrap_or_else(|| color_for(name, 0.55, 0.85)));
+        // Entities fall back to a shade of the map view's friendly blue;
+        // tiles keep the full-hue hash. A name is one or the other in
+        // practice, and an unrecognised *floor* has no reason to be blue: the
+        // blue is what the game uses for structures specifically.
+        self.entity_colors.push(color.unwrap_or_else(|| friendly_shade(name)));
         self.tile_colors.push(color.unwrap_or_else(|| color_for(name, 0.35, 0.5)));
         self.ids.insert(name.to_string(), id);
         id
@@ -108,14 +112,225 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(8, 8, 8));
     }
 
+    // Player-built structures, following Factorio's own map view.
+    //
+    // The game paints the chart from each prototype's chart colour (see
+    // `core/prototypes/utility-constants.lua`): rails grey, the belt family
+    // yellow, a handful of types with their own colour, and everything else
+    // one friendly blue. That palette is already in a player's head from
+    // looking at the map screen, so matching it makes a timelapse read the
+    // way the game does instead of like a hash function's opinion.
+    if RAIL_TRACK.contains(&name) {
+        // The game lightens elevated rail and ramps so a raised line is
+        // distinguishable from the ground it crosses, which is worth keeping.
+        if name.starts_with("elevated-") {
+            return Some(rgb(186, 186, 186));
+        }
+        if name == "rail-ramp" {
+            return Some(rgb(166, 166, 166));
+        }
+        return Some(rgb(140, 140, 140));
+    }
+    if name.ends_with("splitter") {
+        return Some(rgb(255, 209, 0));
+    }
+    if name.ends_with("underground-belt") {
+        return Some(rgb(112, 92, 0));
+    }
+    if name.ends_with("transport-belt") {
+        return Some(rgb(204, 161, 71));
+    }
+    if name == "heat-pipe" {
+        return Some(rgb(58, 130, 172));
+    }
+    if name == "pipe-to-ground" {
+        return Some(rgb(25, 103, 150));
+    }
+    if name == "pipe" {
+        return Some(rgb(69, 130, 165));
+    }
+    if name == "storage-tank" {
+        return Some(rgb(131, 166, 188));
+    }
+    if name.ends_with("-wall") {
+        return Some(rgb(204, 217, 204));
+    }
+    if name == "gate" {
+        return Some(rgb(128, 128, 128));
+    }
+    if name.ends_with("-turret") {
+        return Some(rgb(202, 167, 24));
+    }
+    if name == "roboport" {
+        return Some(rgb(211, 207, 136));
+    }
+    if name == "solar-panel" {
+        return Some(rgb(31, 33, 36));
+    }
+    if name == "accumulator" {
+        return Some(rgb(122, 122, 122));
+    }
+    if name == "beacon" {
+        return Some(rgb(7, 68, 104));
+    }
+
+    // Space Age planets.
+    //
+    // Taken from each tile prototype's own `map_color`, the value Factorio
+    // draws that tile with in map view, rather than picked by eye. That is
+    // the palette a player already has in their head from looking at the
+    // in-game map, and it means a timelapse of Vulcanus looks like Vulcanus
+    // rather than like a hash function's opinion of one. Read out of
+    // `data/space-age/prototypes/tile/tiles-<planet>.lua`.
+    //
+    // Grouped by prefix rather than listed tile by tile, matching how the
+    // Nauvis terrain above is handled: there are around 75 of these across
+    // the three planets and most of a family shares one colour anyway, so
+    // naming each individually would be a table to maintain for no visible
+    // gain.
+
+    // Vulcanus: near-black rock and ash, with lava the only bright thing on
+    // the planet. The contrast is the point, and it is what makes a lava flow
+    // read at a glance against a base built on the rock beside it.
+    if name == "lava-hot" {
+        return Some(rgb(255, 138, 57));
+    }
+    if name.starts_with("lava") {
+        return Some(rgb(150, 49, 30));
+    }
+    if name.starts_with("volcanic") {
+        // The "hot" and "warm" variants are the ground immediately around
+        // lava and are tinted towards it in game, so they keep that warmth
+        // rather than flattening into the general grey.
+        if name.contains("hot") || name.contains("warm") {
+            return Some(rgb(33, 13, 10));
+        }
+        if name.contains("ash-cracks") {
+            return Some(rgb(39, 39, 39));
+        }
+        if name.contains("soil") {
+            return Some(rgb(24, 21, 15));
+        }
+        return Some(rgb(25, 25, 25));
+    }
+
+    // Fulgora: brown throughout, with the oil oceans darker than the islands
+    // and the deep ocean darker still.
+    if name == "oil-ocean-deep" {
+        return Some(rgb(56, 36, 40));
+    }
+    if name.starts_with("oil-ocean") {
+        return Some(rgb(74, 42, 43));
+    }
+    if name.starts_with("fulgoran") {
+        if name.contains("paving") {
+            return Some(rgb(120, 94, 67));
+        }
+        // The ruins: conduit and machinery read greyer than the sand around
+        // them, which is what distinguishes a ruin field from open ground.
+        if name.contains("machinery") || name.contains("conduit") {
+            return Some(rgb(93, 79, 68));
+        }
+        if name.contains("rock") {
+            return Some(rgb(131, 85, 66));
+        }
+        return Some(rgb(120, 70, 58));
+    }
+
+    // Gleba: brown and olive ground with strongly coloured biomes over it.
+    if name.starts_with("gleba-deep-lake") {
+        return Some(rgb(18, 37, 51));
+    }
+    if name == "pit-rock" {
+        return Some(rgb(22, 22, 30));
+    }
+    if name.contains("yumako") {
+        return Some(rgb(204, 183, 6));
+    }
+    if name.contains("jellynut") {
+        return Some(rgb(204, 6, 183));
+    }
+    if name.starts_with("wetland") {
+        if name.contains("green-slime") {
+            return Some(rgb(28, 56, 28));
+        }
+        if name.contains("tentacle") {
+            return Some(rgb(58, 17, 28));
+        }
+        if name.contains("blue-slime") {
+            return Some(rgb(25, 49, 58));
+        }
+        return Some(rgb(48, 47, 53));
+    }
+    if name.starts_with("lowland") {
+        if name.contains("red-vein") || name.contains("red-infection") {
+            return Some(rgb(115, 53, 66));
+        }
+        if name.contains("cream") || name.contains("dead-skin") {
+            return Some(rgb(95, 93, 88));
+        }
+        return Some(rgb(66, 82, 11));
+    }
+    if name.starts_with("midland") {
+        if name.contains("turquoise-bark") {
+            return Some(rgb(46, 68, 48));
+        }
+        if name.contains("yellow-crust") {
+            return Some(rgb(114, 86, 40));
+        }
+        return Some(rgb(75, 71, 41));
+    }
+    if name.starts_with("highland") {
+        return Some(rgb(52, 55, 48));
+    }
+
+    // Aquilo: pale snow at the top of the range, mid blue ice below it, and
+    // near-black ammoniacal ocean at the bottom. The whole planet is one cold
+    // ramp, so what matters is keeping those three bands apart.
+    //
+    // The ocean values here are the *uncommented* ones. The file also carries
+    // an earlier `{5, 15, 25}` commented out directly above the live
+    // `{15, 13, 25}`, which is an easy thing to read off by mistake.
+    if name.starts_with("ammoniacal-ocean") {
+        return Some(rgb(16, 14, 27));
+    }
+    if name.starts_with("brash-ice") {
+        return Some(rgb(21, 42, 56));
+    }
+    if name == "ice-platform" {
+        return Some(rgb(95, 122, 156));
+    }
+    if name.starts_with("ice-") {
+        return Some(rgb(100, 135, 177));
+    }
+    // Snow and dust share one palette, graded by how much ground shows
+    // through: flat is fresh cover, patchy is nearly bare. The game builds
+    // these by interpolating between two colours, so these are the computed
+    // ends and midpoints rather than literals in the file.
+    if name.starts_with("snow-") || name.starts_with("dust-") {
+        if name.ends_with("patchy") {
+            return Some(rgb(156, 166, 181));
+        }
+        if name.ends_with("lumpy") {
+            return Some(rgb(166, 174, 186));
+        }
+        if name.ends_with("crests") {
+            return Some(rgb(180, 186, 192));
+        }
+        return Some(rgb(190, 194, 197));
+    }
+
     // Resource deposits: colored to match Factorio's own map-view resource
     // palette (the little colored blobs shown in chart/map mode), since
     // that's the mental model a player already has for "what color is
     // iron" from staring at the map screen, not the ore chunk's in-world
-    // sprite. Only the vanilla set is curated: the handful of Space Age
-    // additions in `is_resource` (tungsten ore, calcite, scrap) don't have
-    // an established look here yet, so they fall through to the hash
-    // palette below like any other unrecognized name.
+    // sprite.
+    //
+    // Space Age's are here too now, taken from their prototypes' own
+    // `map_color` rather than picked by eye. Leaving them out was survivable
+    // while unrecognised names got a random hue, but once structures became
+    // blue it meant Vulcanus's calcite and Fulgora's scrap rendered as
+    // buildings, which is exactly the opposite of what a resource patch is.
     if name == "iron-ore" {
         return Some(rgb(140, 165, 200));
     }
@@ -133,6 +348,24 @@ fn known_color(name: &str) -> Option<Color> {
     }
     if name == "crude-oil" {
         return Some(rgb(126, 44, 96));
+    }
+    if name == "tungsten-ore" {
+        return Some(rgb(98, 86, 150));
+    }
+    if name == "calcite" {
+        return Some(rgb(204, 179, 179));
+    }
+    if name == "scrap" {
+        return Some(rgb(230, 230, 230));
+    }
+    if name == "sulfuric-acid-geyser" {
+        return Some(rgb(199, 199, 26));
+    }
+    if name == "fluorine-vent" {
+        return Some(rgb(179, 255, 153));
+    }
+    if name == "lithium-brine" {
+        return Some(rgb(0, 204, 255));
     }
 
     // Placed infrastructure common enough to have a strong expected color.
@@ -171,11 +404,28 @@ fn known_color(name: &str) -> Option<Color> {
     // rather than green, since that's the biggest visual distinction
     // between tree variants, not the specific species.
     if is_terrain_scatter(name) {
-        if name == "cliff" {
+        // Each planet's cliffs are its own rock, so they take that planet's
+        // stone rather than one shared grey that would look imported.
+        if name == "cliff-vulcanus" {
+            return Some(rgb(45, 42, 40));
+        }
+        if name == "cliff-fulgora" {
+            return Some(rgb(96, 70, 58));
+        }
+        if name == "cliff-gleba" {
+            return Some(rgb(78, 80, 62));
+        }
+        if name.starts_with("cliff") {
             return Some(rgb(96, 92, 88));
         }
         if name.starts_with("dead-") || name.starts_with("dry-") {
             return Some(rgb(107, 92, 66));
+        }
+        // Vulcanus lichen is ash-grey scrub on black rock, not forest. Nauvis
+        // green here would dot a volcanic planet with something that reads as
+        // a different world's vegetation.
+        if name.starts_with("ashland-lichen") {
+            return Some(rgb(74, 78, 62));
         }
         return Some(rgb(53, 89, 42));
     }
@@ -232,8 +482,54 @@ pub fn is_enemy(name: &str) -> bool {
 /// the factory grew, and counting it would track how much of the map has
 /// been revealed instead of where the buildings are.
 pub fn is_terrain_scatter(name: &str) -> bool {
-    name == "cliff" || name.starts_with("dead-") || name.starts_with("dry-") || name.starts_with("tree")
+    // `cliff-` rather than just `cliff`: every planet has its own cliff
+    // prototype (`cliff-vulcanus`, `cliff-fulgora`, `cliff-gleba`), and
+    // matching the bare name alone left all three rendering as structures.
+    //
+    // A prefix here rather than the exact list used for rails and flora,
+    // because unlike those there is nothing a `cliff-` entity could be except
+    // a cliff, and a new planet should not need this file edited to stop its
+    // cliffs looking like buildings.
+    name == "cliff"
+        || name.starts_with("cliff-")
+        || name.starts_with("dead-")
+        || name.starts_with("dry-")
+        || name.starts_with("tree")
+        || OFF_WORLD_FLORA.contains(&name)
 }
+
+/// Every flora prototype outside Nauvis, named exactly.
+///
+/// Nauvis names happen to share `tree`, `dead-` and `dry-` prefixes, so it
+/// got away with prefix matching. Nothing on the other planets follows that
+/// convention: Gleba's are called `jellystem`, `boompuff`, `stingfrond` and
+/// so on, and Vulcanus has `ashland-lichen-tree`. Without them listed, a
+/// Gleba forest counted as construction and dragged the auto-follow camera
+/// out over untouched wilderness, and every one of them rendered as a
+/// structure rather than as scenery.
+///
+/// Exact names rather than a pattern, for the reason `RAIL_TRACK` is:
+/// `rocket-turret` contains "rock", and `cryogenic-plant` and
+/// `electromagnetic-plant` are crafting machines despite the name. Taken from
+/// the prototypes of type `tree` and `plant` in the game's own data.
+const OFF_WORLD_FLORA: &[&str] = &[
+    // Vulcanus
+    "ashland-lichen-tree",
+    "ashland-lichen-tree-flaming",
+    // Gleba
+    "boompuff",
+    "cuttlepop",
+    "funneltrunk",
+    "hairyclubnub",
+    "jellystem",
+    "lickmaw",
+    "slipstack",
+    "stingfrond",
+    "sunnycomb",
+    "teflilly",
+    "water-cane",
+    "yumako-tree",
+];
 
 /// Whether `name` is a resource deposit: ore, oil, and the like, captured
 /// only when the include-resources setting is on. Like terrain scatter,
@@ -243,14 +539,28 @@ pub fn is_terrain_scatter(name: &str) -> bool {
 /// distant oil field or ore patch instead of hugging the actual buildings.
 ///
 /// Named exactly, not pattern-matched: unlike tree/cliff names, resource
-/// names share no common prefix, so this is the vanilla set plus what's
-/// confirmed from Space Age (`tungsten-ore`, `calcite` on Vulcanus,
-/// `scrap` on Fulgora), best-effort the same way `is_terrain_scatter` is;
-/// a modded or as-yet-unseen resource name just won't be caught.
+/// names share no common prefix. This is the vanilla set plus every Space
+/// Age one, taken from the prototypes of type `resource` in the game's data
+/// rather than from whichever ones happened to be noticed. A modded resource
+/// still will not be caught, which costs a wandering camera rather than
+/// anything incorrect.
 pub fn is_resource(name: &str) -> bool {
     matches!(
         name,
-        "iron-ore" | "copper-ore" | "coal" | "stone" | "uranium-ore" | "crude-oil" | "tungsten-ore" | "calcite" | "scrap"
+        "iron-ore"
+            | "copper-ore"
+            | "coal"
+            | "stone"
+            | "uranium-ore"
+            | "crude-oil"
+            | "tungsten-ore"
+            | "calcite"
+            | "scrap"
+            // The three that were missing entirely, so they counted as
+            // construction and dragged the auto-follow camera toward them.
+            | "sulfuric-acid-geyser"
+            | "fluorine-vent"
+            | "lithium-brine"
     )
 }
 
@@ -274,15 +584,96 @@ pub fn is_rotation_allowed(name: &str) -> bool {
     ALWAYS_ROTATE.contains(&name)
 }
 
-/// Deterministic name -> color, so a given entity type is always the same
-/// color across runs with nothing to curate as new Factorio types show up.
-pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
+/// Every prototype that is rail track, and therefore should look like rail
+/// track rather than like twelve unrelated things.
+///
+/// Factorio 2.0 split what used to be two rail prototypes into a family:
+/// straight, two curve halves, half-diagonal, the elevated version of each,
+/// ramps and supports, plus `legacy-` variants kept for saves made before the
+/// split. Hashing each name separately gave every one its own hue, so a
+/// single rail line rendered as a rainbow and a pre-2.0 save's track was a
+/// different colour again from track laid after it.
+///
+/// Named explicitly rather than matched on "rail" as a substring, which would
+/// wrongly swallow `rail-signal`, `rail-chain-signal`, `gate-over-rail` and
+/// `railgun-turret`. Those are genuinely different things and keep their own
+/// colours. Taken from the game's own `entity-name` locale entries rather
+/// than from memory.
+const RAIL_TRACK: &[&str] = &[
+    "straight-rail",
+    "curved-rail-a",
+    "curved-rail-b",
+    "half-diagonal-rail",
+    "legacy-straight-rail",
+    "legacy-curved-rail",
+    "elevated-straight-rail",
+    "elevated-curved-rail-a",
+    "elevated-curved-rail-b",
+    "elevated-half-diagonal-rail",
+    "rail-ramp",
+    "rail-support",
+];
+
+/// The name a prototype is coloured by, which is its own unless it belongs to
+/// a family the eye reads as one thing.
+///
+/// Deliberately the only grouping so far. A curated list of "these look alike"
+/// is exactly the maintenance burden `color_for` was designed to avoid, so
+/// this earns its place only where the alternative is visibly wrong, and rail
+/// is that case: track is a continuous line, and a line changing colour along
+/// its length reads as a different structure rather than as the same one.
+fn color_group(name: &str) -> &str {
+    if RAIL_TRACK.contains(&name) {
+        return "rail";
+    }
+    // Aquilo freezes placed floor into a `frozen-` twin of the same tile,
+    // deep-copied from it in the game's own data. It is the same path the
+    // player laid, so it must not change colour because the weather did, and
+    // a path crossing from a warm surface to a cold one must not appear to
+    // change material halfway.
+    if let Some(base) = name.strip_prefix("frozen-") {
+        return base;
+    }
+    name
+}
+
+fn name_hash(name: &str) -> u32 {
     let mut hash: u32 = 2166136261;
     for b in name.as_bytes() {
         hash ^= *b as u32;
         hash = hash.wrapping_mul(16777619);
     }
-    let hue = (hash % 360) as f32 / 360.0;
+    hash
+}
+
+/// Deterministic name -> color, so a given entity type is always the same
+/// color across runs with nothing to curate as new Factorio types show up.
+pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
+    let hue = (name_hash(color_group(name)) % 360) as f32 / 360.0;
+    let (r, g, b) = hsv_to_rgb(hue, saturation, value);
+    Color::new(r, g, b, 1.0)
+}
+
+/// A shade of Factorio's map-view friendly blue, for any structure without a
+/// colour of its own.
+///
+/// The game paints all of these with exactly one blue
+/// (`default_friendly_color`), which is why a Factorio map reads as a blue
+/// city. Copying that literally would make a furnace, an assembler and a
+/// chest indistinguishable here, and telling machines apart is most of what
+/// this renderer is for.
+///
+/// So the hash picks a shade *within* the blue rather than anywhere on the
+/// wheel: the hue stays in a narrow band around the game's own 200 degrees,
+/// and lightness and saturation carry the rest of the variation. Everything
+/// still reads as blue at a glance, while two neighbouring machine types stay
+/// visibly different up close, which is the compromise the plain hash got
+/// backwards and a single flat blue would get backwards the other way.
+fn friendly_shade(name: &str) -> Color {
+    let hash = name_hash(color_group(name));
+    let hue = (188 + hash % 26) as f32 / 360.0;
+    let saturation = 0.55 + ((hash >> 8) % 35) as f32 / 100.0;
+    let value = 0.42 + ((hash >> 16) % 48) as f32 / 100.0;
     let (r, g, b) = hsv_to_rgb(hue, saturation, value);
     Color::new(r, g, b, 1.0)
 }
@@ -306,6 +697,275 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl TypeRegistry {
+        /// A registry holding exactly one name, so a test can ask what colour
+        /// that name actually resolves to through the real path rather than
+        /// reimplementing the fallback chain.
+        fn new_with(name: &str) -> TypeRegistry {
+            let mut registry = TypeRegistry::new();
+            registry.intern(name);
+            registry
+        }
+    }
+
+    /// A rail line is one continuous structure and has to read as one. Before
+    /// this, 2.0's split into straight, curved, half-diagonal and elevated
+    /// variants gave each its own hue, and a save from before the split
+    /// coloured differently again from track laid after it.
+    #[test]
+    fn every_kind_of_rail_track_shares_one_color() {
+        let reference = color_for("straight-rail", 0.6, 0.9);
+        for name in RAIL_TRACK {
+            assert_eq!(color_for(name, 0.6, 0.9), reference, "{name} must colour as rail");
+        }
+    }
+
+    /// The reason the list is explicit rather than a substring match on
+    /// "rail": all four of these contain it and none of them are track.
+    #[test]
+    fn things_that_merely_have_rail_in_the_name_keep_their_own_color() {
+        let rail = color_for("straight-rail", 0.6, 0.9);
+        for name in ["rail-signal", "rail-chain-signal", "gate-over-rail", "railgun-turret"] {
+            assert_ne!(color_for(name, 0.6, 0.9), rail, "{name} is not track and must not colour as it");
+        }
+    }
+
+    /// Every Space Age tile a capture can contain resolves to a curated
+    /// colour rather than falling through to the hash.
+    ///
+    /// The names are the real prototype names, read out of the game's own
+    /// tile definitions. A tile falling through here would not look broken,
+    /// it would just look like an arbitrary hue in the middle of a planet
+    /// whose palette is otherwise deliberate, which is exactly the kind of
+    /// thing nobody notices until they see a screenshot of it.
+    #[test]
+    fn every_space_age_tile_family_has_a_curated_color() {
+        for name in [
+            // Vulcanus
+            "lava",
+            "lava-hot",
+            "volcanic-jagged-ground",
+            "volcanic-cracks-hot",
+            "volcanic-ash-light",
+            "volcanic-soil-dark",
+            "volcanic-smooth-stone",
+            // Fulgora
+            "fulgoran-dust",
+            "fulgoran-rock",
+            "fulgoran-paving",
+            "fulgoran-machinery",
+            "oil-ocean-shallow",
+            "oil-ocean-deep",
+            // Gleba
+            "natural-yumako-soil",
+            "wetland-jellynut",
+            "lowland-red-vein",
+            "lowland-dead-skin",
+            "lowland-olive-blubber",
+            "midland-turquoise-bark",
+            "midland-yellow-crust",
+            "midland-cracked-lichen",
+            "highland-dark-rock",
+            "wetland-green-slime",
+            "wetland-blue-slime",
+            "gleba-deep-lake",
+            "pit-rock",
+            // Aquilo
+            "ammoniacal-ocean",
+            "ammoniacal-ocean-2",
+            "brash-ice",
+            "brash-ice-2",
+            "ice-smooth",
+            "ice-rough",
+            "ice-platform",
+            "snow-flat",
+            "snow-crests",
+            "snow-lumpy",
+            "snow-patchy",
+            "dust-flat",
+            "dust-patchy",
+        ] {
+            assert!(known_color(name).is_some(), "{name} should have a curated color");
+        }
+    }
+
+    /// Aquilo is one cold ramp from pale snow down to near-black ocean, and
+    /// the three bands staying apart is the only thing that makes its terrain
+    /// readable at a glance.
+    #[test]
+    fn aquilo_reads_as_snow_then_ice_then_ocean() {
+        let brightness = |c: Color| c.r + c.g + c.b;
+        let snow = brightness(known_color("snow-flat").unwrap());
+        let ice = brightness(known_color("ice-smooth").unwrap());
+        let ocean = brightness(known_color("ammoniacal-ocean").unwrap());
+        assert!(snow > ice, "snow must be brighter than ice");
+        assert!(ice > ocean, "ice must be brighter than the ammoniacal ocean");
+    }
+
+    /// A path does not become a different material because the weather
+    /// changed, so Aquilo's frozen floors colour as the floor they are.
+    #[test]
+    fn frozen_floor_colours_as_the_floor_it_is() {
+        for base in ["concrete", "stone-path", "refined-concrete", "hazard-concrete-left"] {
+            assert_eq!(
+                color_for(&format!("frozen-{base}"), 0.6, 0.9),
+                color_for(base, 0.6, 0.9),
+                "frozen-{base} must match {base}"
+            );
+        }
+    }
+
+    /// Lava has to stay obviously brighter than the rock it sits in, which is
+    /// the whole reason Vulcanus reads at a glance. Asserted rather than
+    /// eyeballed, because a later tweak to the greys could quietly close the
+    /// gap.
+    #[test]
+    fn lava_is_far_brighter_than_volcanic_rock() {
+        let brightness = |c: Color| c.r + c.g + c.b;
+        let rock = brightness(known_color("volcanic-ash-light").unwrap());
+        assert!(brightness(known_color("lava").unwrap()) > rock * 2.0, "lava must stand out against rock");
+        assert!(brightness(known_color("lava-hot").unwrap()) > rock * 2.0);
+    }
+
+    /// Fulgora's oil oceans have to be darker than its islands, and the deep
+    /// ocean darker than the shallow, or the shape of the terrain is lost.
+    #[test]
+    fn fulgoras_oceans_are_darker_than_its_islands() {
+        let brightness = |c: Color| c.r + c.g + c.b;
+        let island = brightness(known_color("fulgoran-rock").unwrap());
+        let shallow = brightness(known_color("oil-ocean-shallow").unwrap());
+        let deep = brightness(known_color("oil-ocean-deep").unwrap());
+        assert!(shallow < island, "shallow ocean must be darker than the islands");
+        assert!(deep < shallow, "deep ocean must be darker than shallow");
+    }
+
+    /// The three families Factorio's map view makes instantly recognisable:
+    /// grey rails, yellow belts, blue everything else.
+    #[test]
+    fn structures_follow_the_games_map_palette() {
+        let grey = |c: Color| (c.r - c.g).abs() < 0.02 && (c.g - c.b).abs() < 0.02;
+        for rail in ["straight-rail", "curved-rail-a", "legacy-straight-rail"] {
+            assert!(grey(known_color(rail).unwrap()), "{rail} should be grey");
+        }
+
+        // Yellow: red and green high, blue low.
+        for belt in ["transport-belt", "fast-transport-belt", "turbo-transport-belt", "express-splitter"] {
+            let c = known_color(belt).unwrap();
+            assert!(c.r > 0.4 && c.g > 0.3 && c.b < c.g, "{belt} should read yellow, got {c:?}");
+        }
+    }
+
+    /// Everything without a colour of its own is a shade of blue, the way the
+    /// map view paints every player structure it has no specific colour for.
+    #[test]
+    fn ordinary_machines_are_shades_of_blue() {
+        for name in ["assembling-machine-1", "stone-furnace", "iron-chest", "lab", "steel-furnace"] {
+            let c = TypeRegistry::new_with(name).entity_color(0);
+            assert!(c.b > c.r && c.b > c.g, "{name} should be blue-dominant, got {c:?}");
+        }
+    }
+
+    /// ...but not the *same* blue, or a base becomes one undifferentiated
+    /// smear and the renderer stops saying anything about what is where.
+    #[test]
+    fn different_machines_are_different_shades() {
+        let a = TypeRegistry::new_with("assembling-machine-1").entity_color(0);
+        let b = TypeRegistry::new_with("stone-furnace").entity_color(0);
+        let apart = (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs();
+        assert!(apart > 0.08, "two machine types should be tellable apart, got {apart}");
+    }
+
+    /// Flora on the other planets is scenery, exactly like a Nauvis forest.
+    ///
+    /// This matters well beyond colour. `construction.rs` and `activity.rs`
+    /// both skip terrain scatter, so while these went unrecognised a Gleba
+    /// forest counted as construction and dragged the auto-follow camera out
+    /// over untouched wilderness.
+    #[test]
+    fn flora_on_every_planet_counts_as_scenery() {
+        for name in [
+            "tree-01",
+            "dead-grey-trunk",
+            "cliff",
+            "yumako-tree",
+            "jellystem",
+            "boompuff",
+            "stingfrond",
+            "water-cane",
+            "ashland-lichen-tree",
+        ] {
+            assert!(is_terrain_scatter(name), "{name} should be scenery, not a structure");
+            assert!(known_color(name).is_some(), "{name} should have a curated colour");
+        }
+    }
+
+    /// Every resource is a deposit, on every planet.
+    ///
+    /// Two separate failures were possible here and both bit. A resource
+    /// missing from `is_resource` counts as construction and drags the
+    /// auto-follow camera toward it; one missing from `known_color` renders
+    /// as a structure, which since structures went blue meant Vulcanus's
+    /// calcite and Fulgora's scrap looked like buildings.
+    #[test]
+    fn every_resource_on_every_planet_is_a_deposit() {
+        for name in [
+            "iron-ore",
+            "copper-ore",
+            "coal",
+            "stone",
+            "uranium-ore",
+            "crude-oil",
+            "tungsten-ore",
+            "calcite",
+            "scrap",
+            "sulfuric-acid-geyser",
+            "fluorine-vent",
+            "lithium-brine",
+        ] {
+            assert!(is_resource(name), "{name} should be a resource");
+            assert!(known_color(name).is_some(), "{name} should have a curated colour, not a blue shade");
+        }
+    }
+
+    /// Every planet has its own cliff prototype. Matching the bare name
+    /// alone left the other three rendering as structures.
+    #[test]
+    fn every_planets_cliffs_are_scenery_in_that_planets_stone() {
+        let nauvis = known_color("cliff").unwrap();
+        for name in ["cliff", "cliff-vulcanus", "cliff-fulgora", "cliff-gleba"] {
+            assert!(is_terrain_scatter(name), "{name} should be scenery");
+            assert!(known_color(name).is_some(), "{name} should have a curated colour");
+        }
+        // Each planet's own rock, not one shared grey that would look
+        // imported from Nauvis.
+        for name in ["cliff-vulcanus", "cliff-fulgora", "cliff-gleba"] {
+            assert_ne!(known_color(name).unwrap(), nauvis, "{name} should not be Nauvis grey");
+        }
+    }
+
+    /// The reason the flora list is exact: all three of these read as flora
+    /// to a substring match and are in fact machines and a turret.
+    #[test]
+    fn machines_that_sound_like_flora_are_not_scenery() {
+        for name in ["cryogenic-plant", "electromagnetic-plant", "rocket-turret"] {
+            assert!(!is_terrain_scatter(name), "{name} is a structure, not scenery");
+        }
+    }
+
+    /// Vulcanus lichen must not be Nauvis forest green, or a volcanic planet
+    /// ends up dotted with another world's vegetation.
+    #[test]
+    fn vulcanus_lichen_is_not_forest_green() {
+        assert_ne!(known_color("ashland-lichen-tree"), known_color("tree-01"));
+    }
+
+    /// Grouping must not leak: two unrelated prototypes still get their own
+    /// colours, which is the property the hash exists for.
+    #[test]
+    fn unrelated_types_still_differ() {
+        assert_ne!(color_for("transport-belt", 0.6, 0.9), color_for("stone-furnace", 0.6, 0.9));
+    }
 
     /// Every one of these is a real name a live capture actually produced
     /// (see the terrain-capture work in mod/control.lua); pinning that
@@ -394,10 +1054,15 @@ mod tests {
         }
     }
 
+    /// A machine with no colour of its own in the game's chart palette has
+    /// none here either, and picks up a shade of the friendly blue instead.
+    ///
+    /// Belts and rails deliberately no longer qualify: the game gives those
+    /// their own chart colours, so this build does too.
     #[test]
     fn known_color_falls_back_to_none_for_ordinary_factory_entities() {
-        for name in ["transport-belt", "assembling-machine-1", "electric-furnace"] {
-            assert!(known_color(name).is_none(), "{name} should use the hash fallback, not a curated color");
+        for name in ["assembling-machine-1", "electric-furnace", "iron-chest"] {
+            assert!(known_color(name).is_none(), "{name} should fall back to a blue shade, not a curated color");
         }
     }
 
@@ -476,18 +1141,34 @@ mod tests {
         assert_eq!(registry.name(belt), "transport-belt");
     }
 
-    /// The registry has to agree with the function it replaces, or interning
+    /// The registry has to agree with the functions it caches, or interning
     /// would silently recolor every entity in the viewer.
+    ///
+    /// The two lists deliberately disagree with each other for an
+    /// uncurated name: as an entity it is a structure and gets a blue shade,
+    /// as a tile it is floor and keeps the full-hue hash. Asserting both is
+    /// what stops one of them quietly being wired to the other.
     #[test]
-    fn registry_colors_match_the_underlying_hash() {
+    fn registry_colors_match_the_functions_behind_them() {
+        let name = "assembling-machine-1";
         let mut registry = TypeRegistry::new();
-        let id = registry.intern("assembling-machine-1");
-        let entity = color_for("assembling-machine-1", 0.55, 0.85);
-        let tile = color_for("assembling-machine-1", 0.35, 0.5);
-        assert_eq!(
-            (registry.entity_color(id).r, registry.entity_color(id).g, registry.entity_color(id).b),
-            (entity.r, entity.g, entity.b)
-        );
-        assert_eq!((registry.tile_color(id).r, registry.tile_color(id).g, registry.tile_color(id).b), (tile.r, tile.g, tile.b));
+        let id = registry.intern(name);
+
+        let entity = friendly_shade(name);
+        let tile = color_for(name, 0.35, 0.5);
+        let rgb = |c: Color| (c.r, c.g, c.b);
+        assert_eq!(rgb(registry.entity_color(id)), rgb(entity), "entities use the friendly blue shade");
+        assert_eq!(rgb(registry.tile_color(id)), rgb(tile), "tiles keep the hash");
+    }
+
+    /// A curated name uses its curated colour in *both* lists, so a belt is
+    /// the same yellow whichever list happens to be consulted.
+    #[test]
+    fn a_curated_name_uses_its_curated_color_in_both_lists() {
+        let mut registry = TypeRegistry::new();
+        let id = registry.intern("transport-belt");
+        let curated = known_color("transport-belt").expect("belts are curated");
+        assert_eq!(registry.entity_color(id).r, curated.r);
+        assert_eq!(registry.tile_color(id).r, curated.r);
     }
 }

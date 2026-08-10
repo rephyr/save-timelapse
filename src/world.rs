@@ -84,6 +84,18 @@ fn is_placed_floor(name: &str) -> bool {
             | "brown-refined-concrete"
             | "cyan-refined-concrete"
             | "acid-refined-concrete"
+            // Aquilo's frozen twins of the same floors. Placed by the player
+            // exactly like the unfrozen ones, so they belong in the tracked
+            // layer rather than in the terrain that is captured once and
+            // never revisited. The game generates these seven only, not one
+            // per coloured refined concrete.
+            | "frozen-stone-path"
+            | "frozen-concrete"
+            | "frozen-hazard-concrete-left"
+            | "frozen-hazard-concrete-right"
+            | "frozen-refined-concrete"
+            | "frozen-refined-hazard-concrete-left"
+            | "frozen-refined-hazard-concrete-right"
     )
 }
 
@@ -754,11 +766,23 @@ mod tests {
             "brown-refined-concrete",
             "cyan-refined-concrete",
             "acid-refined-concrete",
+            // Aquilo's frozen twins. Without these an entire Aquilo base's
+            // paving is invisible to live capture, since the mod would never
+            // log it as a tile the player placed.
+            "frozen-stone-path",
+            "frozen-concrete",
+            "frozen-hazard-concrete-left",
+            "frozen-hazard-concrete-right",
+            "frozen-refined-concrete",
+            "frozen-refined-hazard-concrete-left",
+            "frozen-refined-hazard-concrete-right",
         ] {
             assert!(is_placed_floor(name), "{name} should be placed floor");
         }
 
-        for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3"] {
+        // Aquilo's own natural ground, which must not be mistaken for floor
+        // just because everything on that planet is frozen.
+        for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3", "snow-flat", "ice-smooth", "ammoniacal-ocean"] {
             assert!(!is_placed_floor(name), "{name} should be natural terrain");
         }
     }

@@ -48,6 +48,12 @@ function M.excluded_types()
   if not settings.startup["save-timelapse-capture-terrain"].value then
     list[#list + 1] = "tree"
     list[#list + 1] = "cliff"
+    -- Gleba's flora is type "plant", not "tree": yumako trees, jellystem and
+    -- the rest. Without this line, turning terrain capture off silenced
+    -- Nauvis's forests while Gleba's kept being recorded, which is both
+    -- surprising and the more expensive half on a planet that is mostly
+    -- wilderness.
+    list[#list + 1] = "plant"
   end
   return list
 end

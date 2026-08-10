@@ -74,6 +74,19 @@ M.PLACED_FLOOR_TILES = {
   "orange-refined-concrete", "yellow-refined-concrete", "pink-refined-concrete",
   "purple-refined-concrete", "black-refined-concrete", "brown-refined-concrete",
   "cyan-refined-concrete", "acid-refined-concrete",
+  -- Aquilo freezes placed floor into a `frozen-` twin of the same tile.
+  -- These are still floor the player laid, placeable and blueprintable, so
+  -- without them here an entire Aquilo base's paving is invisible to live
+  -- capture: it would only ever appear if terrain capture happened to be on,
+  -- and then only in the baseline, never as it was built.
+  --
+  -- Seven of them, not one per floor type: the game only generates frozen
+  -- variants for stone path, concrete, refined concrete and the two hazard
+  -- pairs, not for the coloured refined concretes.
+  "frozen-stone-path", "frozen-concrete",
+  "frozen-hazard-concrete-left", "frozen-hazard-concrete-right",
+  "frozen-refined-concrete",
+  "frozen-refined-hazard-concrete-left", "frozen-refined-hazard-concrete-right",
 }
 
 -- Terrain capture bounding box

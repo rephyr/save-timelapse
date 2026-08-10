@@ -17,6 +17,8 @@ Date: 2026-08-10
   Bugfixes:
     - Space platform construction is now recorded. Everything on a platform is placed by platform construction bots, which raise different events than planet side robots, so a platform previously showed up fully built and then never changed
     - Entities revived from a ghost by another mod, rather than built by a bot, are now recorded too
+    - Paving on Aquilo is recorded. Concrete and stone path freeze into their own tile types there, which the mod did not recognise as floor you had placed, so an entire Aquilo base's paving was invisible
+    - Turning terrain capture off now also stops recording Gleba's plants. They are a different prototype type than trees, so switching terrain off silenced Nauvis's forests while Gleba's kept being captured, on a planet that is mostly wilderness
 ---------------------------------------------------------------------------------------------------
 Version: 0.4.0
 Date: 2026-08-09
