@@ -692,6 +692,42 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
+## What the tool remembers
+
+Four things, in plain JSON under the user's own config directory
+(`%APPDATA%\save-timelapse\settings.json` on Windows, the platform
+equivalent elsewhere): where Factorio's folder is, where its executable is,
+seconds per emitted frame, and whether to include natural terrain.
+
+Beside the executable would have been the more obvious home for a tool that
+ships as a zip, and is exactly wrong: replacing the zip on update wipes it,
+which is when somebody least wants to redo their setup.
+
+Three rules keep it from becoming a liability:
+
+**Absent means never asked, not a default.** Every field is an `Option`. That
+distinction is what lets the first run explain itself once and never again,
+and it is why no field carries a baked-in value.
+
+**Remembered paths are validated, never trusted.** A Factorio folder that has
+since moved, been renamed, or lived on a drive that is not plugged in falls
+through to auto-detection rather than being handed downstream to fail
+confusingly later. The point of remembering it is to save the user work, not
+to invent a new way to waste it.
+
+**Nothing it does is fatal.** A missing file is the first run. A corrupt file
+is one warning and a fresh start, because a tool that refuses to launch until
+you find and delete a file you never knew about is worse than one that forgets
+your preferences. A failed write is a warning too: not remembering an answer
+costs one prompt next time, which is no reason to abandon a build.
+
+Surface choice is deliberately **not** remembered. Which surfaces a capture
+has changes as a playthrough reaches new planets, so a remembered answer would
+quietly pick a stale one, and being shown the wrong world is more annoying than
+being asked. The terrain choice is remembered but still asked every time, since
+it is a real cost decision rather than a preference; what is remembered is only
+which way Enter goes.
+
 ## Tile reverts
 
 Removing a placed tile has to restore what it was covering. Mining landfill

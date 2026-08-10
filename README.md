@@ -259,10 +259,10 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Milestones for timelapses built from existing saves, recovered by comparing consecutive saves
 - [x] Skip writing frames that changed nothing: a surface is only written at moments something on it changed, measured at 90% smaller on a real nine-surface megabase export
 - [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
-- [ ] Linux and macOS builds
-- [ ] Settings persistence and first-run setup
+- [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
 - [ ] Bookmarks and jumping between milestones and busy stretches
 - [ ] Single binary, so the tool and viewer cannot be separated
+- [ ] Linux and macOS builds
 
 ### v1.0
 

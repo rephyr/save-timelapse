@@ -17,6 +17,7 @@ use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
 use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
+use save_timelapse::settings::{self, Settings};
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -51,6 +52,20 @@ fn prompt(question: &str) -> io::Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// Announces a step and leaves the line open, so whatever the step finds
+/// finishes the sentence.
+///
+/// Every one of these was previously silent, which is fine when it takes no
+/// time and awful when it does: loading a megabase baseline is tens of
+/// seconds of a blank screen, and "is this doing anything?" is not a question
+/// a tool should make anyone ask. Flushed explicitly because stdout is line
+/// buffered, so without it the announcement would appear *after* the work it
+/// is announcing, which is worse than not printing it at all.
+fn step(what: &str) {
+    print!("{what}... ");
+    io::stdout().flush().ok();
+}
+
 fn ask_mode() -> io::Result<Mode> {
     loop {
         let input = prompt(
@@ -74,24 +89,46 @@ fn ask_mode() -> io::Result<Mode> {
     }
 }
 
-/// Auto-detects Factorio's data folder (saves/mods/script-output), falling
-/// back to asking for it. Validated by checking for a `mods` subfolder
-/// rather than just accepting any path, since a wrong answer here would
-/// otherwise only surface as a confusing failure several steps later.
-fn locate_factorio_user_dir_interactive() -> io::Result<PathBuf> {
+/// Factorio's data folder (saves/mods/script-output): remembered answer
+/// first, then auto-detection, then asking.
+///
+/// Validated by checking for a `mods` subfolder rather than accepting any
+/// path, since a wrong answer here would otherwise only surface as a
+/// confusing failure several steps later. That applies to the remembered
+/// path too (see
+/// `Settings::valid_factorio_dir`), so a folder that has since moved falls
+/// through to detection rather than becoming a confusing failure several
+/// steps later. Whatever ends up resolving is written back, which is what
+/// makes this a question asked once rather than every run: the case that
+/// actually hurt was auto-detection failing, since that meant retyping the
+/// same path forever.
+fn locate_factorio_user_dir_interactive(settings: &mut Settings) -> io::Result<PathBuf> {
+    step("Finding your Factorio folder");
+
+    // Says which of the three it was. "Remembered" versus "found" is the
+    // difference between the tool knowing something about this machine and
+    // having just worked it out, and it is the only clue anyone gets that a
+    // saved setting is in play at all.
+    if let Some(dir) = settings.valid_factorio_dir() {
+        println!("remembered from last time\n  {}", dir.display());
+        return Ok(dir.to_path_buf());
+    }
     if let Some(dir) = factorio_user_dir() {
         if dir.join("mods").is_dir() {
+            println!("found at\n  {}", dir.display());
+            settings.factorio_dir = Some(dir.clone());
             return Ok(dir);
         }
     }
+    println!("not found automatically.\n");
     loop {
         let input = prompt(
-            "Could not find your Factorio folder automatically.\n\
-             Please enter the path to it (the folder containing \"mods\" and \"saves\", \
+            "Please enter the path to it (the folder containing \"mods\" and \"saves\", \
              usually %APPDATA%\\Factorio on Windows):",
         )?;
         let path = PathBuf::from(&input);
         if path.join("mods").is_dir() {
+            settings.factorio_dir = Some(path.clone());
             return Ok(path);
         }
         println!("That doesn't look right: no \"mods\" folder inside {}.\n", path.display());
@@ -100,18 +137,27 @@ fn locate_factorio_user_dir_interactive() -> io::Result<PathBuf> {
 
 /// Same idea for the actual game executable, only needed by the from-saves
 /// flow, which launches it headless.
-fn locate_factorio_exe_interactive() -> io::Result<PathBuf> {
+fn locate_factorio_exe_interactive(settings: &mut Settings) -> io::Result<PathBuf> {
+    step("Finding your Factorio install");
+
+    if let Some(exe) = settings.valid_factorio_exe() {
+        println!("remembered from last time\n  {}", exe.display());
+        return Ok(exe.to_path_buf());
+    }
     if let Some(exe) = locate_factorio() {
+        println!("found at\n  {}", exe.display());
+        settings.factorio_exe = Some(exe.clone());
         return Ok(exe);
     }
+    println!("not found automatically.\n");
     loop {
         let input = prompt(
-            "Could not find your Factorio install automatically.\n\
-             Please enter the full path to factorio.exe (usually inside a Steam \
+            "Please enter the full path to factorio.exe (usually inside a Steam \
              library, under Factorio\\bin\\x64\\factorio.exe):",
         )?;
         let path = PathBuf::from(&input);
         if path.is_file() {
+            settings.factorio_exe = Some(path.clone());
             return Ok(path);
         }
         println!("That file doesn't exist: {}\n", path.display());
@@ -341,15 +387,17 @@ fn viewer_path() -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
-fn run_live_capture() -> io::Result<PathBuf> {
-    let user_dir = locate_factorio_user_dir_interactive()?;
+fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
+    let user_dir = locate_factorio_user_dir_interactive(settings)?;
 
     let capture = user_dir.join("script-output").join("save-timelapse");
     // A missing capture folder (nothing has ever been captured) and one that
     // exists but names no finished baseline are the same "not started yet"
     // state from here, so a read_dir failure is folded into the empty case
     // rather than surfaced as a raw IO error.
+    step("Looking for captured playthroughs");
     let sessions = replay::discover_sessions(&capture).unwrap_or_default();
+    println!("{} found", sessions.len());
     if sessions.is_empty() {
         return Err(io::Error::other(format!(
             "No live capture found at {}.\n\n\
@@ -370,18 +418,36 @@ fn run_live_capture() -> io::Result<PathBuf> {
         sessions.into_iter().nth(index).expect("ask_session_choice returned a valid index")
     };
 
+    // The slowest silent step in the whole tool: a megabase baseline is tens
+    // of megabytes and takes real time to read, with nothing on screen until
+    // it finished.
+    step("\nReading the baseline snapshot");
     let mut replay_state = replay::load_baseline(&chosen.baseline_path)?;
     println!(
-        "\nbaseline tick {} ({} entities, {} tiles)",
+        "tick {} ({} entities, {} tiles)",
         replay_state.baseline.tick,
         replay_state.world.entity_count(),
         replay_state.world.tile_count()
     );
+
+    step("Finding surfaces");
     let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
-    println!("surfaces: {}\n", surfaces.join(", "));
+    println!("{}\n", surfaces.join(", "));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;
-    let frame_seconds = ask_frame_seconds(DEFAULT_FRAME_SECONDS)?;
+    let frame_seconds = ask_frame_seconds(settings.frame_seconds.unwrap_or(DEFAULT_FRAME_SECONDS))?;
+
+    // Saved here rather than after the export, so an answer survives even if
+    // the build that follows fails or is interrupted. Retyping preferences
+    // because something else went wrong is exactly the friction this exists
+    // to remove.
+    //
+    // Surface choice is deliberately not remembered: which surfaces a capture
+    // has changes as a playthrough reaches new planets, so a remembered one
+    // would silently pick a stale answer, and picking the wrong world is far
+    // more annoying than being asked.
+    settings.frame_seconds = Some(frame_seconds);
+    remember(settings);
 
     // Fixed and owned entirely by this tool, so it's safe to clear before
     // every run: a shorter capture than last time can't leave stale,
@@ -410,7 +476,6 @@ fn run_live_capture() -> io::Result<PathBuf> {
     // its doc comment: this is what turns "every surface, every frame" into
     // "every surface that changed".
     let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
-    let mut files = 0usize;
 
     let emitted = match &chosen_surface {
         None => {
@@ -419,12 +484,9 @@ fn run_live_capture() -> io::Result<PathBuf> {
                 if error.is_some() {
                     return;
                 }
-                match replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
-                    Ok(n) => files += n,
-                    Err(e) => {
-                        error = Some(e);
-                        return;
-                    }
+                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
+                    error = Some(e);
+                    return;
                 }
                 written += 1;
                 if written.is_multiple_of(25) {
@@ -453,22 +515,6 @@ fn run_live_capture() -> io::Result<PathBuf> {
             })?
         }
     };
-    // Worth reporting rather than leaving implicit, because the frame count
-    // alone now understates what happened: a surface is only written at
-    // moments something on it changed, so "14 frames" can mean far fewer than
-    // 14 files per surface. On a real nine-surface capture this was 93% of
-    // the bytes.
-    if chosen_surface.is_none() && written > 0 {
-        let surfaces = replay_state.world.surface_names().len();
-        let would_have = written * surfaces;
-        if would_have > files {
-            println!(
-                "\n{files} surface file(s) written instead of {would_have}: a surface is only \
-                 written when something on it changed"
-            );
-        }
-    }
-
     if let Some(e) = error {
         return Err(e);
     }
@@ -548,24 +594,26 @@ fn run_live_capture() -> io::Result<PathBuf> {
     Ok(out)
 }
 
-fn run_from_saves() -> io::Result<PathBuf> {
-    let factorio = locate_factorio_exe_interactive()?;
-    let user_dir = locate_factorio_user_dir_interactive()?;
+fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
+    let factorio = locate_factorio_exe_interactive(settings)?;
+    let user_dir = locate_factorio_user_dir_interactive(settings)?;
     let user_mods = user_dir.join("mods");
     let saves_dir = user_dir.join("saves");
 
+    step("Scanning your saves folder");
     let mut saves: Vec<PathBuf> = std::fs::read_dir(&saves_dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
         .collect();
     saves.sort_by_key(|p| ordering_key(p));
+    println!("{} save(s) found", saves.len());
 
     if saves.is_empty() {
         return Err(io::Error::other(format!("No .zip saves found in {}.", saves_dir.display())));
     }
 
-    println!("\nFound {} save(s) in {}:", saves.len(), saves_dir.display());
+    println!("\nIn {}:", saves_dir.display());
     for (i, save) in saves.iter().enumerate() {
         println!("  {}) {}", i + 1, save.file_name().unwrap_or_default().to_string_lossy());
     }
@@ -594,8 +642,13 @@ fn run_from_saves() -> io::Result<PathBuf> {
     let capture_terrain = ask_yes_no(
         "Include natural terrain (grass, water, trees, cliffs) around the base? This can \
          significantly increase export size and time (roughly 5x in testing)",
-        false,
+        // Remembered, but still asked. It is a real cost decision rather than
+        // a preference, so it keeps being put in front of the user; what is
+        // remembered is only which way Enter goes.
+        settings.capture_terrain.unwrap_or(false),
     )?;
+    settings.capture_terrain = Some(capture_terrain);
+    remember(settings);
 
     let out = output_dir_next_to_exe("frames");
     let _ = std::fs::remove_dir_all(&out);
@@ -666,20 +719,48 @@ fn run_from_saves() -> io::Result<PathBuf> {
     Ok(out)
 }
 
+/// Writes the settings, reporting a failure without treating it as one.
+///
+/// Not being able to remember an answer costs one prompt next time. Refusing
+/// to build somebody's timelapse over it would be absurd, so this never
+/// returns an error to a caller who would only have to ignore it.
+fn remember(settings: &Settings) {
+    if let Err(e) = settings.save() {
+        eprintln!("warning: could not save your preferences ({e}); they will be asked again next time");
+    }
+}
+
 /// `None` when there is nothing to open the viewer on, which is the case for
 /// managing captures: it is housekeeping, not a build.
 fn run() -> io::Result<Option<PathBuf>> {
     println!("save-timelapse\n");
+
+    // Said once, on the run that has nothing saved yet, so the questions
+    // below read as setup rather than as something that will happen forever.
+    // Checked before loading, since loading is what would create the file.
+    let first_run = Settings::is_first_run();
+    let mut settings = Settings::load();
+    if first_run {
+        println!("First run: the answers below are remembered, so you will not be asked again.");
+        if let Some(path) = settings::settings_path() {
+            println!("They live in {}, and deleting that file resets them.\n", path.display());
+        }
+    }
+
     loop {
         match ask_mode()? {
-            Mode::LiveCapture => return run_live_capture().map(Some),
-            Mode::FromSaves => return run_from_saves().map(Some),
+            Mode::LiveCapture => return run_live_capture(&mut settings).map(Some),
+            Mode::FromSaves => return run_from_saves(&mut settings).map(Some),
             // Loops back to the menu instead of returning, since managing
             // captures is housekeeping done *before* building something:
             // naming a playthrough and then being dropped out of the program
             // means starting it again to actually use the name.
             Mode::ManageCaptures => {
-                let capture = locate_factorio_user_dir_interactive()?.join("script-output").join("save-timelapse");
+                let capture = locate_factorio_user_dir_interactive(&mut settings)?.join("script-output").join("save-timelapse");
+                // Locating the folder may well have been the thing that
+                // needed asking, and it is worth keeping even though nothing
+                // was built.
+                remember(&settings);
                 manage_captures(&capture)?;
                 println!();
             }
