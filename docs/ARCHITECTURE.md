@@ -1,5 +1,65 @@
 # Architecture
 
+This document is long because it records *why* rather than *what*, including
+the approaches that were tried and rejected. Read this summary first and dip
+into the section you need; nothing below depends on being read in order.
+
+## In short
+
+**The constraint everything follows from.** Factorio's Lua sandbox cannot read
+files, open sockets, or spawn processes. A mod's only output channel is
+writing into `script-output`, and it can never read back what it wrote. So the
+mod and the desktop tool never communicate: the mod appends bytes, the tool
+reads the directory afterwards. Almost every design decision here is a
+consequence of that, and the recurring shape is **the mod states what it saw,
+and every hard question is answered on the Rust side, where the evidence
+actually exists.**
+
+**Two ways in, one way out.**
+
+    existing saves ──> CLI drives headless Factorio, mod exports each save ──┐
+                                                                             ├──> frames ──> viewer ──> video
+    live play ──────> mod snapshots once, then logs only what changes ──────┘
+
+A save file has no history of its own, so those two paths know completely
+different things and converge on the same on-disk shape.
+
+**Five decisions that shape everything else:**
+
+| Decision | Because |
+|---|---|
+| Custom binary formats, not JSON | The mod writes during real gameplay on bases of ~900k entities. Text formatting per entity *was* the cost. Runs plus delta varints plus a name dictionary took one megabase surface from 200 MB to 38 MB |
+| Unknown records are skipped, not fatal | Factorio auto-updates mods from the portal; the desktop tool does not update itself. "Mod newer than tool" is the normal state of anyone who installed once and kept playing |
+| Log changes, don't re-snapshot | At ~50 bytes per entity, snapshotting a megabase every ten seconds writes gigabytes an hour, all of it repeating what the log already says |
+| Reloads are resolved when reading | The mod *cannot* detect a reloaded save. Every value durable enough to survive a load lives in the save and rewinds with it |
+| Nothing under your Factorio install is touched | Exports run against a staged tree the CLI owns and deletes |
+
+**Three rules worth knowing before reading any section:**
+
+1. **This format records that something was built or destroyed, never that it
+   moved.** That one sentence explains the whole entity filter: robots,
+   biters, pentapods, trains and cars are excluded because the format would
+   pin them wherever they were captured while the real one carried on.
+2. **Being worth drawing and being worth aiming at are different questions.**
+   Nests are kept and drawn; they do not move the camera. Conflating the two
+   was a long-lived bug.
+3. **Core format layout is frozen at version 3.** Anything new is an extension
+   record with a length prefix, so an older reader skips exactly what it does
+   not understand.
+
+## Where to read what
+
+| If you want | Read |
+|---|---|
+| How a save becomes frames | Pipeline, Staging model, Export trigger |
+| The file formats | Frame format, Event format, Format stability |
+| Why captures survive version changes | Format stability and the extension contract |
+| What gets recorded and what does not | Entity filtering, What counts as the factory |
+| How live capture reassembles history | Live capture and replay, Why replay is forgiving |
+| The hardest problem here | Reloading an earlier save |
+| Why the viewer is fast | Rendering, Loading, Only writing surfaces that changed |
+| How a video gets made | Exporting a video |
+
 ## Components
 
     mod/     Lua mod loaded by Factorio. Exports entity data in a custom binary format.
@@ -1035,6 +1095,119 @@ already writes every surface at one tick, and `save-timelapse-replay
 all-surfaces` does the same across a whole timelapse. Each world keeps its
 own `Camera`, fitted to its own frames at load time, so switching to another
 world and back doesn't disturb either one's pan/zoom.
+
+## Exporting a video
+
+    growing bounds ─> camera fit ─> draw offscreen at (w·N, h·N)
+                                          │
+                          get_texture_data()   RGBA, bottom up
+                                          │
+                          downsample()         box average N·N ─> w x h
+                                          │
+                          encode_jpeg()        flip rows, RGB, quality 85
+                                          │
+                          AviWriter::add_jpeg()    one "00dc" chunk
+                                          │
+                          finish()             index, then patch four sizes
+
+Each frame is encoded and appended as it is drawn, so memory stays at one
+frame however long the timelapse runs.
+
+### Motion JPEG in an AVI, written by hand
+
+`viewer/src/avi.rs` is a few hundred lines of laying out headers, which is the
+point: the promise is that you run the executable and that is it, nothing to
+install. Linking or shelling out to ffmpeg would break that for the one
+feature most likely to be used by somebody who just wants something to post.
+
+MJPEG is "every frame is a complete JPEG", so there is no inter-frame
+prediction, no bitrate control and no encoder state to get wrong, and every
+mainstream player reads it. The cost is size, since the file is roughly the
+sum of its frames. That is only the right trade because a timelapse is flat
+colour on a dark background, which JPEG compresses hard.
+
+Four fields cannot be known until the last frame lands: the RIFF size, the
+`movi` list size, and the frame count, which appears in **two** separate
+headers. They are written as zero and patched by seeking back, which is why
+`AviWriter::create` takes a path rather than a writer.
+
+Three things that break a file quietly rather than loudly, each with a test:
+RIFF chunks are word aligned, so an unpadded odd-length frame shifts
+everything after it and the file stops parsing partway; index offsets are
+relative to the `movi` fourcc, and getting that wrong still plays but breaks
+seeking, the one thing an index is for; and `dwSuggestedBufferSize` is
+nominally advisory but some decoders size their input buffer from it and
+truncate anything larger.
+
+The tests parse the file the way a player does, following chunk sizes, rather
+than reading fixed offsets. A size wrong by one is exactly the bug worth
+catching, and a fixed-offset assertion sails straight past it.
+
+### Which way up
+
+Video shipped upside down, and it took two agreeing fixes, which is worth
+recording because either alone just moves the flip.
+
+A render target reads back bottom up, the way OpenGL stores it. macroquad's
+`Image::export_png` undoes that itself, so the PNG sequence was always right
+and the JPEG path, which touches `bytes` directly, was not. The other half is
+`biHeight` in the `BITMAPINFOHEADER`, which carries row order **in its sign**:
+positive means bottom up (the DIB convention, and the one written by
+accident), negative means top down. Declaring the truth is also the more
+compatible choice, since a player that ignores the sign treats MJPEG as top
+down anyway, so both kinds of player agree.
+
+### Full detail, supersampled
+
+An export renders at `N` times the requested size and averages down.
+
+The averaging is not cosmetic. At 1080p a 2,900 tile base puts about three
+tiles behind every output pixel, so at one sample per pixel whichever entity
+a pixel lands on wins it outright and the other two tiles are simply gone,
+and which one wins changes frame to frame as the camera creeps. A box filter
+is the correct kernel rather than merely the cheap one: the samples cover
+exactly one output pixel's area, so their unweighted mean *is* that pixel's
+coverage. Bicubic would be reaching outside the pixel to reconstruct a
+continuous signal, and the source is flat quads with hard edges.
+
+That in turn is what makes **chunk LOD wrong for an export**. LOD exists to
+keep a live frame rate up by not submitting items too small to perceive, and
+an export has no frame rate to protect: it renders one frame at a time, as
+slowly as it likes. What it was costing is real, since a cell keeps only its
+dominant type, so at these zooms a paved area swallowed every belt and
+machine running through it. Full detail is only sound *because* of
+supersampling, since at one sample per pixel the items it restores are
+sub-pixel and alias into speckle.
+
+Measured on a real 860k entity base, 41 frames at 1080p: 4x supersampling
+cost about 3% more wall clock than 2x, because the bottleneck is submitting
+entities rather than fill rate or the downsample. The shipped default is
+still 2, since a 7680x4320 readback is 132 MB per frame and that is not a
+thing to default to on hardware nobody has checked.
+
+### The bug that made all of this hard to see
+
+`view_bounds` culled against `screen_width()`/`screen_height()`, which are the
+**window's** dimensions. That is the same thing only while drawing to the
+window. An export renders into an offscreen target of whatever size was asked
+for, so culling to the window threw away everything outside a window-sized
+corner of it, and at the default 1280x800 window every 1080p export was
+silently cropped to its top-left two thirds.
+
+It resisted diagnosis because it looks exactly like a framing problem, and
+framing is genuinely worth improving, so two rounds of camera work went past
+it. What settled it was numeric: two exports with deliberately different
+camera bounds produced byte-identical content boxes. Framing changes could
+not move the output because framing was never what was wrong.
+
+`view_bounds` now derives the surface size from `screen_center * 2.0`. Every
+caller already builds `screen_center` as exactly half the surface it is
+drawing to, so it is the same number by a route that cannot go stale, and it
+takes the last window global out of the draw path. The lesson worth keeping
+is that a rendering bug deserves a measurement of the rendered pixels before
+any theory about the camera: a ten-line check of a PNG's non-background
+bounding box, and whether it touches an edge, would have found this
+immediately.
 
 ## Concurrency
 
