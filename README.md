@@ -181,6 +181,8 @@ Current features:
 - Construction heatmap (`h` to toggle, off by default): warm overlay showing where building happened over the last few frames, drawn under the factory so it never obscures what you built
 - Milestone markers under the scrub bar: the first of each science pack, the first rocket launch, and each planet reached, coloured by science pack and labelled on hover
 - Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
+- Jump between notable moments: `m` for the next milestone or bookmark, `c` for the next busy stretch of building, and hold shift with either to go backwards
+- Bookmarks (`b` to set or clear one at the current frame), drawn as yellow ticks above the scrub bar and saved beside the frames, so they are still there next time you open that timelapse
 - Home / End navigation
 - Surface switching
 - Player position marker
@@ -261,7 +263,7 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Skip writing frames that changed nothing: a surface is only written at moments something on it changed, measured at 90% smaller on a real nine-surface megabase export
 - [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
 - [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
-- [ ] Bookmarks and jumping between milestones and busy stretches
+- [x] Bookmarks and jumping between milestones and busy stretches
 - [ ] Single binary, so the tool and viewer cannot be separated
 - [ ] Linux and macOS builds
 
@@ -311,6 +313,7 @@ much, and how to re-measure all of it: 5x smaller frames, 90% smaller exports,
 - **Tile reverts need terrain capture on:** Removing a placed tile restores whatever it was covering, so mining landfill puts the water back rather than leaving a hole. With terrain capture off there is deliberately no natural ground in the timelapse, so the tile simply disappears instead. Only applies to tiles removed while capture is running: a tile already gone before capture started was never seen either way.
 - **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
 - **From-saves milestones are only as precise as your save cadence:** A save records that a science pack has been produced, never when it first was, so a timelapse built from existing saves marks each milestone at the first save that shows it. A pack first produced an hour before the save that first mentions it is marked at that save, not an hour earlier. Live capture watches them happen and is exact. Building from an already established base also opens with a cluster of markers, since everything already done is reported by the earliest save; that is accurate rather than tidy, and live capture does the same thing when switched on mid-playthrough.
+- **The construction heatmap barely registers bot building:** The overlay scales every cell against the busiest single cell of the whole run, and that peak is almost always a blueprint landing hundreds of entities in one frame. Construction robots place the same blueprint gradually over many frames instead, so each frame contributes a small fraction of what an instant placement does and the glow stays dim or invisible even while a large area is genuinely being built. The activity graph along the scrub bar has the same cause and shows bot work as a long low plateau rather than a spike. Separately, space platform construction was not recorded at all before v0.5, which looked like the same problem but was a different one and is fixed.
 - **Nothing that moves is recorded:** The capture format records that something was built or destroyed, never that it moved, so biters, spitters and flying construction/logistics robots are deliberately excluded rather than drawn frozen wherever they happened to be. Stationary enemies are kept: nests and worms appear in red, so clearing them is visible as the front line moves outward.
 
 ---

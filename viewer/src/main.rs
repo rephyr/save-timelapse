@@ -107,6 +107,22 @@ struct WorldView {
     /// The busiest single cell of the run, so heat brightness stays anchored
     /// to a fixed reference rather than to whatever is currently on screen.
     heat_peak: u32,
+    /// Frames worth jumping to with `[` and `]`: every milestone, plus
+    /// whatever the viewer has bookmarked. Sorted, and rebuilt whenever a
+    /// bookmark is added or removed.
+    jump_targets: Vec<usize>,
+    /// The busiest frame of each stretch of sustained construction, for
+    /// PageUp and PageDown. Fixed at load, since the activity it derives
+    /// from is.
+    busy: Vec<usize>,
+    /// Just the bookmarked frames, for drawing them on the bar. Kept beside
+    /// `jump_targets` rather than derived from it, because that list has
+    /// milestones mixed in and they are already drawn their own way.
+    bookmark_frames: Vec<usize>,
+    /// Bookmarked *ticks*, not frames. See `viewer::marks`: a rebuild at a
+    /// different seconds-per-frame renumbers every index, so a bookmark that
+    /// meant an index would silently come back pointing somewhere else.
+    bookmarks: Vec<u64>,
     follow: FollowState,
     /// This surface's natural-terrain layer, loaded once (not per frame:
     /// terrain never changes after the baseline, see
@@ -529,6 +545,7 @@ fn draw_tile_lod_layer(
 
 /// Mouse and keyboard input for the active world: panning, zooming,
 /// timeline scrubbing, and every playback/display toggle.
+#[allow(clippy::too_many_arguments)]
 fn handle_input(
     camera: &mut Camera,
     sequence: &mut FrameSequence,
@@ -536,6 +553,8 @@ fn handle_input(
     state: &mut ViewerState,
     timeline: &Timeline,
     screen_center: Vec2,
+    jump_targets: &[usize],
+    busy: &[usize],
 ) {
     let mouse: Vec2 = mouse_position().into();
 
@@ -578,6 +597,47 @@ fn handle_input(
         state.playing = false;
         follow.enabled = false;
     }
+    // Jumping between marked moments. Both pairs stop playback and drop
+    // auto-follow for the same reason stepping does: a deliberate move to a
+    // specific point should stay there rather than be dragged onward.
+    //
+    // A jump with nowhere to go is silently nothing, not a wrap to the other
+    // end: wrapping from the last milestone back to the first would look like
+    // the key had jumped somewhere at random.
+    let jump = |targets: &[usize], sequence: &mut FrameSequence, forward: bool| -> bool {
+        let found =
+            if forward { viewer::next_mark(targets, sequence.index()) } else { viewer::previous_mark(targets, sequence.index()) };
+        match found {
+            Some(frame) => {
+                sequence.goto(frame);
+                true
+            }
+            None => false,
+        }
+    };
+
+    // Letters, with shift for the reverse direction, rather than brackets or
+    // PageUp/PageDown. Bracket keys sit somewhere different on every non-US
+    // layout, and plenty of compact keyboards have no page keys at all, so
+    // both would have been a shortcut that silently does not exist for some
+    // people. A letter is in the same place everywhere, and shift is the one
+    // modifier every keyboard has.
+    //
+    // `m` for mark and `c` for construction, so the mnemonic survives not
+    // having read the key list recently.
+    let back = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    let mut jumped = false;
+    if is_key_pressed(KeyCode::M) {
+        jumped |= jump(jump_targets, sequence, !back);
+    }
+    if is_key_pressed(KeyCode::C) {
+        jumped |= jump(busy, sequence, !back);
+    }
+    if jumped {
+        state.playing = false;
+        follow.enabled = false;
+    }
+
     if is_key_pressed(KeyCode::Home) {
         sequence.goto(0);
         state.playing = false;
@@ -1123,15 +1183,33 @@ fn heat_color(intensity: f32) -> Color {
 /// box, since dragging a scrubber pulls the pointer off it vertically almost
 /// immediately, and losing the readout at exactly that moment would take it
 /// away whenever it is being used most deliberately.
+/// A bookmark's mark on the bar: a thin upright tick above the track.
+///
+/// Deliberately unlike the milestone diamonds below the bar and the round
+/// playhead. A bookmark is somebody's own mark rather than something the
+/// capture found, and telling the two apart at a glance is the whole reason
+/// they are not drawn the same.
+fn draw_bookmark_markers(timeline: &Timeline, sequence: &FrameSequence, bookmark_frames: &[usize]) {
+    for &frame in bookmark_frames {
+        let x = timeline.x_for_index(frame, sequence.len());
+        // A warm yellow, distinct from every milestone color and from the
+        // activity graph behind it.
+        draw_line(x, timeline.y - 9.0, x, timeline.y - 2.0, 2.0, Color::new(1.0, 0.84, 0.35, 1.0));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_timeline_bar(
     timeline: &Timeline,
     sequence: &FrameSequence,
     activity: &[f32],
     milestones: &[Milestone],
+    bookmark_frames: &[usize],
     mouse: Vec2,
     scrubbing: bool,
 ) {
     draw_activity_graph(timeline, sequence, activity);
+    draw_bookmark_markers(timeline, sequence, bookmark_frames);
 
     // Track, filled up to the current frame, a tick per frame when
     // there are few enough to read, and a playhead on top.
@@ -1253,6 +1331,20 @@ fn milestone_color(milestone: &Milestone) -> Color {
         Kind::Planet => rgb(255, 165, 60),
         Kind::Other(_) => rgb(180, 180, 180),
     }
+}
+
+/// Every frame `[` and `]` should stop at, and separately the frames the
+/// bookmarks alone sit on for drawing.
+///
+/// Milestones and bookmarks share one jump list because "take me to the next
+/// interesting thing" is one gesture rather than two. Both are stored as
+/// ticks and resolved here rather than kept as indices, since the same tick
+/// lands on a different frame depending on how coarsely the timelapse was
+/// built.
+fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -> (Vec<usize>, Vec<usize>) {
+    let bookmark_frames = viewer::frames_for_ticks(bookmarks, frame_ticks);
+    let ticks: Vec<u64> = milestones.iter().map(|m| m.tick).chain(bookmarks.iter().copied()).collect();
+    (viewer::frames_for_ticks(&ticks, frame_ticks), bookmark_frames)
 }
 
 /// Milestone markers: a small diamond under the bar at each notable moment,
@@ -1453,6 +1545,12 @@ async fn main() {
         println!("{} milestone(s) loaded", milestones.len());
     }
 
+    // Bookmarks live beside the frames, like every other sidecar. `None` for
+    // a single-file or synthetic load, which has no directory to keep them
+    // in; bookmarking is simply unavailable there rather than a special case
+    // threaded through everything below.
+    let frames_dir: Option<std::path::PathBuf> = args.path.as_deref().map(std::path::PathBuf::from).filter(|p| p.is_dir());
+
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
         Some(dir) => println!("factorio data: {}", dir.display()),
@@ -1482,7 +1580,32 @@ async fn main() {
             // base actually starts. `f` still toggles it off for anyone who
             // wants full manual control from the start.
             let follow = FollowState { enabled: true, ..Default::default() };
-            WorldView { name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain }
+
+            let busy = viewer::busy_stretches(&measured.counts);
+            // Milestones and bookmarks share one list because "take me to the
+            // next interesting thing" is one gesture, not two. Busy stretches
+            // stay separate: they are derived rather than chosen, and there
+            // are far more of them, so mixing them in would bury the handful
+            // of moments somebody actually marked.
+            let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
+            let bookmarks = frames_dir.as_deref().map(viewer::read_bookmarks).unwrap_or_default();
+            let (jump_targets, bookmark_frames) = marks_for(&milestones, &bookmarks, &frame_ticks);
+
+            WorldView {
+                name,
+                sequence,
+                camera,
+                growing_bounds,
+                activity,
+                heat,
+                heat_peak,
+                jump_targets,
+                busy,
+                bookmark_frames,
+                bookmarks,
+                follow,
+                terrain,
+            }
         })
         .collect();
     let mut current = 0usize;
@@ -1525,13 +1648,45 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let WorldView { name: world_name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain } =
-            &mut worlds[current];
+        let WorldView {
+            name: world_name,
+            sequence,
+            camera,
+            growing_bounds,
+            activity,
+            heat,
+            heat_peak,
+            jump_targets,
+            busy,
+            bookmark_frames,
+            bookmarks,
+            follow,
+            terrain,
+        } = &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let timeline = Timeline::for_screen(screen_width(), screen_height());
 
-        handle_input(camera, sequence, follow, &mut state, &timeline, screen_center);
+        handle_input(camera, sequence, follow, &mut state, &timeline, screen_center, jump_targets, busy);
+
+        // Toggling a bookmark at the frame on screen. Stored as that frame's
+        // tick, and written straight away rather than on exit, since the
+        // viewer is a window somebody closes rather than a program that
+        // shuts down tidily.
+        if is_key_pressed(KeyCode::B) {
+            if let (Some(dir), Some(tick)) = (frames_dir.as_deref(), sequence.tick_at(sequence.index())) {
+                match bookmarks.iter().position(|&t| t == tick) {
+                    Some(at) => {
+                        bookmarks.remove(at);
+                    }
+                    None => bookmarks.push(tick),
+                }
+                bookmarks.sort_unstable();
+                viewer::write_bookmarks(dir, bookmarks);
+                let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
+                (*jump_targets, *bookmark_frames) = marks_for(&milestones, bookmarks, &frame_ticks);
+            }
+        }
         advance_playback(sequence, &mut state);
         update_auto_follow(camera, follow, growing_bounds, sequence.index(), screen_width(), screen_height());
 
@@ -1572,7 +1727,15 @@ async fn main() {
             use_sprites,
             &counter,
         );
-        draw_timeline_bar(&timeline, sequence, activity, &milestones, mouse_position().into(), state.dragging_timeline);
+        draw_timeline_bar(
+            &timeline,
+            sequence,
+            activity,
+            &milestones,
+            bookmark_frames,
+            mouse_position().into(),
+            state.dragging_timeline,
+        );
         draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
 
         next_frame().await;
