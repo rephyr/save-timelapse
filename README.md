@@ -19,6 +19,7 @@ The companion tool automatically detects your Factorio saves folder, so you can 
 - 🎮 Live capture mode with minimal performance impact
 - 🎛️ In-game panel to control live capture: start/stop, choose which surfaces are recorded, and reset
 - 🗂 Capture management in the desktop tool: name each playthrough, see its size on disk, and delete ones you are finished with
+- 📂 Built timelapses are kept, so you can close the tool and reopen one later instead of rebuilding it
 - 🗺 Interactive viewer with pan, zoom and timeline scrubbing
 - 🌍 Multi-surface support (Nauvis, platforms, planets)
 - 🏁 Milestone markers on the timeline: first science packs, first rocket, planets reached, in both live capture and timelapses built from existing saves

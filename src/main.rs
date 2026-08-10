@@ -30,6 +30,7 @@ const TICKS_PER_SECOND: u64 = 60;
 const MAX_FRAMES: usize = 100_000;
 
 enum Mode {
+    OpenExisting,
     LiveCapture,
     FromSaves,
     ManageCaptures,
@@ -66,25 +67,36 @@ fn step(what: &str) {
     io::stdout().flush().ok();
 }
 
-fn ask_mode() -> io::Result<Mode> {
+/// `already_built` only changes what option 1 *says*, never the numbering.
+/// Hiding it when there is nothing to open would renumber everything else
+/// depending on state, and a menu whose option 2 means different things on
+/// different days is worse than one line that sometimes reads "none yet".
+fn ask_mode(already_built: usize) -> io::Result<Mode> {
+    let opened = match already_built {
+        0 => "Open a timelapse I already built (none yet)".to_string(),
+        1 => "Open a timelapse I already built (1 available)".to_string(),
+        n => format!("Open a timelapse I already built ({n} available)"),
+    };
     loop {
-        let input = prompt(
+        let input = prompt(&format!(
             "What would you like to do?\n\
-             \x20 1) Update my timelapse from live capture (recommended if capture is on)\n\
-             \x20 2) Build a timelapse from existing save files\n\
-             \x20 3) Manage my captures (name them, see their size, delete ones you're done with)\n\
-             Enter 1, 2 or 3, or press Enter to quit:",
-        )?;
+             \x20 1) {opened}\n\
+             \x20 2) Update my timelapse from live capture (recommended if capture is on)\n\
+             \x20 3) Build a timelapse from existing save files\n\
+             \x20 4) Manage my captures (name them, see their size, delete ones you're done with)\n\
+             Enter 1, 2, 3 or 4, or press Enter to quit:"
+        ))?;
         match input.as_str() {
-            "1" => return Ok(Mode::LiveCapture),
-            "2" => return Ok(Mode::FromSaves),
-            "3" => return Ok(Mode::ManageCaptures),
+            "1" => return Ok(Mode::OpenExisting),
+            "2" => return Ok(Mode::LiveCapture),
+            "3" => return Ok(Mode::FromSaves),
+            "4" => return Ok(Mode::ManageCaptures),
             // Managing captures returns here rather than exiting, so this
-            // menu needs its own way out. Blank rather than a fourth number:
+            // menu needs its own way out. Blank rather than a fifth number:
             // Enter is what someone already presses to leave the management
             // screen, and it should keep meaning "back" one level up.
             "" => return Ok(Mode::Quit),
-            _ => println!("Please enter 1, 2 or 3.\n"),
+            _ => println!("Please enter 1, 2, 3 or 4.\n"),
         }
     }
 }
@@ -369,6 +381,98 @@ fn output_dir_next_to_exe(name: &str) -> PathBuf {
     std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
 }
 
+/// Where built timelapses are kept, one subfolder each.
+///
+/// Built results used to go to a single fixed folder that every run deleted
+/// and rebuilt, which meant reopening yesterday's timelapse was impossible:
+/// the only way to look at one was to make it again. Keeping them apart by
+/// name is what lets the tool open one instead of always building.
+fn timelapses_root() -> PathBuf {
+    output_dir_next_to_exe("timelapses")
+}
+
+/// Turns a playthrough name or save name into something safe to use as a
+/// folder name, since both come from the user and can hold anything.
+fn as_folder_name(raw: &str) -> String {
+    // Dots are kept, since a name like "v1.2 run" is perfectly ordinary and
+    // mangling it would be gratuitous. They are trimmed from the ends
+    // afterwards, which is the case that actually matters: "." and ".." name
+    // the current and parent directory, so a name of nothing but dots would
+    // produce one of those rather than a folder of its own.
+    let cleaned: String =
+        raw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "timelapse".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// One timelapse already built and sitting on disk.
+struct BuiltTimelapse {
+    name: String,
+    path: PathBuf,
+    frames: usize,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+/// Every built timelapse, newest first.
+///
+/// Counts frames and weighs the folder rather than only listing names: which
+/// of two timelapses somebody wants is usually answered by how big and how
+/// recent it is, and neither is visible from a folder name.
+fn list_timelapses() -> Vec<BuiltTimelapse> {
+    list_timelapses_in(&timelapses_root())
+}
+
+/// Split from [`list_timelapses`] only so it can be tested: the real root is
+/// derived from the running executable's own location, which no test can
+/// arrange.
+fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+
+    let mut found: Vec<BuiltTimelapse> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let files: Vec<_> = std::fs::read_dir(&path).ok()?.filter_map(Result::ok).collect();
+            let frames = files.iter().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("stfr")).count();
+            // A folder with no frames in it is a half-finished or interrupted
+            // build, not something worth offering to open.
+            if frames == 0 {
+                return None;
+            }
+            let bytes = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some(BuiltTimelapse { name: entry.file_name().to_string_lossy().into_owned(), path, frames, bytes, modified })
+        })
+        .collect();
+
+    found.sort_by_key(|t| std::cmp::Reverse(t.modified));
+    found
+}
+
+fn ask_timelapse_choice(built: &[BuiltTimelapse]) -> io::Result<Option<usize>> {
+    println!("\nTimelapses you have already built:");
+    for (i, t) in built.iter().enumerate() {
+        let age = t.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
+        println!("  {}) {} ({} frames, {}, built {age})", i + 1, t.name, t.frames, describe_size(t.bytes));
+    }
+    loop {
+        let input = prompt("\nWhich would you like to open? Enter a number, or press Enter to go back:")?;
+        if input.is_empty() {
+            return Ok(None);
+        }
+        match input.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= built.len() => return Ok(Some(n - 1)),
+            _ => println!("Please enter a number between 1 and {}.", built.len()),
+        }
+    }
+}
+
 /// `viewer` is a sibling binary, not a library this crate can call into
 /// directly (it depends on this one, not the other way around, and its
 /// `main` is a macroquad event loop besides), so launching it means finding
@@ -449,11 +553,13 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     settings.frame_seconds = Some(frame_seconds);
     remember(settings);
 
-    // Fixed and owned entirely by this tool, so it's safe to clear before
-    // every run: a shorter capture than last time can't leave stale,
-    // higher-numbered frames behind for the viewer to mix in with current
-    // data.
-    let out = output_dir_next_to_exe("save-timelapse-frames");
+    // Named after the playthrough, so rebuilding one leaves every other
+    // timelapse alone and reopening it later is possible at all. Clearing
+    // just this one before writing is still right: a shorter capture than
+    // last time cannot leave stale, higher-numbered frames behind for the
+    // viewer to mix in with current data.
+    let name = chosen.label().unwrap_or_else(|| format!("playthrough-{:08x}", chosen.session_id));
+    let out = timelapses_root().join(as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -650,7 +756,16 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     settings.capture_terrain = Some(capture_terrain);
     remember(settings);
 
-    let out = output_dir_next_to_exe("frames");
+    // Named after the first save chosen, which is the earliest one and so
+    // usually names the playthrough rather than the moment. Asking for a name
+    // would be one more question in a flow that already has several, and this
+    // is renameable by renaming the folder.
+    let name = chosen
+        .first()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "from-saves".to_string());
+    let out = timelapses_root().join(as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -748,7 +863,23 @@ fn run() -> io::Result<Option<PathBuf>> {
     }
 
     loop {
-        match ask_mode()? {
+        let built = list_timelapses();
+        match ask_mode(built.len())? {
+            // Straight to the viewer, building nothing. The whole point: a
+            // timelapse that already exists should not have to be made again
+            // to be looked at.
+            Mode::OpenExisting => {
+                if built.is_empty() {
+                    println!("\nNothing built yet. Use option 2 or 3 first.\n");
+                    continue;
+                }
+                match ask_timelapse_choice(&built)? {
+                    Some(index) => return Ok(Some(built[index].path.clone())),
+                    // Back to the menu rather than out of the program, the
+                    // same as leaving the management screen.
+                    None => println!(),
+                }
+            }
             Mode::LiveCapture => return run_live_capture(&mut settings).map(Some),
             Mode::FromSaves => return run_from_saves(&mut settings).map(Some),
             // Loops back to the menu instead of returning, since managing
@@ -966,6 +1097,64 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both names come from the user, a playthrough label or a save
+    /// filename, so both can hold anything a filesystem will not.
+    #[test]
+    fn folder_names_survive_whatever_the_user_called_it() {
+        assert_eq!(as_folder_name("My Megabase"), "My Megabase");
+        assert_eq!(as_folder_name("Nauvis/Run:2"), "Nauvis_Run_2");
+        assert_eq!(as_folder_name("  spaced  "), "spaced");
+        // Empty or punctuation-only would otherwise produce a folder named
+        // "" or ".", one of which cannot be created and the other of which
+        // is the parent directory.
+        assert_eq!(as_folder_name(""), "timelapse");
+        assert_eq!(as_folder_name("..."), "timelapse");
+        assert_eq!(as_folder_name("///"), "___");
+    }
+
+    fn built(root: &Path, name: &str, frames: usize) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..frames {
+            std::fs::write(dir.join(format!("frame_{i:04}.stfr")), b"pretend frame").unwrap();
+        }
+    }
+
+    #[test]
+    fn built_timelapses_are_listed_with_their_frame_counts() {
+        let root = tempfile::tempdir().unwrap();
+        built(root.path(), "alpha", 3);
+        built(root.path(), "beta", 7);
+
+        let found = list_timelapses_in(root.path());
+        assert_eq!(found.len(), 2);
+        let alpha = found.iter().find(|t| t.name == "alpha").expect("alpha listed");
+        assert_eq!(alpha.frames, 3);
+        assert!(alpha.bytes > 0);
+    }
+
+    /// A folder with no frames is an interrupted or failed build, and
+    /// offering to open it would only ever lead to the viewer reporting it
+    /// found nothing.
+    #[test]
+    fn a_folder_with_no_frames_is_not_offered() {
+        let root = tempfile::tempdir().unwrap();
+        built(root.path(), "empty", 0);
+        std::fs::write(root.path().join("empty").join("players.jsonl"), b"{}").unwrap();
+        built(root.path(), "real", 1);
+
+        let found = list_timelapses_in(root.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "real");
+    }
+
+    /// Nothing built yet is an ordinary state on a first run, not an error.
+    #[test]
+    fn a_missing_root_lists_nothing_rather_than_failing() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(list_timelapses_in(&root.path().join("never-created")).is_empty());
+    }
 
     /// Both sidecars a live capture writes have to land next to the frames,
     /// or the viewer never sees them: it looks for them beside the frames it
