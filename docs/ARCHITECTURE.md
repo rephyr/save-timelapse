@@ -692,6 +692,32 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
+## Tile reverts
+
+Removing a placed tile has to restore what it was covering. Mining landfill
+should put the water back, not leave a hole where a lake used to be.
+
+Neither side can work that out alone. `RemoveTile` carries only a position, and
+nothing on the reading side can recover what was underneath: a baseline taken
+while the landfill was already down never saw the water, so the information was
+never captured. The obvious fix, extending `RemoveTile` to carry the uncovered
+name, is a core layout change and therefore off the table after the version 3
+freeze.
+
+The mod does it instead, and needs no new record type to. `on_player_mined_tile`
+and `on_robot_mined_tile` fire **after** the tiles have been replaced, so
+`capture.lua` reads `surface.get_tile` at that position and logs an ordinary
+`AddTile` for what is now there, immediately after the `RemoveTile`. Applied in
+order, the position ends up holding the revealed ground. The reader has never
+cared whether an `AddTile` names a placed floor or natural ground, so this is
+additive in the strongest sense: no format change, no version bump, and an
+older tool replaying a newer capture gets the fix for free.
+
+Gated on the terrain capture setting, because that is precisely the opt-out it
+would otherwise violate. With terrain off the timelapse deliberately shows no
+natural ground, and uncovering a patch of water or grass under a removed tile
+would put some back.
+
 ## Only writing surfaces that changed
 
 An export used to write every surface at every frame. A playthrough only ever

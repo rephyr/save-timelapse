@@ -258,7 +258,7 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Settled capture format: extension records make future additions skippable, so the mod and the tool no longer have to be updated in lockstep
 - [x] Milestones for timelapses built from existing saves, recovered by comparing consecutive saves
 - [x] Skip writing frames that changed nothing: a surface is only written at moments something on it changed, measured at 90% smaller on a real nine-surface megabase export
-- [ ] Complete tile change tracking
+- [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
 - [ ] Settings persistence and first-run setup
 
 ### Later
@@ -310,7 +310,7 @@ much, and how to re-measure all of it: 5x smaller frames, 90% smaller exports,
 
 ## Known Limitations
 
-- **Landfill revert:** With terrain capture enabled, removing landfill leaves an empty tile instead of restoring the underlying water. Planned for a future release.
+- **Tile reverts need terrain capture on:** Removing a placed tile restores whatever it was covering, so mining landfill puts the water back rather than leaving a hole. With terrain capture off there is deliberately no natural ground in the timelapse, so the tile simply disappears instead. Only applies to tiles removed while capture is running: a tile already gone before capture started was never seen either way.
 - **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
 - **From-saves milestones are only as precise as your save cadence:** A save records that a science pack has been produced, never when it first was, so a timelapse built from existing saves marks each milestone at the first save that shows it. A pack first produced an hour before the save that first mentions it is marked at that save, not an hour earlier. Live capture watches them happen and is exact. Building from an already established base also opens with a cluster of markers, since everything already done is reported by the earliest save; that is accurate rather than tidy, and live capture does the same thing when switched on mid-playthrough.
 - **Nothing that moves is recorded:** The capture format records that something was built or destroyed, never that it moved, so biters, spitters and flying construction/logistics robots are deliberately excluded rather than drawn frozen wherever they happened to be. Stationary enemies are kept: nests and worms appear in red, so clearing them is visible as the front line moves outward.

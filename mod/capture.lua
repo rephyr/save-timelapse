@@ -495,6 +495,16 @@ local function log_entity(op, entity)
     entity.surface.name)
 end
 
+--- Whether natural ground is being captured at all. Memoized: a startup
+--- setting cannot change during a session.
+local capture_terrain = nil
+local function terrain_captured()
+  if capture_terrain == nil then
+    capture_terrain = settings.startup["save-timelapse-capture-terrain"].value and true or false
+  end
+  return capture_terrain
+end
+
 local function log_tile_change(op, event)
   -- Tile events carry a surface_index rather than the surface itself.
   local surface = game.surfaces[event.surface_index]
@@ -508,6 +518,34 @@ local function log_tile_change(op, event)
       end
     elseif change.old_tile and is_placed_floor(change.old_tile.name) then
       log_event("-", "t", nil, pos.x, pos.y, nil, nil, nil, nil, surface_name)
+
+      -- What the removal uncovered, logged as an ordinary add so the
+      -- position ends up holding it rather than going empty. This is the
+      -- landfill case: mining landfill reveals the water it was covering,
+      -- which no baseline ever saw, because the landfill was already there
+      -- when the snapshot was taken. Without this the tile just disappears
+      -- and a filled lake un-fills into a hole.
+      --
+      -- Readable only because these events fire *after* the tiles have been
+      -- replaced, so `get_tile` already returns the new ground rather than
+      -- what was just mined.
+      --
+      -- Needs no new record type, which is what keeps it inside the format
+      -- freeze: it is an AddTile carrying a natural ground name instead of a
+      -- placed floor one, and the reader has never cared which.
+      --
+      -- Gated on terrain capture because that is exactly the opt-out this
+      -- would otherwise violate: with it off the timelapse deliberately shows
+      -- no natural ground, and revealing a patch of water or grass under a
+      -- removed tile would put some back.
+      if surface and terrain_captured() then
+        local ok, revealed = pcall(function()
+          return surface.get_tile(pos.x, pos.y).name
+        end)
+        if ok and revealed then
+          log_event("+", "t", revealed, pos.x, pos.y, nil, nil, nil, nil, surface_name)
+        end
+      end
     end
   end
 end

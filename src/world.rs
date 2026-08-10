@@ -369,14 +369,20 @@ impl World {
                     None => false,
                 }
             }
-            // Known gap, not fixed here: removing landfill fires this the
-            // same as any other tile removal, but `tiles` only ever holds
-            // placed floor now (see `Surface::terrain`) and still has no
-            // idea what was there before the removed tile, e.g. the water a
-            // baseline captured underneath it. The position just goes empty
-            // instead of reverting to water. A real fix needs the mod to
-            // capture what a removed placed-floor tile is replacing at
-            // removal time, which this event does not carry.
+            // Clears the position rather than reverting it, because this
+            // record cannot say what was underneath and nothing on this side
+            // can know: a baseline taken while landfill was already down
+            // never saw the water it covered.
+            //
+            // The revert is the mod's job instead, and it does it without
+            // needing a record type for it (see `capture.lua`'s
+            // `log_tile_change`): these events fire after the tiles have
+            // already been replaced, so it reads the uncovered ground and
+            // logs an ordinary `AddTile` for it immediately after this one.
+            // Applied in order, the position ends up holding what was
+            // revealed. Only when terrain capture is on, since with it off
+            // there is deliberately no natural ground in the timelapse to
+            // reveal.
             Event::RemoveTile { x, y } => self.target(surface).is_some_and(|s| {
                 let changed = s.tiles.remove(&(*x, *y)).is_some();
                 if changed {
@@ -505,6 +511,44 @@ mod tests {
         world.load_baseline(&frame);
         assert_eq!(world.entity_count(), expected, "entities lost loading a real frame");
         assert_eq!(world.to_frame("nauvis", 0).count, expected);
+    }
+
+    /// Mining landfill has to put the water back, not leave a hole.
+    ///
+    /// The mod logs the removal and then an add for whatever the removal
+    /// uncovered (see `capture.lua`'s `log_tile_change`), because only it can
+    /// see that: a baseline taken while the landfill was already down never
+    /// saw the water underneath, so nothing on this side could reconstruct
+    /// it. This pins the pair applying in order to the right result, which is
+    /// the behaviour the two halves only have together.
+    #[test]
+    fn a_removed_tile_reverts_to_whatever_the_mod_says_was_uncovered() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(Vec::new(), vec![Tile { n: "landfill".into(), x: 5, y: 5 }]));
+        assert_eq!(world.to_frame("nauvis", 0).tiles.len(), 1);
+
+        assert!(world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 }));
+        assert!(world.to_frame("nauvis", 0).tiles.is_empty(), "the landfill is gone");
+
+        assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "water".to_string(), x: 5, y: 5 }));
+        let tiles = world.to_frame("nauvis", 0).tiles;
+        assert_eq!(tiles.len(), 1);
+        assert_eq!((tiles[0].n.as_ref(), tiles[0].x, tiles[0].y), ("water", 5, 5));
+    }
+
+    /// The revert is a real change to the surface, so it has to mark the
+    /// surface dirty. Otherwise `write_all_surfaces` would skip the very
+    /// frame that shows the water coming back.
+    #[test]
+    fn revealing_a_tile_bumps_the_surface_revision() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(Vec::new(), vec![Tile { n: "landfill".into(), x: 5, y: 5 }]));
+        let before = world.surface("nauvis").unwrap().revision();
+
+        world.apply(Some("nauvis"), &Event::RemoveTile { x: 5, y: 5 });
+        world.apply(Some("nauvis"), &Event::AddTile { name: "water".to_string(), x: 5, y: 5 });
+
+        assert!(world.surface("nauvis").unwrap().revision() > before, "the surface changed twice over");
     }
 
     #[test]
