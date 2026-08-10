@@ -63,7 +63,7 @@ impl Camera {
             });
         };
 
-        frames.for_each_frame(|_, frame| {
+        frames.for_each_frame(|_, frame, _| {
             for entity in &frame.entities {
                 let half = Vec2::new(entity.w as f32, entity.h as f32) / 2.0;
                 let center = Vec2::new(entity.x, entity.y);

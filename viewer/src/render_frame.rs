@@ -400,6 +400,10 @@ pub struct FrameSequence {
     /// Per frame, and tiny next to the item data, so these stay plain vecs.
     ticks: Vec<u64>,
     counts: Vec<usize>,
+    /// Which frames the loader reconstructed rather than read (see
+    /// `is_repeat`). A `Vec<bool>` rather than a bitset: one byte per frame
+    /// against megabytes of item data is not where this pays attention.
+    repeats: Vec<bool>,
     /// The frame at `index`, rebuilt by `goto`. Handed out by `current` so
     /// the renderer keeps taking an ordinary `&RenderFrame`.
     current: RenderFrame,
@@ -441,6 +445,22 @@ impl FrameSequence {
         &self.current
     }
 
+    /// Spans across all four layers, which is what this sequence's memory is
+    /// proportional to. An item standing through a thousand frames is one
+    /// span, not a thousand copies, so this staying flat while the frame
+    /// count grows is the whole property the layout exists for.
+    /// Whether this frame was reconstructed rather than read: the export
+    /// omitted it because nothing on this surface changed (see
+    /// `replay::write_all_surfaces`), and the loader put it back.
+    ///
+    /// Worth carrying forward rather than recomputing, because it is the
+    /// premise the load-time passes short-circuit on: a frame identical to
+    /// the one before it cannot have new construction in it and cannot extend
+    /// a bounding box, so both answers are known without looking.
+    pub fn is_repeat(&self, index: usize) -> bool {
+        self.repeats.get(index).copied().unwrap_or(false)
+    }
+
     /// The in-game tick of any frame, without materializing it: the timeline
     /// labels every position on the bar and needs nothing else about them.
     pub fn tick_at(&self, index: usize) -> Option<u64> {
@@ -454,16 +474,29 @@ impl FrameSequence {
     /// A callback rather than an iterator because each frame is a temporary:
     /// there is no per-frame storage left to hand out a borrow of, which is
     /// the entire point.
-    pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame)) {
+    ///
+    /// A repeat frame is **not re-materialized**. The scratch buffer already
+    /// holds the previous frame's contents, and a repeat is by definition
+    /// identical to it, so the callback still sees exactly the right data
+    /// having done no work to get it. On a long capture most frames are
+    /// repeats, so this is the difference between the load-time passes
+    /// costing one walk per file and one per reconstructed frame.
+    ///
+    /// The third argument says which kind this is, so a caller whose answer
+    /// is also known in advance for a repeat can skip its own work too.
+    pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame, bool)) {
         let mut scratch = RenderFrame::empty();
         for index in 0..self.len() {
+            let repeat = self.is_repeat(index);
             scratch.tick = self.ticks[index];
             scratch.count = self.counts[index];
-            self.entities.materialize(index, &mut scratch.entities, &mut scratch.entity_runs);
-            self.tiles.materialize(index, &mut scratch.tiles, &mut scratch.tile_runs);
-            self.entity_lod.materialize(index, &mut scratch.entity_lod, &mut scratch.entity_lod_runs);
-            self.tile_lod.materialize(index, &mut scratch.tile_lod, &mut scratch.tile_lod_runs);
-            visit(index, &scratch);
+            if !repeat {
+                self.entities.materialize(index, &mut scratch.entities, &mut scratch.entity_runs);
+                self.tiles.materialize(index, &mut scratch.tiles, &mut scratch.tile_runs);
+                self.entity_lod.materialize(index, &mut scratch.entity_lod, &mut scratch.entity_lod_runs);
+                self.tile_lod.materialize(index, &mut scratch.tile_lod, &mut scratch.tile_lod_runs);
+            }
+            visit(index, &scratch, repeat);
         }
     }
 
@@ -518,6 +551,11 @@ pub struct SequenceBuilder {
     tile_lod: SpanBuilder<LodCell>,
     ticks: Vec<u64>,
     counts: Vec<usize>,
+    /// Which frames were reconstructed rather than read. Recorded here
+    /// because this is the only place that knows: by the time a
+    /// `FrameSequence` exists, a repeat is indistinguishable from a frame
+    /// that happened to be identical.
+    repeats: Vec<bool>,
 }
 
 impl SequenceBuilder {
@@ -530,6 +568,7 @@ impl SequenceBuilder {
     pub fn push(&mut self, frame: &RenderFrame) {
         self.ticks.push(frame.tick);
         self.counts.push(frame.count);
+        self.repeats.push(false);
         self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
         self.tiles
             .push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
@@ -560,6 +599,7 @@ impl SequenceBuilder {
         }
         self.ticks.extend_from_slice(ticks);
         self.counts.extend(std::iter::repeat_n(count, ticks.len()));
+        self.repeats.extend(std::iter::repeat_n(true, ticks.len()));
         self.entities.push_repeats(ticks.len());
         self.tiles.push_repeats(ticks.len());
         self.entity_lod.push_repeats(ticks.len());
@@ -587,6 +627,7 @@ impl SequenceBuilder {
             tile_lod: self.tile_lod.finish(),
             ticks: self.ticks,
             counts: self.counts,
+            repeats: self.repeats,
             current: RenderFrame::empty(),
             index: 0,
         };

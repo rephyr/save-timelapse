@@ -99,7 +99,19 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
     let (mut previous, mut current): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
     let mut built: Vec<u64> = Vec::new();
 
-    frames.for_each_frame(|index, frame| {
+    frames.for_each_frame(|index, frame, repeat| {
+        // A repeat is identical to the frame before it, so nothing was built
+        // between them: the count is zero and the heat is empty, both known
+        // without looking. `previous` is deliberately left alone, since it
+        // already holds this frame's positions too, which is what lets the
+        // next real frame diff correctly across the whole gap.
+        //
+        // Everything below (materialise, sort, dedup, merge over every entity
+        // on the surface) would otherwise run per repeat to reach the same
+        // answer, and on a long capture repeats are most of the frames.
+        if repeat {
+            return;
+        }
         current.clear();
         for run in &frame.entity_runs {
             let name = registry.name(run.type_id);

@@ -449,7 +449,7 @@ mod bench {
         let seeks = start.elapsed();
 
         let start = std::time::Instant::now();
-        sequence.for_each_frame(|_, _| {});
+        sequence.for_each_frame(|_, _, _| {});
         let walk = start.elapsed();
 
         println!("GAINS frames={frames_n} peak_entities={peak_entities}");
