@@ -1,9 +1,22 @@
 ---------------------------------------------------------------------------------------------------
 Version: 0.5.0
 Date: 2026-08-10
+  Features:
+    - Milestones now work for timelapses built from existing saves, not just live capture. A save records that something happened but never when, so each milestone is marked at the first save that shows it, making them as precise as your save cadence
+    - Built timelapses are kept. You can close the tool, open it again, and go straight to one you already made instead of rebuilding it
+    - Bookmark any moment in the viewer with b, then press m to jump between bookmarks and milestones, or c to jump between the busiest stretches of building. Hold shift with either to go backwards. Bookmarks are saved and still there next time you open that timelapse
+    - The tool remembers where Factorio is, how much game time each frame covers, and whether you wanted terrain, so it stops asking the same questions every run
+    - Removing a placed tile now restores whatever it was covering, so mining landfill puts the water back instead of leaving a hole. Needs terrain capture switched on
+  Optimizations:
+    - Exports are around 90 percent smaller on a save with several surfaces. A surface is only written at the moments something on it actually changed, and a playthrough only ever builds on one surface at a time. Measured on a real nine surface megabase, one export went from 238 MB to 16 MB
+    - Opening a timelapse is roughly twice as fast, because the analysis done while loading now skips the frames that were reconstructed rather than read from disk
   Changes:
-    - Capture files are built to stay readable from here on. New capture features are now added in a way older versions of the desktop tool can step over instead of choking on, so the mod and the tool no longer have to be updated in lockstep
+    - Capture files are built to stay readable from here on. New capture features are added in a way older versions of the desktop tool can step over instead of choking on, so the mod and the tool no longer have to be updated together
     - Captures made with 0.4 keep working, and you do not need to reset your capture when updating to this version
+    - The tool now says what it is doing while it works, instead of sitting silently while it reads a large baseline
+  Bugfixes:
+    - Space platform construction is now recorded. Everything on a platform is placed by platform construction bots, which raise different events than planet side robots, so a platform previously showed up fully built and then never changed
+    - Entities revived from a ghost by another mod, rather than built by a bot, are now recorded too
 ---------------------------------------------------------------------------------------------------
 Version: 0.4.0
 Date: 2026-08-09
