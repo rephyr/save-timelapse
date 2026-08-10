@@ -109,11 +109,34 @@ pub struct Surface {
     /// made every emitted frame file redundantly balloon to the same huge,
     /// unchanging size.
     terrain: HashMap<PosKey, NameId>,
+    /// Bumped by every mutation that actually changes this surface, and by
+    /// nothing else.
+    ///
+    /// What `replay::write_all_surfaces` compares against to decide whether a
+    /// surface needs writing at all. A counter rather than a hash of the
+    /// frame, because the entire point is to never materialise the frame: on
+    /// a nine-surface save, measured over 13 minutes of real play, 86% of the
+    /// files written were byte-identical to that surface's previous one and
+    /// 93% of the bytes were, since you can only build on one surface at a
+    /// time but every surface was written every frame. Hashing to detect that
+    /// would mean doing the expensive work first and then throwing it away.
+    ///
+    /// Precision matters more than it looks: a spurious bump costs a whole
+    /// duplicate file, which is why `insert` below checks for a genuinely
+    /// unchanged re-add rather than blindly overwriting.
+    revision: u64,
 }
 
 impl Surface {
     pub fn entity_count(&self) -> usize {
         self.by_pos.len()
+    }
+
+    /// See the field's own comment. Only ever compared against a previously
+    /// observed value from the same surface; the absolute number means
+    /// nothing.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Both layers together: what a baseline's "tiles" count means to
@@ -142,6 +165,15 @@ impl Surface {
         // Idempotent: an add for a position already occupied updates it in
         // place rather than creating a second entity on the same tile.
         if let Some(&slot) = self.by_pos.get(&key) {
+            // An add landing on exactly what is already there changed
+            // nothing, so it must not bump `revision`. Checked rather than
+            // assumed because a spurious bump costs a whole redundant frame
+            // file, and re-adds are not rare: the baseline smear (a snapshot
+            // taken slightly after the events describing the same
+            // construction) produces them by design.
+            if self.slots[slot] == Some(entity) {
+                return;
+            }
             if let Some(existing) = self.slots[slot].take() {
                 if let Some(id) = existing.id {
                     self.by_id.remove(&id);
@@ -151,6 +183,7 @@ impl Surface {
                 self.by_id.insert(id, slot);
             }
             self.slots[slot] = Some(entity);
+            self.revision += 1;
             return;
         }
 
@@ -168,6 +201,7 @@ impl Surface {
         if let Some(id) = entity.id {
             self.by_id.insert(id, slot);
         }
+        self.revision += 1;
     }
 
     fn remove_slot(&mut self, slot: usize) {
@@ -177,6 +211,7 @@ impl Surface {
             self.by_id.remove(&id);
         }
         self.free.push(slot);
+        self.revision += 1;
     }
 
     fn remove_by_id(&mut self, id: u64) -> bool {
@@ -272,6 +307,13 @@ impl World {
             }
         }
 
+        // Bumped once for the whole load rather than per tile above, and
+        // unconditionally: a catch-up baseline landing mid-replay is a change
+        // to this surface however much of it happens to match what was
+        // already there, and the entity loop's own bumps do not cover a
+        // baseline that is only tiles.
+        surface.revision += 1;
+
         self.tick = self.tick.max(frame.tick);
     }
 
@@ -318,7 +360,13 @@ impl World {
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
                 match self.target(surface) {
-                    Some(s) => s.tiles.insert((*x, *y), name) != Some(name),
+                    Some(s) => {
+                        let changed = s.tiles.insert((*x, *y), name) != Some(name);
+                        if changed {
+                            s.revision += 1;
+                        }
+                        changed
+                    }
                     None => false,
                 }
             }
@@ -330,9 +378,13 @@ impl World {
             // instead of reverting to water. A real fix needs the mod to
             // capture what a removed placed-floor tile is replacing at
             // removal time, which this event does not carry.
-            Event::RemoveTile { x, y } => {
-                self.target(surface).is_some_and(|s| s.tiles.remove(&(*x, *y)).is_some())
-            }
+            Event::RemoveTile { x, y } => self.target(surface).is_some_and(|s| {
+                let changed = s.tiles.remove(&(*x, *y)).is_some();
+                if changed {
+                    s.revision += 1;
+                }
+                changed
+            }),
         }
     }
 

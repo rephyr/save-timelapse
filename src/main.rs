@@ -412,6 +412,12 @@ fn run_live_capture() -> io::Result<PathBuf> {
     let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
     let mut written = 0usize;
     let mut error: Option<io::Error> = None;
+    // Last revision written per surface, carried across the whole run so
+    // `write_all_surfaces` can skip a surface nothing has touched since. See
+    // its doc comment: this is what turns "every surface, every frame" into
+    // "every surface that changed".
+    let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
+    let mut files = 0usize;
 
     let emitted = match &chosen_surface {
         None => {
@@ -420,9 +426,12 @@ fn run_live_capture() -> io::Result<PathBuf> {
                 if error.is_some() {
                     return;
                 }
-                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written) {
-                    error = Some(e);
-                    return;
+                match replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
+                    Ok(n) => files += n,
+                    Err(e) => {
+                        error = Some(e);
+                        return;
+                    }
                 }
                 written += 1;
                 if written.is_multiple_of(25) {
@@ -451,6 +460,22 @@ fn run_live_capture() -> io::Result<PathBuf> {
             })?
         }
     };
+    // Worth reporting rather than leaving implicit, because the frame count
+    // alone now understates what happened: a surface is only written at
+    // moments something on it changed, so "14 frames" can mean far fewer than
+    // 14 files per surface. On a real nine-surface capture this was 93% of
+    // the bytes.
+    if chosen_surface.is_none() && written > 0 {
+        let surfaces = replay_state.world.surface_names().len();
+        let would_have = written * surfaces;
+        if would_have > files {
+            println!(
+                "\n{files} surface file(s) written instead of {would_have}: a surface is only \
+                 written when something on it changed"
+            );
+        }
+    }
+
     if let Some(e) = error {
         return Err(e);
     }

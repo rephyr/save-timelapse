@@ -546,6 +546,35 @@ impl SequenceBuilder {
         self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
     }
 
+    /// Repeats the frame just pushed at each of `ticks`, without that frame's
+    /// contents having to be read, parsed or folded in again.
+    ///
+    /// An export omits a surface's file entirely for a moment when nothing on
+    /// that surface changed, so a surface's files carry only the ticks it
+    /// actually moved at. The timeline is index-addressed and every surface
+    /// has to agree on how many moments there were, so the omitted ones are
+    /// put back here.
+    ///
+    /// The cheap half of the saving: the file was never written, never read
+    /// and never parsed, and restoring it costs one pass over what is
+    /// standing per gap rather than per frame (see
+    /// `SpanBuilder::push_repeats`).
+    ///
+    /// A no-op before any frame has been pushed, since there is nothing to
+    /// repeat: a surface's own first frame is always present.
+    pub fn push_repeats(&mut self, ticks: &[u64]) {
+        let Some(&count) = self.counts.last() else { return };
+        if ticks.is_empty() {
+            return;
+        }
+        self.ticks.extend_from_slice(ticks);
+        self.counts.extend(std::iter::repeat_n(count, ticks.len()));
+        self.entities.push_repeats(ticks.len());
+        self.tiles.push_repeats(ticks.len());
+        self.entity_lod.push_repeats(ticks.len());
+        self.tile_lod.push_repeats(ticks.len());
+    }
+
     pub fn len(&self) -> usize {
         self.ticks.len()
     }
@@ -608,6 +637,76 @@ mod tests {
 
     fn sample_frame(tick: u64) -> RenderFrame {
         render(Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() })
+    }
+
+    /// The equivalence the whole skip-unchanged-frames scheme rests on.
+    ///
+    /// An export omits a surface's frame when nothing on that surface
+    /// changed, and the loader restores it with `push_repeats`. That is only
+    /// safe if the restored sequence is indistinguishable from the one an
+    /// export that wrote every frame would have produced, index for index,
+    /// contents and ticks alike. If it ever stops being, the saving is being
+    /// paid for with a subtly different timelapse.
+    #[test]
+    fn repeats_produce_the_same_sequence_as_writing_every_frame() {
+        // Frame contents at each moment: one entity until tick 40, two after.
+        let at = |tick: u64, wide: bool| {
+            let mut entities = vec![entity("pipe", 1.0, 2.0)];
+            if wide {
+                entities.push(entity("belt", 3.0, 2.0));
+            }
+            Frame { tick, surface: "nauvis".to_string(), count: entities.len(), entities, tiles: Vec::new() }
+        };
+        let ticks = [10u64, 20, 30, 40];
+
+        // What an export that wrote every surface every frame produced.
+        let mut every = FrameSequence::builder();
+        for &tick in &ticks {
+            every.push(&render(at(tick, tick >= 40)));
+        }
+        let every = every.finish().unwrap();
+
+        // What an export that skips unchanged surfaces produces: files only
+        // at ticks 10 and 40, with 20 and 30 restored by the loader.
+        let mut skipped = FrameSequence::builder();
+        skipped.push(&render(at(10, false)));
+        skipped.push_repeats(&[20, 30]);
+        skipped.push(&render(at(40, true)));
+        let mut skipped = skipped.finish().unwrap();
+        let mut every = every;
+
+        assert_eq!(skipped.len(), every.len(), "same number of moments");
+        for index in 0..every.len() {
+            every.goto(index);
+            skipped.goto(index);
+            let (a, b) = (every.current(), skipped.current());
+            assert_eq!(a.tick, b.tick, "frame {index}: tick");
+            assert_eq!(a.count, b.count, "frame {index}: count");
+            assert_eq!(a.entities, b.entities, "frame {index}: entities");
+            assert_eq!(a.entity_runs, b.entity_runs, "frame {index}: runs");
+        }
+    }
+
+    /// A gap that runs to the end of the capture, which is the common case:
+    /// a surface stops changing and the playthrough carries on elsewhere.
+    #[test]
+    fn trailing_repeats_keep_a_surface_present_for_the_rest_of_the_capture() {
+        let mut builder = FrameSequence::builder();
+        builder.push(&sample_frame(10));
+        builder.push_repeats(&[20, 30, 40]);
+        let sequence = builder.finish().unwrap();
+
+        assert_eq!(sequence.len(), 4);
+        assert_eq!(sequence.tick_at(3), Some(40), "the last moment is the timeline's, not the surface's");
+    }
+
+    /// Nothing to repeat before a first frame exists. A surface's own first
+    /// frame is always written, so this is a guard rather than a real case.
+    #[test]
+    fn repeats_before_any_frame_are_ignored() {
+        let mut builder = FrameSequence::builder();
+        builder.push_repeats(&[1, 2, 3]);
+        assert!(builder.is_empty());
     }
 
     #[test]

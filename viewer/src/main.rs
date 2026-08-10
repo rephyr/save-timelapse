@@ -298,12 +298,20 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         progress.phase = "reading frame headers";
         redraw_progress(&progress, &mut last, true).await;
         let grouped = viewer::group_paths_by_surface(paths);
+        // Every moment the export covers. An export omits a surface's file at
+        // a moment nothing on that surface changed, so no single surface's
+        // files describe the whole timeline and the union has to stand in for
+        // it. See `viewer::timeline_ticks`.
+        let timeline = viewer::timeline_ticks(&grouped);
 
         progress.phase = "loading frames";
         let mut done = 0usize;
         for (name, paths) in grouped {
             let mut builder = FrameSequence::builder();
-            for chunk in paths.chunks(LOAD_BATCH_FRAMES) {
+            // How far through `timeline` this surface has been filled in.
+            let mut filled = 0usize;
+            let only_paths: Vec<std::path::PathBuf> = paths.iter().map(|(_, p)| p.clone()).collect();
+            for chunk in only_paths.chunks(LOAD_BATCH_FRAMES) {
                 // One batch is parsed across every core, folded into spans,
                 // and dropped before the next is read, so peak memory is a
                 // batch plus the spans rather than the whole capture.
@@ -311,12 +319,27 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                     if let Some(n) = args.synthetic_tile_count {
                         frame.tiles = synthetic_tiles(n);
                     }
+                    // Put back the moments this surface sat unchanged, so
+                    // every surface still has one frame per moment and the
+                    // index-addressed timeline means the same thing whichever
+                    // one is being shown.
+                    //
+                    // Keyed on the parsed frame's own tick rather than the
+                    // path's, because `load_batch` drops a file it cannot
+                    // parse and the two would then be misaligned.
+                    if let Some(offset) = timeline[filled..].iter().position(|&t| t == frame.tick) {
+                        builder.push_repeats(&timeline[filled..filled + offset]);
+                        filled += offset + 1;
+                    }
                     builder.push(&RenderFrame::from_frame(frame, registry));
                 }
                 done += chunk.len();
                 progress.done = done + terrain_load.done();
                 redraw_progress(&progress, &mut last, false).await;
             }
+            // A surface that stopped changing before the capture ended still
+            // exists for the rest of it.
+            builder.push_repeats(&timeline[filled..]);
             if let Some(sequence) = builder.finish() {
                 result.push((name, sequence, None));
             }

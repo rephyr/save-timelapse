@@ -206,6 +206,32 @@ impl<T: Copy> SpanBuilder<T> {
         self.frames += 1;
     }
 
+    /// Folds in `n` frames identical to the one just pushed.
+    ///
+    /// An export omits a surface's frame entirely when nothing on that
+    /// surface changed (see `replay::write_all_surfaces`), which on a
+    /// multi-surface save is most frames for most surfaces. This puts them
+    /// back, so every surface still has one frame per emitted moment and the
+    /// index-addressed timeline keeps working.
+    ///
+    /// One pass over what is standing however large `n` is, rather than `n`
+    /// passes. Nothing changed across the gap by definition, so every span
+    /// open when it started is still open when it ends, and each one's `last`
+    /// can jump straight to the far side. That is the whole reason this takes
+    /// a count instead of being called repeatedly: on a megabase surface
+    /// idling through a long stretch, the difference is one walk over ~900k
+    /// spans versus dozens of them.
+    pub fn push_repeats(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let last = self.frames + n as u32;
+        for &(_, index) in &self.open {
+            self.spans[index as usize].last = last;
+        }
+        self.frames = last;
+    }
+
     /// Sorts by type and hands back the finished set.
     pub fn finish(mut self) -> SpanSet<T> {
         self.spans.sort_by_key(|span| (span.type_id, span.first));

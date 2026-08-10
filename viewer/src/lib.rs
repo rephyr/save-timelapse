@@ -29,7 +29,7 @@ pub use construction::{growing_bounds_per_frame, GrowingBounds};
 pub use draw_calls::DrawCallCounter;
 pub use loading::{
     frame_paths, group_by_surface, group_paths_by_surface, load_batch, load_frame, load_sequence,
-    load_terrain, order_by_tick,
+    load_terrain, order_by_tick, timeline_ticks,
     synthetic_frame, synthetic_tiles, terrain_path, terrain_paths, ParallelFrameLoad,
 };
 pub use player_track::PlayerTrack;

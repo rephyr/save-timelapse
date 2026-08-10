@@ -299,7 +299,7 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
 ///
 /// A file whose header will not read is dropped with a warning rather than
 /// failing the load, matching how the full parse already treats one.
-pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<PathBuf>)> {
+pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<(u64, PathBuf)>)> {
     /// One frame file as this needs it before parsing: when it is, how big
     /// it is (standing in for how busy), and where it lives.
     type Candidate = (u64, u64, PathBuf);
@@ -324,9 +324,16 @@ pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<PathBuf>)
     }
     surfaces.sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|(_, size, _)| *size).max().unwrap_or(0)));
 
+    // The tick is kept rather than dropped here because the loader needs it
+    // to put back the frames an export deliberately omitted: a surface is not
+    // written at a moment nothing on it changed (see
+    // `replay::write_all_surfaces`), so a surface's files carry only the ticks
+    // it actually moved at, and the gaps have to be filled against the union
+    // of every surface's ticks. Reading the headers again to recover
+    // something this function already had would be the only alternative.
     surfaces
         .into_iter()
-        .map(|(name, group)| (name, group.into_iter().map(|(_, _, path)| path).collect()))
+        .map(|(name, group)| (name, group.into_iter().map(|(tick, _, path)| (tick, path)).collect()))
         .collect()
 }
 
@@ -353,6 +360,21 @@ pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
         std::cmp::Reverse(group.iter().map(|f| f.entities.len()).max().unwrap_or(0))
     });
     surfaces
+}
+
+/// Every moment an export covers, ascending and deduplicated: the union of
+/// the ticks each surface has a frame at.
+///
+/// This is the timeline all surfaces share. It cannot be taken from any one
+/// surface, because a surface is only written at moments something on it
+/// changed, so each has an arbitrary subset of the whole. The union is what
+/// each surface's gaps get filled against, which is what keeps the
+/// index-addressed timeline meaning the same thing on every surface.
+pub fn timeline_ticks(surfaces: &[(String, Vec<(u64, PathBuf)>)]) -> Vec<u64> {
+    let mut ticks: Vec<u64> = surfaces.iter().flat_map(|(_, group)| group.iter().map(|&(tick, _)| tick)).collect();
+    ticks.sort_unstable();
+    ticks.dedup();
+    ticks
 }
 
 pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
@@ -507,8 +529,7 @@ mod tests {
             assert_eq!(header_paths.len(), parse_frames.len(), "{header_name}: same frame count");
             // The orders have to agree file for file, since this decides the
             // sequence the spans are folded in.
-            let header_ticks: Vec<u64> =
-                header_paths.iter().map(|p| save_timelapse::frame::read_header(p).unwrap().0).collect();
+            let header_ticks: Vec<u64> = header_paths.iter().map(|&(tick, _)| tick).collect();
             let parse_ticks: Vec<u64> = parse_frames.iter().map(|f| f.tick).collect();
             assert_eq!(header_ticks, parse_ticks, "{header_name}: tick order");
         }

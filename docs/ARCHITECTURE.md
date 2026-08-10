@@ -692,6 +692,57 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
+## Only writing surfaces that changed
+
+An export used to write every surface at every frame. A playthrough only ever
+builds on one surface at a time, so the rest were re-serialized and re-written
+byte for byte unchanged. Measured on a real nine-surface Space Age capture over
+13 minutes of play, at the tool's 60s default: **86% of the files written were
+byte-identical to that surface's own previous file, and 93% of the bytes were.**
+Nauvis alone accounted for 219.7 MB of which 211.5 MB was duplication, because
+the player was on Gleba the whole time.
+
+`World` therefore keeps a **per-surface revision counter**, bumped by every
+mutation that actually changes that surface and by nothing else, and
+`replay::write_all_surfaces` skips a surface whose revision matches the one it
+last wrote for it. A counter rather than a hash of the frame, because the whole
+point is never to materialise the frame: hashing to detect the duplicate would
+mean doing the expensive half of the work and then discarding it.
+
+Precision matters more than it looks, since a spurious bump costs a whole
+redundant file. `Surface::insert` therefore checks whether an add lands on
+exactly what is already there and leaves the revision alone if so. Those are
+not rare: the baseline smear (a snapshot taken slightly after the events
+describing the same construction) produces them by design.
+
+**The gap in the numbering is the record.** Files stay named
+`frame_<index>_<surface>.stfr` against a global frame index, so a surface that
+did not change simply has no file at that index. Nothing about the format or
+the naming changes and there is no sidecar to keep in sync. This is also not a
+new shape: `write_all_surfaces` has always skipped a surface with nothing on
+it, so the viewer already groups by surface into independently ordered
+timelines.
+
+The viewer puts the omitted frames back. `loading::timeline_ticks` takes the
+union of every surface's ticks, which is the set of moments the export covers
+and cannot be read off any single surface, and the loader fills each surface's
+gaps against it with `SequenceBuilder::push_repeats`. That matters because
+`Timeline` is index-addressed: every surface has to agree on how many moments
+there were, or switching surfaces would scrub at a different rate.
+
+Restoring a gap costs **one pass over what is standing per gap, not per
+frame**. Nothing changed across the gap by definition, so every span open when
+it started is still open when it ends and each one's `last` jumps straight to
+the far side. On a megabase surface idling through a long stretch that is one
+walk over ~900k spans instead of dozens. The frame itself was never written,
+never read and never parsed, so the load-time saving comes free with the disk
+one.
+
+`render_frame.rs` asserts the equivalence this all rests on: a sequence built
+with gaps and repeats is identical, index for index and tick for tick, to one
+built from an export that wrote every frame. Without that, the saving would be
+paid for with a subtly different timelapse.
+
 ## Milestones
 
 Three moments worth marking on a timeline rather than watching for: the first
