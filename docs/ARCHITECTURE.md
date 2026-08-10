@@ -692,6 +692,68 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
+## Milestones
+
+Three moments worth marking on a timeline rather than watching for: the first
+time each science pack is produced, the first rocket launch, and each planet
+reached. Both capture paths produce the same `milestones.jsonl`
+(`{"tick":T,"kind":K,"id":I}` per line), so the viewer cannot tell which one
+built a given timelapse. They arrive by completely different routes, though,
+because the two paths have completely different evidence available.
+
+### Live capture watches them happen
+
+`mod/milestones.lua` polls on the capture flush that already runs every few
+seconds. Science is polled rather than evented because the game exposes no "an
+assembling machine finished an item" event (`on_player_crafted_item` covers
+hand crafting only, which is not how science gets made past the first hour), so
+production statistics are the only source. A planet counts as reached when a
+player is standing on a surface with `planet` set, swept over connected players
+rather than hooked to `on_player_changed_surface` alone, since nobody changes
+surface to arrive on Nauvis at the start. Every milestone fires once, tracked in
+`storage.timelapse_milestones`, which is a sibling of `storage.timelapse_capture`
+rather than nested inside it so that a capture reset wipes both together: the
+file recording them is deleted by that reset, and a survivor key would believe
+every milestone had already fired while the record of them was gone.
+
+Ticks from this path are exact.
+
+### From saves, they are recovered by comparison
+
+A save has no history of its own. It knows that a science pack has been
+produced, never when it first was. So the mod reports **state** rather than
+events: `export.milestone_state` collects the science packs with nonzero
+production, the inhabited planet surfaces, and `force.rockets_launched`, and
+`export_all_to` writes them into the per-save manifest it already produces.
+Riding in the manifest rather than a file of its own is deliberate, since it
+describes the same instant the manifest describes and every consumer that wants
+one wants the other; being JSON, an older reader ignores the field, which is
+what lets `baseline.json` carry it too without disturbing live capture.
+
+`milestone::from_saves` then sorts the per-save states by tick and walks them,
+emitting a milestone the first time each id appears. Rockets are carried as a
+count rather than a flag precisely so that walk can distinguish a first launch
+from launches that had been happening before the earliest save.
+
+Two consequences worth being explicit about, both inherent rather than
+implementation shortcomings:
+
+**Precision is bounded by save cadence.** The earliest tick at which something
+can be *proved* to have happened is the tick of the first save reporting it, so
+that is the tick used. Interpolating between saves would invent a moment no
+evidence supports.
+
+**An established base opens with a cluster.** Everything already true in the
+earliest save is emitted at that save's tick, because it genuinely happened at
+or before then. This matches what live capture does when switched on
+mid-playthrough, where the first poll records every pack already produced.
+
+"Planet reached" uses `is_inhabited` rather than mere surface existence,
+because the game creates a planet's surface before anybody goes there. That
+also keeps the marker honest against the timelapse it annotates: a surface only
+appears in frames once inhabited, so a planet is marked reached exactly when it
+starts being shown.
+
 ## Rendering
 
 The viewer converts each parsed `Frame` into a `RenderFrame` at load time and

@@ -19,7 +19,7 @@ The companion tool automatically detects your Factorio saves folder, so you can 
 - 🗂 Capture management in the desktop tool: name each playthrough, see its size on disk, and delete ones you are finished with
 - 🗺 Interactive viewer with pan, zoom and timeline scrubbing
 - 🌍 Multi-surface support (Nauvis, platforms, planets)
-- 🏁 Milestone markers on the timeline: first science packs, first rocket, planets reached
+- 🏁 Milestone markers on the timeline: first science packs, first rocket, planets reached, in both live capture and timelapses built from existing saves
 - ⚡ Chunked renderer with automatic level-of-detail rendering
 - 🦀 Written in Rust for performance
 - 🔧 No Python, command-line tools or FFmpeg required
@@ -232,11 +232,17 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 
 ### v0.5
 
-- [ ] Bookmarks and jumping between milestones and busy stretches
-- [ ] First-run setup
-- [ ] Persistent settings and preferences
+- [x] Settled capture format: extension records make future additions skippable, so the mod and the tool no longer have to be updated in lockstep
+- [x] Milestones for timelapses built from existing saves, recovered by comparing consecutive saves
+- [ ] Skip writing frames that changed nothing (measured at a third of a default export, over half at fine intervals)
 - [ ] Complete tile change tracking
-- [ ] Polished Windows packaging
+- [ ] Settings persistence and first-run setup
+
+### Later
+
+- [ ] Bookmarks and jumping between milestones and busy stretches
+- [ ] Single binary, so the tool and viewer cannot be separated
+- [ ] Linux and macOS builds
 
 ### v1.0
 
@@ -276,7 +282,7 @@ More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 - **Landfill revert:** With terrain capture enabled, removing landfill leaves an empty tile instead of restoring the underlying water. Planned for a future release.
 - **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
-- **Milestones need live capture:** They are detected while you play, so a timelapse built from existing save files has none. The information is in a save (production statistics, researched technologies, rockets launched), so recovering them by comparing consecutive saves is possible, just not built yet.
+- **From-saves milestones are only as precise as your save cadence:** A save records that a science pack has been produced, never when it first was, so a timelapse built from existing saves marks each milestone at the first save that shows it. A pack first produced an hour before the save that first mentions it is marked at that save, not an hour earlier. Live capture watches them happen and is exact. Building from an already established base also opens with a cluster of markers, since everything already done is reported by the earliest save; that is accurate rather than tidy, and live capture does the same thing when switched on mid-playthrough.
 - **Nothing that moves is recorded:** The capture format records that something was built or destroyed, never that it moved, so biters, spitters and flying construction/logistics robots are deliberately excluded rather than drawn frozen wherever they happened to be. Stationary enemies are kept: nests and worms appear in red, so clearing them is visible as the front line moves outward.
 
 ---

@@ -35,6 +35,13 @@ pub struct ExportOutcome {
     /// The mod's one-shot player-position sample, if it found anyone with a
     /// valid position to record (see mod/control.lua's `sample_all_players`).
     pub players_log: Option<PathBuf>,
+    /// What this save knows about milestones, read out of the manifest the
+    /// mod writes beside the frames.
+    ///
+    /// `None` for a manifest written by a mod predating milestone state,
+    /// which costs markers and nothing else. One save's state cannot place a
+    /// marker by itself; see `milestone::from_saves`, which compares them.
+    pub milestones: Option<crate::milestone::State>,
 }
 
 /// Read the version from the executable rather than assuming one.
@@ -224,5 +231,26 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
 
     let players_log = Some(written_to.join("players.jsonl")).filter(|p| p.exists());
 
-    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log })
+    // The manifest the mod writes beside the frames, which is what carries
+    // this save's milestone state. Deliberately best-effort: a missing or
+    // unreadable manifest costs markers, never the export, since the frames
+    // are the thing actually being asked for here.
+    let milestones = std::fs::read_dir(&written_to)
+        .ok()
+        .and_then(|entries| {
+            entries.filter_map(Result::ok).map(|item| item.path()).find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("frame_") && name.ends_with("_manifest.json"))
+            })
+        })
+        .and_then(|path| match crate::milestone::State::from_manifest(&path) {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("warning: could not read milestone state from {}: {e}", path.display());
+                None
+            }
+        });
+
+    Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log, milestones })
 }

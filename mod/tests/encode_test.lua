@@ -235,6 +235,36 @@ end
 -- See the note above `event_reset_dictionaries` in encode.lua; reloads are
 -- resolved on the reading side by `event::segment_run_bounds`.
 
+-- milestones
+
+check("milestone_line: tick, kind and id as one JSON line",
+  encode.milestone_line(1234, "science", "logistic-science-pack"),
+  '{"tick":1234,"kind":"science","id":"logistic-science-pack"}\n')
+
+check("is_science_pack: matches on the suffix", encode.is_science_pack("logistic-science-pack"), true)
+check("is_science_pack: a modded pack is picked up for free",
+  encode.is_science_pack("se-deep-space-science-pack"), true)
+check("is_science_pack: an ordinary item is not one", encode.is_science_pack("iron-plate"), false)
+
+-- The from-saves half of milestones. A save knows only totals, never when
+-- something first became true, so the mod reports state here and src/milestone.rs
+-- recovers the timings by comparing consecutive saves. Rockets is a count
+-- rather than a flag so that diff can tell a first launch from launches that
+-- had been happening all along.
+check("milestone_state: both lists and the rocket count as one JSON object",
+  encode.milestone_state({ "automation-science-pack", "logistic-science-pack" }, { "nauvis" }, 3),
+  '{"science":["automation-science-pack","logistic-science-pack"],"planets":["nauvis"],"rockets":3}')
+
+check("milestone_state: a save with nothing reached yet is still well formed",
+  encode.milestone_state({}, {}, 0),
+  '{"science":[],"planets":[],"rockets":0}')
+
+-- Goes through encode.quote, so a name needing escaping stays valid JSON
+-- rather than terminating the string early.
+check("milestone_state: a name needing escaping is quoted properly",
+  encode.milestone_state({}, { 'a "quoted" moon' }, 0),
+  '{"science":[],"planets":["a \\"quoted\\" moon"],"rockets":0}')
+
 -- checksums
 
 check("checksum_init: the djb2 seed", encode.checksum_init(), 5381)

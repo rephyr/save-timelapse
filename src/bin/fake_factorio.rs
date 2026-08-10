@@ -138,9 +138,16 @@ fn main() -> ExitCode {
         eprintln!("fake-factorio: cannot write frame: {err}");
         return ExitCode::FAILURE;
     }
+    // Milestone state included because the real mod includes it (see
+    // mod/export.lua's `export_all_to`), and it is the only thing on the
+    // from-saves path that a single save cannot answer for itself: the Rust
+    // side recovers timings by comparing consecutive saves, so the pickup
+    // being exercised here is what makes that possible at all.
     let _ = std::fs::write(
         out_dir.join(format!("frame_{tick}_manifest.json")),
-        format!(r#"{{"tick":{tick},"entities":4,"surfaces":["nauvis"]}}"#),
+        format!(
+            r#"{{"tick":{tick},"entities":4,"surfaces":["nauvis"],"milestones":{{"science":["automation-science-pack"],"planets":["nauvis"],"rockets":1}}}}"#
+        ),
     );
 
     if flag_value(&settings, RESOURCES) {

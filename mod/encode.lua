@@ -617,6 +617,32 @@ function M.is_science_pack(name)
   return name:sub(-13) == "-science-pack"
 end
 
+--- What one save can say about milestones, as a JSON object for the export
+--- manifest: `{"science":[...],"planets":[...],"rockets":N}`.
+---
+--- State, not events, and that difference is the whole reason this exists.
+--- Live capture watches milestones happen and can write the exact tick
+--- (milestones.lua). A save file has no history of its own: it knows only
+--- that a pack has been produced at some point, never when. So this reports
+--- what is true as of this save, and recovering *when* each thing first
+--- became true is left to the Rust side, which has every save's state and
+--- can diff consecutive ones (see src/milestone.rs).
+---
+--- Rockets is a count rather than a flag so the diff can tell "the first
+--- rocket flew between these two saves" from "some rockets flew, as they had
+--- been all along."
+function M.milestone_state(science, planets, rockets)
+  local quoted_science, quoted_planets = {}, {}
+  for i, name in ipairs(science) do
+    quoted_science[i] = M.quote(name)
+  end
+  for i, name in ipairs(planets) do
+    quoted_planets[i] = M.quote(name)
+  end
+  return string.format('{"science":[%s],"planets":[%s],"rockets":%d}',
+    table.concat(quoted_science, ","), table.concat(quoted_planets, ","), rockets)
+end
+
 -- Player position log
 --
 -- Deliberately plain newline-delimited JSON, not a tagged binary format

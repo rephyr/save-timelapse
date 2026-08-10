@@ -111,6 +111,28 @@ fn exporting_produces_a_frame() {
     assert_eq!(frame.count, 4);
 }
 
+/// A save's milestone state comes back out of the manifest the mod writes
+/// beside the frames, which is the only route it has: no single save knows
+/// when anything first happened, so `milestone::from_saves` needs one of
+/// these per save to compare.
+#[test]
+fn exporting_reads_the_saves_milestone_state_from_its_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config_for(tmp.path());
+
+    let save = tmp.path().join("MyBase.zip");
+    fs::write(&save, b"pretend save").unwrap();
+
+    let outcome =
+        export::export_save(&save, &tmp.path().join("staged"), &config).expect("export should produce a frame");
+
+    let state = outcome.milestones.expect("the manifest carries milestone state");
+    assert_eq!(state.tick, 216_000);
+    assert_eq!(state.science, ["automation-science-pack"]);
+    assert_eq!(state.planets, ["nauvis"]);
+    assert_eq!(state.rockets, 1);
+}
+
 #[test]
 fn staging_preserves_other_mods_settings() {
     let tmp = tempfile::tempdir().unwrap();

@@ -267,6 +267,69 @@ function M.is_inhabited(surface)
   return ok and found ~= nil and #found > 0
 end
 
+--- Everything this save can say about milestones, for the from-saves path:
+--- which science packs have ever been produced, which planets have been
+--- reached, and how many rockets have launched.
+---
+--- Lives here rather than in milestones.lua, which is the obvious home,
+--- because that module already requires this one (for `EXPORT_DIR`) and Lua
+--- handles a require cycle badly. The two are doing different jobs anyway:
+--- milestones.lua watches for transitions during live play, while this
+--- snapshots totals for a save that has no history to watch.
+---
+--- "Planets reached" is a planet surface that is *inhabited*, not merely one
+--- that exists, since the game creates a planet's surface before anybody goes
+--- there. Reusing `is_inhabited` also keeps the marker honest against the
+--- timelapse it annotates: a surface only appears in frames once it is
+--- inhabited, so a planet is marked reached exactly when it starts being
+--- shown.
+---
+--- Every read is `pcall`'d like the rest of this file: a statistics call
+--- failing should cost one marker, never the whole export.
+function M.milestone_state()
+  local science, planets, rockets = {}, {}, 0
+  local force = game.forces["player"]
+
+  if force then
+    -- Statistics are per surface in 2.0, so this unions across them: a pack
+    -- first assembled on Vulcanus still counts as produced.
+    local seen = {}
+    for _, surface in pairs(game.surfaces) do
+      local ok, counts = pcall(function()
+        return force.get_item_production_statistics(surface).input_counts
+      end)
+      if ok and counts then
+        for name, count in pairs(counts) do
+          if count > 0 and encode.is_science_pack(name) and not seen[name] then
+            seen[name] = true
+            science[#science + 1] = name
+          end
+        end
+      end
+    end
+
+    local ok, launched = pcall(function() return force.rockets_launched end)
+    if ok and launched then
+      rockets = launched
+    end
+  end
+
+  for _, surface in pairs(game.surfaces) do
+    local ok, name = pcall(function()
+      return surface.planet and M.is_inhabited(surface) and surface.name
+    end)
+    if ok and name then
+      planets[#planets + 1] = name
+    end
+  end
+
+  -- Sorted so a manifest is stable between runs of the same save, which
+  -- keeps a diff of two saves free of spurious ordering churn.
+  table.sort(science)
+  table.sort(planets)
+  return science, planets, rockets
+end
+
 --- Shared by the synchronous export below and the periodic test-snapshot
 --- timer (see snapshot.lua): both describe "everything exported at this
 --- tick" in the same shape, so both write it through one function rather
@@ -404,10 +467,18 @@ function M.export_all_to(tick, manifest_path, session_id, is_excluded)
     end
   end
 
+  -- Milestone state rides in the manifest rather than in a file of its own:
+  -- it describes the same instant the manifest already describes, and every
+  -- consumer that wants one wants the other. Being JSON, an older reader
+  -- simply ignores the field, which is why this can be added to a file
+  -- `baseline.json` also uses without disturbing live capture.
+  local science, planets, rockets = M.milestone_state()
+
   helpers.write_file(
     manifest_path,
-    string.format('{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s]}',
-      tick, total, tile_total, table.concat(names, ",")),
+    string.format('{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s],"milestones":%s}',
+      tick, total, tile_total, table.concat(names, ","),
+      encode.milestone_state(science, planets, rockets)),
     false)
 
   return total, tile_total, #names

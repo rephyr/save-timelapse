@@ -526,6 +526,44 @@ M.CAPTURE_HANDLERS = {
   [defines.events.on_robot_mined_tile] = function(e) log_tile_change("-", e) end,
 }
 
+--- Adds a handler only if this Factorio build actually defines the event.
+---
+--- Written this way rather than as more entries in the literal above because
+--- indexing a table with a nil key is a hard error in Lua, not a skipped
+--- entry. A build whose defines lack one of the events below would therefore
+--- fail to load the mod at all, turning "one kind of build goes unrecorded"
+--- into "nothing works", which is a far worse trade for events that only
+--- exist from 2.0 onward.
+local function capture_handler(event_name, handler)
+  local id = defines.events[event_name]
+  if id then
+    M.CAPTURE_HANDLERS[id] = handler
+  end
+end
+
+-- Space platforms are a separate event family from planet-side robots, and
+-- everything on a platform is placed by platform construction bots, so
+-- without these a platform's entire construction history goes unrecorded.
+-- The platform still shows up, because snapshots scan every inhabited
+-- surface and a platform with player entities on it qualifies, so the
+-- symptom is not a missing platform but one that appears fully formed and
+-- then never changes: no growth in the timelapse and no construction heat
+-- while it is being built.
+--
+-- The payloads are shaped exactly like their robot equivalents (`entity` for
+-- the entity events, `surface_index`/`tile`/`tiles` for the tile ones), which
+-- is why these reuse the same two handlers rather than needing their own.
+capture_handler("on_space_platform_built_entity", function(e) log_entity("+", e.entity) end)
+capture_handler("on_space_platform_mined_entity", function(e) log_entity("-", e.entity) end)
+capture_handler("on_space_platform_built_tile", function(e) log_tile_change("+", e) end)
+capture_handler("on_space_platform_mined_tile", function(e) log_tile_change("-", e) end)
+
+-- A ghost revived by a script rather than carried out by a bot. Vanilla bot
+-- construction raises `on_robot_built_entity` and is already covered above;
+-- this is the path mods use, and without it a modded construction aid places
+-- entities the capture never sees.
+capture_handler("script_raised_revive", function(e) log_entity("+", e.entity) end)
+
 --- The CAPTURE_FLUSH_TICKS periodic callback body, run from control.lua's
 --- timer multiplexer while live capture is on. Calls `ensure_capture_segment`
 --- directly rather than `request_baseline`: a save that starts with live

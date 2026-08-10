@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 use save_timelapse::export;
 use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
+use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 
 /// Default game time per frame during live-capture replay, asked about
@@ -596,6 +597,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
     };
 
     let mut done = 0usize;
+    let mut milestone_states: Vec<milestone::State> = Vec::new();
     for (index, save) in chosen.iter().enumerate() {
         let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
         print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
@@ -616,6 +618,9 @@ fn run_from_saves() -> io::Result<PathBuf> {
                         std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
                     combined.write_all(&std::fs::read(log)?)?;
                 }
+                if let Some(state) = outcome.milestones {
+                    milestone_states.push(state);
+                }
                 let kib = target.metadata().map(|m| m.len()).unwrap_or(0) / 1024;
                 println!("ok, {kib} KiB in {:.1}s", outcome.seconds);
                 done += 1;
@@ -629,6 +634,25 @@ fn run_from_saves() -> io::Result<PathBuf> {
 
     if done == 0 {
         return Err(io::Error::other("none of the selected saves exported successfully"));
+    }
+
+    // Milestones are the one output that cannot be derived from a single
+    // save, so it is written here rather than per-export: each save reports
+    // only totals, and when something first became true is recoverable only
+    // by comparing consecutive ones.
+    let milestones = milestone::from_saves(milestone_states);
+    if !milestones.is_empty() {
+        match milestone::write_jsonl(&out.join("milestones.jsonl"), &milestones) {
+            Ok(()) => println!(
+                "{} milestone(s) recovered by comparing saves; each is marked at the first save \
+                 that shows it, so they are as precise as your save cadence",
+                milestones.len()
+            ),
+            // Markers are an annotation on a timelapse that is already built
+            // and already usable, so failing to write them is worth saying
+            // and not worth failing over.
+            Err(e) => eprintln!("warning: could not write milestones: {e}"),
+        }
     }
 
     Ok(out)

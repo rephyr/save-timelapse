@@ -33,7 +33,7 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua run viewer drawcalls check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -77,8 +77,21 @@ test:
 #   string.pack,       not syntax, just absent: the call parses fine and
 #   math.type          fails only when that line actually runs, so this
 #                      catches it only where a test covers that path.
-test-lua:
+test-lua: check-mod-syntax
 	$(LUA) mod/tests/encode_test.lua
+
+# Compiles every shipped Lua file without running it. The unit suite above
+# only dofile()s encode.lua, so a syntax error anywhere else would otherwise
+# surface for the first time as Factorio refusing to load the mod, and a mod
+# that will not load at all is a far worse failure than any one feature being
+# wrong. `loadfile` compiles without executing, which is what makes this work
+# for files like capture.lua that reference `game` and `defines` and could
+# never actually be run outside the game.
+check-mod-syntax:
+	@for f in $(addprefix mod/,$(MOD_LUA)); do \
+	  $(LUA) -e "local c,e=loadfile('$$f'); if not c then io.stderr:write('syntax error: '..tostring(e)..'\n'); os.exit(1) end" || exit 1; \
+	  echo "ok   $$f parses"; \
+	done
 
 run:
 	cargo run --release --bin save-timelapse

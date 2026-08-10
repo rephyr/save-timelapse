@@ -357,6 +357,15 @@ pub struct Replay {
     /// baseline is not an event, exactly like the original baseline's own
     /// load in `load_baseline` never touches those counters either.
     pub catch_ups_applied: usize,
+    /// Frames emitted onto a world identical to the one the previous frame
+    /// was emitted onto, because nothing was built or destroyed in between.
+    ///
+    /// Purely a measurement for now: every one of these still costs a full
+    /// serialization and a full file today. What it sizes is whether skipping
+    /// that work is worth building, which depends entirely on how much of a
+    /// given playthrough is building versus research, combat and walking, and
+    /// that is not a ratio worth guessing at.
+    pub unchanged_emits: usize,
 }
 
 /// Seed a world from the baseline at `baseline_path`.
@@ -422,6 +431,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         unknown_extensions: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
+        unchanged_emits: 0,
     })
 }
 
@@ -488,9 +498,22 @@ where
     let mut next_emit = replay.baseline.tick;
     let mut emitted = 0;
 
+    // Everything that can change the world between two emits: an event that
+    // actually applied, or a catch-up baseline landing. `no_op_events` is
+    // deliberately not in here, since an event that changed nothing leaves a
+    // world identical to the one before it. Counted rather than compared,
+    // because comparing two worlds of a million entities to learn they match
+    // would cost more than the work being measured.
+    let mut previous_revision: Option<usize> = None;
+
     let mut flush_until = |replay: &mut Replay, tick: u64, next: &mut u64, emitted: &mut usize| {
         while tick >= *next && *emitted < options.max_frames {
             apply_due_catch_ups(replay, *next);
+            let revision = replay.applied_events + replay.catch_ups_applied;
+            if previous_revision == Some(revision) {
+                replay.unchanged_emits += 1;
+            }
+            previous_revision = Some(revision);
             emit(&replay.world, *next);
             *emitted += 1;
             *next += options.interval;
@@ -750,6 +773,86 @@ fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
         replay.world.tick = replay.world.tick.max(logged.tick);
     }
     pending.clear();
+}
+
+/// Sizing the "skip unchanged frames" idea against a real capture, which no
+/// fixture can stand in for: the whole answer is a property of how somebody
+/// actually played, not of the code.
+#[cfg(test)]
+mod idle_study {
+    use super::*;
+
+    /// Reports how much of an export is frames identical to the one before
+    /// them.
+    ///
+    /// Ignored and environment driven so it never runs in CI and no local
+    /// path is ever committed:
+    ///
+    /// ```text
+    /// SAVE_TIMELAPSE_CAPTURE='<...>/script-output/save-timelapse/<session>' \
+    ///   cargo test --lib measure_unchanged_frames -- --ignored --nocapture
+    /// ```
+    ///
+    /// `SAVE_TIMELAPSE_FRAME_SECONDS` overrides the 60 seconds of game time
+    /// per frame the tool defaults to. Worth sweeping, because the ratio
+    /// moves with it in the obvious direction: the coarser the interval, the
+    /// more chance each frame has of containing at least one change, so a
+    /// fine interval flatters this optimization and a coarse one buries it.
+    ///
+    /// Duplicates are counted two independent ways that should agree. The
+    /// byte comparison is the ground truth (it is exactly what a body hash
+    /// would deduplicate), while `Replay::unchanged_emits` is the cheap
+    /// counter a shipped build could afford. They disagreeing would mean the
+    /// cheap counter is not a sound proxy.
+    #[test]
+    #[ignore]
+    fn measure_unchanged_frames() {
+        let dir = std::env::var("SAVE_TIMELAPSE_CAPTURE")
+            .expect("set SAVE_TIMELAPSE_CAPTURE to one session folder under script-output");
+        let dir = Path::new(&dir);
+        let frame_seconds: u64 =
+            std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+
+        let mut replay = load_baseline(&dir.join("baseline.json")).expect("baseline must load");
+        let surface = replay.world.surface_names().first().map(|s| s.to_string()).expect("a surface to render");
+
+        let options = Options { interval: frame_seconds * 60, max_frames: 100_000 };
+
+        // Serialized for real rather than estimated: the question is how many
+        // bytes an export actually writes, and `write_binary` is what decides
+        // that.
+        //
+        // The comparison skips the 8 byte tick at offset 5 and the 4 byte
+        // trailing checksum, which is precisely "same surface, same entities,
+        // same tiles, different moment".
+        let mut total_bytes = 0usize;
+        let mut duplicate_bytes = 0usize;
+        let mut duplicate_frames = 0usize;
+        let mut previous: Option<Vec<u8>> = None;
+
+        let emitted = run(&mut replay, dir, &options, |world, tick| {
+            let bytes = crate::frame::write_binary(&world.to_frame(&surface, tick).as_out());
+            let body = |b: &[u8]| b[13..b.len() - 4].to_vec();
+            if previous.as_deref().map(|p| body(p) == body(&bytes)).unwrap_or(false) {
+                duplicate_frames += 1;
+                duplicate_bytes += bytes.len();
+            }
+            total_bytes += bytes.len();
+            previous = Some(bytes);
+        })
+        .expect("replay must run");
+
+        let pct = |part: usize, whole: usize| if whole == 0 { 0.0 } else { part as f64 * 100.0 / whole as f64 };
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+
+        println!("\nIDLE STUDY  surface={surface}  {frame_seconds}s per frame");
+        println!("  frames emitted        {emitted}");
+        println!("  byte-identical to previous  {duplicate_frames}  ({:.1}%)", pct(duplicate_frames, emitted));
+        println!("  Replay::unchanged_emits     {}", replay.unchanged_emits);
+        println!("  total written         {:.1} MB", mb(total_bytes));
+        println!("  in duplicate frames   {:.1} MB  ({:.1}%)", mb(duplicate_bytes), pct(duplicate_bytes, total_bytes));
+        println!("  applied events {}  no-op {}", replay.applied_events, replay.no_op_events);
+    }
 }
 
 #[cfg(test)]
