@@ -88,7 +88,26 @@ fn config_for(root: &Path) -> ExportConfig {
 fn version_is_read_from_the_executable() {
     let tmp = tempfile::tempdir().unwrap();
     let exe = fake_install(tmp.path());
-    assert_eq!(export::factorio_version(&exe), Some([2, 0, 77, 0]));
+
+    // Reports what the process actually did when this fails, rather than only
+    // that the answer was `None`. Every way this can break (the copy not
+    // being executable, the binary refusing to start, the banner arriving on
+    // a stream nobody read) produces the identical `None`, and a bare
+    // assertion on it sends whoever hits it back to guessing. That is not
+    // hypothetical: it failed exactly this way the first time CI ran on
+    // Linux, having always passed on Windows.
+    let ran = std::process::Command::new(&exe).arg("--version").output();
+    let detail = match &ran {
+        Ok(out) => format!(
+            "exit {:?}\n  stdout: {:?}\n  stderr: {:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => format!("could not run {} at all: {e}", exe.display()),
+    };
+
+    assert_eq!(export::factorio_version(&exe), Some([2, 0, 77, 0]), "running --version gave:\n  {detail}");
 }
 
 #[test]

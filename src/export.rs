@@ -45,9 +45,14 @@ pub struct ExportOutcome {
 }
 
 /// Read the version from the executable rather than assuming one.
+///
+/// Reads stdout and stderr together. Which stream a program writes a version
+/// banner to is a per-build detail nobody should have to know, and searching
+/// both costs one concatenation against silently returning `None` and
+/// reporting no version at all.
 pub fn factorio_version(exe: &Path) -> Option<Version> {
     let output = Command::new(exe).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let field = text.lines().find(|line| line.contains("Version:"))?.split_whitespace().find(|token| token.contains('.'))?;
 
     let parts: Vec<u16> = field.split('.').filter_map(|p| p.parse().ok()).collect();
