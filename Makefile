@@ -33,7 +33,7 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls stress stress-save check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -43,6 +43,8 @@ help:
 	@echo "  run          save-timelapse: interactive, asks what to do and opens the viewer"
 	@echo "  viewer       open the interactive viewer on FRAMES"
 	@echo "  drawcalls    headless draw-call report on FRAMES"
+	@echo "  stress       benchmark the whole pipeline against the saved baseline"
+	@echo "  stress-save  run the benchmark and record it as the new baseline"
 	@echo "  install-mod  copy mod/ into MOD_INSTALL (your Factorio mods folder)"
 	@echo "  package      zip mod/ into dist/$(PACKAGE_NAME).zip, ready for the mod portal"
 	@echo "  clean        cargo clean"
@@ -101,6 +103,27 @@ viewer:
 
 drawcalls:
 	cargo run -p viewer --release --bin drawcalls -- $(FRAMES)
+
+# Development benchmark: run the whole pipeline at megabase scale and compare
+# every number against a saved baseline, to answer "did the change I just made
+# help or hurt". Take a baseline first, edit, then re-run:
+#
+#   make stress-save     # record the current code as the baseline
+#   ...edit...
+#   make stress          # current vs baseline, with deltas
+#
+# Sizes and counts are exact, so any delta there is real. Timings swing a few
+# percent between identical runs and are marked as noise below 10%.
+#
+# A baseline is only comparable against the same shape, so re-record after
+# changing any dimension:
+#
+#   make stress STRESS_ARGS="--surfaces 1 --entities 2000000"
+stress:
+	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS)
+
+stress-save:
+	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS) --save
 
 # Fails if mod/ holds a .lua that neither list names, which is exactly how a
 # newly added, required file would otherwise reach a player: control.lua
