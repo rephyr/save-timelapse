@@ -264,7 +264,7 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
 - [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
 - [x] Bookmarks and jumping between milestones and busy stretches
-- [ ] Linux builds
+- [x] Linux builds
 
 ### v1.0
 
