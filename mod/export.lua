@@ -12,10 +12,15 @@ local M = {}
 
 M.EXPORT_DIR = "save-timelapse/"
 local FLUSH_EVERY = 2000
---- How far past the entities/placed-floor bounding box to also capture
---- natural terrain, so the factory reads as sitting on real ground rather
---- than stopping at a hard edge. Roughly a chunk; not exposed as a setting
---- since nothing has asked for this to be tunable yet.
+--- The *least* ground to capture past the built area, so the factory reads
+--- as sitting on real land rather than stopping at a hard edge. Roughly a
+--- chunk; not exposed as a setting since nothing has asked for this to be
+--- tunable yet.
+---
+--- A floor rather than the whole answer: `encode.terrain_margin` widens it
+--- to cover what a fitted 16:9 frame actually shows around a base this
+--- shape, which on anything large is far more than a chunk. This value is
+--- what a base small enough for that not to matter still gets.
 local TERRAIN_MARGIN_TILES = 32
 
 --- Set at load when the CLI's startup flag is on, and acted on by
@@ -93,6 +98,15 @@ function M.checksummed_write(path, data, append, checksum)
   return encode.checksum_update(checksum, data)
 end
 
+--- Whether somebody built `entity`, as opposed to the map having generated
+--- it. `"player"` is the same force name `M.is_inhabited` and
+--- `M.milestone_state` already treat as "the player's" everywhere else in
+--- this file.
+local function is_player_built(entity)
+  local force = entity.force
+  return force ~= nil and force.name == "player"
+end
+
 --- Write one surface to its own file. Returns entity and tile counts written.
 ---
 --- `session_id`, when given, tags the path so a baseline written into the
@@ -111,7 +125,27 @@ local function export_surface(surface, tick, session_id)
   -- Grown as entities and placed floor below are scanned, so the terrain
   -- pass after them knows what area to cover without a separate scan of
   -- the whole surface just to learn its extent.
+  --
+  -- Only what somebody actually built grows it. Everything else exported
+  -- here sits wherever the map generated it: with terrain capture on that
+  -- is every tree on every generated chunk, and enemy nests and worms are
+  -- there in every direction regardless of the setting. Letting those in
+  -- made this "the explored map" rather than "the factory", which is not a
+  -- margin around anything, and then multiplied the terrain pass below by
+  -- the whole difference.
   local bbox = encode.new_bbox()
+
+  -- Which prototype names somebody built, asked once per distinct name
+  -- instead of once per entity. `entity.force.name` is two crossings of the
+  -- mod/game boundary and this loop runs per entity on bases that reach
+  -- hundreds of thousands of them, so the difference is a few dozen
+  -- questions against ~900k.
+  --
+  -- Per name does mean a prototype standing on two forces at once is judged
+  -- by whichever was seen first. That is fine for what this feeds: the box
+  -- only decides how far past the factory to capture ground, so being one
+  -- building wrong at its edge changes nothing anybody can see.
+  local player_built = {}
 
   local pending_count, written = 0, 0
 
@@ -162,12 +196,21 @@ local function export_surface(surface, tick, session_id)
       -- Each field crosses the mod/game boundary, so each is read exactly
       -- once, straight into the run being built.
       local pos = entity.position
-      local group = group_for(entity.name, entity.tile_width, entity.tile_height)
+      local name = entity.name
+      local group = group_for(name, entity.tile_width, entity.tile_height)
       local k = group.n + 1
       group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
       written = written + 1
       pending_count = pending_count + 1
-      encode.grow_bbox(bbox, pos.x, pos.y)
+
+      local built = player_built[name]
+      if built == nil then
+        built = is_player_built(entity)
+        player_built[name] = built
+      end
+      if built then
+        encode.grow_bbox(bbox, pos.x, pos.y)
+      end
 
       -- Each write_file call is a separate file append, so flushing per entity
       -- would make export time track syscalls rather than entity count.
@@ -215,6 +258,9 @@ local function export_surface(surface, tick, session_id)
     group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
     tiles_written = tiles_written + 1
     pending_count = pending_count + 1
+    -- Unconditional, unlike the entity loop above: this query asks only for
+    -- PLACED_FLOOR_TILES, so everything it returns was laid down by
+    -- somebody and there is no force to ask about.
     encode.grow_bbox(bbox, pos.x, pos.y)
 
     if pending_count >= FLUSH_EVERY then
@@ -232,8 +278,19 @@ local function export_surface(surface, tick, session_id)
   -- so opting in is a real decision, not a free improvement. `nil` when
   -- nothing was seen above (an untouched surface has no factory to show
   -- context around) also skips it, same as the setting being off.
+  --
+  -- The margin is only worth what `bbox` is worth: it now surrounds what
+  -- somebody built, so it is a real edge around the factory. While trees
+  -- and nests still counted, this was a margin around the explored map,
+  -- which captured almost the whole surface and is most of where that 5x
+  -- came from.
+  --
+  -- That is also what makes widening it affordable. `encode.terrain_margin`
+  -- asks for enough ground to fill the frame a timelapse is watched in
+  -- rather than a fixed chunk, which against the old map-sized box would
+  -- have been unthinkable and against this one is bounded.
   local terrain_area = settings.startup["save-timelapse-capture-terrain"].value
-    and encode.expand_bbox(bbox, TERRAIN_MARGIN_TILES)
+    and encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
   if terrain_area then
     for _, tile in pairs(surface.find_tiles_filtered({
       area = terrain_area,

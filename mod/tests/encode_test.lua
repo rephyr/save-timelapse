@@ -317,6 +317,57 @@ do
   check("expand_bbox: right_bottom y is max_y plus the margin", area[2][2], 34)
 end
 
+-- how far past the built area to capture ground
+
+do
+  local function box(w, h)
+    local bbox = encode.new_bbox()
+    encode.grow_bbox(bbox, 0, 0)
+    encode.grow_bbox(bbox, w, h)
+    return bbox
+  end
+
+  check("terrain_margin: an untouched surface just gets the floor",
+    encode.terrain_margin(encode.new_bbox(), 32), 32)
+
+  check("terrain_margin: a base small enough not to matter gets the floor",
+    encode.terrain_margin(box(20, 20), 32), 32)
+
+  -- A square base fills 52% of a 16:9 frame's width, so nearly half the
+  -- picture is world past the box and the margin has to reach that far.
+  check("terrain_margin: a square base is padded to fill the frame's width",
+    encode.terrain_margin(box(1000, 1000), 32), 466)
+
+  -- The two that show why a fraction of the larger dimension cannot work.
+  -- Both have a 2:1 side ratio and each needs an order of magnitude
+  -- different padding, because what a fit exposes depends on the base's
+  -- shape against the frame's, not on how big it is.
+  check("terrain_margin: a base wider than the frame needs very little",
+    encode.terrain_margin(box(2000, 1000), 32), 111)
+
+  check("terrain_margin: a base taller than the frame needs more than its own width",
+    encode.terrain_margin(box(200, 400), 32), 286)
+
+  -- The corridor named in `terrain_margin`'s own comment: it asks for a
+  -- 4780 tile margin, which would be 140M tiles of ground.
+  check("terrain_margin: a long thin base is capped well below what it asks for",
+    encode.terrain_margin(box(100, 5000), 32), 306)
+
+  do
+    local m = encode.terrain_margin(box(100, 5000), 32)
+    check("terrain_margin: the cap keeps the captured region inside the budget",
+      (100 + 2 * m) * (5000 + 2 * m) <= 4000000, true)
+  end
+
+  -- Already over budget on its own, so there is nothing to spend on a
+  -- margin and it falls back to the floor rather than going negative.
+  check("terrain_margin: a base larger than the whole budget falls back to the floor",
+    encode.terrain_margin(box(5000, 5000), 32), 32)
+
+  check("terrain_margin: always a whole number of tiles",
+    encode.terrain_margin(box(1000, 1000), 32) % 1, 0)
+end
+
 -- per-playthrough file naming
 
 check("session_dir: session id as zero padded 8 digit hex",
@@ -422,6 +473,32 @@ check("EXCLUDED_TYPES: does not contain asteroid-collector", excluded["asteroid-
 -- them get cleared is how expansion actually reads in a timelapse. The viewer
 -- colors them red (see viewer/src/registry.rs's is_enemy).
 check("EXCLUDED_TYPES: does not contain unit-spawner", excluded["unit-spawner"], nil)
+-- Space Age gave its own mobile enemies prototype types of their own, so
+-- "unit" above never covered them and every one landed in captures as though
+-- somebody had built it. Found in a real Gleba capture holding
+-- small-stomper-pentapod, small-strafer-pentapod and both their leg
+-- prototypes; because they roam, the auto-follow camera stretched to wherever
+-- they had wandered. Read from the game's own prototypes rather than guessed:
+-- space-age/prototypes/entity/enemies.lua.
+check("EXCLUDED_TYPES: contains spider-unit (Gleba stompers and strafers)", excluded["spider-unit"], true)
+check("EXCLUDED_TYPES: contains spider-leg (their legs, and Spidertron's)", excluded["spider-leg"], true)
+check("EXCLUDED_TYPES: contains segmented-unit (Vulcanus demolisher heads)", excluded["segmented-unit"], true)
+check("EXCLUDED_TYPES: contains segment (demolisher bodies)", excluded["segment"], true)
+-- Vehicles and rolling stock, excluded under the same rule and simply missed
+-- until now. Trains are the worst case: a from-saves export catches them
+-- somewhere different in every save, so they blink around the network.
+check("EXCLUDED_TYPES: contains car (cars and tanks)", excluded["car"], true)
+check("EXCLUDED_TYPES: contains spider-vehicle (Spidertron)", excluded["spider-vehicle"], true)
+check("EXCLUDED_TYPES: contains locomotive", excluded["locomotive"], true)
+check("EXCLUDED_TYPES: contains cargo-wagon", excluded["cargo-wagon"], true)
+check("EXCLUDED_TYPES: contains fluid-wagon", excluded["fluid-wagon"], true)
+check("EXCLUDED_TYPES: contains artillery-wagon", excluded["artillery-wagon"], true)
+-- ...but the track they run on is stationary infrastructure and is exactly
+-- what shows a rail network growing, the same way roboports stay while the
+-- robots do not.
+check("EXCLUDED_TYPES: does not contain straight-rail", excluded["straight-rail"], nil)
+check("EXCLUDED_TYPES: does not contain rail-signal", excluded["rail-signal"], nil)
+check("EXCLUDED_TYPES: does not contain train-stop", excluded["train-stop"], nil)
 
 local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILES")
 check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)

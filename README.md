@@ -192,6 +192,26 @@ Current features:
 - Flat-color LOD rendering
 - Parallel loading
 - Progress indicator
+- Export, so a timelapse can leave the viewer
+
+---
+
+## Saving a video
+
+Option **4** in the menu, `Save a timelapse as a video file I can share`. It asks which timelapse, which world if there is more than one, how big and how fast, and puts the result in a `videos` folder next to the program. Your answers are remembered, so the next export is mostly pressing Enter.
+
+The file is Motion JPEG in an AVI container, encoded in-process, so exporting installs nothing either. Answer no to the video question and you get a numbered PNG per frame instead, which is what you want if you are editing rather than watching.
+
+Resolution is independent of the window, since frames are rendered offscreen rather than screenshotted, and the camera is fitted to the base in every frame rather than gliding after it the way interactive browsing does.
+
+The viewer takes the same options directly if you would rather not go through the menu:
+
+```bash
+viewer <folder> --export out --video --fps 30      # out.avi, plays anywhere
+viewer <folder> --export out --width 1920 --height 1080
+viewer <folder> --export out --surface gleba
+viewer <folder> --export out --surface all
+```
 
 ---
 
@@ -214,6 +234,10 @@ Use **Lua 5.2**, the version Factorio's modding API is. The suite passes
 under 5.1 through 5.5 alike, so a newer interpreter looks healthy while
 accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 `math.type`) that Factorio will not run.
+
+[docs/TESTING.md](docs/TESTING.md) covers the rest: the benchmark that
+separates real changes from noise, what to check in the game, and how to read
+a capture's event log when something looks wrong.
 
 ---
 
@@ -265,6 +289,11 @@ accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
 - [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
 - [x] Bookmarks and jumping between milestones and busy stretches
 - [x] Linux builds
+
+### v0.6
+
+- [x] Export a timelapse as a numbered image sequence, at any resolution, independent of the window size
+- [x] Playable video export with nothing to install: Motion JPEG in an AVI container, encoded in-process
 
 ### v1.0
 

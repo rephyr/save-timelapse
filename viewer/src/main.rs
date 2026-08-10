@@ -13,11 +13,11 @@ use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
-    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians,
-    format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed, recent_heat, synthetic_frame,
-    synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, HeatCell,
-    LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES,
-    LOD_CELL_TILES,
+    activity_heights, analyze_activity, color_for, downsample, entity_cull_half_extents, entity_footprint_size,
+    entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed,
+    recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, AviWriter, Camera, CameraTransition, DrawCallCounter,
+    FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run,
+    Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -59,6 +59,17 @@ const SPRITE_MIN_PIXELS: f32 = 12.0;
 const BATCH_QUAD_CAPACITY: usize = 4096;
 const BATCH_VERTEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 4;
 const BATCH_INDEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 6;
+
+/// Oversampling factor an export uses unless told otherwise. See
+/// `ExportRequest::supersample` for what it buys; 2 costs four times the
+/// pixels and is the point where the averaging is clearly visible while an
+/// export still finishes in about the time it used to.
+const DEFAULT_SUPERSAMPLE: u32 = 2;
+
+/// Longest render target edge to ask a GPU for. Past roughly this, drivers
+/// start refusing the allocation, and macroquad reports that as a texture
+/// that simply never draws rather than as an error.
+const MAX_RENDER_EDGE: u32 = 8192;
 
 /// Frame files parsed at once before being folded into spans and dropped.
 /// Bounds peak load memory at roughly this many frames, while still being
@@ -164,16 +175,57 @@ struct ViewerState {
     heatmap_enabled: bool,
 }
 
+/// Render every frame to an image file instead of opening for browsing.
+///
+/// Resolution is deliberately independent of the window: the export draws
+/// into an offscreen target, so a 1080p sequence comes out of a 1280x800
+/// window unchanged. Tying output size to whatever the window happened to be
+/// would make the result depend on how somebody had dragged a corner.
+struct ExportRequest {
+    dir: PathBuf,
+    width: u32,
+    height: u32,
+    /// Frames per second when writing video. Ignored for an image sequence,
+    /// which has no notion of a rate.
+    fps: u32,
+    /// Write a playable `.avi` instead of a folder of PNGs.
+    video: bool,
+    /// Which surface to render. `None` means the busiest, which is what
+    /// `group_by_surface` already orders first. `Some("all")` renders every
+    /// surface into its own subfolder.
+    surface: Option<String>,
+    /// Render this many times oversized on each axis, then average back down
+    /// to `width` x `height`.
+    ///
+    /// A megabase does not fit its own detail into a video frame: at 1080p a
+    /// 2,900 tile base puts three tiles behind every pixel, so whichever
+    /// entity a pixel happens to land on wins it outright and everything
+    /// else in those three tiles is simply gone. Rendering large and
+    /// averaging down replaces that coin toss with a real area average, so a
+    /// belt crossing an otherwise empty pixel tints it instead of either
+    /// taking it whole or vanishing.
+    ///
+    /// It is also what makes full detail worth asking for at all in an
+    /// export (see `export_frames`), since at one sample per pixel the
+    /// individual entities LOD would have merged are exactly what aliases.
+    supersample: u32,
+}
+
 struct Args {
     path: Option<String>,
     synthetic_entities: Option<usize>,
     synthetic_tile_count: Option<usize>,
     factorio: Option<PathBuf>,
+    export: Option<ExportRequest>,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut result = Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None };
+    let mut result = Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None, export: None };
+    let (mut export_dir, mut width, mut height) = (None, 1920u32, 1080u32);
+    let mut supersample = DEFAULT_SUPERSAMPLE;
+    let mut surface = None;
+    let (mut fps, mut video) = (30u32, false);
 
     let mut i = 0;
     while i < args.len() {
@@ -190,10 +242,60 @@ fn parse_args() -> Args {
                 i += 1;
                 result.factorio = args.get(i).map(PathBuf::from);
             }
+            "--export" => {
+                i += 1;
+                export_dir = args.get(i).map(PathBuf::from);
+            }
+            "--width" => {
+                i += 1;
+                width = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(width);
+            }
+            "--height" => {
+                i += 1;
+                height = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(height);
+            }
+            "--surface" => {
+                i += 1;
+                surface = args.get(i).cloned();
+            }
+            "--fps" => {
+                i += 1;
+                fps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(fps);
+            }
+            "--supersample" => {
+                i += 1;
+                supersample = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(supersample);
+            }
+            "--video" => video = true,
             other => result.path = Some(other.to_string()),
         }
         i += 1;
     }
+
+    // Clamped rather than trusted: a zero or negative size would make an
+    // unusable render target, and something enormous would exhaust GPU memory
+    // partway through a long export, which is a far worse way to find out.
+    result.export = export_dir.map(|dir| {
+        // Rounded down to even: JPEG works in 8x8 blocks and some decoders
+        // are fussy about odd dimensions, which is a miserable thing to
+        // discover only when a player refuses the finished file.
+        let width = width.clamp(160, 7680) & !1;
+        let height = height.clamp(120, 4320) & !1;
+        ExportRequest {
+            dir,
+            width,
+            height,
+            surface,
+            fps: fps.clamp(1, 240),
+            video,
+            // Capped by the render target it implies, not just on its own:
+            // GPUs stop honouring texture sizes somewhere past 8192 on a
+            // side, and a silently-refused target is a black export rather
+            // than an error. Asking for 4x at 4K therefore quietly gets 2x
+            // rather than nothing.
+            supersample: supersample.clamp(1, 4).min(MAX_RENDER_EDGE / width).min(MAX_RENDER_EDGE / height).max(1),
+        }
+    });
 
     result
 }
@@ -468,9 +570,23 @@ fn draw_lod_cell(screen: Vec2, size: f32, color: Color) {
 /// World-space view rectangle, so culling is a pair of comparisons per item
 /// instead of a full world-to-screen transform per item followed by a screen
 /// bounds test. Only survivors pay for the transform.
+///
+/// The surface size comes from `screen_center`, doubled, rather than from
+/// `screen_width()`/`screen_height()`. Those are the *window's* dimensions,
+/// which is the same thing only while drawing to the window: an export
+/// renders into an offscreen target of whatever size was asked for, and
+/// culling to the window instead threw away everything outside a
+/// window-sized corner of it. At the default 1280x800 window that silently
+/// cropped every 1080p export to its top-left two thirds, which no amount of
+/// fixing the camera's framing could have shown up, since the framing was
+/// never what was wrong.
+///
+/// Every caller already builds `screen_center` as exactly half the surface
+/// it is drawing to, so this is the same number by a route that cannot go
+/// stale, and it takes the last window global out of the draw path.
 fn view_bounds(camera: &Camera, screen_center: Vec2) -> (Vec2, Vec2) {
     let min = camera.screen_to_world(Vec2::ZERO, screen_center);
-    let max = camera.screen_to_world(Vec2::new(screen_width(), screen_height()), screen_center);
+    let max = camera.screen_to_world(screen_center * 2.0, screen_center);
     (min, max)
 }
 
@@ -768,6 +884,210 @@ fn update_auto_follow(
 /// Draws the current frame: terrain backdrop (if loaded), then its own
 /// tiles, then entities, in either full detail or chunk-LOD depending on
 /// zoom.
+/// Renders every frame of `world` to a numbered PNG in `request.dir`.
+///
+/// Draws into an offscreen target rather than the window, so the output size
+/// is whatever was asked for rather than whatever the window happens to be.
+/// Everything else is the ordinary draw path: same `draw_world`, same
+/// auto-follow, so an exported sequence looks like what browsing it looks
+/// like rather than like a second renderer that has to be kept in step.
+///
+/// Files are `frame_00000.png` upward, zero padded so any tool that takes a
+/// numbered sequence reads them in order without being told a pattern.
+async fn export_frames(
+    world: &mut WorldView,
+    registry: &TypeRegistry,
+    sprites: &[Option<Sprite>],
+    request: &ExportRequest,
+) -> std::io::Result<usize> {
+    // For video the target is a file, so only its parent needs to exist; for
+    // a sequence the target is the folder itself.
+    let video_path = request.dir.with_extension("avi");
+    match request.video {
+        true => {
+            if let Some(parent) = video_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        false => std::fs::create_dir_all(&request.dir)?,
+    }
+
+    // Everything below draws at the oversampled size and only the final
+    // readback comes back down, so the camera, the culling and the draw code
+    // all see one consistent surface and none of them needs to know this is
+    // happening at all.
+    let ss = request.supersample;
+    let (rw, rh) = (request.width * ss, request.height * ss);
+    let (w, h) = (rw as f32, rh as f32);
+    let mut video = match request.video {
+        true => Some(AviWriter::create(&video_path, request.width, request.height, request.fps)?),
+        false => None,
+    };
+    let target = render_target(rw, rh);
+    target.texture.set_filter(FilterMode::Nearest);
+
+    // Maps the target's pixel space one to one onto the draw code's
+    // screen-space coordinates, so `draw_world` needs no notion of being
+    // rendered offscreen.
+    //
+    // The negative y in `zoom` is the piece to distrust if the output comes
+    // out upside down: macroquad flips y for render targets (see its
+    // `Camera2D::matrix`), and which way that lands is the one thing here
+    // that cannot be reasoned out without looking at a rendered file.
+    //
+    // `viewport` is not optional here despite being an `Option`. Left unset,
+    // macroquad falls back to the *window's* dimensions for the GL viewport
+    // (`Camera2D::viewport` defaults to `None`), not the render target's, so
+    // an export larger than the window rasterized the whole picture into a
+    // window-sized corner of the target and left the rest untouched black.
+    // At the default 1280x800 window that put a 1920x1080 export into the
+    // top-left two thirds, squashed to the wrong aspect, with the camera
+    // fitting for 16:9 while the pixels landed in 8:5.
+    let camera = Camera2D {
+        render_target: Some(target.clone()),
+        zoom: vec2(2.0 / w, -2.0 / h),
+        target: vec2(w / 2.0, h / 2.0),
+        viewport: Some((0, 0, rw as i32, rh as i32)),
+        ..Default::default()
+    };
+    let screen_center = Vec2::new(w / 2.0, h / 2.0);
+
+    let total = world.sequence.len();
+    let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
+    let destination = if request.video { video_path.display().to_string() } else { request.dir.display().to_string() };
+    let rate = if request.video { format!(" at {} fps", request.fps) } else { String::new() };
+    let sampling = if ss > 1 { format!(" ({ss}x supersampled from {rw}x{rh})") } else { String::new() };
+    println!("exporting {total} frames at {}x{}{rate}{sampling} to {destination}", request.width, request.height);
+
+    for index in 0..total {
+        world.sequence.goto(index);
+
+        // Fitted directly per frame rather than through `update_auto_follow`.
+        // That glides over wall-clock seconds, which is right when somebody
+        // is watching and wrong here: an export advances a frame per
+        // iteration as fast as the disk allows, so the camera would crawl
+        // through its 1.5 second transition while hundreds of frames went by,
+        // and the whole sequence would render framed on wherever it started.
+        //
+        // Nothing is lost by snapping. The glide exists to smooth a camera
+        // that jumps when somebody scrubs; across an exported sequence the
+        // bounds grow monotonically and gradually, so a per-frame fit *is*
+        // smooth, and it guarantees the base is framed in every single frame
+        // rather than eventually.
+        if let Some(bounds) = world.growing_bounds[index] {
+            world.camera = Camera::fit_bounds(
+                bounds.center,
+                bounds.half_extent * 2.0,
+                w,
+                h,
+                AUTO_FOLLOW_MIN_FOCUS_TILES,
+                AUTO_FOLLOW_FIT_MARGIN,
+            );
+        }
+
+        set_camera(&camera);
+        clear_background(Color::new(0.08, 0.08, 0.1, 1.0));
+
+        let pixels_per_tile = world.camera.pixels_per_tile();
+        let frame = world.sequence.current();
+        counter.reset();
+        draw_world(
+            frame,
+            world.terrain.as_ref(),
+            &world.camera,
+            screen_center,
+            registry,
+            sprites,
+            pixels_per_tile > SPRITE_MIN_PIXELS,
+            // Never aggregated, unlike the interactive view. Chunk LOD exists
+            // to keep a *live* frame rate up by not transforming and
+            // submitting items too small to perceive (see
+            // `LOD_MAX_TILE_PIXELS`), and an export has no frame rate to
+            // protect: it renders one frame at a time, as slowly as it likes.
+            // What it gives up is real, since a cell keeps only its dominant
+            // type and discards the rest, and at these zooms that is a paved
+            // area swallowing the belts and machines running through it.
+            //
+            // Only sound because of supersampling. At one sample per pixel
+            // the individual items this restores are sub-pixel and would
+            // alias into speckle; averaged down from an oversized render they
+            // contribute their real share of each pixel instead.
+            false,
+            None,
+            &mut counter,
+        );
+        set_default_camera();
+
+        // Read back and write before yielding: the texture is what was just
+        // drawn into, and letting the loop advance first would race the next
+        // frame's clear.
+        let image = downsample(&target.texture.get_texture_data(), ss);
+        match &mut video {
+            Some(writer) => writer.add_jpeg(&encode_jpeg(&image)?)?,
+            None => {
+                let path = request.dir.join(format!("frame_{index:05}.png"));
+                image.export_png(&path.to_string_lossy());
+            }
+        }
+
+        if index % 25 == 0 || index + 1 == total {
+            print!("\r  {}/{total}", index + 1);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+        // Hands the frame to the driver. Without it the whole export happens
+        // inside one displayed frame and the window sits unresponsive until
+        // it finishes.
+        next_frame().await;
+    }
+
+    if let Some(writer) = video {
+        let frames = writer.frames();
+        // Writes the index and patches the sizes that could not be known
+        // until the last frame landed. Skipping it leaves a file most players
+        // refuse outright, so a failure here is worth surfacing rather than
+        // leaving a plausible-looking but broken video behind.
+        writer.finish()?;
+        let size = std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
+        println!("\ndone: {frames} frames, {:.1} MB, {}", size as f64 / (1024.0 * 1024.0), video_path.display());
+    } else {
+        println!("\ndone: {} frames in {}", total, request.dir.display());
+    }
+    Ok(total)
+}
+
+/// One frame as JPEG.
+///
+/// macroquad hands back RGBA and JPEG has no alpha, so the alpha byte is
+/// dropped rather than composited: every pixel here came from a `clear_background`
+/// and opaque draws, so there is nothing to composite against.
+fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
+    // Rows are emitted last to first, which is not a stylistic choice: a
+    // render target reads back bottom-up, the way OpenGL stores it.
+    // `Image::export_png` undoes that itself, so the PNG sequence was always
+    // the right way up and this path, which touches `bytes` directly, was
+    // not. That is what shipped as a video playing upside down.
+    //
+    // Reversing here rather than at readback keeps the PNG path untouched,
+    // and costs one pass over the frame, which is nothing next to encoding
+    // it. See `avi.rs`, whose header now declares these rows top-down: the
+    // two have to agree, or fixing one just moves the flip.
+    let (width, height) = (image.width as usize, image.height as usize);
+    let mut rgb: Vec<u8> = Vec::with_capacity(width * height * 3);
+    for y in (0..height).rev() {
+        let row = &image.bytes[y * width * 4..(y + 1) * width * 4];
+        rgb.extend(row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+    }
+    let mut out = Vec::new();
+    // 85 rather than the usual default: this content is flat colour with hard
+    // edges between entity and background, which is exactly what low-quality
+    // JPEG smears into halos. It is also cheap to be generous here, since the
+    // content compresses well to begin with.
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 85)
+        .encode(&rgb, image.width as u32, image.height as u32, image::ColorType::Rgb8)
+        .map_err(std::io::Error::other)?;
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_world(
     frame: &RenderFrame,
@@ -1638,6 +1958,54 @@ async fn main() {
              for the reasons above, which usually means they were written by a different \
              version of this tool than the one reading them."
         );
+        return;
+    }
+
+    // Exporting is a one-shot job, not a mode of the browser, so it runs to
+    // completion and exits rather than becoming another branch inside the
+    // draw loop below. It exports the first surface, which `group_by_surface`
+    // already orders busiest-first, so the default is the one worth showing.
+    if let Some(request) = &args.export {
+        let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
+        let chosen: Vec<usize> = match request.surface.as_deref() {
+            // The default is the busiest surface, which `group_by_surface`
+            // already orders first, so the common single-surface case needs
+            // no flag at all.
+            None => vec![0],
+            Some(name) if name.eq_ignore_ascii_case("all") => (0..worlds.len()).collect(),
+            Some(name) => match available.iter().position(|s| s.eq_ignore_ascii_case(name)) {
+                Some(index) => vec![index],
+                // Naming what *is* there rather than only what is not: a
+                // surface name is easy to misremember, and the answer is
+                // always in the timelapse the user just pointed at.
+                None => {
+                    eprintln!("no surface called \"{name}\". This timelapse has: {}", available.join(", "));
+                    return;
+                }
+            },
+        };
+
+        // One subfolder per surface only when exporting more than one, so a
+        // single-surface export puts its frames exactly where it was told to
+        // rather than one level deeper than expected.
+        let per_surface = chosen.len() > 1;
+        for index in chosen {
+            let name = available[index].clone();
+            let dir = if per_surface { request.dir.join(&name) } else { request.dir.clone() };
+            println!("\nsurface {name}");
+            let this = ExportRequest {
+                dir,
+                width: request.width,
+                height: request.height,
+                surface: None,
+                fps: request.fps,
+                video: request.video,
+                supersample: request.supersample,
+            };
+            if let Err(e) = export_frames(&mut worlds[index], &registry, &sprites, &this).await {
+                eprintln!("export of {name} failed: {e}");
+            }
+        }
         return;
     }
 

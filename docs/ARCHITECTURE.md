@@ -266,6 +266,46 @@ worse than leaving it out.
   fill a live-capture log with removals indistinguishable from the player
   mining something. Confirmed against a real capture, where enemies were ~6%
   of exported entities.
+- **Space Age's own mobile enemies** (`spider-unit`, `spider-leg`,
+  `segmented-unit`, `segment`). Gleba's stompers and strafers, the legs they
+  walk on, and Vulcanus's demolishers with their trailing body segments. Only
+  Gleba's wrigglers are plain `unit`.
+- **Vehicles and rolling stock** (`car`, `spider-vehicle`, `locomotive`,
+  `cargo-wagon`, `fluid-wagon`, `artillery-wagon`). Rails, signals and
+  stations stay, being the stationary infrastructure that shows the network
+  growing, exactly as roboports stay while the robots do not.
+
+The last two were missed for a long time and are worth dwelling on, because
+neither was a judgement call that went the wrong way. They are the same rule
+failing to reach things nobody re-checked it against.
+
+`unit` is not "enemies", it is one prototype type, and Space Age gave its new
+enemies types of their own. The list was written when `unit` covered every
+mobile enemy in the game and was never revisited when that stopped being
+true. It surfaced only by reading a real Gleba capture, which held
+`small-stomper-pentapod`, `small-strafer-pentapod` and both of their `-leg`
+prototypes; since they roam, the auto-follow camera stretched to wherever they
+had wandered and the factory rendered as a smudge in untouched jungle.
+Demolishers are the same miss on another planet, found by looking rather than
+by waiting for a second bug report.
+
+Vehicles were never excluded at all, which is harder to explain away: the rule
+names movement, and a train is the most mobile thing in the game. Trains are
+also the worst case, because they never stop. A from-saves export catches them
+somewhere different in every save, so they blink around the rail network frame
+by frame; a live capture logs one add where a locomotive was placed and then
+shows it parked there for the rest of the playthrough.
+
+Prototype types here were read out of the game's own
+`space-age/prototypes/entity/enemies.lua` and `base/prototypes/entity/`,
+not inferred from names. That matters once: `spider-unit` sounds like it would
+catch Spidertron and does not, because Spidertron is `spider-vehicle`. Guessing
+would have excluded a player entity while leaving the enemies in.
+
+None of this helps a capture already on disk, where these entities are already
+recorded. `viewer/src/registry.rs` therefore names them too (`is_enemy`,
+`is_vehicle`), which cannot un-capture them but does stop them counting as
+construction for the auto-follow camera.
 
 Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
 being enemies, because they are stationary and so the format represents them
@@ -279,6 +319,56 @@ than by what the entity actually is, risking a real player entity.
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
 while carrying no information about factory growth.
+
+## What counts as the factory
+
+Being worth drawing and being worth *aiming at* are separate questions, and
+conflating them was a long-lived bug. Two things point themselves at the base:
+the auto-follow camera (`viewer/src/construction.rs`) and the terrain margin
+(`mod/export.lua`). Both need "where the buildings are", and both were being
+handed "where anything the capture kept is", which is not the same set.
+
+Trees, cliffs and resource deposits had each already been excluded from the
+camera's box, one at a time, as each was noticed dragging it toward untouched
+wilderness. Enemy nests and worms are the same problem and were missed longest,
+because unlike the others they are not scenery: they are kept on purpose, drawn
+red, and clearing them is worth watching. They are still generated rather than
+built, though, and they cover every generated chunk in every direction, so
+counting them made the box span the explored map. Since the camera centers on
+the box's **midpoint**, it centered on the middle of the revealed map rather
+than on anything anybody built.
+
+The mod side had the identical bug feeding the terrain margin, with trees in it
+too, so "32 tiles around the factory" was really 32 tiles around the explored
+map. That is most of where terrain capture's measured 5x came from.
+
+The Rust side filters by name (`is_terrain_scatter`, `is_resource`, `is_enemy`),
+which is a hand-maintained denylist and has needed a patch per planet. The mod
+side does not have to: it asks `entity.force`, which answers the question
+structurally, and it asks once per distinct prototype name rather than once per
+entity, since that loop runs on bases holding hundreds of thousands of them. The
+durable fix for the viewer is to carry force on the wire so it can stop guessing
+from names; the frame format's run flags have room for a bit that changes no
+layout, so an older reader would ignore it safely.
+
+### How much ground to capture
+
+`encode.terrain_margin` decides, and it is derived rather than picked. A fitted
+view leaves the difference between the base's shape and the frame's as empty
+world on whichever axis does not bind: a square base in 16:9 fills 52% of the
+width, so nearly half the picture is beyond the box. The margin is exactly that
+exposed region, computed from the output aspect and `AUTO_FOLLOW_FIT_MARGIN`.
+
+A single fraction of the base's larger dimension is the obvious rule and is
+wrong by an order of magnitude in both directions, because what a fit exposes
+depends on shape, not size: a 2:1 base needs 0.06 of its long side, a 1:2 base
+needs 1.4 of it.
+
+Shape-driven also means a long thin base asks for enormous amounts (a 100x5000
+corridor wants 4,800 tiles, which is 140M tiles of ground), so the result is
+capped to a 4M tile budget. That ceiling matters more than it looks: terrain is
+rewritten into **every** frame of a from-saves export, since unlike entities it
+cannot be skipped as unchanged, so its cost is multiplied by the frame count.
 
 ## Write batching
 
