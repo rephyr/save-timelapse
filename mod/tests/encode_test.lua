@@ -411,6 +411,12 @@ check("EXCLUDED_TYPES: does not contain roboport", excluded["roboport"], nil)
 -- of exported entities were biters/spitters/spawners before these were added,
 -- and that bulk was the mobile units rather than the nests that spawn them.
 check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true)
+-- Asteroid chunks drift and are collected continuously, and are never built,
+-- so every one logs a removal for something replay never had. On a real
+-- five-platform capture that was 6,101 of 6,259 events.
+check("EXCLUDED_TYPES: contains asteroid-chunk", excluded["asteroid-chunk"], true)
+-- ...but the collector is a structure worth watching go up.
+check("EXCLUDED_TYPES: does not contain asteroid-collector", excluded["asteroid-collector"], nil)
 -- Nests are deliberately captured despite being enemies: stationary, so the
 -- format represents them honestly, few enough to cost little, and watching
 -- them get cleared is how expansion actually reads in a timelapse. The viewer

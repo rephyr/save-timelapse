@@ -59,6 +59,18 @@ M.EXCLUDED_TYPES = {
   "smoke-with-trigger", "stream", "sticker", "beam",
   -- not yet real, or lying on the floor
   "entity-ghost", "tile-ghost", "item-entity",
+  -- Asteroid chunks. Same reasoning as biters and bots, and for the same two
+  -- reasons: they drift, so a format that records placement and removal but
+  -- never movement would pin one wherever it was first seen while the real
+  -- one moved on, and a platform collects them continuously.
+  --
+  -- The volume is the part that actually forced this. A chunk is never
+  -- *built*, only collected, so every one produces a removal for something
+  -- the replay never had: on a real capture with five platforms running,
+  -- 6,101 of 6,259 logged events were exactly that, and the replay warned
+  -- that almost nothing it read did anything. Collectors, silos and the rest
+  -- of a platform stay, since those are the structures worth watching go up.
+  "asteroid-chunk",
 }
 
 -- Natural terrain (grass, water, sand, dirt, ...) vastly outnumbers placed

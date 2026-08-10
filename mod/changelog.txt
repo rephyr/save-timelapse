@@ -1,4 +1,9 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.5.1
+Date: 2026-08-10
+  Bugfixes:
+    - Space platforms no longer flood the capture with thousands of useless records. Asteroid chunks are collected continuously and are never built by anyone, so every collection was recorded as the removal of something that had never been there. On a save with five platforms this was 6,101 of 6,259 recorded events, and made the desktop tool warn that almost nothing it read did anything. Collectors and the rest of a platform are still recorded
+---------------------------------------------------------------------------------------------------
 Version: 0.5.0
 Date: 2026-08-10
   Features:
