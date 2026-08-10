@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.5.0
+Date: 2026-08-10
+  Changes:
+    - Capture files are built to stay readable from here on. New capture features are now added in a way older versions of the desktop tool can step over instead of choking on, so the mod and the tool no longer have to be updated in lockstep
+    - Captures made with 0.4 keep working, and you do not need to reset your capture when updating to this version
+---------------------------------------------------------------------------------------------------
 Version: 0.4.0
 Date: 2026-08-09
   Features:
