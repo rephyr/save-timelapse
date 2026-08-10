@@ -466,11 +466,54 @@ fn known_color(name: &str) -> Option<Color> {
 /// `EXCLUDED_TYPES`), since the event log records construction and
 /// destruction but never movement, so a captured biter would sit frozen
 /// wherever it was first logged while the real one walked away.
+///
+/// Space Age's own mobile enemies, Gleba's pentapods and Vulcanus's
+/// demolishers, *should* be absent for that same reason and are not in any
+/// capture recorded so far: `EXCLUDED_TYPES` kept out Factorio's `unit` type,
+/// and Space Age gave its new enemies types of their own (`spider-unit`,
+/// `spider-leg`, `segmented-unit`, `segment`), so every one of them landed in
+/// captures as though somebody had built it. Found by reading a real Gleba
+/// capture, which holds `small-stomper-pentapod`, `small-strafer-pentapod`
+/// and both of their `-leg` prototypes.
+///
+/// `mod/encode.lua` excludes those types now, which fixes it at the source
+/// and helps no capture already on disk. Naming them here is what those
+/// captures get: it stops them counting as construction, which matters
+/// because they roam. On that same capture they held the auto-follow box
+/// open across the whole explored map, so the factory rendered as a smudge
+/// in the middle of untouched jungle.
+///
+/// Matching is by substring, which is safe here in the way
+/// `is_terrain_scatter`'s exact lists are not: no player-craftable entity
+/// carries either word. Pentapod eggs are an *item*, and items are not
+/// entities. `demolisher` covers the head and its `-segment` bodies at all
+/// three sizes together, the same way `pentapod` covers the size prefixes
+/// and `-leg` suffixes.
 pub fn is_enemy(name: &str) -> bool {
     if name == "captive-biter-spawner" {
         return false;
     }
-    name.contains("spawner") || name.ends_with("-worm-turret")
+    name.contains("spawner") || name.ends_with("-worm-turret") || name.contains("pentapod") || name.contains("demolisher")
+}
+
+/// Whether `name` is something that drives, walks or rolls: a car, a tank, a
+/// Spidertron, or a train.
+///
+/// Excluded from capture now (`mod/encode.lua`'s `EXCLUDED_TYPES`) under the
+/// same rule as robots and biters, and named here for the captures written
+/// before that, where they are already recorded. Not folded into `is_enemy`
+/// despite both feeding the same two callers: a locomotive is not an enemy,
+/// and colouring one enemy red on an existing capture would be a worse lie
+/// than leaving it the shade it already has.
+///
+/// Trains are the ones that actually matter. A from-saves export catches
+/// them somewhere different in every save, so they blink around the rail
+/// network frame by frame, and every position they were ever caught in would
+/// otherwise pull the camera. Rails, signals and stations are not here, being
+/// stationary infrastructure rather than the thing moving over it.
+pub fn is_vehicle(name: &str) -> bool {
+    matches!(name, "car" | "tank" | "spidertron" | "locomotive" | "cargo-wagon" | "fluid-wagon" | "artillery-wagon")
+        || name.starts_with("spidertron-leg-")
 }
 
 /// Whether `name` is a tree or cliff prototype: decorative terrain scatter
@@ -1082,6 +1125,60 @@ mod tests {
         ] {
             assert!(is_enemy(name), "{name} should be an enemy");
             assert!(known_color(name).is_some(), "{name} should be colored red, not hashed");
+        }
+    }
+
+    /// Every one of these was found in a real Gleba capture, having slipped
+    /// past `EXCLUDED_TYPES`'s `unit` filter because Space Age gave its new
+    /// enemies their own prototype types. They roam, so counting them as
+    /// construction held the auto-follow box open across the whole explored
+    /// map.
+    #[test]
+    fn glebas_pentapods_are_enemies_despite_not_being_units() {
+        for name in [
+            "small-stomper-pentapod",
+            "small-stomper-pentapod-leg",
+            "small-strafer-pentapod",
+            "small-strafer-pentapod-leg",
+            "medium-wriggler-pentapod",
+            "big-stomper-pentapod",
+        ] {
+            assert!(is_enemy(name), "{name} should be an enemy");
+        }
+    }
+
+    /// Vulcanus's demolishers, the other half of the same miss: a
+    /// `segmented-unit` head trailing `segment` bodies, neither of them the
+    /// `unit` type that was being filtered.
+    #[test]
+    fn vulcanus_demolishers_are_enemies() {
+        for name in ["small-demolisher", "medium-demolisher", "big-demolisher", "small-demolisher-segment"] {
+            assert!(is_enemy(name), "{name} should be an enemy");
+        }
+    }
+
+    #[test]
+    fn vehicles_and_rolling_stock_are_recognized() {
+        for name in ["car", "tank", "spidertron", "spidertron-leg-1", "locomotive", "cargo-wagon", "fluid-wagon"] {
+            assert!(is_vehicle(name), "{name} moves and should be recognized as a vehicle");
+        }
+    }
+
+    /// The infrastructure a train runs on is stationary and stays. Getting
+    /// this wrong would erase the rail network, which is one of the things
+    /// most worth watching a base grow.
+    #[test]
+    fn rails_and_stations_are_not_vehicles() {
+        for name in [
+            "straight-rail",
+            "curved-rail-a",
+            "rail-signal",
+            "rail-chain-signal",
+            "train-stop",
+            "artillery-turret",
+            "car-battery",
+        ] {
+            assert!(!is_vehicle(name), "{name} does not move and must be kept");
         }
     }
 

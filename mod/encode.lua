@@ -49,6 +49,39 @@ M.EXCLUDED_TYPES = {
   -- they share the "turret" type with player turrets, so excluding them
   -- would mean name-sniffing and risking a real player entity.
   "unit",
+  -- Space Age's own mobile enemies, which "unit" above does not cover
+  -- because they were given prototype types of their own. Gleba's stompers
+  -- and strafers are "spider-unit" and their legs "spider-leg"; Vulcanus's
+  -- demolishers are a "segmented-unit" head trailing "segment" bodies.
+  -- Only Gleba's wrigglers are plain "unit".
+  --
+  -- Found by reading a real capture rather than by reasoning: a Gleba
+  -- timelapse held small-stomper-pentapod and small-strafer-pentapod
+  -- alongside both their leg prototypes, every one of them logged as though
+  -- somebody had built it. They roam, so the auto-follow camera stretched
+  -- to cover wherever they had wandered and the factory rendered as a
+  -- smudge in the middle of untouched jungle.
+  --
+  -- "spider-unit" cannot catch a player entity: Spidertron is
+  -- "spider-vehicle", a separate type (base/prototypes/entity/entities.lua).
+  -- "spider-leg" does also cover Spidertron's own legs, which is correct
+  -- for the same reason everything else here is excluded.
+  "spider-unit", "spider-leg", "segmented-unit", "segment",
+  -- Vehicles and rolling stock. The rule that put every one of the above
+  -- here applies to these just as squarely, and they were simply missed:
+  -- "car" (cars and tanks), "spider-vehicle" (Spidertron) and the four
+  -- rolling stock types all move, and this format cannot say that anything
+  -- moved.
+  --
+  -- Trains are the worst of them, because they never stop. A from-saves
+  -- export catches them somewhere different in every save, so they blink
+  -- around the rail network frame by frame; a live capture logs one add
+  -- where the locomotive was placed and then shows it parked there for the
+  -- rest of the playthrough. Rails, signals and stations stay, being the
+  -- stationary infrastructure that actually shows the network growing,
+  -- exactly as roboports stay while the robots do not.
+  "car", "spider-vehicle",
+  "locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon",
   -- generic decorative/rock scatter, kept out for now: unlike trees and
   -- cliffs (rendered as ground context, see export.lua's terrain capture),
   -- this catch-all covers whatever else Space Age uses it for, which is
@@ -140,6 +173,85 @@ function M.expand_bbox(bbox, margin)
     { bbox.min_x - margin, bbox.min_y - margin },
     { bbox.max_x + margin, bbox.max_y + margin },
   }
+end
+
+--- The frame shape `M.terrain_margin` assumes a timelapse gets watched at.
+--- 16:9 is save-timelapse.exe's default export size and every resolution
+--- preset it offers, and it is what a video gets played back in regardless.
+local TERRAIN_VIEW_ASPECT = 16 / 9
+
+--- Matches `AUTO_FOLLOW_FIT_MARGIN` in `viewer/src/main.rs`: how much
+--- smaller than edge to edge the export camera fits the base, so the
+--- buildings have visible breathing room rather than touching the frame
+--- border. Named here because the margin below is derived from what that
+--- fit exposes, so the two have to agree to mean anything.
+local TERRAIN_VIEW_FIT = 0.92
+
+--- Ceiling on the region terrain is captured over, in tiles.
+---
+--- Needed because the margin below is driven by the base's *shape*, and a
+--- long thin one asks for enormous amounts: a 100x5000 rail corridor wants
+--- a 4800 tile margin, which is 140M tiles of ground, most of it nowhere
+--- near anything.
+---
+--- 4M is a 2000x2000 region. A 1000 tile wide base (a real megabase
+--- footprint) gets its full 16:9 framing covered without this ever
+--- engaging, and past that the camera is zoomed far enough out that ground
+--- detail stops reading anyway. It matters more than the raw number
+--- suggests because terrain is rewritten into *every* frame of a from-saves
+--- export, unlike entities it cannot be skipped as unchanged, so its cost
+--- is multiplied by the frame count.
+local TERRAIN_MAX_TILES = 4000000
+
+--- How far past `bbox` to capture natural ground, in tiles, never less than
+--- `base_margin`.
+---
+--- `base_margin` alone was the whole rule when this only had to serve a
+--- window somebody pans and zooms freely, where "roughly a chunk of
+--- context" is a complete answer. Video export fits the base into a frame
+--- of a fixed shape instead, and a fit leaves the difference between the
+--- two shapes as empty world on whichever axis does not bind: a square base
+--- in a 16:9 frame occupies 52% of its width, so nearly half the picture is
+--- beyond the box, and 32 tiles of that is nothing on a base a thousand
+--- tiles across.
+---
+--- So the margin is what the fit actually exposes rather than a guess.
+--- `fit_bounds` takes the smaller of the two axis zooms and backs off by
+--- `TERRAIN_VIEW_FIT`, so the visible region is the box grown to the
+--- frame's aspect and then by 1/fit. Each of the first two candidates below
+--- is that growth on one axis, and each goes negative when its axis is the
+--- one that binds, so taking the largest picks the right one with no
+--- branch. The third is the fit's own slack, which applies either way.
+---
+--- Deliberately *not* a fraction of the larger dimension, which is the
+--- obvious rule and is wrong in both directions, because how much empty
+--- space a fit leaves depends on the base's shape against the frame's, not
+--- on its size: a 2:1 base needs 0.06 of its long side and a 1:2 base needs
+--- 1.4 of it, so any single fraction is an order of magnitude out on one of
+--- them.
+function M.terrain_margin(bbox, base_margin)
+  if not bbox.min_x then
+    return base_margin
+  end
+  local w = bbox.max_x - bbox.min_x
+  local h = bbox.max_y - bbox.min_y
+  local slack = 1 / TERRAIN_VIEW_FIT
+
+  local wanted = math.max(
+    base_margin,
+    (h * TERRAIN_VIEW_ASPECT * slack - w) / 2,
+    (w * slack / TERRAIN_VIEW_ASPECT - h) / 2,
+    math.max(w, h) * (slack - 1) / 2
+  )
+
+  -- Largest margin keeping (w + 2m)(h + 2m) within the budget, i.e. the
+  -- positive root of 4m^2 + 2m(w + h) + wh - max = 0. Goes negative once
+  -- the base alone is over budget, which the outer max floors back to
+  -- `base_margin`: a base that size pays for its own ground either way, and
+  -- a chunk of edge around it is a rounding error next to that.
+  local affordable = (math.sqrt((w - h) * (w - h) + 4 * TERRAIN_MAX_TILES) - (w + h)) / 4
+
+  return math.floor(math.max(base_margin, math.min(wanted, affordable)))
 end
 
 M.FRAME_MAGIC = "STF1"

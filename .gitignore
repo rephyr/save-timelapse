@@ -14,10 +14,19 @@
 *.gif
 scan_*.json
 
+# Exported image sequences and video. The output folder is whatever gets
+# passed to --export, so this only covers the names the README suggests;
+# anything else is on you to keep out of a commit.
+/out/
+/out-*/
+/timelapses/
+*.avi
+
 # ...except intentional, committed demo media.
 !assets/*.mp4
 !assets/*.webm
 !assets/*.gif
+!assets/*.avi
 
 # Packaged mod
 /dist/

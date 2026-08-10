@@ -1,11 +1,11 @@
 {
   "name": "save-timelapse",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "title": "Save Timelapse",
   "author": "Emilia Sipola",
   "contact": "",
   "homepage": "",
   "factorio_version": "2.0",
-  "description": "Alpha release: expect bugs and breaking changes between versions. Turn the save files you already have into a timelapse of your factory. No need to have had a mod installed while you played - point the tool at your saves folder and it reconstructs the growth of your base.",
+  "description": "Alpha release: expect bugs and breaking changes between versions. Records your factory as you build it, then replays the whole thing in an interactive viewer you can pan, zoom and scrub through, or export as a video. It takes one snapshot and logs only what changes after that, so it stays cheap enough to leave running on a megabase. The companion tool can also build a timelapse from save files you already have, no mod needed.",
   "dependencies": ["base >= 2.0.0"]
 }

@@ -8,6 +8,7 @@
 //! exactly as before this split, so `main.rs` needed no import changes.
 
 mod activity;
+mod avi;
 mod camera;
 mod construction;
 mod draw_calls;
@@ -17,11 +18,13 @@ mod player_track;
 mod progress;
 mod registry;
 mod render_frame;
+mod resample;
 mod spans;
 mod sprites;
 mod timecode;
 
 pub use activity::{activity_heights, analyze_activity, recent_heat, Activity, HeatCell, HEAT_CELL_TILES};
+pub use avi::AviWriter;
 pub use camera::{
     entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition, Timeline,
     BASE_PIXELS_PER_TILE,
@@ -40,6 +43,7 @@ pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, SequenceBuilder, LOD_CELL_TILES,
     LOD_MAX_TILE_PIXELS,
 };
+pub use resample::downsample;
 pub use spans::{Span, SpanBuilder, SpanSet};
 pub use sprites::{icon_candidates, icon_path, icon_source_rect};
 pub use timecode::{format_game_time, TICKS_PER_SECOND};

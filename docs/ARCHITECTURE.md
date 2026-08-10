@@ -1,5 +1,65 @@
 # Architecture
 
+This document is long because it records *why* rather than *what*, including
+the approaches that were tried and rejected. Read this summary first and dip
+into the section you need; nothing below depends on being read in order.
+
+## In short
+
+**The constraint everything follows from.** Factorio's Lua sandbox cannot read
+files, open sockets, or spawn processes. A mod's only output channel is
+writing into `script-output`, and it can never read back what it wrote. So the
+mod and the desktop tool never communicate: the mod appends bytes, the tool
+reads the directory afterwards. Almost every design decision here is a
+consequence of that, and the recurring shape is **the mod states what it saw,
+and every hard question is answered on the Rust side, where the evidence
+actually exists.**
+
+**Two ways in, one way out.**
+
+    existing saves ──> CLI drives headless Factorio, mod exports each save ──┐
+                                                                             ├──> frames ──> viewer ──> video
+    live play ──────> mod snapshots once, then logs only what changes ──────┘
+
+A save file has no history of its own, so those two paths know completely
+different things and converge on the same on-disk shape.
+
+**Five decisions that shape everything else:**
+
+| Decision | Because |
+|---|---|
+| Custom binary formats, not JSON | The mod writes during real gameplay on bases of ~900k entities. Text formatting per entity *was* the cost. Runs plus delta varints plus a name dictionary took one megabase surface from 200 MB to 38 MB |
+| Unknown records are skipped, not fatal | Factorio auto-updates mods from the portal; the desktop tool does not update itself. "Mod newer than tool" is the normal state of anyone who installed once and kept playing |
+| Log changes, don't re-snapshot | At ~50 bytes per entity, snapshotting a megabase every ten seconds writes gigabytes an hour, all of it repeating what the log already says |
+| Reloads are resolved when reading | The mod *cannot* detect a reloaded save. Every value durable enough to survive a load lives in the save and rewinds with it |
+| Nothing under your Factorio install is touched | Exports run against a staged tree the CLI owns and deletes |
+
+**Three rules worth knowing before reading any section:**
+
+1. **This format records that something was built or destroyed, never that it
+   moved.** That one sentence explains the whole entity filter: robots,
+   biters, pentapods, trains and cars are excluded because the format would
+   pin them wherever they were captured while the real one carried on.
+2. **Being worth drawing and being worth aiming at are different questions.**
+   Nests are kept and drawn; they do not move the camera. Conflating the two
+   was a long-lived bug.
+3. **Core format layout is frozen at version 3.** Anything new is an extension
+   record with a length prefix, so an older reader skips exactly what it does
+   not understand.
+
+## Where to read what
+
+| If you want | Read |
+|---|---|
+| How a save becomes frames | Pipeline, Staging model, Export trigger |
+| The file formats | Frame format, Event format, Format stability |
+| Why captures survive version changes | Format stability and the extension contract |
+| What gets recorded and what does not | Entity filtering, What counts as the factory |
+| How live capture reassembles history | Live capture and replay, Why replay is forgiving |
+| The hardest problem here | Reloading an earlier save |
+| Why the viewer is fast | Rendering, Loading, Only writing surfaces that changed |
+| How a video gets made | Exporting a video |
+
 ## Components
 
     mod/     Lua mod loaded by Factorio. Exports entity data in a custom binary format.
@@ -266,6 +326,46 @@ worse than leaving it out.
   fill a live-capture log with removals indistinguishable from the player
   mining something. Confirmed against a real capture, where enemies were ~6%
   of exported entities.
+- **Space Age's own mobile enemies** (`spider-unit`, `spider-leg`,
+  `segmented-unit`, `segment`). Gleba's stompers and strafers, the legs they
+  walk on, and Vulcanus's demolishers with their trailing body segments. Only
+  Gleba's wrigglers are plain `unit`.
+- **Vehicles and rolling stock** (`car`, `spider-vehicle`, `locomotive`,
+  `cargo-wagon`, `fluid-wagon`, `artillery-wagon`). Rails, signals and
+  stations stay, being the stationary infrastructure that shows the network
+  growing, exactly as roboports stay while the robots do not.
+
+The last two were missed for a long time and are worth dwelling on, because
+neither was a judgement call that went the wrong way. They are the same rule
+failing to reach things nobody re-checked it against.
+
+`unit` is not "enemies", it is one prototype type, and Space Age gave its new
+enemies types of their own. The list was written when `unit` covered every
+mobile enemy in the game and was never revisited when that stopped being
+true. It surfaced only by reading a real Gleba capture, which held
+`small-stomper-pentapod`, `small-strafer-pentapod` and both of their `-leg`
+prototypes; since they roam, the auto-follow camera stretched to wherever they
+had wandered and the factory rendered as a smudge in untouched jungle.
+Demolishers are the same miss on another planet, found by looking rather than
+by waiting for a second bug report.
+
+Vehicles were never excluded at all, which is harder to explain away: the rule
+names movement, and a train is the most mobile thing in the game. Trains are
+also the worst case, because they never stop. A from-saves export catches them
+somewhere different in every save, so they blink around the rail network frame
+by frame; a live capture logs one add where a locomotive was placed and then
+shows it parked there for the rest of the playthrough.
+
+Prototype types here were read out of the game's own
+`space-age/prototypes/entity/enemies.lua` and `base/prototypes/entity/`,
+not inferred from names. That matters once: `spider-unit` sounds like it would
+catch Spidertron and does not, because Spidertron is `spider-vehicle`. Guessing
+would have excluded a player entity while leaving the enemies in.
+
+None of this helps a capture already on disk, where these entities are already
+recorded. `viewer/src/registry.rs` therefore names them too (`is_enemy`,
+`is_vehicle`), which cannot un-capture them but does stop them counting as
+construction for the auto-follow camera.
 
 Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
 being enemies, because they are stationary and so the format represents them
@@ -279,6 +379,56 @@ than by what the entity actually is, risking a real player entity.
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
 while carrying no information about factory growth.
+
+## What counts as the factory
+
+Being worth drawing and being worth *aiming at* are separate questions, and
+conflating them was a long-lived bug. Two things point themselves at the base:
+the auto-follow camera (`viewer/src/construction.rs`) and the terrain margin
+(`mod/export.lua`). Both need "where the buildings are", and both were being
+handed "where anything the capture kept is", which is not the same set.
+
+Trees, cliffs and resource deposits had each already been excluded from the
+camera's box, one at a time, as each was noticed dragging it toward untouched
+wilderness. Enemy nests and worms are the same problem and were missed longest,
+because unlike the others they are not scenery: they are kept on purpose, drawn
+red, and clearing them is worth watching. They are still generated rather than
+built, though, and they cover every generated chunk in every direction, so
+counting them made the box span the explored map. Since the camera centers on
+the box's **midpoint**, it centered on the middle of the revealed map rather
+than on anything anybody built.
+
+The mod side had the identical bug feeding the terrain margin, with trees in it
+too, so "32 tiles around the factory" was really 32 tiles around the explored
+map. That is most of where terrain capture's measured 5x came from.
+
+The Rust side filters by name (`is_terrain_scatter`, `is_resource`, `is_enemy`),
+which is a hand-maintained denylist and has needed a patch per planet. The mod
+side does not have to: it asks `entity.force`, which answers the question
+structurally, and it asks once per distinct prototype name rather than once per
+entity, since that loop runs on bases holding hundreds of thousands of them. The
+durable fix for the viewer is to carry force on the wire so it can stop guessing
+from names; the frame format's run flags have room for a bit that changes no
+layout, so an older reader would ignore it safely.
+
+### How much ground to capture
+
+`encode.terrain_margin` decides, and it is derived rather than picked. A fitted
+view leaves the difference between the base's shape and the frame's as empty
+world on whichever axis does not bind: a square base in 16:9 fills 52% of the
+width, so nearly half the picture is beyond the box. The margin is exactly that
+exposed region, computed from the output aspect and `AUTO_FOLLOW_FIT_MARGIN`.
+
+A single fraction of the base's larger dimension is the obvious rule and is
+wrong by an order of magnitude in both directions, because what a fit exposes
+depends on shape, not size: a 2:1 base needs 0.06 of its long side, a 1:2 base
+needs 1.4 of it.
+
+Shape-driven also means a long thin base asks for enormous amounts (a 100x5000
+corridor wants 4,800 tiles, which is 140M tiles of ground), so the result is
+capped to a 4M tile budget. That ceiling matters more than it looks: terrain is
+rewritten into **every** frame of a from-saves export, since unlike entities it
+cannot be skipped as unchanged, so its cost is multiplied by the frame count.
 
 ## Write batching
 
@@ -945,6 +1095,119 @@ already writes every surface at one tick, and `save-timelapse-replay
 all-surfaces` does the same across a whole timelapse. Each world keeps its
 own `Camera`, fitted to its own frames at load time, so switching to another
 world and back doesn't disturb either one's pan/zoom.
+
+## Exporting a video
+
+    growing bounds ─> camera fit ─> draw offscreen at (w·N, h·N)
+                                          │
+                          get_texture_data()   RGBA, bottom up
+                                          │
+                          downsample()         box average N·N ─> w x h
+                                          │
+                          encode_jpeg()        flip rows, RGB, quality 85
+                                          │
+                          AviWriter::add_jpeg()    one "00dc" chunk
+                                          │
+                          finish()             index, then patch four sizes
+
+Each frame is encoded and appended as it is drawn, so memory stays at one
+frame however long the timelapse runs.
+
+### Motion JPEG in an AVI, written by hand
+
+`viewer/src/avi.rs` is a few hundred lines of laying out headers, which is the
+point: the promise is that you run the executable and that is it, nothing to
+install. Linking or shelling out to ffmpeg would break that for the one
+feature most likely to be used by somebody who just wants something to post.
+
+MJPEG is "every frame is a complete JPEG", so there is no inter-frame
+prediction, no bitrate control and no encoder state to get wrong, and every
+mainstream player reads it. The cost is size, since the file is roughly the
+sum of its frames. That is only the right trade because a timelapse is flat
+colour on a dark background, which JPEG compresses hard.
+
+Four fields cannot be known until the last frame lands: the RIFF size, the
+`movi` list size, and the frame count, which appears in **two** separate
+headers. They are written as zero and patched by seeking back, which is why
+`AviWriter::create` takes a path rather than a writer.
+
+Three things that break a file quietly rather than loudly, each with a test:
+RIFF chunks are word aligned, so an unpadded odd-length frame shifts
+everything after it and the file stops parsing partway; index offsets are
+relative to the `movi` fourcc, and getting that wrong still plays but breaks
+seeking, the one thing an index is for; and `dwSuggestedBufferSize` is
+nominally advisory but some decoders size their input buffer from it and
+truncate anything larger.
+
+The tests parse the file the way a player does, following chunk sizes, rather
+than reading fixed offsets. A size wrong by one is exactly the bug worth
+catching, and a fixed-offset assertion sails straight past it.
+
+### Which way up
+
+Video shipped upside down, and it took two agreeing fixes, which is worth
+recording because either alone just moves the flip.
+
+A render target reads back bottom up, the way OpenGL stores it. macroquad's
+`Image::export_png` undoes that itself, so the PNG sequence was always right
+and the JPEG path, which touches `bytes` directly, was not. The other half is
+`biHeight` in the `BITMAPINFOHEADER`, which carries row order **in its sign**:
+positive means bottom up (the DIB convention, and the one written by
+accident), negative means top down. Declaring the truth is also the more
+compatible choice, since a player that ignores the sign treats MJPEG as top
+down anyway, so both kinds of player agree.
+
+### Full detail, supersampled
+
+An export renders at `N` times the requested size and averages down.
+
+The averaging is not cosmetic. At 1080p a 2,900 tile base puts about three
+tiles behind every output pixel, so at one sample per pixel whichever entity
+a pixel lands on wins it outright and the other two tiles are simply gone,
+and which one wins changes frame to frame as the camera creeps. A box filter
+is the correct kernel rather than merely the cheap one: the samples cover
+exactly one output pixel's area, so their unweighted mean *is* that pixel's
+coverage. Bicubic would be reaching outside the pixel to reconstruct a
+continuous signal, and the source is flat quads with hard edges.
+
+That in turn is what makes **chunk LOD wrong for an export**. LOD exists to
+keep a live frame rate up by not submitting items too small to perceive, and
+an export has no frame rate to protect: it renders one frame at a time, as
+slowly as it likes. What it was costing is real, since a cell keeps only its
+dominant type, so at these zooms a paved area swallowed every belt and
+machine running through it. Full detail is only sound *because* of
+supersampling, since at one sample per pixel the items it restores are
+sub-pixel and alias into speckle.
+
+Measured on a real 860k entity base, 41 frames at 1080p: 4x supersampling
+cost about 3% more wall clock than 2x, because the bottleneck is submitting
+entities rather than fill rate or the downsample. The shipped default is
+still 2, since a 7680x4320 readback is 132 MB per frame and that is not a
+thing to default to on hardware nobody has checked.
+
+### The bug that made all of this hard to see
+
+`view_bounds` culled against `screen_width()`/`screen_height()`, which are the
+**window's** dimensions. That is the same thing only while drawing to the
+window. An export renders into an offscreen target of whatever size was asked
+for, so culling to the window threw away everything outside a window-sized
+corner of it, and at the default 1280x800 window every 1080p export was
+silently cropped to its top-left two thirds.
+
+It resisted diagnosis because it looks exactly like a framing problem, and
+framing is genuinely worth improving, so two rounds of camera work went past
+it. What settled it was numeric: two exports with deliberately different
+camera bounds produced byte-identical content boxes. Framing changes could
+not move the output because framing was never what was wrong.
+
+`view_bounds` now derives the surface size from `screen_center * 2.0`. Every
+caller already builds `screen_center` as exactly half the surface it is
+drawing to, so it is the same number by a route that cannot go stale, and it
+takes the last window global out of the draw path. The lesson worth keeping
+is that a rendering bug deserves a measurement of the rendered pixels before
+any theory about the camera: a ten-line check of a PNG's non-background
+bounding box, and whether it touches an edge, would have found this
+immediately.
 
 ## Concurrency
 

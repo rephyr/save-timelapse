@@ -2,325 +2,212 @@
 
 [![CI](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml/badge.svg)](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml)
 
-Save Timelapse is a Factorio timelapse mod and companion desktop application for creating interactive, explorable timelapses of your Factorio factory.
+**Watch your Factorio factory grow without sacrificing performance.**
 
-> Watch your Factorio factory grow. Record it live as you play, or build a timelapse from Factorio saves you already have.
+Save Timelapse is an interactive Factorio timelapse tool built for large factories and long-running saves. Its live capture records your factory as you play using an initial snapshot followed by incremental changes, avoiding repeated full-world exports.
 
-**Save Timelapse reconstructs your factory's history as an interactive replay**, not a fixed video. Pan, zoom, scrub through construction history, and watch your base grow from a small starter factory into a massive megabase.
+The result is an interactive replay you can pan, zoom, scrub, and explore. It is designed to stay efficient even as your factory reaches hundreds of thousands of entities, with optimized binary storage, parallel loading, memory-efficient replay data, and a renderer built for megabase-scale factories.
 
-The companion tool automatically detects your Factorio saves folder, so you can generate a timelapse from existing saves with no manual setup. For live capture, install the mod and enable the `save-timelapse-live-capture` setting to record your factory as you play.
+Already have a factory? Save Timelapse can also reconstruct a timelapse from your existing Factorio save files, even if you never had the mod installed while playing.
 
-> ⚠️ **Alpha:** The core pipeline is functional, but the project is under active development. Expect bugs, missing features, and breaking changes between releases.
+![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
 
----
-## Features
-
-- 📦 Build timelapses from **existing save files**
-- 🎮 Live capture mode with minimal performance impact
-- 🎛️ In-game panel to control live capture: start/stop, choose which surfaces are recorded, and reset
-- 🗂 Capture management in the desktop tool: name each playthrough, see its size on disk, and delete ones you are finished with
-- 📂 Built timelapses are kept, so you can close the tool and reopen one later instead of rebuilding it
-- 🗺 Interactive viewer with pan, zoom and timeline scrubbing
-- 🌍 Multi-surface support (Nauvis, platforms, planets)
-- 🏁 Milestone markers on the timeline: first science packs, first rocket, planets reached, in both live capture and timelapses built from existing saves
-- ⚡ Chunked renderer with automatic level-of-detail rendering
-- 🦀 Written in Rust for performance
-- 🔧 No Python, command-line tools or FFmpeg required
-
----
-
-## Try it without owning Factorio
-
-The repository ships five real exported frames, so the viewer can be run
-against genuine captured data with nothing else installed:
-
-```bash
-cargo run -p viewer --release --bin viewer -- tests/fixtures/frames
-```
-
-A factory growing from 240 to 22,971 entities across 58 entity types,
-captured from a real 100 hour Space Age save. Scrub the timeline, zoom in far
-enough for sprites, press `h` for the construction heatmap.
-
-The exporter can be developed and tested without the game too. `fake-factorio`
-is a binary in this crate that implements enough of Factorio's command line to
-exercise the real export path, including reading back the staged
-`mod-settings.dat` so a test proves the settings staging actually worked
-rather than assuming it. See [tests/fixtures/README.md](tests/fixtures/README.md).
+> ⚠️ **Alpha.** The core pipeline works, but the project is still under active development. Expect bugs and changes between releases.
 
 ---
 
 ## Why Save Timelapse?
 
-Most Factorio timelapse tools have one major limitation:
+### 🎮 Live capture with low overhead
 
-> They only start recording after you install them.
+Enable live capture and Save Timelapse takes one initial snapshot of your factory. After that, it records only the changes that happen as you play instead of repeatedly exporting the entire factory.
 
-Save Timelapse can reconstruct a timelapse from the saves already sitting in your saves folder. If you've kept autosaves or milestone saves, you can build a timelapse of a factory that was created weeks or months ago.
+This makes it practical for long-running games and large factories where repeatedly scanning hundreds of thousands of entities would be expensive.
 
-For ongoing factories, enable live capture once and the mod records only incremental changes instead of repeatedly exporting the whole world.
+### ⚡ Built for megabase-scale performance
 
----
+Large Factorio factories create a lot of data. Save Timelapse is designed around that problem rather than treating it as an afterthought.
 
-## Installation
+- Custom binary formats instead of JSON for high-volume data
+- Incremental event recording during live capture
+- Compact frame storage
+- Parallel frame loading across CPU cores
+- Memory-efficient replay representation
+- Chunk-based rendering and level of detail
+- GPU draw-call batching
+- World-space culling before rendering
 
-Two separate downloads, depending on what you want to do.
+The result is a viewer that can handle captures containing hundreds of thousands of entities without loading a full duplicate of every frame into memory.
 
-**The tool** (`save-timelapse.exe` + `viewer.exe`): needed either way, since this is what builds and shows the timelapse.
+### 📦 Use saves you already have
 
-1. Download the latest release from [GitHub Releases](https://github.com/rephyr/save-timelapse/releases)
-2. Unzip `save-timelapse.exe` and `viewer.exe` into the same folder (the first launches the second, so they need to sit together)
-3. Run `save-timelapse.exe`
+Save Timelapse does not require you to have been recording beforehand.
 
-**The mod**: only needed for live capture, not for building a timelapse from saves you already have.
-
-- Get it from the [Factorio mod portal](https://mods.factorio.com/mod/save-timelapse), or install it in-game via Settings > Mods > Install mods
-- Enable the `save-timelapse-live-capture` runtime setting to start recording
-
-No changes are made to your Factorio installation or mods folder unless you install the mod yourself.
-
----
-
-## Screenshots
-- Overview of the current state of the tool
-![Tool overview](assets/overview.gif)
-
-- Timeline scrubbing
-![Timeline scrubbing](assets/scrubbing.gif)
-
-- Zoomed sprite rendering
-![Sprite rendering](assets/sprites.PNG)
-
-- Camera auto-follow gradually zooming out as the base grows
-![Camera auto-follow](assets/camera-follow.gif)
+If you have autosaves or milestone saves from an existing factory, the companion tool can use those saves to reconstruct its history. It runs Factorio in an isolated environment, exports the selected saves, and builds them into the same replay format used by live capture.
 
 ---
 
-## How it works
+## Install
 
-Save Timelapse supports two workflows.
+Save Timelapse has two parts: a desktop companion tool and an optional Factorio mod.
 
-### Existing saves
+### Build a timelapse from existing saves
 
-The application:
+You only need the companion tool.
 
-1. Finds your Factorio installation
-2. Launches Factorio in headless mode
-3. Exports each selected save
-4. Reconstructs the world
-5. Opens the interactive viewer
+1. Download the latest [release](https://github.com/rephyr/save-timelapse/releases).
+2. Unzip `save-timelapse.exe` and `viewer.exe` into the same folder.
+3. Run `save-timelapse.exe`.
 
-It also asks whether to include natural terrain (grass, water, trees,
-cliffs) around the base. Worth it for how much more it looks like a real
-place, but it's a real cost, not a free improvement: roughly 5x more export
-time and file size in testing, so it's an explicit yes/no each run rather
-than always on.
+The tool automatically finds your Factorio installation and saves folder and remembers your settings for future runs.
 
-No changes are made to your real installation or mod folder.
+It asks whether to include natural terrain, meaning the grass, water, trees and cliffs around your factory. It looks considerably better with it, but it makes the export larger and slower, so it is a choice you make each run.
 
----
+### Record while you play
 
-### Live capture
+Install the Save Timelapse mod from the [Factorio Mod Portal](https://mods.factorio.com/mod/save-timelapse) or through **Settings > Mods > Install mods**.
 
-Enable the runtime setting:
+Enable the `save-timelapse-live-capture` runtime setting.
 
-```
-save-timelapse-live-capture
-```
+The mod takes an initial snapshot and then records changes as you play.
 
-The mod:
+Press **Control+Shift+T** in game, or use the toolbar button, to open the live capture control panel.
 
-- performs one initial snapshot
-- records only entity additions/removals afterwards
-- writes a compact binary format: entities are grouped by type and their
-  positions stored as small deltas, which measured roughly 5x smaller than
-  the previous format on a megabase (a 200 MB surface export became 38 MB)
-  while also being faster to write than the format it replaced
-- tags every capture with which playthrough it belongs to, so saves from
-  different games never get mixed into one timelapse
+From the panel you can:
 
-Whenever you want to view the replay, simply launch Save Timelapse. If more
-than one playthrough has capture data waiting, it asks which one to build
-the timelapse from.
+- Start and stop live capture
+- Choose which planets and space platforms to record
+- Add previously skipped surfaces and generate catch-up baselines
+- Reset the current capture
 
-Click the Save Timelapse shortcut in the top toolbar (or press
-Control+Shift+T) to open the in-game control panel: toggle live capture,
-exclude individual surfaces from recording (including planets you haven't
-visited yet), or reset capture. Excluding a surface skips its baseline
-entirely, not just its ongoing events, so a huge base you don't care about
-tracking (a sprawling Nauvis factory, say, while you only want a smaller
-Gleba outpost recorded) doesn't cost anything to capture. Checking a box
-only records the choice; press **Generate** to actually take a catch-up
-baseline for whatever you just included, so ticking several surfaces first
-batches into one freeze instead of one per box, without touching any other
-surface's already-recorded history. Resetting (behind a confirmation
-dialog, since it's permanent) deletes this playthrough's own capture files
-and retakes the baseline, so files no longer need to be deleted by hand
-first.
+> **The initial snapshot pauses the game.** It reads your entire factory in one go, which on a very large base takes a few tens of seconds. The mod tells you how many entities it is about to read and gives you a moment before it starts. This happens once, and everything afterwards is incremental, so it has no ongoing effect on your game. Surfaces you exclude in the panel are skipped entirely, so you never pay for a base you did not want recorded.
 
-> Upgrading from an older version? Run `/timelapse-reset-capture` once
-> in-game (or use the panel's reset button) so your current playthrough
-> starts a freshly tagged capture.
-
-Terrain works differently here, since save-timelapse.exe only reads a
-baseline after the mod already took it, not before: enable the
-`save-timelapse-capture-terrain` **startup** setting (off by default, same
-reasoning as above) before your baseline is taken if you want it included
-in a live capture (see [Known Limitations](#known-limitations)).
+> **Want terrain in a live capture?** Enable `save-timelapse-capture-terrain` before the initial snapshot is taken. It is a **startup** setting, so Factorio restarts when you change it. Terrain cannot be added to a capture afterwards, and switching it on later means resetting the capture and losing what you have recorded so far.
 
 ---
 
-## Viewer
+## Interactive viewer
 
-Current features:
+The replay is designed to be explored rather than simply watched.
 
-- Pan
-- Zoom
-- Timeline scrubbing, labelled with elapsed in-game time at each end and at the playhead, and hovering the bar shows the time and frame number at that point before you commit to a seek
-- Activity graph along the scrub bar: how much got built at each point in the run, so busy stretches and idle ones are visible at a glance without playing through them
-- Construction heatmap (`h` to toggle, off by default): warm overlay showing where building happened over the last few frames, drawn under the factory so it never obscures what you built
-- Milestone markers under the scrub bar: the first of each science pack, the first rocket launch, and each planet reached, coloured by science pack and labelled on hover
-- Play / Pause (`-`/`=` adjust speed, 0.25x-8x)
-- Jump between notable moments: `m` for the next milestone or bookmark, `c` for the next busy stretch of building, and hold shift with either to go backwards
-- Bookmarks (`b` to set or clear one at the current frame), drawn as yellow ticks above the scrub bar and saved beside the frames, so they are still there next time you open that timelapse
-- Home / End navigation
-- Surface switching
-- Player position marker
-- Camera auto-follow (on by default, `f` to toggle off): gradually pans and zooms out to keep the whole base in frame as it grows, the way TLBE's own camera does
-- Sprite rendering
-- Entity rotation (belts only for now, see [Known Limitations](#known-limitations))
-- Flat-color LOD rendering
-- Parallel loading
-- Progress indicator
+- 🗺️ Pan and zoom around your factory
+- ⏱️ Scrub through the entire timeline
+- ▶️ Play at 0.25x to 8x speed
+- 🏁 Jump between milestones
+- 📊 See construction activity over time
+- 🔥 View a construction heatmap
+- 🔖 Add bookmarks
+- 🌍 Switch between planets and space platforms
+- 👤 Track player position, in timelapses recorded with live capture
+
+![Scrubbing through a Factorio factory construction timeline](assets/scrubbing.gif)
+
+### Viewer controls
+
+| Key | Action |
+|---|---|
+| Drag / scroll | Pan and zoom |
+| `Space` | Play / pause |
+| `-` / `=` | Decrease / increase playback speed |
+| `←` / `→` or `,` / `.` | Step one frame |
+| `Home` / `End` | Jump to start / end |
+| `Tab` | Switch planet or platform |
+| `M` | Next milestone or bookmark |
+| `Shift+M` | Previous milestone or bookmark |
+| `C` | Next busy construction period |
+| `Shift+C` | Previous busy construction period |
+| `B` | Add or clear bookmark |
+| `F` | Toggle camera auto-follow |
+| `H` | Toggle construction heatmap |
+| `S` | Toggle entity icons |
+
+![Camera automatically following a growing Factorio base](assets/camera-follow.gif)
+
+![Factorio entities drawn as icons when zoomed in](assets/sprites.PNG)
 
 ---
 
-## Building
+## Export a video
+
+Exporting is done from the companion tool rather than from inside the viewer. Run `save-timelapse.exe`, choose the video option, and pick a timelapse, a resolution and a frame rate. The finished file is written to a `videos` folder next to the program.
+
+No FFmpeg or other video software is needed. You can also export a numbered image per frame instead, for editing the result yourself.
+
+---
+
+## Try it without Factorio
+
+The repository includes real captured frames from a 100-hour Space Age factory.
 
 ```bash
-cargo build --release
-cargo test --workspace
+cargo run -p viewer --release --bin viewer -- tests/fixtures/frames
 ```
 
-The Lua mod requires no build step, but it has its own test suite, which
-needs a Lua interpreter that `cargo test` deliberately does not depend on:
+The included capture grows from 240 to 22,971 entities, allowing the renderer to be tested without a Factorio installation.
 
-```bash
-make test-lua                 # needs `lua` on PATH
-make test-lua LUA=lua52       # or point it at a specific interpreter
-```
+---
 
-Use **Lua 5.2**, the version Factorio's modding API is. The suite passes
-under 5.1 through 5.5 alike, so a newer interpreter looks healthy while
-accepting syntax (`//`, `&`, `~`) and library functions (`string.pack`,
-`math.type`) that Factorio will not run.
+## Known limitations
+
+- **Moving entities are not recorded.** Biters, pentapods, demolishers, flying robots, vehicles, Spidertrons, and trains are excluded rather than being shown frozen in place.
+- **Live capture starts when enabled.** Earlier factory history requires existing save files.
+- **Save-based milestones depend on save frequency.** Live capture records milestone timing precisely, while existing saves can only identify the first save that shows an event.
+- **Bot construction is less visible in the heatmap.** Automated construction is spread across multiple frames, while manual building can create many entities in a single frame.
+- **Entity rotation is limited.** Belts render with their correct direction, while most other entities remain unrotated because their icons are not designed to rotate convincingly.
 
 ---
 
 ## Roadmap
 
-### v0.1
+### Shipped
 
-- [x] Existing save export
-- [x] Live capture
-- [x] Interactive replay
-- [x] Timeline scrubbing
-- [x] Chunked renderer
-- [x] Sprite rendering
-- [x] LOD rendering
+- **v0.1:** Save export, live capture, interactive replay, timeline scrubbing, chunked renderer, sprites, LOD
+- **v0.2:** Checksums, format versioning, playback speed, terrain rendering, player tracking, camera auto-follow
+- **v0.3:** Terrain optimization, entity rotation, capture recovery, in-game control panel, surface selection
+- **v0.4:** Timeline timestamps, activity graph, heatmap, milestones, capture management
+- **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
 
-### v0.2
+### v0.6
 
-- [x] Checksums and format versioning
-- [x] Adjustable playback speed
-- [x] Documentation, screenshots, and GIFs
-- [x] Terrain and terrain-scatter rendering
-- [x] Player position tracking
-- [x] Camera auto-follow
-
-### v0.3
-
-- [x] Terrain capture optimization
-- [x] Entity rotation tracking
-- [x] Robust capture recovery and diagnostics
-- [x] In-game live capture control panel
-- [x] Safer capture reset
-- [x] Per-surface capture selection
-- [x] Mid-playthrough surface baselines
-- [x] Improved baseline warnings
-
-### v0.4
-
-- [x] Timeline timestamps and hover information
-- [x] Construction activity graph and map heatmap
-- [x] Milestone markers (first of each science pack, first rocket, each planet reached)
-- [x] Capture management: name your captures, see what they cost on disk, delete ones you are done with
-
-### v0.5
-
-- [x] Settled capture format: extension records make future additions skippable, so the mod and the tool no longer have to be updated in lockstep
-- [x] Milestones for timelapses built from existing saves, recovered by comparing consecutive saves
-- [x] Skip writing frames that changed nothing: a surface is only written at moments something on it changed, measured at 90% smaller on a real nine-surface megabase export
-- [x] Complete tile change tracking: removing a placed tile restores what it was covering, so mining landfill puts the water back
-- [x] Settings persistence and first-run setup: where Factorio is, seconds per frame, and the terrain choice are remembered between runs
-- [x] Bookmarks and jumping between milestones and busy stretches
-- [x] Linux builds
+- [x] Image sequence export at any resolution
+- [x] Video export
+- [x] Oversampled rendering for sharper video
+- [x] Improved camera framing
+- [x] Exclude moving entities from capture
 
 ### v1.0
 
-- [ ] Broader modded-game compatibility
+- [ ] Broader modded-game support
 - [ ] Smarter camera auto-follow
 - [ ] Camera keyframes and cinematic controls
-- [ ] Export resolution and FPS controls
-- [ ] MP4 video export
-- [ ] Polished export workflow
-- [ ] Single binary, so the tool and viewer cannot be separated
-- [ ] Stable capture format and format migration
+- [ ] MP4 export
+- [ ] Single-binary distribution
+- [ ] Stable capture format with migration
 
 ---
 
-## Architecture
+## For developers
 
-```
-Factorio Save
-        │
-        ▼
- Lua Export Mod
-        │
-        ▼
- Binary Snapshot + Event Log
-        │
-        ▼
- Replay Engine (Rust)
-        │
-        ▼
- Interactive Renderer
+```bash
+cargo build --release
+cargo test --workspace
+make test-lua LUA=lua52
 ```
 
-More details are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-including the wire formats, the extension contract that keeps captures
-readable across versions, and why the mod cannot detect a reloaded save.
+Documentation:
 
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) covers what was optimized, by how
-much, and how to re-measure all of it: 5x smaller frames, 90% smaller exports,
-37.7x less viewer memory. It also records what was measured and then
-**rejected**, which is the more useful half.
+- [Architecture](docs/ARCHITECTURE.md)
+- [Performance](docs/PERFORMANCE.md)
+- [Testing](docs/TESTING.md)
+- [Test fixtures](tests/fixtures/README.md)
 
----
-
-## Known Limitations
-
-- **Tile reverts need terrain capture on:** Removing a placed tile restores whatever it was covering, so mining landfill puts the water back rather than leaving a hole. With terrain capture off there is deliberately no natural ground in the timelapse, so the tile simply disappears instead. Only applies to tiles removed while capture is running: a tile already gone before capture started was never seen either way.
-- **Entity rotation:** Rotation is currently limited to a small allowlist of confirmed entities, such as transport belts. Other icons use an oblique 3D-style perspective and do not rotate correctly. Rotation also only works for square-footprint entities.
-- **From-saves milestones are only as precise as your save cadence:** A save records that a science pack has been produced, never when it first was, so a timelapse built from existing saves marks each milestone at the first save that shows it. A pack first produced an hour before the save that first mentions it is marked at that save, not an hour earlier. Live capture watches them happen and is exact. Building from an already established base also opens with a cluster of markers, since everything already done is reported by the earliest save; that is accurate rather than tidy, and live capture does the same thing when switched on mid-playthrough.
-- **The construction heatmap barely registers bot building:** The overlay scales every cell against the busiest single cell of the whole run, and that peak is almost always a blueprint landing hundreds of entities in one frame. Construction robots place the same blueprint gradually over many frames instead, so each frame contributes a small fraction of what an instant placement does and the glow stays dim or invisible even while a large area is genuinely being built. The activity graph along the scrub bar has the same cause and shows bot work as a long low plateau rather than a spike. Separately, space platform construction was not recorded at all before v0.5, which looked like the same problem but was a different one and is fixed.
-- **Nothing that moves is recorded:** The capture format records that something was built or destroyed, never that it moved, so biters, spitters and flying construction/logistics robots are deliberately excluded rather than drawn frozen wherever they happened to be. Stationary enemies are kept: nests and worms appear in red, so clearing them is visible as the front line moves outward.
+The exporter can also be developed and tested without owning Factorio.
 
 ---
 
 ## Contributing
 
-Issues, bug reports and feature suggestions are welcome.
+Issues, bug reports, performance reports, and feature suggestions are welcome.
 
 ---
 

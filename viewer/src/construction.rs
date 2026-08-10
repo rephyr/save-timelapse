@@ -31,11 +31,70 @@
 //! resource sits wherever the map generated it, and a distant oil field can
 //! pull the tracked area out toward it just as easily as a distant tree (see
 //! `registry::is_resource`).
+//!
+//! Enemy nests and worm turrets are excluded for that same reason a third
+//! time (see `registry::is_enemy`). They are kept in the capture because
+//! they are stationary, so the format represents them honestly and clearing
+//! them is worth watching, but a spawner sits wherever the map generated it,
+//! exactly like a tree or an ore patch. Counting them was the worst case of
+//! the three: nests cover every generated chunk in every direction, so the
+//! tracked box spanned the whole explored map rather than the factory, and
+//! since the box's midpoint is what the camera centers on, it centered on
+//! the middle of the revealed map instead of on anything built.
+//!
+//! ## Not everything built is worth aiming at
+//!
+//! Excluding what the map generated is necessary and turned out not to be
+//! sufficient, because the remaining offenders are genuinely player built.
+//! Measured on a real 860k entity megabase, the four entities defining the
+//! box were a gun turret, two stone walls and a rail chain signal: the
+//! *defended perimeter and the rail outposts*, enclosing a great deal of
+//! land nobody built anything on. The factory filled well under half of the
+//! resulting frame, and no amount of filtering by prototype fixes that,
+//! since a wall is exactly as player built as an assembling machine.
+//!
+//! So the box is taken over where the buildings actually *are*, not over
+//! their extremes. Entity counts go into a per-axis histogram of chunk-sized
+//! bins, and each end is walked inward while the entities given up stay
+//! inside a small budget. That is deliberately not a percentile filter with
+//! extra steps: the point is that **empty bins are free**, so the walk
+//! crosses the whole gap between a perimeter and the factory at no cost and
+//! halts the instant it meets real density. A thin wall line is affordable;
+//! the first genuine factory bin never is.
+//!
+//! Being per axis rather than per cell is what keeps a real second base
+//! safe. A cell-by-cell density threshold would have to decide whether a
+//! remote outpost is dense enough to keep, and would get it wrong in both
+//! directions. Projecting onto each axis asks only how much is standing
+//! beyond a given line, and a second base is far too much to give up
+//! whatever its shape.
 
 use macroquad::math::Vec2;
 
-use crate::registry::{is_resource, is_terrain_scatter, TypeRegistry};
-use crate::render_frame::{FrameSequence, RenderFrame};
+use crate::registry::{is_enemy, is_resource, is_terrain_scatter, is_vehicle, TypeRegistry};
+use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame};
+
+/// Side of one bin in the density histograms, in tiles. A Factorio chunk,
+/// the granularity the rest of the viewer already thinks in (see
+/// `LOD_CELL_TILES`) and comfortably larger than any single building, so no
+/// one machine straddles enough bins to matter.
+const DENSITY_BIN_TILES: f32 = 32.0;
+
+/// How much of what is standing may be trimmed off each end of each axis
+/// before the box is taken, as a fraction of everything counted.
+///
+/// Half a percent per side sounds timid and is not, because **empty bins
+/// cost nothing to trim**. The walk inward stops at the first bin it cannot
+/// afford, so it crosses the entire empty gap between a perimeter and the
+/// factory for free and halts the moment it reaches real density. What the
+/// budget actually has to cover is only the thin outlying structure itself.
+///
+/// Measured against a real 860k entity megabase: its wall line holds about
+/// 3,100 entities against a 4,300 budget, so the perimeter is trimmed and
+/// the first genuine factory bin (thousands in one bin) stops the walk
+/// immediately. Raising this much further would start eating factory, and
+/// there is no need: the gap, not the budget, is what does the work.
+const DENSITY_TRIM: f32 = 0.005;
 
 /// A world-space box: a center and half-extent, the shape `Camera::fit_bounds`
 /// wants.
@@ -45,31 +104,96 @@ pub struct GrowingBounds {
     pub half_extent: Vec2,
 }
 
-/// Corner-to-corner bounding box of every entity's footprint in one frame,
-/// skipping terrain scatter and resource deposits (see the module doc
-/// comment). `None` for a frame with nothing else built yet.
-fn frame_bounds(frame: &RenderFrame, registry: &TypeRegistry) -> Option<(Vec2, Vec2)> {
-    let mut points = frame
+/// Everything in one frame that counts as construction: not terrain
+/// scatter, not a resource deposit, not an enemy structure (see the module
+/// doc comment). Filtering per *run* rather than per entity is why this is
+/// cheap enough to walk twice below: a run is a whole contiguous span of one
+/// prototype, so the name test happens tens of times per frame rather than
+/// hundreds of thousands.
+fn counted<'a>(frame: &'a RenderFrame, registry: &'a TypeRegistry) -> impl Iterator<Item = &'a RenderEntity> + 'a {
+    frame
         .entity_runs
         .iter()
-        .filter(|run| {
+        .filter(move |run| {
             let name = registry.name(run.type_id);
-            !is_terrain_scatter(name) && !is_resource(name)
+            !is_terrain_scatter(name) && !is_resource(name) && !is_enemy(name) && !is_vehicle(name)
         })
-        .flat_map(|run| frame.entities[run.range()].iter())
-        .flat_map(|e| {
-            let half = Vec2::new(e.w as f32, e.h as f32) / 2.0;
-            let center = Vec2::new(e.x, e.y);
-            [center - half, center + half]
-        });
+        .flat_map(move |run| frame.entities[run.range()].iter())
+}
 
-    let first = points.next()?;
-    let (mut min, mut max) = (first, first);
-    for p in points {
-        min = min.min(p);
-        max = max.max(p);
+/// First and last surviving bin, after trimming up to `budget` items off
+/// each end. Stops at the first bin it cannot afford, so a run of empty
+/// bins is crossed for free and dense ones halt it immediately.
+///
+/// The two walks share a budget each rather than one between them, since
+/// they are answering the same question independently at opposite ends, and
+/// neither may cross the other: a frame holding nothing but outliers keeps
+/// its whole range rather than inverting into an empty box.
+fn trim_ends(bins: &[u32], budget: u32) -> (usize, usize) {
+    let (mut lo, mut hi) = (0usize, bins.len() - 1);
+
+    let mut spent = 0u32;
+    while lo < hi && spent + bins[lo] <= budget {
+        spent += bins[lo];
+        lo += 1;
     }
-    Some((min, max))
+
+    let mut spent = 0u32;
+    while hi > lo && spent + bins[hi] <= budget {
+        spent += bins[hi];
+        hi -= 1;
+    }
+
+    (lo, hi)
+}
+
+/// The box worth aiming a camera at for one frame, which is not the same as
+/// the box containing everything built (see the module doc comment). `None`
+/// for a frame with nothing built yet.
+///
+/// Two passes over the frame's entities: the raw extent has to be known
+/// before there is anywhere to put bins, and the total has to be known
+/// before a fraction of it means anything. A hash map keyed by bin index
+/// would fold them into one pass and be slower, since hashing every entity
+/// costs more than reading them a second time in order.
+fn frame_bounds(frame: &RenderFrame, registry: &TypeRegistry) -> Option<(Vec2, Vec2)> {
+    let mut extent: Option<(Vec2, Vec2)> = None;
+    let mut total: u32 = 0;
+    for e in counted(frame, registry) {
+        let half = Vec2::new(e.w as f32, e.h as f32) / 2.0;
+        let center = Vec2::new(e.x, e.y);
+        extent = Some(match extent {
+            None => (center - half, center + half),
+            Some((lo, hi)) => (lo.min(center - half), hi.max(center + half)),
+        });
+        total += 1;
+    }
+    let (lo, hi) = extent?;
+
+    let bin_count = |span: f32| ((span / DENSITY_BIN_TILES).ceil() as usize).max(1);
+    let (nx, ny) = (bin_count(hi.x - lo.x), bin_count(hi.y - lo.y));
+    let (mut xs, mut ys) = (vec![0u32; nx], vec![0u32; ny]);
+    for e in counted(frame, registry) {
+        // Binned by center, while `lo`/`hi` come from footprint corners, so
+        // the index is clamped rather than trusted to land in range.
+        xs[(((e.x - lo.x) / DENSITY_BIN_TILES) as usize).min(nx - 1)] += 1;
+        ys[(((e.y - lo.y) / DENSITY_BIN_TILES) as usize).min(ny - 1)] += 1;
+    }
+
+    // Rounds down, so a frame small enough for the budget to floor to zero
+    // keeps exactly the extent it always had. Nothing that fits comfortably
+    // on screen is worth second-guessing.
+    let budget = (total as f32 * DENSITY_TRIM) as u32;
+    let (x0, x1) = trim_ends(&xs, budget);
+    let (y0, y1) = trim_ends(&ys, budget);
+
+    // Clamped back to the real extent: the last bin on each axis is a
+    // partial one, so its far edge generally overshoots what is standing.
+    let at = |start: f32, bin: usize| start + bin as f32 * DENSITY_BIN_TILES;
+    Some((
+        Vec2::new(at(lo.x, x0).max(lo.x), at(lo.y, y0).max(lo.y)),
+        Vec2::new(at(lo.x, x1 + 1).min(hi.x), at(lo.y, y1 + 1).min(hi.y)),
+    ))
 }
 
 fn union_min_max(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2) {
@@ -216,6 +340,113 @@ mod tests {
         let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("crude-oil", -151.0, -195.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant oil deposit must not affect the box");
+    }
+
+    /// The worst of the three, and the one this file missed for longest:
+    /// nests and worms are kept in the capture on purpose, so they are the
+    /// only unbuilt thing left that the box still counted. They cover every
+    /// generated chunk in every direction, so the box spanned the explored
+    /// map and the camera centered on the middle of that rather than on the
+    /// factory.
+    #[test]
+    fn growing_bounds_ignores_enemy_nests_and_worms() {
+        let mut registry = TypeRegistry::new();
+        let frames = vec![render(
+            vec![entity("a", 0.0, 0.0), entity("biter-spawner", 4000.0, 4000.0), entity("medium-worm-turret", -4000.0, -4000.0)],
+            Vec::new(),
+            &mut registry,
+        )];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "distant nests and worms must not affect the box");
+    }
+
+    /// A captive biter spawner is player placed (Space Age captivity), so it
+    /// is construction like anything else and has to keep counting. This is
+    /// the one name `is_enemy` deliberately excepts, and the exception is
+    /// only worth anything if this file honours it too.
+    #[test]
+    fn growing_bounds_counts_a_captive_biter_spawner() {
+        let mut registry = TypeRegistry::new();
+        let frames =
+            vec![render(vec![entity("a", 0.0, 0.0), entity("captive-biter-spawner", 100.0, 0.0)], Vec::new(), &mut registry)];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert_eq!(bounds.center, Vec2::new(50.0, 0.0), "a captive spawner is built, so it must count");
+    }
+
+    /// A compact block of `count` 1x1 entities, one per tile, filling as
+    /// square a patch as it can from `(ox, oy)`. Dense enough that the trim
+    /// cannot afford to touch it.
+    fn cluster(name: &str, count: usize, ox: f32, oy: f32) -> Vec<Entity> {
+        let side = (count as f32).sqrt().ceil() as usize;
+        (0..count).map(|i| entity(name, ox + (i % side) as f32, oy + (i / side) as f32)).collect()
+    }
+
+    /// The measured case: on a real megabase the box was defined by a gun
+    /// turret, two stone walls and a rail signal, none of which is scenery
+    /// and all of which sat far outside the factory.
+    #[test]
+    fn growing_bounds_is_not_dragged_out_by_a_thin_outlying_structure() {
+        let mut registry = TypeRegistry::new();
+        let mut entities = cluster("assembling-machine-1", 2000, 0.0, 0.0);
+        entities.push(entity("gun-turret", 4000.0, 0.0));
+        entities.push(entity("rail-chain-signal", 0.0, 4000.0));
+        let frames = vec![render(entities, Vec::new(), &mut registry)];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert!(bounds.half_extent.x < 200.0, "the distant turret must not set the box, got {:?}", bounds);
+        assert!(bounds.half_extent.y < 200.0, "the distant rail signal must not set the box, got {:?}", bounds);
+    }
+
+    /// The other half of the same rule, and the one that makes it safe: a
+    /// genuine second base is far too much to give up, however far away it
+    /// is, so the box has to stretch to reach it.
+    #[test]
+    fn growing_bounds_still_reaches_a_real_second_base() {
+        let mut registry = TypeRegistry::new();
+        let mut entities = cluster("assembling-machine-1", 500, 0.0, 0.0);
+        entities.extend(cluster("electric-furnace", 500, 4000.0, 0.0));
+        let frames = vec![render(entities, Vec::new(), &mut registry)];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert!(bounds.half_extent.x > 1900.0, "both bases must be framed, got {:?}", bounds);
+    }
+
+    /// A parked train is wherever it stopped, not where anything was built,
+    /// and in a from-saves export that is somewhere different in every save.
+    #[test]
+    fn growing_bounds_ignores_trains_and_vehicles() {
+        let mut registry = TypeRegistry::new();
+        let frames = vec![render(
+            vec![
+                entity("a", 0.0, 0.0),
+                entity("locomotive", 3000.0, 0.0),
+                entity("cargo-wagon", 3007.0, 0.0),
+                entity("spidertron", 0.0, -3000.0),
+            ],
+            Vec::new(),
+            &mut registry,
+        )];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "a train parked far away must not set the box");
+    }
+
+    /// The rails themselves are exactly what a timelapse should follow out
+    /// to a new outpost, so the vehicle filter must not touch them.
+    #[test]
+    fn growing_bounds_still_follows_the_rail_network() {
+        let mut registry = TypeRegistry::new();
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("straight-rail", 1000.0, 0.0)], Vec::new(), &mut registry)];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert!(bounds.half_extent.x > 400.0, "rail out to an outpost is construction, got {:?}", bounds);
+    }
+
+    /// The trim budget rounds down, so anything small enough to frame
+    /// comfortably keeps the exact extent it always had. Without this, every
+    /// existing expectation about small inputs would quietly shift.
+    #[test]
+    fn growing_bounds_leaves_a_small_base_exactly_as_it_was() {
+        let mut registry = TypeRegistry::new();
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("b", 40.0, 40.0)], Vec::new(), &mut registry)];
+        let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
+        assert_eq!(bounds.center, Vec2::new(20.0, 20.0), "two entities cannot afford any trim at all");
     }
 
     #[test]

@@ -29,10 +29,21 @@ const TICKS_PER_SECOND: u64 = 60;
 
 const MAX_FRAMES: usize = 100_000;
 
+/// Offered when nothing has been exported yet, and remembered afterwards.
+/// 1080p rather than the largest option: it is what video sites expect, and
+/// a 4K export of a long playthrough is several gigabytes and many minutes
+/// of rendering, which is a bad thing to pick for somebody by default.
+const DEFAULT_EXPORT_SIZE: (u32, u32) = (1920, 1080);
+
+/// Smooth without being wasteful. Frames are spaced by game time, not by
+/// this, so it only sets how fast the finished file plays back.
+const DEFAULT_EXPORT_FPS: u32 = 30;
+
 enum Mode {
     OpenExisting,
     LiveCapture,
     FromSaves,
+    ExportVideo,
     ManageCaptures,
     Quit,
 }
@@ -83,20 +94,22 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
              \x20 1) {opened}\n\
              \x20 2) Update my timelapse from live capture (recommended if capture is on)\n\
              \x20 3) Build a timelapse from existing save files\n\
-             \x20 4) Manage my captures (name them, see their size, delete ones you're done with)\n\
-             Enter 1, 2, 3 or 4, or press Enter to quit:"
+             \x20 4) Save a timelapse as a video file I can share\n\
+             \x20 5) Manage my captures (name them, see their size, delete ones you're done with)\n\
+             Enter 1, 2, 3, 4 or 5, or press Enter to quit:"
         ))?;
         match input.as_str() {
             "1" => return Ok(Mode::OpenExisting),
             "2" => return Ok(Mode::LiveCapture),
             "3" => return Ok(Mode::FromSaves),
-            "4" => return Ok(Mode::ManageCaptures),
+            "4" => return Ok(Mode::ExportVideo),
+            "5" => return Ok(Mode::ManageCaptures),
             // Managing captures returns here rather than exiting, so this
-            // menu needs its own way out. Blank rather than a fifth number:
+            // menu needs its own way out. Blank rather than another number:
             // Enter is what someone already presses to leave the management
             // screen, and it should keep meaning "back" one level up.
             "" => return Ok(Mode::Quit),
-            _ => println!("Please enter 1, 2, 3 or 4.\n"),
+            _ => println!("Please enter 1, 2, 3, 4 or 5.\n"),
         }
     }
 }
@@ -455,14 +468,14 @@ fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
     found
 }
 
-fn ask_timelapse_choice(built: &[BuiltTimelapse]) -> io::Result<Option<usize>> {
+fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
     println!("\nTimelapses you have already built:");
     for (i, t) in built.iter().enumerate() {
         let age = t.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
         println!("  {}) {} ({} frames, {}, built {age})", i + 1, t.name, t.frames, describe_size(t.bytes));
     }
     loop {
-        let input = prompt("\nWhich would you like to open? Enter a number, or press Enter to go back:")?;
+        let input = prompt(&format!("\n{question} Enter a number, or press Enter to go back:"))?;
         if input.is_empty() {
             return Ok(None);
         }
@@ -489,6 +502,220 @@ fn viewer_path() -> io::Result<PathBuf> {
         )));
     }
     Ok(candidate)
+}
+
+/// The surfaces a built timelapse holds, read off its own filenames.
+///
+/// A multi-surface build writes `frame_0000_nauvis.stfr`; a single-surface
+/// one writes `frame_0000.stfr` with no name in it at all. So an empty
+/// result means "one surface, whose name is not recorded here", not "none",
+/// which is exactly the case where there is nothing worth asking about.
+///
+/// Split at the *first* underscore after the index rather than the last, so
+/// a surface whose own name contains one survives intact.
+fn surfaces_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            // Terrain files are named per surface too, and a timelapse can
+            // have terrain for a surface it has frames for, so counting both
+            // would list the same name twice. Deduped below either way, but
+            // terrain alone is not a surface anyone can export.
+            let rest = stem.strip_prefix("frame_")?;
+            let (_index, surface) = rest.split_once('_')?;
+            (!surface.is_empty()).then(|| surface.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `None` means "let the viewer pick", which is its busiest surface, and is
+/// what Enter gives. `Some("all")` is passed straight through, since the
+/// viewer already understands it as every surface.
+fn ask_export_surface(surfaces: &[String]) -> io::Result<Option<String>> {
+    loop {
+        let input = prompt(&format!(
+            "\nThis timelapse has more than one world in it.\n\
+             Surfaces: {}\n\
+             Enter a name, \"all\" for one file each, or press Enter for the busiest one:",
+            surfaces.join(", ")
+        ))?;
+        if input.is_empty() {
+            return Ok(None);
+        }
+        if input.eq_ignore_ascii_case("all") {
+            return Ok(Some("all".to_string()));
+        }
+        if let Some(found) = find_surface(&input, surfaces) {
+            return Ok(Some(found.to_string()));
+        }
+        println!("\"{input}\" doesn't match any surface listed above. Try again.");
+    }
+}
+
+/// The four presets, in the order they are offered. 1080p leads because it
+/// is the default; the rest run smallest to largest so the cost of going up
+/// is visible as a direction rather than something to work out.
+const RESOLUTION_PRESETS: [(u32, u32, &str); 4] = [
+    (1920, 1080, "1080p, recommended"),
+    (1280, 720, "720p, smallest and fastest"),
+    (2560, 1440, "1440p"),
+    (3840, 2160, "4K, large and slow"),
+];
+
+/// A preset number, or a literal `WIDTHxHEIGHT`. `None` for anything else,
+/// including a size with a zero in it, which would make an unusable video.
+///
+/// Accepts `x` in either case because "1920X1080" is a perfectly reasonable
+/// thing to type and refusing it would teach nobody anything.
+fn parse_resolution(input: &str) -> Option<(u32, u32)> {
+    let trimmed = input.trim();
+    if let Ok(n) = trimmed.parse::<usize>() {
+        let (w, h, _) = *RESOLUTION_PRESETS.get(n.checked_sub(1)?)?;
+        return Some((w, h));
+    }
+    let lowered = trimmed.to_lowercase();
+    let (w, h) = lowered.split_once('x')?;
+    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn ask_resolution(default: (u32, u32)) -> io::Result<(u32, u32)> {
+    println!("\nHow big should the video be?");
+    for (i, (w, h, label)) in RESOLUTION_PRESETS.iter().enumerate() {
+        println!("  {}) {w}x{h} ({label})", i + 1);
+    }
+    loop {
+        let input = prompt(&format!("Enter a number, or a size like 1920x1080 [default {}x{}]:", default.0, default.1))?;
+        if input.trim().is_empty() {
+            return Ok(default);
+        }
+        match parse_resolution(&input) {
+            Some(size) => return Ok(size),
+            None => println!("Please enter one of the numbers above, or a size like 1920x1080."),
+        }
+    }
+}
+
+/// Rejects zero the same way `parse_frame_seconds` does, and caps at the
+/// viewer's own limit rather than letting a typo like 300 through to be
+/// silently clamped somewhere the user cannot see it happen.
+fn parse_fps(input: &str) -> Option<u32> {
+    let fps: u32 = input.trim().parse().ok()?;
+    (1..=240).contains(&fps).then_some(fps)
+}
+
+fn ask_fps(default: u32) -> io::Result<u32> {
+    loop {
+        let input = prompt(&format!(
+            "\nHow fast should it play? Frames are spaced by game time, so this only sets \
+             playback speed: 30 is smooth, 10 is slow enough to read. Enter frames per second \
+             [default {default}]:"
+        ))?;
+        if input.trim().is_empty() {
+            return Ok(default);
+        }
+        match parse_fps(&input) {
+            Some(fps) => return Ok(fps),
+            None => println!("Please enter a whole number between 1 and 240."),
+        }
+    }
+}
+
+/// Where finished videos and image sequences are put: one folder next to the
+/// executable, the same way `timelapses/` works, so the answer to "where did
+/// it go" is always the same place rather than wherever the shell happened
+/// to be when the tool started.
+fn videos_root() -> PathBuf {
+    output_dir_next_to_exe("videos")
+}
+
+/// Renders a built timelapse to a video file or an image sequence.
+///
+/// Runs the viewer rather than reimplementing any of it: rendering needs a
+/// GPU context and the whole sprite and palette pipeline, all of which live
+/// there. This is the part that was missing, which is not the ability to
+/// export (the viewer has had it) but a way to reach it without knowing the
+/// viewer exists, where the frames are, or what flags to type.
+fn run_export(settings: &mut Settings) -> io::Result<()> {
+    let built = list_timelapses();
+    if built.is_empty() {
+        println!("\nNothing built yet. Use option 2 or 3 first, then come back.\n");
+        return Ok(());
+    }
+
+    let Some(index) = ask_timelapse_choice(&built, "Which would you like to save as a video?")? else {
+        return Ok(());
+    };
+    let chosen = &built[index];
+
+    let surfaces = surfaces_in(&chosen.path);
+    let surface = if surfaces.len() > 1 { ask_export_surface(&surfaces)? } else { None };
+
+    // Asked as a question about the output rather than as a format choice:
+    // "AVI or PNG" means nothing to somebody who just wants to post their
+    // base, and the reason to want the frames instead is editing them.
+    let video = ask_yes_no(
+        "\nWrite one video file? Answering no writes a numbered PNG per frame instead, \
+         which is what you want if you are editing rather than watching",
+        true,
+    )?;
+
+    let size = ask_resolution(settings.export_size().unwrap_or(DEFAULT_EXPORT_SIZE))?;
+    let fps = if video { ask_fps(settings.export_fps.unwrap_or(DEFAULT_EXPORT_FPS))? } else { DEFAULT_EXPORT_FPS };
+
+    // Saved before the render, which is the slow part and the part most
+    // likely to be interrupted. Retyping preferences because something else
+    // went wrong is exactly the friction this exists to remove.
+    settings.export_width = Some(size.0);
+    settings.export_height = Some(size.1);
+    settings.export_fps = Some(fps);
+    remember(settings);
+
+    let root = videos_root();
+    std::fs::create_dir_all(&root)?;
+    // No extension here: the viewer appends `.avi` for a video and treats
+    // the path as a folder for an image sequence, so the same argument
+    // serves both.
+    let target = root.join(as_folder_name(&chosen.name));
+
+    let viewer = viewer_path()?;
+    let mut command = Command::new(&viewer);
+    command
+        .arg(&chosen.path)
+        .arg("--export")
+        .arg(&target)
+        .arg("--width")
+        .arg(size.0.to_string())
+        .arg("--height")
+        .arg(size.1.to_string());
+    if video {
+        command.arg("--video").arg("--fps").arg(fps.to_string());
+    }
+    if let Some(name) = &surface {
+        command.arg("--surface").arg(name);
+    }
+
+    println!("\nRendering. A window opens while this runs; leave it alone until it closes.\n");
+    // `status` rather than `spawn`: every other mode hands off to the viewer
+    // and exits, but an export finishes, and returning to the menu before it
+    // does would leave its progress printing over a fresh prompt.
+    let status = command.status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("the viewer exited with {status} without finishing the export")));
+    }
+
+    // Naming the folder, not the file: with "all" there is one file per
+    // surface, and with an image sequence there is a folder of them, so the
+    // one thing that is always true is where to go looking.
+    println!("\nDone. Find it in {}\n", root.display());
+    Ok(())
 }
 
 fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
@@ -873,7 +1100,7 @@ fn run() -> io::Result<Option<PathBuf>> {
                     println!("\nNothing built yet. Use option 2 or 3 first.\n");
                     continue;
                 }
-                match ask_timelapse_choice(&built)? {
+                match ask_timelapse_choice(&built, "Which would you like to open?")? {
                     Some(index) => return Ok(Some(built[index].path.clone())),
                     // Back to the menu rather than out of the program, the
                     // same as leaving the management screen.
@@ -882,6 +1109,10 @@ fn run() -> io::Result<Option<PathBuf>> {
             }
             Mode::LiveCapture => return run_live_capture(&mut settings).map(Some),
             Mode::FromSaves => return run_from_saves(&mut settings).map(Some),
+            // Loops back to the menu for the same reason managing captures
+            // does: the export has already run and opening the viewer on top
+            // of a finished video would be answering a question nobody asked.
+            Mode::ExportVideo => run_export(&mut settings)?,
             // Loops back to the menu instead of returning, since managing
             // captures is housekeeping done *before* building something:
             // naming a playthrough and then being dropped out of the program
@@ -1202,6 +1433,83 @@ mod tests {
 
         std::fs::write(session.join("milestones.jsonl"), "").unwrap();
         assert_eq!(copy_session_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
+    }
+
+    /// The export menu asks which world to render, and the only record of
+    /// which worlds a built timelapse holds is its own filenames.
+    #[test]
+    fn surfaces_are_read_off_the_frame_filenames() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["frame_0000_nauvis.stfr", "frame_0001_nauvis.stfr", "frame_0000_vulcanus.stfr", "terrain_nauvis.stfr"] {
+            std::fs::write(root.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(surfaces_in(root.path()), vec!["nauvis", "vulcanus"]);
+    }
+
+    /// A single-surface build writes untagged filenames, so there is no name
+    /// to find. Reporting none is what makes the caller skip the question
+    /// entirely, which is right: there is nothing to choose between.
+    #[test]
+    fn an_untagged_single_surface_build_lists_no_surfaces() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("frame_0000.stfr"), b"x").unwrap();
+        assert!(surfaces_in(root.path()).is_empty());
+    }
+
+    /// Space platforms are named by the player, so a surface name can hold
+    /// an underscore. Splitting at the last one would truncate it.
+    #[test]
+    fn a_surface_name_containing_an_underscore_survives() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("frame_0003_my_platform.stfr"), b"x").unwrap();
+        assert_eq!(surfaces_in(root.path()), vec!["my_platform"]);
+    }
+
+    #[test]
+    fn parse_resolution_accepts_a_preset_number() {
+        assert_eq!(parse_resolution("1"), Some((1920, 1080)));
+        assert_eq!(parse_resolution(" 2 "), Some((1280, 720)));
+        assert_eq!(parse_resolution("4"), Some((3840, 2160)));
+    }
+
+    #[test]
+    fn parse_resolution_accepts_an_explicit_size_in_either_case() {
+        assert_eq!(parse_resolution("1600x900"), Some((1600, 900)));
+        assert_eq!(parse_resolution("1600X900"), Some((1600, 900)));
+    }
+
+    /// A zero in either half would make a render target no GPU will accept,
+    /// and an out-of-range preset number is a typo, not a size.
+    #[test]
+    fn parse_resolution_rejects_zero_out_of_range_presets_and_junk() {
+        assert_eq!(parse_resolution("0"), None);
+        assert_eq!(parse_resolution("9"), None);
+        assert_eq!(parse_resolution("0x1080"), None);
+        assert_eq!(parse_resolution("1920x0"), None);
+        assert_eq!(parse_resolution("big"), None);
+        assert_eq!(parse_resolution(""), None);
+    }
+
+    #[test]
+    fn parse_fps_accepts_a_playable_rate_and_rejects_the_rest() {
+        assert_eq!(parse_fps("30"), Some(30));
+        assert_eq!(parse_fps(" 1 "), Some(1));
+        assert_eq!(parse_fps("240"), Some(240));
+        assert_eq!(parse_fps("0"), None);
+        assert_eq!(parse_fps("241"), None);
+        assert_eq!(parse_fps("fast"), None);
+    }
+
+    /// Half an answer is no answer: a width with no height cannot be
+    /// completed without inventing an aspect ratio the user never chose.
+    #[test]
+    fn a_half_remembered_export_size_is_not_used() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.export_size(), None);
+        settings.export_width = Some(1920);
+        assert_eq!(settings.export_size(), None);
+        settings.export_height = Some(1080);
+        assert_eq!(settings.export_size(), Some((1920, 1080)));
     }
 
     #[test]

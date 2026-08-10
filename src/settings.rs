@@ -1,11 +1,11 @@
 //! What the tool remembers between runs, so a repeat run stops re-asking
 //! questions it already has the answer to.
 //!
-//! Deliberately small. Only four things are stored, and every one of them is
-//! something a user would otherwise retype identically every single time:
-//! where Factorio is (twice, since the folder and the executable are found
-//! separately), how much game time a frame covers, and whether to include
-//! natural terrain.
+//! Deliberately small. Every field is something a user would otherwise retype
+//! identically every single time: where Factorio is (twice, since the folder
+//! and the executable are found separately), how much game time a frame
+//! covers, whether to include natural terrain, and the size and frame rate of
+//! an exported video.
 //!
 //! **Nothing here is authoritative.** Every field is an `Option`, absent
 //! meaning "never answered", and every one is offered as a *default* that
@@ -41,6 +41,13 @@ pub struct Settings {
     pub frame_seconds: Option<u64>,
     /// Whether to include natural terrain when exporting from saves.
     pub capture_terrain: Option<bool>,
+    /// Video resolution last chosen when exporting a timelapse. Both stored
+    /// rather than a single quality level, since a custom size need not be
+    /// 16:9 and deriving one from the other would silently change it.
+    pub export_width: Option<u32>,
+    pub export_height: Option<u32>,
+    /// Frames per second last chosen for a video export.
+    pub export_fps: Option<u32>,
 }
 
 /// Where the settings file lives, following each platform's own convention
@@ -79,6 +86,15 @@ impl Settings {
                 Settings::default()
             }
         }
+    }
+
+    /// The remembered export size, and only when *both* halves are there.
+    ///
+    /// A width with no height is not half an answer, it is no answer: there
+    /// is no sensible way to complete it, and guessing would produce a video
+    /// in a shape the user never picked.
+    pub fn export_size(&self) -> Option<(u32, u32)> {
+        Some((self.export_width?, self.export_height?))
     }
 
     /// Whether anything has ever been saved. What the first run keys off to
@@ -141,6 +157,9 @@ mod tests {
             factorio_exe: Some(PathBuf::from("/tmp/factorio/bin/x64/factorio")),
             frame_seconds: Some(30),
             capture_terrain: Some(true),
+            export_width: Some(2560),
+            export_height: Some(1440),
+            export_fps: Some(24),
         };
         let text = serde_json::to_string(&settings).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), settings);
