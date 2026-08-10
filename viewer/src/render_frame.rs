@@ -197,9 +197,7 @@ fn group_by_type<T: Copy + Default + Send + Sync>(ids: &[TypeId], items: &[T], t
         let handles: Vec<_> = ids
             .chunks(chunk_size)
             .zip(items.chunks(chunk_size))
-            .map(|(id_chunk, item_chunk)| {
-                scope.spawn(move || group_by_type_sequential(id_chunk, item_chunk, type_count))
-            })
+            .map(|(id_chunk, item_chunk)| scope.spawn(move || group_by_type_sequential(id_chunk, item_chunk, type_count)))
             .collect();
         handles.into_iter().map(|h| h.join().expect("group_by_type worker thread panicked")).collect()
     });
@@ -352,8 +350,7 @@ impl RenderFrame {
 
         // Computed from the pre-grouped ids/positions, so this doesn't need
         // the full-detail grouping to have happened first.
-        let entity_chunks: Vec<(i32, i32)> =
-            entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
+        let entity_chunks: Vec<(i32, i32)> = entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
         let (entity_lod, entity_lod_runs) = build_chunk_lod(&entity_ids, &entity_chunks, type_count);
 
         let tile_chunks: Vec<(i32, i32)> = tiles.iter().map(|t| chunk_of(t.x, t.y)).collect();
@@ -476,10 +473,7 @@ impl FrameSequence {
 
     /// Total spans across all four sets, for measuring what the layout costs.
     pub fn span_estimate(&self) -> usize {
-        self.entities.span_count()
-            + self.tiles.span_count()
-            + self.entity_lod.span_count()
-            + self.tile_lod.span_count()
+        self.entities.span_count() + self.tiles.span_count() + self.entity_lod.span_count() + self.tile_lod.span_count()
     }
 
     pub fn len(&self) -> usize {
@@ -536,12 +530,9 @@ impl SequenceBuilder {
     pub fn push(&mut self, frame: &RenderFrame) {
         self.ticks.push(frame.tick);
         self.counts.push(frame.count);
-        self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| {
-            span_key(e.x, e.y)
-        }));
-        self.tiles.push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| {
-            span_key(t.x as f32, t.y as f32)
-        }));
+        self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
+        self.tiles
+            .push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
         self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
         self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
     }
@@ -614,8 +605,7 @@ fn runs_with_items<'a, T: Copy + 'a>(
     // `key` is taken by reference so the inner closure can capture a Copy
     // shared borrow: capturing the closure itself by move would have it
     // escape the outer `FnMut`, which `flat_map` will not allow.
-    runs.iter()
-        .flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
+    runs.iter().flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
 }
 
 fn cell_key(cell: &LodCell) -> u64 {
@@ -808,14 +798,11 @@ mod tests {
         let chunk_coords: Vec<(i32, i32)> = (0..n).map(|i| ((i % 3) as i32, 0)).collect();
 
         let (parallel_cells, parallel_runs) = build_chunk_lod(&ids, &chunk_coords, type_count);
-        let (sequential_cells, sequential_runs) =
-            finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
+        let (sequential_cells, sequential_runs) = finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
 
         let content = |cells: &[LodCell], runs: &[Run]| {
-            let mut pairs: Vec<(TypeId, i32, i32)> = runs
-                .iter()
-                .flat_map(|r| cells[r.range()].iter().map(move |c| (r.type_id, c.cx, c.cy)))
-                .collect();
+            let mut pairs: Vec<(TypeId, i32, i32)> =
+                runs.iter().flat_map(|r| cells[r.range()].iter().map(move |c| (r.type_id, c.cx, c.cy))).collect();
             pairs.sort();
             pairs
         };

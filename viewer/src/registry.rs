@@ -250,15 +250,7 @@ pub fn is_terrain_scatter(name: &str) -> bool {
 pub fn is_resource(name: &str) -> bool {
     matches!(
         name,
-        "iron-ore"
-            | "copper-ore"
-            | "coal"
-            | "stone"
-            | "uranium-ore"
-            | "crude-oil"
-            | "tungsten-ore"
-            | "calcite"
-            | "scrap"
+        "iron-ore" | "copper-ore" | "coal" | "stone" | "uranium-ore" | "crude-oil" | "tungsten-ore" | "calcite" | "scrap"
     )
 }
 
@@ -276,12 +268,7 @@ pub fn is_resource(name: &str) -> bool {
 /// while this only needs to grow one confirmed-good entry at a time. Add to
 /// it once an entity's rotated icon is checked and looks right; anything not
 /// listed renders unrotated by default, same as before this feature existed.
-const ALWAYS_ROTATE: &[&str] = &[
-    "transport-belt",
-    "fast-transport-belt",
-    "express-transport-belt",
-    "turbo-transport-belt",
-];
+const ALWAYS_ROTATE: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
 
 pub fn is_rotation_allowed(name: &str) -> bool {
     ALWAYS_ROTATE.contains(&name)
@@ -328,10 +315,26 @@ mod tests {
     #[test]
     fn known_color_recognizes_real_captured_terrain_names() {
         for name in [
-            "water", "deepwater", "grass-1", "grass-4", "dirt-3", "dry-dirt", "sand-2", "red-desert-1",
-            "out-of-map", "concrete", "refined-concrete", "hazard-concrete-left",
-            "refined-hazard-concrete-right", "stone-path", "landfill", "cliff", "tree-01", "tree-09-brown",
-            "dead-tree-desert", "dry-hairy-tree",
+            "water",
+            "deepwater",
+            "grass-1",
+            "grass-4",
+            "dirt-3",
+            "dry-dirt",
+            "sand-2",
+            "red-desert-1",
+            "out-of-map",
+            "concrete",
+            "refined-concrete",
+            "hazard-concrete-left",
+            "refined-hazard-concrete-right",
+            "stone-path",
+            "landfill",
+            "cliff",
+            "tree-01",
+            "tree-09-brown",
+            "dead-tree-desert",
+            "dry-hairy-tree",
         ] {
             assert!(known_color(name).is_some(), "{name} should have a curated color");
         }
@@ -485,9 +488,6 @@ mod tests {
             (registry.entity_color(id).r, registry.entity_color(id).g, registry.entity_color(id).b),
             (entity.r, entity.g, entity.b)
         );
-        assert_eq!(
-            (registry.tile_color(id).r, registry.tile_color(id).g, registry.tile_color(id).b),
-            (tile.r, tile.g, tile.b)
-        );
+        assert_eq!((registry.tile_color(id).r, registry.tile_color(id).g, registry.tile_color(id).b), (tile.r, tile.g, tile.b));
     }
 }

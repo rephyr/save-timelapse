@@ -544,14 +544,7 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
                     px += r.varint_i32().ok_or_else(truncated)?;
                     py += r.varint_i32().ok_or_else(truncated)?;
                     let d = if directions { r.u8().ok_or_else(truncated)? } else { 0 };
-                    entities.push(Entity {
-                        n: Arc::clone(&name),
-                        x: round10_back(px),
-                        y: round10_back(py),
-                        d,
-                        w,
-                        h,
-                    });
+                    entities.push(Entity { n: Arc::clone(&name), x: round10_back(px), y: round10_back(py), d, w, h });
                 }
 
                 if flags & RUN_FLAG_EXTENSION != 0 {
@@ -725,12 +718,20 @@ mod tests {
             .u64(100)
             .string("nauvis")
             // DefineName carries the prototype's footprint, so entities do not.
-            .u8(0).string("pipe").u8(1).u8(1)
+            .u8(0)
+            .string("pipe")
+            .u8(1)
+            .u8(1)
             // EntityRun: name id, count, flags (this one rotates, so each
             // item carries a direction byte).
-            .u8(1).varint(0).varint(1).u8(RUN_FLAG_DIRECTIONS)
+            .u8(1)
+            .varint(0)
+            .varint(1)
+            .u8(RUN_FLAG_DIRECTIONS)
             // First item's coordinates are deltas from the origin.
-            .varint_i32(-805).varint_i32(285).u8(4)
+            .varint_i32(-805)
+            .varint_i32(285)
+            .u8(4)
             .u8(9); // EndEntities, no tiles follow
         let payload = expected.into_vec();
 
@@ -862,10 +863,7 @@ mod tests {
     /// quietly stops holding.
     #[test]
     fn version_3_writes_the_same_body_as_version_2() {
-        let entities = vec![
-            entity("transport-belt", -80.5, 28.5, 4, 1, 1),
-            entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3),
-        ];
+        let entities = vec![entity("transport-belt", -80.5, 28.5, 4, 1, 1), entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3)];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
         let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles };
 

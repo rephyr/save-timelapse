@@ -237,8 +237,7 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
         println!("  {}) {}", i + 1, describe_session(session, now));
     }
     loop {
-        let input =
-            prompt("\nWhich playthrough do you want to update the timelapse for? Enter a number:")?;
+        let input = prompt("\nWhich playthrough do you want to update the timelapse for? Enter a number:")?;
         if let Some(index) = parse_session_index(&input, sessions.len()) {
             return Ok(index);
         }
@@ -285,9 +284,7 @@ fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
     let needle = trimmed.to_lowercase();
     saves
         .iter()
-        .filter(|path| {
-            path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.to_lowercase().contains(&needle))
-        })
+        .filter(|path| path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.to_lowercase().contains(&needle)))
         .cloned()
         .collect()
 }
@@ -323,11 +320,7 @@ fn mod_source_dir() -> io::Result<PathBuf> {
 /// happens to live. Falls back to the current directory only if the exe's
 /// own path can't be determined, which realistically never happens.
 fn output_dir_next_to_exe(name: &str) -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(name)
+    std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
 }
 
 /// `viewer` is a sibling binary, not a library this crate can call into
@@ -595,11 +588,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
     println!(
         "\nUsing {} save(s): {}\n",
         chosen.len(),
-        chosen
-            .iter()
-            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(", ")
+        chosen.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy()).collect::<Vec<_>>().join(", ")
     );
 
     let capture_terrain = ask_yes_no(
@@ -613,13 +602,8 @@ fn run_from_saves() -> io::Result<PathBuf> {
     std::fs::create_dir_all(&out)?;
 
     let workspace = std::env::temp_dir().join(format!("save-timelapse-{}", std::process::id()));
-    let config = export::ExportConfig {
-        factorio,
-        user_mods,
-        mod_source: mod_source_dir()?,
-        include_resources: false,
-        capture_terrain,
-    };
+    let config =
+        export::ExportConfig { factorio, user_mods, mod_source: mod_source_dir()?, include_resources: false, capture_terrain };
 
     let mut done = 0usize;
     let mut milestone_states: Vec<milestone::State> = Vec::new();
@@ -639,8 +623,7 @@ fn run_from_saves() -> io::Result<PathBuf> {
                 // playthrough builds up one line per save in the shared
                 // output file, the same as a live capture's many samples.
                 if let Some(log) = &outcome.players_log {
-                    let mut combined =
-                        std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
+                    let mut combined = std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
                     combined.write_all(&std::fs::read(log)?)?;
                 }
                 if let Some(state) = outcome.milestones {
@@ -696,9 +679,7 @@ fn run() -> io::Result<Option<PathBuf>> {
             // naming a playthrough and then being dropped out of the program
             // means starting it again to actually use the name.
             Mode::ManageCaptures => {
-                let capture = locate_factorio_user_dir_interactive()?
-                    .join("script-output")
-                    .join("save-timelapse");
+                let capture = locate_factorio_user_dir_interactive()?.join("script-output").join("save-timelapse");
                 manage_captures(&capture)?;
                 println!();
             }
@@ -752,16 +733,23 @@ fn manage_captures(capture_dir: &Path) -> io::Result<()> {
     loop {
         let mut sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
         if sessions.is_empty() {
-            println!("
-No captures found in {}.", capture_dir.display());
+            println!(
+                "
+No captures found in {}.",
+                capture_dir.display()
+            );
             return Ok(());
         }
 
         let now = SystemTime::now();
         let total: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
-        println!("
+        println!(
+            "
 {} capture(s), {} in total:
-", sessions.len(), describe_size(total));
+",
+            sessions.len(),
+            describe_size(total)
+        );
         for (i, session) in sessions.iter().enumerate() {
             println!("  {}) {}", i + 1, describe_session(session, now));
         }
@@ -907,8 +895,12 @@ mod tests {
         let (session, out) = (dir.path().join("session"), dir.path().join("out"));
         std::fs::create_dir_all(&session).unwrap();
         std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(session.join("players.jsonl"), "{\"tick\":1,\"players\":[]}
-").unwrap();
+        std::fs::write(
+            session.join("players.jsonl"),
+            "{\"tick\":1,\"players\":[]}
+",
+        )
+        .unwrap();
         std::fs::write(
             session.join("milestones.jsonl"),
             "{\"tick\":9,\"kind\":\"rocket\",\"id\":\"rocket-launched\"}
@@ -987,11 +979,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join("0000002a");
         std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(
-            session_dir.join("baseline.json"),
-            r#"{"tick":100,"entities":7,"tiles":3,"surfaces":["nauvis"]}"#,
-        )
-        .unwrap();
+        std::fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":7,"tiles":3,"surfaces":["nauvis"]}"#)
+            .unwrap();
 
         let sessions = replay::discover_sessions(dir.path()).unwrap();
         let line = describe_session(&sessions[0], SystemTime::now());
@@ -1043,13 +1032,9 @@ mod tests {
 
     #[test]
     fn ordering_key_sorts_numerically_not_lexicographically() {
-        let mut saves =
-            vec![PathBuf::from("base2.zip"), PathBuf::from("base10.zip"), PathBuf::from("base1.zip")];
+        let mut saves = vec![PathBuf::from("base2.zip"), PathBuf::from("base10.zip"), PathBuf::from("base1.zip")];
         saves.sort_by_key(|p| ordering_key(p));
-        assert_eq!(
-            saves,
-            vec![PathBuf::from("base1.zip"), PathBuf::from("base2.zip"), PathBuf::from("base10.zip")]
-        );
+        assert_eq!(saves, vec![PathBuf::from("base1.zip"), PathBuf::from("base2.zip"), PathBuf::from("base10.zip")]);
     }
 
     #[test]

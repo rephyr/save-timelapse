@@ -329,8 +329,7 @@ impl World {
         match event {
             Event::AddEntity { name, x, y, d, w, h, id } => {
                 let name = self.names.intern(name);
-                let entity =
-                    WorldEntity { name, x: *x, y: *y, d: *d, w: *w, h: *h, id: *id };
+                let entity = WorldEntity { name, x: *x, y: *y, d: *d, w: *w, h: *h, id: *id };
                 match self.target(surface) {
                     Some(s) => {
                         s.insert(entity);
@@ -398,27 +397,14 @@ impl World {
     /// loaded it. Use `terrain_frame` to get that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame {
-                tick,
-                surface: surface_name.to_string(),
-                entities: Vec::new(),
-                count: 0,
-                tiles: Vec::new(),
-            };
+            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
         };
 
         let names = self.name_table();
 
         let entities: Vec<Entity> = surface
             .entities()
-            .map(|e| Entity {
-                n: Arc::clone(&names[e.name as usize]),
-                x: e.x,
-                y: e.y,
-                d: e.d,
-                w: e.w,
-                h: e.h,
-            })
+            .map(|e| Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
             .collect();
 
         let tiles = Self::materialize_tiles(&surface.tiles, &names);
@@ -434,13 +420,7 @@ impl World {
     /// per replayed frame.
     pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame {
-                tick,
-                surface: surface_name.to_string(),
-                entities: Vec::new(),
-                count: 0,
-                tiles: Vec::new(),
-            };
+            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
         };
 
         let names = self.name_table();
@@ -461,10 +441,8 @@ impl World {
     /// `HashMap` iterates in an order that depends on allocation and
     /// hashing rather than on its contents.
     fn materialize_tiles(tiles: &HashMap<PosKey, NameId>, names: &[Arc<str>]) -> Vec<Tile> {
-        let mut out: Vec<Tile> = tiles
-            .iter()
-            .map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y })
-            .collect();
+        let mut out: Vec<Tile> =
+            tiles.iter().map(|(&(x, y), &name)| Tile { n: Arc::clone(&names[name as usize]), x, y }).collect();
         out.sort_by_key(|t| (t.y, t.x));
         out
     }
@@ -475,13 +453,7 @@ mod tests {
     use super::*;
 
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
-        Frame {
-            tick: 100,
-            surface: "nauvis".to_string(),
-            count: entities.len(),
-            entities,
-            tiles,
-        }
+        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles }
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
@@ -509,10 +481,7 @@ mod tests {
     fn entities_a_tenth_of_a_tile_apart_stay_distinct() {
         let mut world = World::new();
         world.load_baseline(&baseline(
-            vec![
-                entity("logistic-train-stop-lamp-control", 326.9, -843.0),
-                entity("logistic-train-stop", 327.0, -843.0),
-            ],
+            vec![entity("logistic-train-stop-lamp-control", 326.9, -843.0), entity("logistic-train-stop", 327.0, -843.0)],
             Vec::new(),
         ));
         assert_eq!(world.entity_count(), 2);
@@ -587,10 +556,7 @@ mod tests {
         // A real unit_number Factorio assigned long before capture started,
         // so replay's by_id map was never told about it.
         let unrecognized_id = 999_999;
-        assert!(world.apply(
-            Some("nauvis"),
-            &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }
-        ));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }));
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
@@ -631,10 +597,14 @@ mod tests {
         world.load_baseline(&baseline(Vec::new(), Vec::new()));
 
         assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }));
-        assert!(!world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }),
-            "re-adding the same tile changes nothing");
-        assert!(world.apply(Some("nauvis"), &Event::AddTile { name: "stone-path".into(), x: -5, y: 12 }),
-            "a different tile on the same spot is a change");
+        assert!(
+            !world.apply(Some("nauvis"), &Event::AddTile { name: "concrete".into(), x: -5, y: 12 }),
+            "re-adding the same tile changes nothing"
+        );
+        assert!(
+            world.apply(Some("nauvis"), &Event::AddTile { name: "stone-path".into(), x: -5, y: 12 }),
+            "a different tile on the same spot is a change"
+        );
         assert_eq!(world.tile_count(), 1);
 
         assert!(world.apply(Some("nauvis"), &Event::RemoveTile { x: -5, y: 12 }));
@@ -778,10 +748,7 @@ mod tests {
         let mut world = World::new();
         world.load_baseline(&baseline(
             Vec::new(),
-            vec![
-                Tile { n: "concrete".into(), x: 0, y: 0 },
-                Tile { n: "grass-1".into(), x: 1, y: 0 },
-            ],
+            vec![Tile { n: "concrete".into(), x: 0, y: 0 }, Tile { n: "grass-1".into(), x: 1, y: 0 }],
         ));
 
         let frame = world.to_frame("nauvis", 10);

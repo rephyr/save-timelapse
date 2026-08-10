@@ -46,17 +46,13 @@ fn default_frame_bytes() -> Vec<u8> {
 }
 
 fn flag_value(file: &settings_dat::SettingsFile, name: &str) -> bool {
-    matches!(
-        file.listing().get(&("startup".to_string(), name.to_string())),
-        Some(Payload::Flag(true))
-    )
+    matches!(file.listing().get(&("startup".to_string(), name.to_string())), Some(Payload::Flag(true)))
 }
 
 /// Pull `write-data` out of a Factorio config.ini.
 fn write_data_dir(config: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config).ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("write-data=").map(|v| PathBuf::from(v.trim())))
+    text.lines().find_map(|line| line.strip_prefix("write-data=").map(|v| PathBuf::from(v.trim())))
 }
 
 fn arg_after(args: &[String], flag: &str) -> Option<PathBuf> {

@@ -70,7 +70,11 @@ fn every_released_frame_version_loads_and_agrees() {
         assert_eq!(frame.tick, first.tick, "{label} disagrees with {first_label} on tick");
         assert_eq!(frame.surface, first.surface, "{label} disagrees with {first_label} on surface");
         assert_eq!(frame.count, first.count, "{label} disagrees with {first_label} on entity count");
-        assert_eq!(entity_keys(&frame.entities), entity_keys(&first.entities), "{label} disagrees with {first_label} on entities");
+        assert_eq!(
+            entity_keys(&frame.entities),
+            entity_keys(&first.entities),
+            "{label} disagrees with {first_label} on entities"
+        );
         assert_eq!(tile_keys(&frame.tiles), tile_keys(&first.tiles), "{label} disagrees with {first_label} on tiles");
     }
 }

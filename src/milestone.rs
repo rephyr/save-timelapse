@@ -122,11 +122,7 @@ pub fn read(path: &Path) -> io::Result<Vec<Milestone>> {
     let mut milestones: Vec<Milestone> = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<RawMilestone>(line) {
-            Ok(raw) => milestones.push(Milestone {
-                tick: raw.tick,
-                kind: Kind::parse(&raw.kind),
-                id: raw.id,
-            }),
+            Ok(raw) => milestones.push(Milestone { tick: raw.tick, kind: Kind::parse(&raw.kind), id: raw.id }),
             Err(e) => eprintln!("warning: skipping malformed milestone line: {e}"),
         }
     }
@@ -186,12 +182,7 @@ impl State {
         let text = fs::read_to_string(path)?;
         let raw: RawManifest = serde_json::from_str(&text)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
-        Ok(raw.milestones.map(|m| State {
-            tick: raw.tick,
-            science: m.science,
-            planets: m.planets,
-            rockets: m.rockets,
-        }))
+        Ok(raw.milestones.map(|m| State { tick: raw.tick, science: m.science, planets: m.planets, rockets: m.rockets }))
     }
 }
 
@@ -240,11 +231,7 @@ pub fn from_saves(mut states: Vec<State>) -> Vec<Milestone> {
         }
         if state.rockets > 0 && !seen_rocket {
             seen_rocket = true;
-            milestones.push(Milestone {
-                tick: state.tick,
-                kind: Kind::Rocket,
-                id: "rocket-launched".to_string(),
-            });
+            milestones.push(Milestone { tick: state.tick, kind: Kind::Rocket, id: "rocket-launched".to_string() });
         }
     }
 
@@ -325,10 +312,7 @@ mod tests {
     #[test]
     fn a_truncated_last_line_does_not_lose_the_ones_before_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "{\"tick\":1,\"kind\":\"science\",\"id\":\"automation-science-pack\"}\n{\"tick\":2,\"kin",
-        );
+        let path = write(dir.path(), "{\"tick\":1,\"kind\":\"science\",\"id\":\"automation-science-pack\"}\n{\"tick\":2,\"kin");
         assert_eq!(read(&path).unwrap().len(), 1);
     }
 
@@ -376,7 +360,14 @@ mod tests {
             state(100, &["automation-science-pack"], &["nauvis"], 0),
             state(200, &["automation-science-pack", "logistic-science-pack"], &["nauvis"], 0),
         ]);
-        assert_eq!(ids(&found), [(100, "automation-science-pack".to_string()), (100, "nauvis".to_string()), (200, "logistic-science-pack".to_string())]);
+        assert_eq!(
+            ids(&found),
+            [
+                (100, "automation-science-pack".to_string()),
+                (100, "nauvis".to_string()),
+                (200, "logistic-science-pack".to_string())
+            ]
+        );
     }
 
     /// Everything already true in the earliest save is emitted there. It did
@@ -412,12 +403,8 @@ mod tests {
     /// one cannot be dated any earlier than that save.
     #[test]
     fn the_rocket_marker_fires_on_the_first_save_with_any_launches() {
-        let found = from_saves(vec![
-            state(10, &[], &[], 0),
-            state(20, &[], &[], 0),
-            state(30, &[], &[], 2),
-            state(40, &[], &[], 9),
-        ]);
+        let found =
+            from_saves(vec![state(10, &[], &[], 0), state(20, &[], &[], 0), state(30, &[], &[], 2), state(40, &[], &[], 9)]);
         assert_eq!(ids(&found), [(30, "rocket-launched".to_string())]);
     }
 
@@ -426,14 +413,9 @@ mod tests {
     /// chronologically.
     #[test]
     fn saves_are_compared_in_tick_order_not_the_order_given() {
-        let found = from_saves(vec![
-            state(300, &["logistic-science-pack"], &[], 0),
-            state(100, &["automation-science-pack"], &[], 0),
-        ]);
-        assert_eq!(
-            ids(&found),
-            [(100, "automation-science-pack".to_string()), (300, "logistic-science-pack".to_string())]
-        );
+        let found =
+            from_saves(vec![state(300, &["logistic-science-pack"], &[], 0), state(100, &["automation-science-pack"], &[], 0)]);
+        assert_eq!(ids(&found), [(100, "automation-science-pack".to_string()), (300, "logistic-science-pack".to_string())]);
     }
 
     /// A planet counts as reached once its surface is inhabited, and a player

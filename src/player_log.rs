@@ -86,10 +86,7 @@ mod tests {
 
         let samples = read_jsonl(&path).unwrap();
         assert_eq!(samples.len(), 3);
-        assert_eq!(
-            samples[0],
-            PlayerSample { tick: 100, name: "Alice".into(), surface: "nauvis".into(), x: 1.5, y: 2.5 }
-        );
+        assert_eq!(samples[0], PlayerSample { tick: 100, name: "Alice".into(), surface: "nauvis".into(), x: 1.5, y: 2.5 });
         assert_eq!(samples[2].name, "Bob");
     }
 

@@ -13,28 +13,14 @@ use save_timelapse::frame::{Entity, Frame, Tile};
 /// Grid of fabricated entities, cycling through a handful of type names, for
 /// load-testing at counts the real fixtures don't reach.
 pub fn synthetic_frame(count: usize) -> Frame {
-    const NAMES: &[&str] = &[
-        "transport-belt",
-        "assembling-machine-1",
-        "electric-pole",
-        "inserter",
-        "pipe",
-        "splitter",
-    ];
+    const NAMES: &[&str] = &["transport-belt", "assembling-machine-1", "electric-pole", "inserter", "pipe", "splitter"];
     let side = (count as f32).sqrt().ceil() as i64;
     let spacing = 2.0;
     let entities = (0..count)
         .map(|i| {
             let ix = (i as i64) % side;
             let iy = (i as i64) / side;
-            Entity {
-                n: NAMES[i % NAMES.len()].into(),
-                x: ix as f32 * spacing,
-                y: iy as f32 * spacing,
-                d: 0,
-                w: 1,
-                h: 1,
-            }
+            Entity { n: NAMES[i % NAMES.len()].into(), x: ix as f32 * spacing, y: iy as f32 * spacing, d: 0, w: 1, h: 1 }
         })
         .collect();
     Frame { tick: 0, surface: "synthetic".to_string(), count, entities, tiles: Vec::new() }
@@ -63,7 +49,7 @@ fn frame_is_candidate(path: &Path) -> bool {
     // without this the viewer treats every marker as a frame and warns about
     // failing to parse an empty file.
     if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
-        return false
+        return false;
     }
 
     let stem = match path.file_stem().and_then(|s| s.to_str()) {
@@ -71,7 +57,7 @@ fn frame_is_candidate(path: &Path) -> bool {
         None => return false,
     };
     if !stem.starts_with("frame_") {
-        return false
+        return false;
     }
 
     let rest = &stem[6..];
@@ -80,7 +66,7 @@ fn frame_is_candidate(path: &Path) -> bool {
     let surface_part = parts.next().unwrap_or("");
 
     if surface_part == "manifest" {
-        return false
+        return false;
     }
 
     tick_part.parse::<u64>().is_ok()
@@ -93,11 +79,8 @@ pub fn frame_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
     if !path.is_dir() {
         return Ok(vec![path.to_path_buf()]);
     }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| frame_is_candidate(p))
-        .collect();
+    let mut entries: Vec<PathBuf> =
+        std::fs::read_dir(path)?.filter_map(Result::ok).map(|e| e.path()).filter(|p| frame_is_candidate(p)).collect();
     entries.sort();
     Ok(entries)
 }
@@ -331,10 +314,7 @@ pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<(u64, Pat
     // it actually moved at, and the gaps have to be filled against the union
     // of every surface's ticks. Reading the headers again to recover
     // something this function already had would be the only alternative.
-    surfaces
-        .into_iter()
-        .map(|(name, group)| (name, group.into_iter().map(|(tick, _, path)| (tick, path)).collect()))
-        .collect()
+    surfaces.into_iter().map(|(name, group)| (name, group.into_iter().map(|(tick, _, path)| (tick, path)).collect())).collect()
 }
 
 /// Parses `paths` in parallel and returns the frames in the same order,
@@ -356,9 +336,7 @@ pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
     for (_, group) in &mut surfaces {
         order_by_tick(group, |f| f.tick, |f| f.entities.len());
     }
-    surfaces.sort_by_key(|(_, group)| {
-        std::cmp::Reverse(group.iter().map(|f| f.entities.len()).max().unwrap_or(0))
-    });
+    surfaces.sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|f| f.entities.len()).max().unwrap_or(0)));
     surfaces
 }
 
@@ -381,10 +359,7 @@ pub fn load_sequence(path: &Path) -> io::Result<Vec<Frame>> {
     let mut frames: Vec<Frame> = frame_paths(path)?.iter().filter_map(|p| load_frame(p)).collect();
 
     if frames.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("no valid frame files found in {}", path.display()),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("no valid frame files found in {}", path.display())));
     }
 
     order_by_tick(&mut frames, |f| f.tick, |f| f.entities.len());
@@ -673,10 +648,7 @@ mod tests {
         write_stub_frame(dir.path(), "terrain_vulcanus.stfr", 0, "vulcanus", 0);
 
         let found = terrain_paths(dir.path()).unwrap();
-        assert_eq!(
-            found,
-            vec![dir.path().join("terrain_nauvis.stfr"), dir.path().join("terrain_vulcanus.stfr")]
-        );
+        assert_eq!(found, vec![dir.path().join("terrain_nauvis.stfr"), dir.path().join("terrain_vulcanus.stfr")]);
     }
 
     #[test]

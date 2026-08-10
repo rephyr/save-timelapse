@@ -45,10 +45,7 @@ impl Entry {
     pub fn flag(value: bool) -> Entry {
         Entry {
             any_type: 0,
-            payload: Payload::Table(vec![(
-                "value".to_string(),
-                Entry { any_type: 0, payload: Payload::Flag(value) },
-            )]),
+            payload: Payload::Table(vec![("value".to_string(), Entry { any_type: 0, payload: Payload::Flag(value) })]),
         }
     }
 }
@@ -102,8 +99,7 @@ impl<'a> Cursor<'a> {
         if len == 0xFF {
             len = self.long()? as usize;
         }
-        String::from_utf8(self.slice(len)?.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        String::from_utf8(self.slice(len)?.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn entry(&mut self) -> io::Result<Entry> {
@@ -191,10 +187,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<SettingsFile> {
     let header_flag = c.byte()?;
     let root = c.entry()?;
     if c.at != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("trailing data: read {} of {} bytes", c.at, bytes.len()),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("trailing data: read {} of {} bytes", c.at, bytes.len())));
     }
     Ok(SettingsFile { version, header_flag, root })
 }
@@ -214,15 +207,9 @@ impl SettingsFile {
     pub fn blank(version: Version) -> SettingsFile {
         let sections = ["startup", "runtime-global", "runtime-per-user"]
             .iter()
-            .map(|name| {
-                (name.to_string(), Entry { any_type: 0, payload: Payload::Table(Vec::new()) })
-            })
+            .map(|name| (name.to_string(), Entry { any_type: 0, payload: Payload::Table(Vec::new()) }))
             .collect();
-        SettingsFile {
-            version,
-            header_flag: 0,
-            root: Entry { any_type: 0, payload: Payload::Table(sections) },
-        }
+        SettingsFile { version, header_flag: 0, root: Entry { any_type: 0, payload: Payload::Table(sections) } }
     }
 
     /// Insert or replace one setting, leaving every other entry as it was.
@@ -239,10 +226,7 @@ impl SettingsFile {
             return;
         }
 
-        sections.push((
-            section.to_string(),
-            Entry { any_type: 0, payload: Payload::Table(vec![(name.to_string(), entry)]) },
-        ));
+        sections.push((section.to_string(), Entry { any_type: 0, payload: Payload::Table(vec![(name.to_string(), entry)]) }));
     }
 
     /// Flat `(section, name) -> value` view, for assertions and diffing.
@@ -268,12 +252,7 @@ impl SettingsFile {
 ///
 /// A missing or undecodable source yields a blank file containing only
 /// `changes`. Nothing is lost in that case because nothing was readable.
-pub fn apply_to_file(
-    source: &Path,
-    target: &Path,
-    changes: &[(&str, &str, bool)],
-    fallback: Version,
-) -> io::Result<()> {
+pub fn apply_to_file(source: &Path, target: &Path, changes: &[(&str, &str, bool)], fallback: Version) -> io::Result<()> {
     let mut file = match std::fs::read(source) {
         Ok(bytes) => decode(&bytes).unwrap_or_else(|err| {
             eprintln!(

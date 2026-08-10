@@ -127,8 +127,7 @@ mod tests {
     #[test]
     fn growing_bounds_covers_the_first_frames_entities() {
         let mut registry = TypeRegistry::new();
-        let frames =
-            vec![render(vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)], Vec::new(), &mut registry)];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(5.0, 5.0));
     }
@@ -164,11 +163,7 @@ mod tests {
     #[test]
     fn growing_bounds_ignores_tiles_entirely() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![render(
-            vec![entity("a", 0.0, 0.0)],
-            vec![Tile { n: "grass".into(), x: 5000, y: 5000 }],
-            &mut registry,
-        )];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0)], vec![Tile { n: "grass".into(), x: 5000, y: 5000 }], &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the far away terrain tile must not affect the box");
     }
@@ -211,11 +206,7 @@ mod tests {
     #[test]
     fn growing_bounds_ignores_resource_deposits() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![render(
-            vec![entity("a", 0.0, 0.0), entity("crude-oil", -151.0, -195.0)],
-            Vec::new(),
-            &mut registry,
-        )];
+        let frames = vec![render(vec![entity("a", 0.0, 0.0), entity("crude-oil", -151.0, -195.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].unwrap();
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant oil deposit must not affect the box");
     }
@@ -223,10 +214,8 @@ mod tests {
     #[test]
     fn growing_bounds_becomes_some_once_something_is_finally_built() {
         let mut registry = TypeRegistry::new();
-        let frames = vec![
-            render(Vec::new(), Vec::new(), &mut registry),
-            render(vec![entity("a", 1.0, 1.0)], Vec::new(), &mut registry),
-        ];
+        let frames =
+            vec![render(Vec::new(), Vec::new(), &mut registry), render(vec![entity("a", 1.0, 1.0)], Vec::new(), &mut registry)];
         let bounds = growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry);
         assert!(bounds[0].is_none());
         assert!(bounds[1].is_some());

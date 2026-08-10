@@ -86,11 +86,7 @@ impl<T: Copy> SpanSet<T> {
                 // Spans are type-sorted, so a matching type is always the run
                 // being built and never one already closed.
                 Some(run) if run.type_id == span.type_id => run.end += 1,
-                _ => runs.push(Run {
-                    type_id: span.type_id,
-                    start: out.len() as u32,
-                    end: out.len() as u32 + 1,
-                }),
+                _ => runs.push(Run { type_id: span.type_id, start: out.len() as u32, end: out.len() as u32 + 1 }),
             }
             out.push(span.item);
         }
@@ -132,13 +128,7 @@ pub struct SpanBuilder<T> {
 
 impl<T: Copy> Default for SpanBuilder<T> {
     fn default() -> Self {
-        SpanBuilder {
-            spans: Vec::new(),
-            open: Vec::new(),
-            current: Vec::new(),
-            next_open: Vec::new(),
-            frames: 0,
-        }
+        SpanBuilder { spans: Vec::new(), open: Vec::new(), current: Vec::new(), next_open: Vec::new(), frames: 0 }
     }
 }
 
@@ -430,13 +420,7 @@ mod bench {
             for (t, &type_id) in types.iter().enumerate() {
                 let start = entities.len() as u32;
                 for i in (t..n).step_by(types.len()) {
-                    entities.push(RenderEntity {
-                        x: (i % 2000) as f32 + 0.5,
-                        y: (i / 2000) as f32 + 0.5,
-                        w: 1,
-                        h: 1,
-                        d: 0,
-                    });
+                    entities.push(RenderEntity { x: (i % 2000) as f32 + 0.5, y: (i / 2000) as f32 + 0.5, w: 1, h: 1, d: 0 });
                 }
                 runs.push(Run { type_id, start, end: entities.len() as u32 });
             }

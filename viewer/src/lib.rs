@@ -22,15 +22,14 @@ mod timecode;
 
 pub use activity::{activity_heights, analyze_activity, recent_heat, Activity, HeatCell, HEAT_CELL_TILES};
 pub use camera::{
-    entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition,
-    Timeline, BASE_PIXELS_PER_TILE,
+    entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition, Timeline,
+    BASE_PIXELS_PER_TILE,
 };
 pub use construction::{growing_bounds_per_frame, GrowingBounds};
 pub use draw_calls::DrawCallCounter;
 pub use loading::{
-    frame_paths, group_by_surface, group_paths_by_surface, load_batch, load_frame, load_sequence,
-    load_terrain, order_by_tick, timeline_ticks,
-    synthetic_frame, synthetic_tiles, terrain_path, terrain_paths, ParallelFrameLoad,
+    frame_paths, group_by_surface, group_paths_by_surface, load_batch, load_frame, load_sequence, load_terrain, order_by_tick,
+    synthetic_frame, synthetic_tiles, terrain_path, terrain_paths, timeline_ticks, ParallelFrameLoad,
 };
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};

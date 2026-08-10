@@ -116,9 +116,19 @@ pub enum Event {
     /// always present in this format (see `control.lua::log_entity`, which
     /// always has an entity's position and passes its `unit_number` whether
     /// or not the entity has one).
-    RemoveEntity { id: Option<u64>, pos: (f32, f32) },
-    AddTile { name: String, x: i32, y: i32 },
-    RemoveTile { x: i32, y: i32 },
+    RemoveEntity {
+        id: Option<u64>,
+        pos: (f32, f32),
+    },
+    AddTile {
+        name: String,
+        x: i32,
+        y: i32,
+    },
+    RemoveTile {
+        x: i32,
+        y: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -227,10 +237,7 @@ impl Iterator for EventStream {
                         (Some(tick), Some(surface)) => Some(LoggedEvent {
                             tick,
                             surface: surface.clone(),
-                            event: Event::RemoveEntity {
-                                id: (id != 0).then_some(id),
-                                pos: (x as f32 / 10.0, y as f32 / 10.0),
-                            },
+                            event: Event::RemoveEntity { id: (id != 0).then_some(id), pos: (x as f32 / 10.0, y as f32 / 10.0) },
                         }),
                         _ => None,
                     };
@@ -314,10 +321,7 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     File::open(path)?.read_to_end(&mut bytes)?;
 
     if bytes.get(0..4) != Some(&MAGIC[..]) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: not an event log (bad magic)", path.display()),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an event log (bad magic)", path.display())));
     }
     match bytes.get(4) {
         Some(&v) if (MIN_SUPPORTED_VERSION..=CURRENT_VERSION).contains(&v) => {}
@@ -330,19 +334,10 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
                 ),
             ));
         }
-        None => {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display())))
-        }
+        None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display()))),
     }
 
-    Ok(EventStream {
-        bytes,
-        pos: 5,
-        names: Vec::new(),
-        surfaces: Vec::new(),
-        current_tick: None,
-        unknown_extensions: 0,
-    })
+    Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None, unknown_extensions: 0 })
 }
 
 /// One segment file, plus the half-open tick range replay should actually
@@ -420,10 +415,8 @@ pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
         .collect();
     found.sort();
 
-    let mut segments: Vec<Segment> = found
-        .into_iter()
-        .map(|(_, start_tick, _, path)| Segment { path, start_tick, end_tick: u64::MAX })
-        .collect();
+    let mut segments: Vec<Segment> =
+        found.into_iter().map(|(_, start_tick, _, path)| Segment { path, start_tick, end_tick: u64::MAX }).collect();
 
     let mut superseded_at = u64::MAX;
     for segment in segments.iter_mut().rev() {
@@ -533,7 +526,8 @@ mod tests {
             w.u8(2).u64(42); // SetTick
             w.u8(1).string("nauvis"); // DefineSurface
             w.u8(0).string("assembling-machine-1"); // DefineName
-            w.u8(3).u16(0).i32(-805).i32(285).u8(4).u8(3).u8(3).u64(1234).u16(0); // AddEntity
+            w.u8(3).u16(0).i32(-805).i32(285).u8(4).u8(3).u8(3).u64(1234).u16(0);
+            // AddEntity
         });
 
         let dir = tempfile::tempdir().unwrap();
@@ -545,15 +539,7 @@ mod tests {
         assert_eq!(events[0].surface, "nauvis");
         assert_eq!(
             events[0].event,
-            Event::AddEntity {
-                name: "assembling-machine-1".to_string(),
-                x: -80.5,
-                y: 28.5,
-                d: 4,
-                w: 3,
-                h: 3,
-                id: Some(1234),
-            }
+            Event::AddEntity { name: "assembling-machine-1".to_string(), x: -80.5, y: 28.5, d: 4, w: 3, h: 3, id: Some(1234) }
         );
     }
 
@@ -625,9 +611,7 @@ mod tests {
         let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
 
         assert_eq!(events.len(), 1, "only the complete record survives");
-        assert_eq!(events[0].event, Event::AddEntity {
-            name: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(1),
-        });
+        assert_eq!(events[0].event, Event::AddEntity { name: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(1) });
     }
 
     /// What a plain quit-and-reload does to a segment that stays open across
@@ -669,10 +653,9 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         match &events[1].event {
-            Event::AddEntity { name, .. } => assert_eq!(
-                name, "transport-belt",
-                "the post-reload record must decode as what the writer meant"
-            ),
+            Event::AddEntity { name, .. } => {
+                assert_eq!(name, "transport-belt", "the post-reload record must decode as what the writer meant")
+            }
             other => panic!("expected an add, got {other:?}"),
         }
     }
@@ -709,8 +692,8 @@ mod tests {
             w.u8(1).string("nauvis"); // DefineSurface
             w.u8(0).string("pipe"); // DefineName
             w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
-            // Something a later mod version writes and this build has never
-            // heard of, sitting between two records it does understand.
+                                                                          // Something a later mod version writes and this build has never
+                                                                          // heard of, sitting between two records it does understand.
             w.u8(TAG_EXTENSION_MIN).varint(4).u32(0xDEADBEEF);
             w.u8(3).u16(0).i32(15).i32(5).u8(0).u8(1).u8(1).u64(2).u16(0); // AddEntity
         });
@@ -721,9 +704,7 @@ mod tests {
         let events: Vec<LoggedEvent> = (&mut stream).collect();
 
         assert_eq!(events.len(), 2, "the record after the extension must still arrive");
-        assert_eq!(events[1].event, Event::AddEntity {
-            name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2),
-        });
+        assert_eq!(events[1].event, Event::AddEntity { name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2) });
         assert_eq!(stream.unknown_extensions(), 1);
     }
 
@@ -787,11 +768,7 @@ mod tests {
     }
 
     fn segment_names(dir: &Path) -> Vec<String> {
-        log_segments(dir)
-            .unwrap()
-            .iter()
-            .map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect()
+        log_segments(dir).unwrap().iter().map(|s| s.path.file_name().unwrap().to_string_lossy().into_owned()).collect()
     }
 
     /// With no reload in the picture, mtime order and tick order agree, and
@@ -808,10 +785,7 @@ mod tests {
         std::fs::write(dir.path().join("frame_1_nauvis.stfr"), "").unwrap();
         std::fs::write(dir.path().join("baseline.json"), "{}").unwrap();
 
-        assert_eq!(
-            segment_names(dir.path()),
-            vec!["events_100.stev", "events_9000.stev", "events_10000.stev"]
-        );
+        assert_eq!(segment_names(dir.path()), vec!["events_100.stev", "events_9000.stev", "events_10000.stev"]);
     }
 
     /// Two reloads, the second reaching further back than the first. Start
@@ -826,10 +800,7 @@ mod tests {
             set_mtime_rank(dir.path(), name, rank as u64);
         }
 
-        assert_eq!(
-            segment_names(dir.path()),
-            vec!["events_0.stev", "events_1000.stev", "events_500.stev"]
-        );
+        assert_eq!(segment_names(dir.path()), vec!["events_0.stev", "events_1000.stev", "events_500.stev"]);
     }
 
     /// A segment ends where the earliest later-created one begins, so the
@@ -843,8 +814,7 @@ mod tests {
             set_mtime_rank(dir.path(), name, rank as u64);
         }
 
-        let bounds: Vec<(u64, u64)> =
-            log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
+        let bounds: Vec<(u64, u64)> = log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
         assert_eq!(bounds, vec![(0, 500), (1000, 500), (500, u64::MAX)]);
     }
 
@@ -901,8 +871,7 @@ mod tests {
             set_mtime_rank(dir.path(), name, 0);
         }
 
-        let bounds: Vec<(u64, u64)> =
-            log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
+        let bounds: Vec<(u64, u64)> = log_segments(dir.path()).unwrap().iter().map(|s| (s.start_tick, s.end_tick)).collect();
         assert_eq!(bounds, vec![(100, 900), (900, 5000), (5000, u64::MAX)]);
     }
 }

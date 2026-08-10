@@ -79,8 +79,7 @@ impl Baseline {
                 ),
             )
         })?;
-        let mut baseline: Baseline =
-            serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut baseline: Baseline = serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         baseline.session_id = path.parent().and_then(parse_session_dir_name).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -155,8 +154,7 @@ impl CatchUpBaseline {
 /// deterministically, so anything else matching the general frame shape is
 /// definitionally a catch-up.
 fn discover_catch_up_baselines(dir: &Path, baseline: &Baseline) -> io::Result<Vec<CatchUpBaseline>> {
-    let known: std::collections::HashSet<PathBuf> =
-        baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
+    let known: std::collections::HashSet<PathBuf> = baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
 
     let mut catch_ups: Vec<CatchUpBaseline> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -209,8 +207,14 @@ impl Session {
                 other => other,
             };
         }
-        std::fs::write(path, format!("{}
-", label.trim()))
+        std::fs::write(
+            path,
+            format!(
+                "{}
+",
+                label.trim()
+            ),
+        )
     }
 
     /// How much disk this capture occupies, for showing what deleting it
@@ -277,8 +281,7 @@ pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
             }
         };
 
-        let mut last_modified =
-            baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut last_modified = baseline_path.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
         if let Ok(segments) = event::log_segments(&session_dir) {
             for segment in segments {
                 if let Ok(modified) = segment.path.metadata().and_then(|m| m.modified()) {
@@ -367,8 +370,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     let baseline = Baseline::read_at(baseline_path)?;
     let dir = baseline_path.parent().unwrap_or_else(|| Path::new("."));
 
-    let mut paths: Vec<PathBuf> =
-        baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
+    let mut paths: Vec<PathBuf> = baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
     paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
 
     let mut world = World::new();
@@ -437,8 +439,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
 /// built there before capture stopped) would otherwise be invisible to both
 /// checks, so `replay.pending_catch_ups` is checked directly too.
 pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<String>> {
-    let mut surfaces: std::collections::BTreeSet<String> =
-        replay.world.surface_names().into_iter().map(String::from).collect();
+    let mut surfaces: std::collections::BTreeSet<String> = replay.world.surface_names().into_iter().map(String::from).collect();
     surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
 
     // Bounded exactly the way `run` bounds them, per append run and not just
@@ -833,8 +834,7 @@ mod idle_study {
         let dir = std::env::var("SAVE_TIMELAPSE_CAPTURE")
             .expect("set SAVE_TIMELAPSE_CAPTURE to one session folder under script-output");
         let dir = Path::new(&dir);
-        let frame_seconds: u64 =
-            std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let frame_seconds: u64 = std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
 
         let mut replay = load_baseline(&dir.join("baseline.json")).expect("baseline must load");
         let surfaces: Vec<String> = replay.world.surface_names().iter().map(|s| s.to_string()).collect();
@@ -891,14 +891,7 @@ mod idle_study {
         let bytes: usize = totals.iter().map(|t| t.1).sum();
         let dups: usize = totals.iter().map(|t| t.2).sum();
         let wasted: usize = duplicate_bytes.iter().sum();
-        println!(
-            "  {:<14} {:>7} {:>8.1}% {:>8.1} MB {:>6.1} MB",
-            "TOTAL",
-            files,
-            pct(dups, files),
-            mb(bytes),
-            mb(wasted)
-        );
+        println!("  {:<14} {:>7} {:>8.1}% {:>8.1} MB {:>6.1} MB", "TOTAL", files, pct(dups, files), mb(bytes), mb(wasted));
         println!("  bytes wasted: {:.1}%", pct(wasted, bytes));
         println!("  applied events {}  no-op {}", replay.applied_events, replay.no_op_events);
     }
@@ -915,8 +908,7 @@ mod idle_study {
         let dir = std::env::var("SAVE_TIMELAPSE_CAPTURE")
             .expect("set SAVE_TIMELAPSE_CAPTURE to one session folder under script-output");
         let dir = Path::new(&dir);
-        let frame_seconds: u64 =
-            std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let frame_seconds: u64 = std::env::var("SAVE_TIMELAPSE_FRAME_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
 
         let mut replay = load_baseline(&dir.join("baseline.json")).expect("baseline must load");
         let out = tempfile::tempdir().unwrap();
@@ -1156,10 +1148,7 @@ mod tests {
         run(&mut replay, session_dir, &options, |world, _| counts.push(world.entity_count())).unwrap();
 
         // No frame may show a partial tick: counts jump from 1 to 51.
-        assert!(
-            counts.iter().all(|&c| c == 1 || c == 51),
-            "a frame caught mid-tick: {counts:?}"
-        );
+        assert!(counts.iter().all(|&c| c == 1 || c == 51), "a frame caught mid-tick: {counts:?}");
         assert_eq!(*counts.last().unwrap(), 51);
         let _dir = dir;
     }
@@ -1304,8 +1293,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join(TEST_SESSION_HEX);
         fs::create_dir_all(&session_dir).unwrap();
-        fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#)
-            .unwrap();
+        fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
         // The shape every capture used before playthroughs got their own
         // folder: a plain file, not a directory, sitting at the top level.
         fs::write(dir.path().join("baseline.json"), r#"{"tick":1,"surfaces":[]}"#).unwrap();
@@ -1438,13 +1426,8 @@ mod tests {
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
-        let names: std::collections::BTreeSet<String> = replay
-            .world
-            .surface("nauvis")
-            .unwrap()
-            .entities()
-            .map(|e| replay.world.names().name(e.name).to_string())
-            .collect();
+        let names: std::collections::BTreeSet<String> =
+            replay.world.surface("nauvis").unwrap().entities().map(|e| replay.world.names().name(e.name).to_string()).collect();
         assert_eq!(
             names,
             ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
@@ -1510,8 +1493,7 @@ mod tests {
             assert_eq!(count, expected, "tick {tick} shows {count} entities");
         }
 
-        let abandoned_survived =
-            replay.world.surface("nauvis").unwrap().entities().any(|e| e.x == 9.5 && e.y == 9.5);
+        let abandoned_survived = replay.world.surface("nauvis").unwrap().entities().any(|e| e.x == 9.5 && e.y == 9.5);
         assert!(!abandoned_survived, "the abandoned future's entity must not survive the reload");
         // baseline's pipe + the tick-200 belt (before the reload point) + the
         // real tick-3500 belt (after it) = 3; never 4, which would mean the
@@ -1558,13 +1540,8 @@ mod tests {
         let mut replay = load_baseline(&baseline_path).unwrap();
         run(&mut replay, session_dir, &Options::default(), |_, _| {}).unwrap();
 
-        let surviving: std::collections::BTreeSet<String> = replay
-            .world
-            .surface("nauvis")
-            .unwrap()
-            .entities()
-            .map(|e| replay.world.names().name(e.name).to_string())
-            .collect();
+        let surviving: std::collections::BTreeSet<String> =
+            replay.world.surface("nauvis").unwrap().entities().map(|e| replay.world.names().name(e.name).to_string()).collect();
         assert_eq!(
             surviving,
             ["pipe", "transport-belt", "chemical-plant"].iter().map(|s| s.to_string()).collect(),
@@ -1627,12 +1604,7 @@ mod tests {
     fn catch_up_baseline_surface_appears_only_from_its_own_tick_onward() {
         let (dir, baseline_path) = capture_dir();
         let session_dir = baseline_path.parent().unwrap();
-        write_catch_up_frame(
-            session_dir,
-            500,
-            "vulcanus",
-            vec![vulcanus_entity(1.5, 1.5), vulcanus_entity(2.5, 1.5)],
-        );
+        write_catch_up_frame(session_dir, 500, "vulcanus", vec![vulcanus_entity(1.5, 1.5), vulcanus_entity(2.5, 1.5)]);
 
         let mut log = TestLog::new();
         // Before the catch-up: logged (the mod starts logging the instant a
@@ -1661,11 +1633,7 @@ mod tests {
             2,
             "the catch-up snapshot's own 2 entities, nothing from the dropped tick-300 event"
         );
-        assert_eq!(
-            seen.last().unwrap().1,
-            3,
-            "the snapshot's 2 plus the tick-600 event's 1"
-        );
+        assert_eq!(seen.last().unwrap().1, 3, "the snapshot's 2 plus the tick-600 event's 1");
         assert_eq!(replay.catch_ups_applied, 1);
         let _dir = dir;
     }
@@ -1785,10 +1753,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_all_surfaces(&world, 100, dir.path(), 7, &mut Default::default()).unwrap();
 
-        let written: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let written: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
     }
 
@@ -1828,15 +1794,7 @@ mod tests {
 
         world.apply(
             Some("gleba"),
-            &crate::event::Event::AddEntity {
-                name: "inserter".to_string(),
-                x: 51.0,
-                y: 2.0,
-                d: 0,
-                w: 1,
-                h: 1,
-                id: Some(1),
-            },
+            &crate::event::Event::AddEntity { name: "inserter".to_string(), x: 51.0, y: 2.0, d: 0, w: 1, h: 1, id: Some(1) },
         );
         assert_eq!(
             write_all_surfaces(&world, 300, dir.path(), 2, &mut revisions).unwrap(),
@@ -1844,10 +1802,8 @@ mod tests {
             "only the surface that actually changed"
         );
 
-        let mut files: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut files: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         files.sort();
         assert_eq!(
             files,
@@ -1878,15 +1834,7 @@ mod tests {
 
         world.apply(
             Some("nauvis"),
-            &crate::event::Event::AddEntity {
-                name: "pipe".to_string(),
-                x: 1.0,
-                y: 2.0,
-                d: 0,
-                w: 1,
-                h: 1,
-                id: None,
-            },
+            &crate::event::Event::AddEntity { name: "pipe".to_string(), x: 1.0, y: 2.0, d: 0, w: 1, h: 1, id: None },
         );
 
         assert_eq!(
@@ -1922,10 +1870,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_all_terrain(&world, 100, dir.path()).unwrap();
 
-        let written: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let written: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(written, vec!["terrain_nauvis.stfr"], "vulcanus has no terrain, so it gets no file");
 
         let bytes = fs::read(dir.path().join("terrain_nauvis.stfr")).unwrap();

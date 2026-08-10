@@ -22,14 +22,7 @@ impl DrawCallCounter {
     pub const INDICES_PER_QUAD: usize = 6;
 
     pub fn new(max_indices: usize) -> Self {
-        DrawCallCounter {
-            max_indices,
-            current: None,
-            started: false,
-            indices: 0,
-            calls: 0,
-            quads: 0,
-        }
+        DrawCallCounter { max_indices, current: None, started: false, indices: 0, calls: 0, quads: 0 }
     }
 
     pub fn reset(&mut self) {

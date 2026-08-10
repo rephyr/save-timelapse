@@ -13,11 +13,11 @@ use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
-    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size,
-    entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect,
-    is_rotation_allowed, recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, Camera, CameraTransition,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar,
-    RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
+    activity_heights, analyze_activity, color_for, entity_cull_half_extents, entity_footprint_size, entity_rotation_radians,
+    format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed, recent_heat, synthetic_frame,
+    synthetic_tiles, use_chunk_lod, Camera, CameraTransition, DrawCallCounter, FrameSequence, GrowingBounds, HeatCell,
+    LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES,
+    LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -157,8 +157,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut result =
-        Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None };
+    let mut result = Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None };
 
     let mut i = 0;
     while i < args.len() {
@@ -190,13 +189,7 @@ fn draw_loading(progress: &LoadProgress) {
 
     let bar = ProgressBar::centered(screen_width(), screen_height());
     draw_rectangle(bar.left, bar.top, bar.width, bar.height, Color::new(1.0, 1.0, 1.0, 0.12));
-    draw_rectangle(
-        bar.left,
-        bar.top,
-        bar.filled_width(progress),
-        bar.height,
-        Color::new(0.45, 0.75, 1.0, 0.9),
-    );
+    draw_rectangle(bar.left, bar.top, bar.filled_width(progress), bar.height, Color::new(0.45, 0.75, 1.0, 0.9));
     draw_rectangle_lines(bar.left, bar.top, bar.width, bar.height, 2.0, Color::new(1.0, 1.0, 1.0, 0.35));
 
     let headline = if progress.total > 0 {
@@ -233,8 +226,7 @@ async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: boo
 /// happened to be busiest.
 async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence, Option<RenderFrame>)> {
     let mut last = Instant::now();
-    let mut progress =
-        LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
+    let mut progress = LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
 
     // Single-frame paths (synthetic, or the default fixture) share the tail
     // of this function; only a real directory can have more than one world.
@@ -287,8 +279,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         // terrain file per surface, so it is bounded by surface count rather
         // than by capture length.
         progress.total = paths.len() + terrain_file_paths.len();
-        progress.detail =
-            format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        progress.detail = format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
 
         // Grouped from headers rather than from parsed frames, which is what
@@ -394,12 +385,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
     };
 
     let mut last = Instant::now();
-    let mut progress = LoadProgress {
-        phase: "loading sprites",
-        detail: String::new(),
-        done: 0,
-        total: registry.len(),
-    };
+    let mut progress = LoadProgress { phase: "loading sprites", detail: String::new(), done: 0, total: registry.len() };
 
     for (id, name) in registry.names().iter().enumerate() {
         progress.done = id;
@@ -429,12 +415,7 @@ fn draw_entity(center: Vec2, size: Vec2, rotation: f32, color: Color, sprite: Op
             top_left.x,
             top_left.y,
             WHITE,
-            DrawTextureParams {
-                dest_size: Some(size),
-                source: Some(sprite.icon_rect),
-                rotation,
-                ..Default::default()
-            },
+            DrawTextureParams { dest_size: Some(size), source: Some(sprite.icon_rect), rotation, ..Default::default() },
         ),
         None => draw_rectangle_ex(
             center.x,
@@ -455,11 +436,7 @@ fn draw_tile(screen: Vec2, size: f32, color: Color, sprite: Option<&Sprite>) {
             screen.x,
             screen.y,
             WHITE,
-            DrawTextureParams {
-                dest_size: Some(Vec2::splat(size)),
-                source: Some(sprite.icon_rect),
-                ..Default::default()
-            },
+            DrawTextureParams { dest_size: Some(Vec2::splat(size)), source: Some(sprite.icon_rect), ..Default::default() },
         ),
         None => draw_rectangle(screen.x, screen.y, size, size, color),
     }
@@ -779,16 +756,7 @@ fn draw_world(
                 counter,
             );
         }
-        draw_tile_lod_layer(
-            &frame.tile_lod,
-            &frame.tile_lod_runs,
-            camera,
-            screen_center,
-            view_min,
-            view_max,
-            registry,
-            counter,
-        );
+        draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
         let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
@@ -895,8 +863,7 @@ fn draw_hud(
     // meaning: how much is this frame doing), with the terrain backdrop
     // (loaded once, not per frame) called out separately rather than
     // folded into the same number.
-    let terrain_suffix =
-        if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
+    let terrain_suffix = if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
     let total_items = frame.entities.len() + frame.tiles.len() + terrain_tiles;
     // Each line reports the height it used, so the next one stacks under it
     // wherever it ended up: a line that had to wrap pushes the rest down
@@ -1112,13 +1079,7 @@ fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
 /// the window slides: cell lists are a few hundred entries each and only
 /// `HEAT_WINDOW_FRAMES` of them are ever touched, so this is a few thousand
 /// operations, unlike the per-entity pass that produced them.
-fn draw_construction_heat(
-    heat: &[Vec<HeatCell>],
-    peak: u32,
-    index: usize,
-    camera: &Camera,
-    screen_center: Vec2,
-) {
+fn draw_construction_heat(heat: &[Vec<HeatCell>], peak: u32, index: usize, camera: &Camera, screen_center: Vec2) {
     let size = HEAT_CELL_TILES as f32;
 
     // Culled to the screen before spreading, grown by the spread radius so
@@ -1133,9 +1094,7 @@ fn draw_construction_heat(
     );
 
     let pixels = size * camera.pixels_per_tile();
-    for (cx, cy, intensity) in
-        recent_heat(heat, index, HEAT_WINDOW_FRAMES, HEAT_SPREAD_CELLS, peak, Some(view))
-    {
+    for (cx, cy, intensity) in recent_heat(heat, index, HEAT_WINDOW_FRAMES, HEAT_SPREAD_CELLS, peak, Some(view)) {
         let world = Vec2::new(cx as f32 * size, cy as f32 * size);
         let screen = camera.world_to_screen(world, screen_center);
         draw_rectangle(screen.x, screen.y, pixels, pixels, heat_color(intensity));
@@ -1307,12 +1266,7 @@ fn milestone_color(milestone: &Milestone) -> Color {
 /// Below the bar rather than above it: the activity graph, playhead label and
 /// hover tooltip already stack upward, and markers want to be near the track
 /// they annotate rather than on the far side of a graph.
-fn draw_milestone_markers(
-    timeline: &Timeline,
-    sequence: &FrameSequence,
-    milestones: &[Milestone],
-    mouse: Vec2,
-) -> bool {
+fn draw_milestone_markers(timeline: &Timeline, sequence: &FrameSequence, milestones: &[Milestone], mouse: Vec2) -> bool {
     // A sequence is never empty (see `FrameSequence`), so only the milestone
     // list needs guarding.
     if milestones.is_empty() {
@@ -1515,8 +1469,7 @@ async fn main() {
     let mut worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence, terrain)| {
-            let camera =
-                Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
+            let camera = Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
             let growing_bounds = growing_bounds_per_frame(&sequence, &registry);
             let measured = analyze_activity(&sequence, &registry);
             let activity = activity_heights(&measured.counts);
@@ -1572,9 +1525,7 @@ async fn main() {
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
-        let WorldView {
-            name: world_name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain
-        } =
+        let WorldView { name: world_name, sequence, camera, growing_bounds, activity, heat, heat_peak, follow, terrain } =
             &mut worlds[current];
 
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
@@ -1592,8 +1543,7 @@ async fn main() {
         let frame = sequence.current();
         counter.reset();
 
-        let heat_layer =
-            state.heatmap_enabled.then(|| (heat.as_slice(), *heat_peak, sequence.index()));
+        let heat_layer = state.heatmap_enabled.then(|| (heat.as_slice(), *heat_peak, sequence.index()));
         draw_world(
             frame,
             terrain.as_ref(),
@@ -1622,14 +1572,7 @@ async fn main() {
             use_sprites,
             &counter,
         );
-        draw_timeline_bar(
-            &timeline,
-            sequence,
-            activity,
-            &milestones,
-            mouse_position().into(),
-            state.dragging_timeline,
-        );
+        draw_timeline_bar(&timeline, sequence, activity, &milestones, mouse_position().into(), state.dragging_timeline);
         draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
 
         next_frame().await;
