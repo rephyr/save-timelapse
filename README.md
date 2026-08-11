@@ -169,11 +169,11 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 ### v0.6
 
-- [x] Image sequence export at any resolution
-- [x] Video export
-- [x] Oversampled rendering for sharper video
+- [x] Image sequence or .avi video export
 - [x] Improved camera framing
 - [x] Exclude moving entities from capture
+- [x] Ground is read from a save afterwards instead of recorded while you play.
+- [x] Improved tree/cliff/water cutoff in the render
 
 ### v1.0
 
