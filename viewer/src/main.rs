@@ -13,11 +13,12 @@ use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
-    activity_heights, analyze_activity, color_for, downsample, entity_cull_half_extents, entity_footprint_size,
-    entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed,
-    is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, AviWriter, Camera, CameraTransition,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame,
-    RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
+    activity_heights, analyze_activity, color_for, downsample, draw_key_panel, entity_cull_half_extents,
+    entity_footprint_size, entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path,
+    icon_source_rect, is_rotation_allowed, is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles,
+    use_chunk_lod, AviWriter, Camera, CameraTransition, Chrome, ChromeState, Click, DrawCallCounter, FrameSequence,
+    GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline,
+    TypeRegistry, Ui, HEAT_CELL_TILES, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -170,9 +171,14 @@ struct ViewerState {
     play_accum: f32,
     play_speed: f32,
     dragging_timeline: bool,
+    /// Latched on press when the click landed on a control, so the drag that
+    /// follows moves the button's own state rather than the camera behind it.
+    on_chrome: bool,
     sprites_enabled: bool,
     lod_enabled: bool,
     heatmap_enabled: bool,
+    /// Whether the `+N more` surface list is open.
+    surfaces_expanded: bool,
 }
 
 /// Render every frame to an image file instead of opening for browsing.
@@ -671,17 +677,27 @@ fn handle_input(
     screen_center: Vec2,
     jump_targets: &[usize],
     busy: &[usize],
+    chrome: &Chrome,
+    debug: bool,
 ) {
     let mouse: Vec2 = mouse_position().into();
 
     // Which a drag does depends on where it started: grabbing the
-    // scrub bar seeks, anywhere else pans the camera, same as a video
-    // player's scrubber taking priority over the content behind it.
+    // scrub bar seeks, a control takes the click for itself, and
+    // anywhere else pans the camera, same as a video player's
+    // scrubber taking priority over the content behind it.
+    //
+    // `on_chrome` is latched on press alongside `dragging_timeline`
+    // rather than tested every frame, so a drag that begins on a
+    // button and wanders off it does not turn into a pan halfway
+    // through. Releasing clears it, since the next press decides
+    // again.
     if is_mouse_button_pressed(MouseButton::Left) {
         state.dragging_timeline = timeline.contains(mouse);
+        state.on_chrome = !state.dragging_timeline && chrome.blocks_world(mouse);
     }
 
-    if is_mouse_button_down(MouseButton::Left) {
+    if is_mouse_button_down(MouseButton::Left) && !state.on_chrome {
         if state.dragging_timeline {
             sequence.goto(timeline.index_for_x(mouse.x, sequence.len()));
             state.playing = false;
@@ -790,20 +806,26 @@ fn handle_input(
     if is_key_pressed(KeyCode::Minus) {
         state.play_speed = (state.play_speed / 2.0).max(0.25);
     }
-    // Sprites off is the A/B for what texture binding costs: same
-    // geometry, one flat-rect batch instead of one batch per type.
-    if is_key_pressed(KeyCode::S) {
-        state.sprites_enabled = !state.sprites_enabled;
-    }
-    // LOD off is the A/B for what per-item CPU cost costs at extreme
-    // zoom-out: forces full-detail rendering even below the chunk
-    // threshold, so the difference is directly comparable.
     if is_key_pressed(KeyCode::H) {
         state.heatmap_enabled = !state.heatmap_enabled;
     }
 
-    if is_key_pressed(KeyCode::L) {
-        state.lod_enabled = !state.lod_enabled;
+    // Both of these are renderer A/B tests, not features: turning sprites off
+    // swaps every icon for a flat rect, and turning LOD off forces full detail
+    // at any zoom. Either one makes the factory look broken to somebody who
+    // pressed the key by accident and has no idea why, so they only answer
+    // while the diagnostics they exist to serve are actually on screen.
+    if debug {
+        // Same geometry, one flat-rect batch instead of one batch per type,
+        // which is what texture binding costs.
+        if is_key_pressed(KeyCode::S) {
+            state.sprites_enabled = !state.sprites_enabled;
+        }
+        // Full detail below the chunk threshold, so the per-item CPU cost at
+        // extreme zoom-out is directly comparable.
+        if is_key_pressed(KeyCode::L) {
+            state.lod_enabled = !state.lod_enabled;
+        }
     }
 }
 
@@ -1246,10 +1268,17 @@ fn draw_world(
     }
 }
 
-/// The three-line text HUD: world/frame/camera/follow status, the
-/// draw-call profiling readout, and the control hints.
+/// The renderer diagnostics, behind `F3`.
+///
+/// This is the readout that used to be the viewer's default view, and it is
+/// unchanged apart from no longer being on. It was never for the person
+/// watching their factory grow: `zoom 1.42x`, `12.3 ms` and a draw-call
+/// budget answer "how is the renderer doing", which is a question only its
+/// author asks, and it answered it in three lines of text over the middle of
+/// the picture. The control hints came off the end because the `?` panel says
+/// the same thing better and actually lists every key.
 #[allow(clippy::too_many_arguments)]
-fn draw_hud(
+fn draw_debug_overlay(
     world_name: &str,
     current: usize,
     world_count: usize,
@@ -1258,7 +1287,6 @@ fn draw_hud(
     terrain_tiles: usize,
     camera: &Camera,
     follow_enabled: bool,
-    state: &ViewerState,
     use_lod: bool,
     use_sprites: bool,
     counter: &DrawCallCounter,
@@ -1317,25 +1345,11 @@ fn draw_hud(
             if use_sprites { "on" } else { "off" },
         )
     };
-    hud_y += draw_hud_line(
+    draw_hud_line(
         &format!("{} draw calls  |  {detail_text}", counter.calls),
         hud_y + 2.0,
         HUD_TEXT_SIZE,
         Color::new(0.65, 0.92, 1.0, 1.0),
-    );
-
-    let tab_hint = if world_count > 1 { "  |  tab switches world" } else { "" };
-    draw_hud_line(
-        &format!(
-            "drag to pan, scroll to zoom  |  left/right step, space {}, home/end jump  |  -/= speed ({}x)  |  s toggles sprites, l toggles LOD  |  h build heatmap ({})  |  f auto-follows the growing base ({})  |  drag the bar below to scrub{tab_hint}",
-            if state.playing { "pause" } else { "play" },
-            state.play_speed,
-            if state.heatmap_enabled { "on" } else { "off" },
-            if follow_enabled { "on" } else { "off" },
-        ),
-        hud_y + 4.0,
-        HUD_TEXT_SIZE,
-        WHITE,
     );
 }
 
@@ -1544,6 +1558,7 @@ fn draw_bookmark_markers(timeline: &Timeline, sequence: &FrameSequence, bookmark
 
 #[allow(clippy::too_many_arguments)]
 fn draw_timeline_bar(
+    ui: &Ui,
     timeline: &Timeline,
     sequence: &FrameSequence,
     activity: &[f32],
@@ -1568,16 +1583,16 @@ fn draw_timeline_bar(
     }
     draw_circle(playhead_x, timeline.y, 7.0, WHITE);
 
-    draw_timeline_endpoint_labels(timeline, sequence);
-    draw_timeline_playhead_label(timeline, sequence, playhead_x);
+    draw_timeline_endpoint_labels(ui, timeline, sequence);
+    draw_timeline_playhead_label(ui, timeline, sequence, playhead_x);
 
     // A hovered marker replaces the frame readout rather than stacking with
     // it: both want the same slot above the bar, and pointing at a milestone
     // is a request to read the milestone. The label carries the time anyway,
     // which is most of what the frame readout would have said.
-    let on_milestone = draw_milestone_markers(timeline, sequence, milestones, mouse);
+    let on_milestone = draw_milestone_markers(ui, timeline, sequence, milestones, mouse);
     if !on_milestone && (timeline.contains(mouse) || scrubbing) {
-        draw_timeline_hover(timeline, sequence, mouse);
+        draw_timeline_hover(ui, timeline, sequence, mouse);
     }
 }
 
@@ -1702,7 +1717,13 @@ fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -
 /// Below the bar rather than above it: the activity graph, playhead label and
 /// hover tooltip already stack upward, and markers want to be near the track
 /// they annotate rather than on the far side of a graph.
-fn draw_milestone_markers(timeline: &Timeline, sequence: &FrameSequence, milestones: &[Milestone], mouse: Vec2) -> bool {
+fn draw_milestone_markers(
+    ui: &Ui,
+    timeline: &Timeline,
+    sequence: &FrameSequence,
+    milestones: &[Milestone],
+    mouse: Vec2,
+) -> bool {
     // A sequence is never empty (see `FrameSequence`), so only the milestone
     // list needs guarding.
     if milestones.is_empty() {
@@ -1742,7 +1763,7 @@ fn draw_milestone_markers(timeline: &Timeline, sequence: &FrameSequence, milesto
     let index = frame_index_for_tick(sequence, milestone.tick);
     let x = timeline.x_for_index(index, sequence.len());
     let label = format!("{}  ({})", milestone.label(), format_game_time(milestone.tick));
-    let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    let width = ui.width(&label, TIMELINE_LABEL_SIZE);
 
     // Above the bar, in the frame readout's slot. Below the marker would be
     // the obvious place, but the bar sits close to the window's bottom edge
@@ -1756,7 +1777,7 @@ fn draw_milestone_markers(timeline: &Timeline, sequence: &FrameSequence, milesto
 
     draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.9));
     draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, milestone_color(milestone));
-    draw_text_legible(&label, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE - 3.0, TIMELINE_LABEL_SIZE, WHITE);
+    ui.text_legible(&label, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE - 3.0, TIMELINE_LABEL_SIZE, WHITE);
 
     // A line from the box down to the marker it belongs to, since the two
     // are now on opposite sides of the bar.
@@ -1782,28 +1803,28 @@ fn frame_index_for_tick(sequence: &FrameSequence, tick: u64) -> usize {
 /// Where the capture starts and ends, anchored under the bar's two ends.
 /// These bound everything else on the bar: without them the playhead's time
 /// is a number with nothing to be a fraction of.
-fn draw_timeline_endpoint_labels(timeline: &Timeline, sequence: &FrameSequence) {
+fn draw_timeline_endpoint_labels(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence) {
     let dim = Color::new(1.0, 1.0, 1.0, 0.9);
     let baseline = timeline.y + 24.0;
 
     let start = frame_time_label(sequence, 0);
-    draw_text_legible(&start, timeline.left, baseline, TIMELINE_LABEL_SIZE, dim);
+    ui.text_legible(&start, timeline.left, baseline, TIMELINE_LABEL_SIZE, dim);
 
     // Right-aligned so it ends flush with the bar rather than starting at
     // it and overhanging into the window edge as the label grows.
     let end = frame_time_label(sequence, sequence.len().saturating_sub(1));
-    let end_width = measure_text(&end, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
-    draw_text_legible(&end, timeline.left + timeline.width - end_width, baseline, TIMELINE_LABEL_SIZE, dim);
+    let end_width = ui.width(&end, TIMELINE_LABEL_SIZE);
+    ui.text_legible(&end, timeline.left + timeline.width - end_width, baseline, TIMELINE_LABEL_SIZE, dim);
 }
 
 /// The current frame's time, centered over the playhead and clamped the same
 /// way the hover tooltip is, since the playhead reaches the same bar ends
 /// the cursor does.
-fn draw_timeline_playhead_label(timeline: &Timeline, sequence: &FrameSequence, playhead_x: f32) {
+fn draw_timeline_playhead_label(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, playhead_x: f32) {
     let label = format_game_time(sequence.current().tick);
-    let width = measure_text(&label, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    let width = ui.width(&label, TIMELINE_LABEL_SIZE);
     let left = Timeline::tooltip_left(playhead_x, width, screen_width());
-    draw_text_legible(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
+    ui.text_legible(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
 }
 
 /// A guide line at the hovered position plus a boxed readout of the time and
@@ -1815,7 +1836,7 @@ fn draw_timeline_playhead_label(timeline: &Timeline, sequence: &FrameSequence, p
 /// across the bar: frames are spaced by a fixed tick interval but the bar
 /// snaps to whole frames, so an interpolated label would disagree with what
 /// clicking there produces.
-fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2) {
+fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2) {
     let index = timeline.index_for_x(mouse.x, sequence.len());
     let hover_x = timeline.x_for_index(index, sequence.len());
 
@@ -1823,8 +1844,8 @@ fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec
 
     let time = frame_time_label(sequence, index);
     let counter = format!("frame {}/{}", index + 1, sequence.len());
-    let time_width = measure_text(&time, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
-    let counter_width = measure_text(&counter, None, TIMELINE_LABEL_SIZE as u16, 1.0).width;
+    let time_width = ui.width(&time, TIMELINE_LABEL_SIZE);
+    let counter_width = ui.width(&counter, TIMELINE_LABEL_SIZE);
 
     let padding = 8.0;
     let box_width = time_width.max(counter_width) + padding * 2.0;
@@ -1834,8 +1855,8 @@ fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec
 
     draw_rectangle(box_left, box_top, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.9));
     draw_rectangle_lines(box_left, box_top, box_width, box_height, 2.0, Color::new(1.0, 1.0, 1.0, 0.5));
-    draw_text_legible(&time, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE, TIMELINE_LABEL_SIZE, WHITE);
-    draw_text_legible(
+    ui.text_legible(&time, box_left + padding, box_top + padding + TIMELINE_LABEL_SIZE, TIMELINE_LABEL_SIZE, WHITE);
+    ui.text_legible(
         &counter,
         box_left + padding,
         box_top + padding + TIMELINE_LABEL_SIZE * 2.0 + 4.0,
@@ -1847,13 +1868,20 @@ fn draw_timeline_hover(timeline: &Timeline, sequence: &FrameSequence, mouse: Vec
 /// Where the player(s) were as of `tick`, on whichever world/surface is
 /// active, looked up fresh each draw rather than cached on the frame,
 /// since it's a cheap scan over a tiny sample count (see PlayerTrack).
-fn draw_player_markers(player_track: &PlayerTrack, world_name: &str, tick: u64, camera: &Camera, screen_center: Vec2) {
+fn draw_player_markers(
+    ui: &Ui,
+    player_track: &PlayerTrack,
+    world_name: &str,
+    tick: u64,
+    camera: &Camera,
+    screen_center: Vec2,
+) {
     for (name, x, y) in player_track.positions_at(world_name, tick) {
         let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
         let color = color_for(name, 0.7, 0.95);
         draw_circle(screen.x, screen.y, 9.0, Color::new(0.0, 0.0, 0.0, 0.6));
         draw_circle(screen.x, screen.y, 6.0, color);
-        draw_text_legible(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
+        ui.text_legible(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
     }
 }
 
@@ -1960,9 +1988,11 @@ async fn main() {
         play_accum: 0.0,
         play_speed: 1.0,
         dragging_timeline: false,
+        on_chrome: false,
         sprites_enabled: true,
         lod_enabled: true,
         heatmap_enabled: false,
+        surfaces_expanded: false,
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
 
@@ -2033,10 +2063,33 @@ async fn main() {
         return;
     }
 
+    // Surface names never change, so the chrome reads them from here rather
+    // than from `worlds`, which spends every frame mutably borrowed by the
+    // destructure below.
+    let surface_names: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
+
+    let mut ui = Ui::new();
+    if !ui.has_font() {
+        println!("no UI font found, falling back to the built-in one");
+    }
+    // Opened once so a first-time viewer is told what the window does, then
+    // never again. Everything else about this UI is on request; this is the
+    // one thing that has to arrive uninvited, because a `?` in the corner
+    // only helps somebody who already suspects there is something to find.
+    ui.show_keys = viewer::first_run();
+
+    // A click on a surface chip lands while `worlds[current]` is still
+    // mutably borrowed, so it is recorded here and applied at the top of the
+    // next iteration. One frame of delay, which is 16ms and invisible.
+    let mut pending_surface: Option<usize> = None;
+
     loop {
         // Captured before the mutable borrow below, which holds `worlds`
         // borrowed for the rest of the loop body.
         let world_count = worlds.len();
+        if let Some(index) = pending_surface.take() {
+            current = index;
+        }
         if is_key_pressed(KeyCode::Tab) && world_count > 1 {
             current = (current + 1) % world_count;
         }
@@ -2059,7 +2112,119 @@ async fn main() {
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let timeline = Timeline::for_screen(screen_width(), screen_height());
 
-        handle_input(camera, sequence, follow, &mut state, &timeline, screen_center, jump_targets, busy);
+        // The chrome is laid out before input is read, because a click has to
+        // be tested against the rects that are actually on screen. Laying out
+        // afterwards would test this frame's click against last frame's
+        // buttons, which only shows up as a missed click on the frame a window
+        // is resized, and is exactly the kind of bug nobody ever reproduces.
+        let clock = frame_time_label(sequence, sequence.index());
+        let chrome_state = ChromeState {
+            surfaces: &surface_names,
+            active: current,
+            playing: state.playing,
+            play_speed: state.play_speed,
+            clock: &clock,
+            buildings: sequence.current().count,
+            surfaces_expanded: state.surfaces_expanded,
+        };
+        let chrome = Chrome::layout(&ui, &timeline, &chrome_state);
+
+        if is_key_pressed(KeyCode::F3) {
+            ui.show_debug = !ui.show_debug;
+        }
+        // `?` is shift+/ on a US layout and somewhere else entirely on others,
+        // so the slash key is accepted unshifted too. Escape closes but never
+        // opens, which is what makes it safe to hit blindly.
+        if is_key_pressed(KeyCode::Slash) {
+            ui.show_keys = !ui.show_keys;
+        }
+        if is_key_pressed(KeyCode::Escape) {
+            ui.show_keys = false;
+            state.surfaces_expanded = false;
+        }
+
+        if is_mouse_button_pressed(MouseButton::Left) {
+            // A click anywhere dismisses the key panel, which is why it is
+            // tested before the chrome underneath it: the panel is modal, and
+            // a click meant to close it must not also press whatever it
+            // happens to be covering.
+            if ui.show_keys {
+                ui.show_keys = false;
+            } else {
+                match chrome.hit(mouse_position().into()) {
+                    Some(Click::Surface(index)) => {
+                        pending_surface = Some(index);
+                        state.surfaces_expanded = false;
+                    }
+                    Some(Click::MoreSurfaces) => state.surfaces_expanded = !state.surfaces_expanded,
+                    Some(Click::StepBack) => {
+                        sequence.step_back();
+                        state.playing = false;
+                        follow.enabled = false;
+                    }
+                    Some(Click::StepForward) => {
+                        sequence.step_forward();
+                        state.playing = false;
+                        follow.enabled = false;
+                    }
+                    Some(Click::PlayPause) => {
+                        state.playing = !state.playing;
+                        state.play_accum = 0.0;
+                    }
+                    // One direction only, wrapping at the top. A pill with no
+                    // second half cannot say which end of it means slower, so
+                    // it cycles the same powers of two the keys step through
+                    // and returns to 0.25x rather than dead-ending at 8x.
+                    Some(Click::Speed) => {
+                        state.play_speed = if state.play_speed >= 8.0 { 0.25 } else { state.play_speed * 2.0 };
+                    }
+                    // A one-shot reframe, not the same thing as `f`: it puts
+                    // the factory back on screen and then leaves the camera
+                    // alone, which is what somebody who has panned into empty
+                    // space wants. Turning follow on instead would keep
+                    // dragging them along afterwards.
+                    Some(Click::Fit) => {
+                        if let Some(bounds) = growing_bounds[sequence.index()] {
+                            *camera = Camera::fit_bounds(
+                                bounds.center,
+                                bounds.half_extent * 2.0,
+                                screen_width(),
+                                screen_height(),
+                                AUTO_FOLLOW_MIN_FOCUS_TILES,
+                                AUTO_FOLLOW_FIT_MARGIN,
+                            );
+                            follow.enabled = false;
+                            follow.transition = None;
+                        }
+                    }
+                    Some(Click::Help) => ui.show_keys = true,
+                    None => {}
+                }
+            }
+        }
+
+        // Everything below is suppressed while the panel is up, so keys that
+        // would otherwise scrub or pan behind it do nothing until it is
+        // dismissed. The panel is the only modal thing in the viewer.
+        if !ui.show_keys {
+            handle_input(
+                camera,
+                sequence,
+                follow,
+                &mut state,
+                &timeline,
+                screen_center,
+                jump_targets,
+                busy,
+                &chrome,
+                ui.show_debug,
+            );
+        } else {
+            // Still tracked while the panel is up, so dismissing it and
+            // dragging does not snap the camera by however far the cursor
+            // moved in between.
+            state.last_mouse = mouse_position().into();
+        }
 
         // Toggling a bookmark at the frame on screen. Stored as that frame's
         // tick, and written straight away rather than on exit, since the
@@ -2104,22 +2269,9 @@ async fn main() {
             &mut counter,
         );
 
-        let terrain_tiles = terrain.as_ref().map_or(0, |t| t.tiles.len());
-        draw_hud(
-            world_name,
-            current,
-            world_count,
-            sequence,
-            frame,
-            terrain_tiles,
-            camera,
-            follow.enabled,
-            &state,
-            use_lod,
-            use_sprites,
-            &counter,
-        );
+        draw_player_markers(&ui, &player_track, world_name, sequence.current().tick, camera, screen_center);
         draw_timeline_bar(
+            &ui,
             &timeline,
             sequence,
             activity,
@@ -2128,7 +2280,30 @@ async fn main() {
             mouse_position().into(),
             state.dragging_timeline,
         );
-        draw_player_markers(&player_track, world_name, sequence.current().tick, camera, screen_center);
+        chrome.draw(&ui, &chrome_state);
+
+        // Both overlays go last so nothing can be drawn over them, and the
+        // key panel last of all: it is the only modal thing here, and while
+        // it is up it should cover the diagnostics too.
+        if ui.show_debug {
+            let terrain_tiles = terrain.as_ref().map_or(0, |t| t.tiles.len());
+            draw_debug_overlay(
+                world_name,
+                current,
+                world_count,
+                sequence,
+                frame,
+                terrain_tiles,
+                camera,
+                follow.enabled,
+                use_lod,
+                use_sprites,
+                &counter,
+            );
+        }
+        if ui.show_keys {
+            draw_key_panel(&ui);
+        }
 
         next_frame().await;
     }

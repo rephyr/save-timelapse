@@ -10,6 +10,7 @@
 mod activity;
 mod avi;
 mod camera;
+mod chrome;
 mod construction;
 mod draw_calls;
 mod loading;
@@ -25,6 +26,7 @@ mod timecode;
 
 pub use activity::{activity_heights, analyze_activity, recent_heat, Activity, HeatCell, HEAT_CELL_TILES};
 pub use avi::AviWriter;
+pub use chrome::{draw_key_panel, first_run, Chrome, ChromeState, Click, Ui};
 pub use camera::{
     entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition, Timeline,
     BASE_PIXELS_PER_TILE,
