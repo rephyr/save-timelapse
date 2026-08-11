@@ -22,11 +22,25 @@ pub struct TypeRegistry {
     ids: HashMap<String, TypeId>,
     entity_colors: Vec<Color>,
     tile_colors: Vec<Color>,
+    /// The game's own map colours for this capture, when it shipped with any.
+    ///
+    /// Consulted before `known_color`, because it is the authority: these came
+    /// out of the running game rather than out of a table somebody typed. It is
+    /// what lets a heavily modded playthrough look like itself without this
+    /// file naming a single one of its prototypes.
+    palette: Option<save_timelapse::palette::Palette>,
 }
 
 impl TypeRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Must be set before anything is interned: a colour is resolved once, at
+    /// intern time, so a palette arriving later would apply to nothing.
+    pub fn set_palette(&mut self, palette: save_timelapse::palette::Palette) {
+        debug_assert!(self.names.is_empty(), "palette must be set before interning");
+        self.palette = Some(palette);
     }
 
     /// Both color variants are precomputed rather than one per registered
@@ -39,13 +53,17 @@ impl TypeRegistry {
         }
         let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
         self.names.push(name.to_string());
+        let from_game = self.palette.as_ref();
+        let rgb = |c: &[u8; 3]| Color::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0);
+        let game_entity = from_game.and_then(|p| p.entities.get(name)).map(rgb);
+        let game_tile = from_game.and_then(|p| p.tiles.get(name)).map(rgb);
         let color = known_color(name);
         // Entities fall back to a shade of the map view's friendly blue;
         // tiles keep the full-hue hash. A name is one or the other in
         // practice, and an unrecognised *floor* has no reason to be blue: the
         // blue is what the game uses for structures specifically.
-        self.entity_colors.push(color.unwrap_or_else(|| friendly_shade(name)));
-        self.tile_colors.push(color.unwrap_or_else(|| color_for(name, 0.35, 0.5)));
+        self.entity_colors.push(game_entity.or(color).unwrap_or_else(|| friendly_shade(name)));
+        self.tile_colors.push(game_tile.or(color).unwrap_or_else(|| color_for(name, 0.35, 0.5)));
         self.ids.insert(name.to_string(), id);
         id
     }

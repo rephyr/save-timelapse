@@ -759,6 +759,73 @@ function M.player_log_name(session_id)
   return M.session_dir(session_id) .. "players.jsonl"
 end
 
+function M.palette_name(session_id)
+  return M.session_dir(session_id) .. "palette.json"
+end
+
+--- Every prototype's own map colour, as JSON, so the desktop side never has to
+--- know what a prototype is called.
+---
+--- These are the exact colours Factorio paints its own map view with, which is
+--- the palette a player already has in their head, and the only place they
+--- exist is inside the running game: a mod ships as a zip in the mods folder,
+--- not as anything the desktop tool can read. Without this, supporting a mod's
+--- terrain means hand-transcribing its colours, once per mod, forever. Alien
+--- Biomes alone adds a couple of hundred tiles.
+---
+--- Written once beside the baseline rather than per tick. Colours cannot change
+--- during a playthrough: prototypes are fixed at load time.
+---
+--- Entities use `friendly_map_color` and fall back to `map_color`, with nests
+--- and their kind taking `enemy_map_color`, which is the same split the game
+--- makes when it draws them.
+function M.palette_json()
+  local parts = {}
+  local function add(name, color)
+    if not color then
+      return
+    end
+    -- Factorio gives these as 0..1 floats. Rounded to bytes here so the file
+    -- stays short and the reader has nothing to interpret.
+    parts[#parts + 1] = string.format(
+      '%q:[%d,%d,%d]',
+      name,
+      math.floor((color.r or 0) * 255 + 0.5),
+      math.floor((color.g or 0) * 255 + 0.5),
+      math.floor((color.b or 0) * 255 + 0.5)
+    )
+  end
+
+  local tiles = {}
+  for name, proto in pairs(prototypes.tile) do
+    tiles[#tiles + 1] = { name = name, color = proto.map_color }
+  end
+  table.sort(tiles, function(a, b) return a.name < b.name end)
+
+  local entities = {}
+  for name, proto in pairs(prototypes.entity) do
+    local enemy = proto.enemy_map_color
+    local friendly = proto.friendly_map_color or proto.map_color
+    entities[#entities + 1] = { name = name, color = enemy or friendly }
+  end
+  table.sort(entities, function(a, b) return a.name < b.name end)
+
+  local out = { '{"tiles":{' }
+  local first = #parts
+  for _, t in ipairs(tiles) do
+    add(t.name, t.color)
+  end
+  out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
+  out[#out + 1] = '},"entities":{'
+  first = #parts
+  for _, e in ipairs(entities) do
+    add(e.name, e.color)
+  end
+  out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
+  out[#out + 1] = '}}'
+  return table.concat(out)
+end
+
 --- Unlike the three names above, a baseline's per-surface frame files are
 --- untagged even without a session_id (see export.lua's export_surface):
 --- `/timelapse-export` and the headless scan share one private, per-run

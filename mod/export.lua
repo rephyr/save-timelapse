@@ -606,6 +606,28 @@ local function player_log_path(session_id)
   return M.EXPORT_DIR .. encode.player_log_name(session_id)
 end
 
+--- Untagged or session-tagged exactly like the player log above.
+local function palette_path(session_id)
+  if not session_id then
+    return M.EXPORT_DIR .. "palette.json"
+  end
+  return M.EXPORT_DIR .. encode.palette_name(session_id)
+end
+
+--- Writes the prototype colour table, once, beside everything else a capture
+--- produces.
+---
+--- Overwrites rather than appends: it is a snapshot of what this game's
+--- prototypes are, and rewriting it on a later run is how a capture picks up
+--- colours for mods added since it started. `pcall` because it is a nicety, and
+--- a colour table that failed to write must never take a capture down with it:
+--- the desktop side falls back to its own palette when this is missing.
+function M.write_palette(session_id)
+  pcall(function()
+    M.safe_write_file(palette_path(session_id), encode.palette_json(), false)
+  end)
+end
+
 --- Periodic, for live capture: only players actually connected right now.
 --- Wrapped in `pcall` per player, the same defensive style as
 --- `compute_session_id`/`is_inhabited`: a player with no valid position
@@ -704,6 +726,9 @@ end
 --- now."
 function M.export_all_to(tick, manifest_path, session_id, is_excluded)
   sample_all_players(tick, session_id)
+  -- One choke point for both paths that produce frames, the live baseline and
+  -- the headless save export, so neither can end up without a palette.
+  M.write_palette(session_id)
   local names, total, tile_total = {}, 0, 0
 
   for _, surface in pairs(game.surfaces) do

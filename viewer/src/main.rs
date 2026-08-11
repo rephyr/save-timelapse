@@ -2182,6 +2182,16 @@ async fn main() {
     let args = parse_args();
 
     let mut registry = TypeRegistry::new();
+    // Before loading anything: colours are resolved once, when a name is first
+    // interned, so this has to be in place before the first frame is read.
+    // Missing is the normal state of any capture older than this feature, and
+    // the registry's own colours cover it.
+    if let Some(dir) = args.path.as_deref().map(std::path::Path::new) {
+        if let Some(palette) = save_timelapse::palette::read(dir) {
+            println!("using this game's own colours for {} tiles and {} entities", palette.tiles.len(), palette.entities.len());
+            registry.set_palette(palette);
+        }
+    }
     let loaded = load_frames(&args, &mut registry).await;
 
     // Absent entirely (an older capture, or nobody was connected during

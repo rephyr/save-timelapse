@@ -7,6 +7,7 @@ pub mod frame;
 pub mod locate;
 pub mod milestone;
 pub mod names;
+pub mod palette;
 pub mod player_log;
 pub mod replay;
 /// What the tool remembers between runs. Distinct from [`settings_dat`],
