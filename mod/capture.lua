@@ -1,8 +1,6 @@
--- save-timelapse: live capture. Logs every construction event as it
--- happens, for frame-perfect playback. Only covers play from the moment
--- it's turned on, since Factorio keeps no placement history inside a save
--- to recover retroactively. Toggled via the save-timelapse-live-capture
--- runtime setting.
+-- save-timelapse: live capture. Logs every construction event as it happens.
+-- Only covers play from the moment it is turned on, Factorio keeping no
+-- placement history inside a save to recover retroactively.
 
 local encode = require("encode")
 local export = require("export")
@@ -11,40 +9,21 @@ local milestones = require("milestones")
 local M = {}
 
 local CAPTURE_FLUSH_EVERY = 200
---- How often the idle timer flushes, in ticks. Ten real seconds.
----
---- This is the *floor* on how often a flush happens, not the rate: a busy
---- factory flushes on volume long before the timer comes round, at every
---- CAPTURE_FLUSH_EVERY pending events. All this bounds is how much a crash can
---- lose while nothing much is being built, and how coarse the two samplers
---- that ride on it are, which is player positions and milestone polling.
----
---- Four seconds before. Raised because the tick a flush lands on does real
---- work (a file write, a player sample, a milestone poll) and doing it half as
---- often is half the interruption for a bound nobody is watching: ten seconds
---- of idle events is a handful of records.
+--- The floor on how often a flush happens, not the rate: a busy factory
+--- flushes on volume at every CAPTURE_FLUSH_EVERY pending events. This bounds
+--- how much a crash can lose while idle, and how coarse the two samplers
+--- riding on it are.
 M.CAPTURE_FLUSH_TICKS = 600
 
---- How long to hold off the actual (synchronous, freezing) baseline export
---- after printing the warning about it. A single tick is one rendered
---- frame at best, often too brief to actually read a message in before the
---- freeze hits; this gives it real, perceptible time on screen first.
+--- How long to hold off the synchronous, freezing baseline export after
+--- warning about it, so the warning gets perceptible time on screen.
 local BASELINE_WARNING_DELAY_TICKS = 120 -- ~2 real seconds
 
---- Written once, after the baseline snapshot finishes, naming the tick and
---- surfaces it covers. This is the handshake with the Rust side: it is the
---- last file written, so its presence means the baseline is complete, and it
---- says which `frame_<tick>_<surface>.stfr` files, alongside it in the same
---- session folder, make up that baseline. Everything after the baseline is
---- reconstructed by replaying the event log. Tagged by session_id (see
---- compute_session_id below) so each playthrough gets its own folder instead
---- of overwriting another one's.
----
---- A save whose capture state predates session_id existing has it as `nil`
---- (see ensure_capture_segment below, which only ever sets it while creating
---- fresh state): this keeps such a save on the untagged, folder-less name it
---- was already using rather than erroring, until /timelapse-reset-capture
---- clears its state and lets it start over with a real one.
+--- Written last, so its presence means the baseline is complete. Names the
+--- tick and surfaces it covers, which is how the Rust side knows which frame
+--- files make it up. Tagged by session_id so playthroughs do not overwrite
+--- each other; a save predating session_id keeps the untagged name until
+--- /timelapse-reset-capture.
 local function baseline_manifest_path(session_id)
   if not session_id then
     return export.EXPORT_DIR .. "baseline.json"
@@ -56,16 +35,10 @@ local capture_pending, capture_pending_count = {}, 0
 local capture_path = nil
 local capture_checked_rollover = false
 
---- Name and surface dictionaries for the event log currently being written.
---- Plain module locals rather than anything persisted in `storage`: Factorio
---- re-runs this whole file's top level on every load, which resets these to
---- fresh and empty exactly when they need to be. A brand new segment needs
---- that (nothing has been defined in it yet); a segment being *continued*
---- after a reload also gets it, even though the physical file already has
---- earlier DefineName/DefineSurface records in it from before the reload,
---- because this session has no way to read those back (see
---- `ensure_capture_segment`'s doc comment on why that's harmless rather than
---- a corruption bug).
+--- Name and surface dictionaries for the segment currently being written.
+--- Module locals rather than `storage`, because Factorio re-runs this file on
+--- every load and resets them, which is what `ensure_capture_segment` relies
+--- on to know a reload happened.
 local capture_names = encode.new_dictionary()
 local capture_surfaces = encode.new_dictionary()
 --- The tick a SetTick record was last written for, so `log_event` only emits
@@ -73,26 +46,18 @@ local capture_surfaces = encode.new_dictionary()
 --- alongside the dictionaries above.
 local capture_last_written_tick = nil
 
---- Whether this session has already reconciled its (empty, freshly re-run)
---- dictionaries with whatever the segment file on disk already contains.
----
---- A plain module local specifically because Factorio resets these on every
---- load, which is exactly the event that needs detecting. Nothing in
---- `storage` can serve here: `storage` is saved inside the save file, so it
---- rewinds along with it and can never tell "this save was just loaded" from
---- "this save has been running a while".
+--- Whether this session has reconciled its freshly reset dictionaries with
+--- what the segment file on disk already holds. A module local because a load
+--- resetting it is exactly the event that needs detecting; `storage` rewinds
+--- with the save and cannot tell a fresh load from a long-running session.
 local capture_dictionaries_synced = false
 
 --- What was loaded, as one string, so the prototype description is rewritten
 --- when the answer could have changed and never otherwise.
 ---
---- `script.active_mods` is exactly what decides that answer: prototypes are
---- fixed at load time, so two loads carrying the same mods at the same
---- versions describe the same game. This mod is in there too, which is what
---- makes a capture heal itself when a version that wrote the file wrongly is
---- replaced by one that does not.
----
---- Memoized, since it cannot change during a session either.
+--- `script.active_mods` is what decides it, prototypes being fixed at load
+--- time. This mod is in it too, which is what makes a capture heal itself when
+--- a version that wrote the file wrongly is replaced.
 local loaded_mods_stamp = nil
 local function loaded_mods()
   if not loaded_mods_stamp then
@@ -131,17 +96,10 @@ local function is_placed_floor(tile_name)
   return placed_floor_set[tile_name]
 end
 
---- Per-surface opt-OUT list: presence as a key means excluded from live
---- capture. A surface absent here is recorded, which is what lets a brand
---- new planet or platform, created after this table already has entries,
---- keep recording with zero special-casing, the same "capture everything
---- unless told otherwise" default this mod has always had, now per-surface.
----
---- Its own top-level storage key, sibling to storage.timelapse_capture
---- rather than nested inside it: M.reset_capture below wipes
---- storage.timelapse_capture wholesale to force a fresh baseline, and a
---- player's choice of which surfaces to record is a separate, persistent
---- preference reset should not also throw away.
+--- Per-surface opt-OUT: presence means excluded, so a planet created later
+--- needs no special casing. Its own storage key rather than nested in
+--- `storage.timelapse_capture`, which `M.reset_capture` wipes: which surfaces
+--- to record is a preference a reset should not throw away.
 local function excluded_surfaces()
   storage.timelapse_excluded_surfaces = storage.timelapse_excluded_surfaces or {}
   return storage.timelapse_excluded_surfaces
@@ -159,24 +117,12 @@ function M.set_surface_excluded(surface_name, excluded)
   end
 end
 
---- Every surface that has ever gotten its own baseline frame, keyed by
---- name, valued by the tick it happened at. The original whole-playthrough
---- baseline (`perform_baseline`'s first-ever run) records every surface it
---- covered here; a later catch-up (`M.generate_pending_baselines`) adds
---- just the one it covers. `request_baseline` computes what's still
---- missing by checking this table, which is what lets the exact same
---- function serve the first-ever baseline, a reset, and any later
---- catch-up with no special-casing between them.
+--- Every surface that has had a baseline frame, keyed by name, valued by tick.
+--- `request_baseline` diffs this against what is wanted, which is what lets one
+--- function serve the first baseline, a reset, and any catch-up.
 ---
---- Nested inside `storage.timelapse_capture`, sibling to `baseline_tick`,
---- NOT alongside `storage.timelapse_excluded_surfaces`: unlike a player's
---- exclusion choice (a persistent preference `M.reset_capture` should not
---- discard), this is capture progress, and `M.reset_capture` wiping
---- `storage.timelapse_capture` wholesale is supposed to throw it away so
---- everything gets a fresh baseline, exactly like `baseline_tick` already
---- does today. Assumes `storage.timelapse_capture` already exists: every
---- caller (`request_baseline`/`perform_baseline`) only ever runs after
---- `ensure_capture_segment` has already guaranteed that.
+--- Nested inside `storage.timelapse_capture` rather than beside it: this is
+--- capture progress, so a reset is supposed to throw it away.
 local function baselined_surfaces()
   local capture = storage.timelapse_capture
   capture.baselined_surfaces = capture.baselined_surfaces or {}
@@ -193,15 +139,10 @@ local function capture_segment_path(session_id, start_tick)
   return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
 end
 
---- A playthrough's identity, for tagging files written into the shared,
---- persistent script-output folder (see encode.baseline_manifest_name's
---- comment). The map's terrain seed is deterministic across save/reload of
---- one playthrough, differs across different ones with overwhelming
---- probability, and needs no new in-game UI to collect, unlike a save name,
---- which mods have no API access to at all. Wrapped in pcall and falling
---- back to 0 the same defensive way is_inhabited does: that only degrades
---- to today's single shared bucket in the unlikely event nauvis or its
---- map_gen_settings are unavailable, never a crash.
+--- A playthrough's identity, for tagging files in the shared script-output
+--- folder. The map's terrain seed is stable across save/reload and differs
+--- across playthroughs, and needs no in-game UI to collect, unlike a save name
+--- which mods cannot read. Falls back to 0 rather than crashing.
 function M.compute_session_id()
   local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
   if ok and seed then
@@ -211,33 +152,16 @@ function M.compute_session_id()
 end
 
 --- A player can load an older save than one already recorded past, which an
---- append-only log can't represent as a single timeline. Called lazily from
---- an event handler or the periodic flush below, never from on_load
---- itself, since storage cannot be written there.
+--- append-only log cannot represent as one timeline. Called lazily from an
+--- event handler or the flush, never from on_load, where storage is read only.
 ---
---- Also where a fresh segment's magic header gets written, and where this
---- session's event dictionaries and tick tracking reset: both only need to
---- happen when `capture_path` points at a file nothing has confirmed
---- initializing yet, tracked by the persisted `state.segment_initialized`
---- flag rather than inferred from whether `segment_start_tick` changed.
---- Those aren't the same question: a save whose `storage.timelapse_capture`
---- was written by a mod version that named segments differently (this
---- actually happened going from the JSON format to this one, mid save, and
---- is exactly the kind of thing a future format change could repeat) would
---- keep the same `segment_start_tick` while `capture_segment_path` now
---- points at a file that has never been created, and inferring from the
---- tick alone would silently skip the magic header and start appending
---- records into a file whose first bytes were never written. A save that
---- predates `segment_initialized` existing has it as `nil`, which is
---- correctly falsy here, so upgrading mid save self-heals on the very next
---- check rather than producing a header-less file a reader can't recognize.
+--- Also where a fresh segment's magic header is written, tracked by the
+--- persisted `segment_initialized` flag rather than inferred from
+--- `segment_start_tick`: a mod version naming segments differently would keep
+--- the same tick while pointing at a file that never existed.
 ---
---- Note that `state.last_tick` tracks the last tick an event was actually
---- logged at, not the last tick played, which is what makes the rollback
---- check below neither trigger-happy nor blind. Reloading past a stretch
---- where nothing was built discards no recorded history, so it correctly
---- reports no rollback and keeps one segment; reloading past anything that
---- was recorded correctly reports one.
+--- `state.last_tick` is the last tick an event was logged at, not the last
+--- played, which keeps the rollback check neither trigger-happy nor blind.
 local function ensure_capture_segment()
   local state = storage.timelapse_capture
 
@@ -260,13 +184,10 @@ local function ensure_capture_segment()
     export.safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
   elseif not capture_dictionaries_synced then
-    -- Resuming a segment this save was already writing before it was loaded.
-    -- The module locals above were reset to empty by Factorio re-running
-    -- this file, while the segment on disk still holds every name defined
-    -- before the load, so the two sides now disagree about what id 0 means.
-    -- The record says so explicitly; see encode.event_reset_dictionaries for
-    -- why this cannot instead be solved by persisting the dictionary or by
-    -- starting a fresh segment.
+    -- Resuming a segment this save was already writing. The module locals
+    -- above were reset by the load while the file still holds every name
+    -- defined before it, so the two sides disagree about what id 0 means.
+    -- See encode.event_reset_dictionaries.
     export.safe_write_file(capture_path, encode.event_reset_dictionaries(), true)
   end
 
@@ -275,50 +196,25 @@ local function ensure_capture_segment()
   capture_dictionaries_synced = true
 end
 
---- Take the baseline once per save, then never again: everything after it is
---- reconstructed by replaying the event log, so a second full snapshot would
---- be pure duplication, at roughly 50 bytes per entity, a megabase snapshot
---- every 10 seconds was writing gigabytes an hour to say what the log
---- already said.
+--- Take the baseline once per save, then never again: everything after is
+--- reconstructed from the event log. At roughly 50 bytes per entity, a
+--- megabase snapshot every 10 seconds wrote gigabytes an hour.
 ---
---- Runs synchronously in a single tick via export.export_all_to, unlike the
---- incremental snapshot.lua machinery the periodic test-snapshot setting
---- uses. That incremental machinery exists specifically to avoid a visible
---- freeze on every run, the right trade for something that repeats. A
---- baseline runs at most once per save, so the trade flips: a freeze
---- proportional to base size (measured on a ~375k entity base: tens of
---- seconds), once, beats a background cost smeared across the next several
---- minutes of play that a save or quit can interrupt and force to restart.
---- Factorio can only save or quit between ticks, never mid-tick, so a
---- single-tick export cannot itself be caught half-written by normal play,
---- only a killed process could, and `baseline_tick` is set below only after
---- the write succeeds, so a save from mid-export never trusts a partial
---- file as done. It also does not silently retry itself (see
---- `M.periodic_flush`): the player has to explicitly re-trigger a baseline,
---- same as if one had never been requested.
+--- Runs synchronously in one tick, unlike the incremental snapshot.lua path,
+--- which exists to avoid a freeze on something that repeats. A baseline runs
+--- at most once per save, so tens of seconds once beats a background cost a
+--- save or quit can interrupt. Factorio cannot save mid-tick, and
+--- `baseline_tick` is set only after the write succeeds.
 ---
---- `baseline_tick` is recorded in `storage`, so it travels inside the save:
---- a save that has been baselined knows it, and a fresh one does not.
----
---- Split into a request/perform pair, `request_baseline`/`perform_baseline`,
---- rather than one function that just does the export: nothing renders
---- between two calls made within the same tick, so a warning printed right
---- before the export in the same handler would only reach the screen at the
---- same moment as the freeze itself ends, alongside the "finished" message,
---- telling the player nothing they didn't already know from the freeze
---- ending. Queuing the actual export for `BASELINE_WARNING_DELAY_TICKS`
---- later, not just the next tick, gives Factorio real, perceptible time to
---- render the warning before the freeze hits, not just one frame that may
---- flash by unread.
+--- Split into `request_baseline`/`perform_baseline` because nothing renders
+--- between two calls in one tick, so a warning printed just before the export
+--- would reach the screen as the freeze ended.
 local baseline_pending_tick = nil
 
---- Computes which currently-included, inhabited surfaces have never gotten
---- a baseline of their own, sorted by name for stable, readable output.
---- Shared by `request_baseline` (to warn about and size the coming
---- export) and `perform_baseline` (to actually run it), rather than either
---- trusting the other's answer: exclusion can change during
---- `BASELINE_WARNING_DELAY_TICKS`'s gap between the two, so re-scanning is
---- what keeps the export matching reality at the moment it actually runs.
+--- Which currently-included, inhabited surfaces have never had a baseline,
+--- sorted by name. Shared by `request_baseline` and `perform_baseline` rather
+--- than either trusting the other: exclusion can change during the delay
+--- between them, so re-scanning keeps the export matching reality.
 local function surfaces_needing_baseline()
   local baselined = baselined_surfaces()
   local names = {}
@@ -331,23 +227,14 @@ local function surfaces_needing_baseline()
   return names
 end
 
---- Warns the player a freeze is coming, with a real entity count alongside
---- the headline message: `count_entities_filtered` gives that without
---- paying to materialise the array `export_surface` needs. There is no way
---- to also promise a number of seconds, though: Factorio's Lua sandbox has
---- no wall clock (ticks are logical, not real time, kept deterministic for
---- multiplayer, and the export that follows runs inside a single one of
---- them anyway), so this can only size the job, not time it.
+--- Warns that a freeze is coming, with a real entity count:
+--- `count_entities_filtered` gives one without materialising the array
+--- `export_surface` needs. It cannot promise seconds, the Lua sandbox having
+--- no wall clock.
 ---
---- Generalized to cover three callers identically: the first-ever baseline
---- (`M.on_capture_enabled`), a reset (`M.reset_capture`), and the panel's
---- Generate button for whatever surfaces were checked since the last one
---- (`M.generate_pending_baselines`), since all three just mean "some
---- currently-wanted surface has never been baselined," which
---- `surfaces_needing_baseline` answers the same way regardless of why it's
---- being asked. Checking several surfaces before pressing Generate
---- coalesces into one warning/freeze instead of one per surface, since
---- `perform_baseline` re-scans everything eligible when it actually runs.
+--- Covers all three callers, since the first baseline, a reset and the panel's
+--- Generate button all mean "some wanted surface has never been baselined", so
+--- checking several boxes coalesces into one freeze.
 local function request_baseline(tick)
   ensure_capture_segment()
   if baseline_pending_tick then
@@ -372,17 +259,10 @@ local function request_baseline(tick)
   baseline_pending_tick = tick + BASELINE_WARNING_DELAY_TICKS
 end
 
---- The other half of `request_baseline`, run from `M.run_pending_tick_work`
---- once `BASELINE_WARNING_DELAY_TICKS` have passed since the warning, so
---- that message gets real time on screen before the freeze it describes.
----
---- The very first baseline this save ever takes (`capture.baseline_tick`
---- still nil) writes `baseline.json` via `export.export_all_to`, exactly
---- as before. Every later call is provably a catch-up (baseline_tick is
---- already set), so it exports only the still-missing surfaces through
---- `export.export_surfaces_to`, which writes no manifest at all; see its
---- own doc comment for why `baseline.json` must never change after it's
---- first written.
+--- The other half of `request_baseline`, run once the warning delay has
+--- passed. The first baseline a save ever takes writes `baseline.json` via
+--- `export.export_all_to`; every later call is provably a catch-up and goes
+--- through `export.export_surfaces_to`, which writes no manifest at all.
 local function perform_baseline(tick)
   baseline_pending_tick = nil
   local capture = storage.timelapse_capture
@@ -396,10 +276,9 @@ local function perform_baseline(tick)
   if not capture.baseline_tick then
     total, tiles, count =
       export.export_all_to(tick, baseline_manifest_path(capture.session_id), capture.session_id, M.is_surface_excluded)
-    -- export_all_to describes the prototypes itself, so record what it was
-    -- describing and the next flush has nothing left to do. Only the
-    -- first-ever baseline: a catch-up goes through export_surfaces_to below,
-    -- which writes no description of its own.
+    -- export_all_to describes the prototypes itself, so record what it
+    -- described and the next flush has nothing to do. First baseline only:
+    -- a catch-up writes no description of its own.
     capture.prototypes_stamp = loaded_mods()
     capture.baseline_tick = tick
     for _, name in ipairs(names) do
@@ -419,30 +298,19 @@ local function perform_baseline(tick)
     total, tiles, count))
 end
 
---- The mod cannot detect that script-output/save-timelapse has been wiped
---- and retake the baseline on its own: `LuaHelpers` (checked against
---- Factorio's own runtime-api.json) exposes `write_file` and `remove_path`
---- and nothing else, no read, no exists check, no directory listing. A
---- mod genuinely cannot tell whether a file it wrote is still there.
---- `baseline_tick` therefore has to be trusted as the source of truth for
---- "has this save already been baselined," which is correct for its actual
---- purpose (never repeat a multi-second export unnecessarily) but leaves no
---- automatic recovery if the output files are deleted out from under it.
+--- The mod cannot detect that script-output has been wiped and retake the
+--- baseline: `LuaHelpers` exposes `write_file` and `remove_path` and nothing
+--- else, so a mod cannot tell whether a file it wrote still exists, and
+--- `baseline_tick` has to be trusted for "already baselined".
 ---
---- This command (and the GUI's own reset button, see gui.lua) is what
---- recovers from that: unlike detecting an external deletion, actually
---- deleting this playthrough's own files is something `remove_path` can do,
---- since the mod already knows exactly what it wrote and where (every
---- playthrough gets its own session-tagged subfolder, see
---- encode.session_dir). So reset does the real thing itself instead of
---- assuming the player already cleared script-output by hand.
+--- This command and the GUI's reset button are the recovery: deleting this
+--- playthrough's own files is something `remove_path` can do.
 function M.reset_capture(player)
   local old_session_id = storage.timelapse_capture and storage.timelapse_capture.session_id
   if old_session_id then
-    -- remove_path's failure behavior isn't documented, so this is pcall'd
-    -- the same defensive way every other capture write in this mod is: a
-    -- failure just degrades to the old behavior (stale files linger
-    -- alongside the new ones), not a new failure mode.
+    -- remove_path's failure behaviour is undocumented, so this is pcall'd
+    -- like every other capture write: a failure leaves stale files beside
+    -- the new ones rather than becoming a new failure mode.
     pcall(helpers.remove_path, export.EXPORT_DIR .. encode.session_dir(old_session_id))
   end
 
@@ -494,10 +362,9 @@ local function encode_capture_event(op, kind, name, x, y, direction, id, w, h, s
 end
 
 local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
-  -- A nil surface (log_tile_change's surface_name can be nil for an
-  -- unresolvable surface_index) is never excluded: a nil table key read is
-  -- legal and never equals true, so this is a no-op for that case, same
-  -- as today.
+  -- A nil surface (log_tile_change's can be nil for an unresolvable
+  -- surface_index) is never excluded: a nil key read is legal and never
+  -- equals true.
   if M.is_surface_excluded(surface) then
     return
   end
@@ -529,18 +396,10 @@ local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
   end
 end
 
---- Every field read here crosses the Lua/C++ boundary, once per property, and
---- on a busy tick those crossings are most of what live capture costs. So a
---- removal reads only what a removal record holds.
----
---- `encode_capture_event` sends one as surface, position and id, and nothing
---- else: direction and footprint belong to the definition an add already
---- carried. Reading them anyway spent three crossings per removal, and
---- deconstructing an area is precisely a burst of removals.
----
---- Written as two calls rather than one with conditionals, so what each kind
---- of record actually needs is visible at the call site instead of being
---- assembled out of `and`/`or` pairs.
+--- Every field read here crosses the Lua/C++ boundary once per property, and
+--- on a busy tick those crossings are most of what capture costs, so a removal
+--- reads only what a removal record holds. Two calls rather than conditionals,
+--- so what each kind of record needs is visible at the call site.
 local function log_entity(op, entity)
   if not entity.valid or is_excluded_type(entity.type) then
     return
@@ -581,25 +440,13 @@ local function log_tile_change(op, event)
     elseif change.old_tile and is_placed_floor(change.old_tile.name) then
       log_event("-", "t", nil, pos.x, pos.y, nil, nil, nil, nil, surface_name)
 
-      -- What the removal uncovered, logged as an ordinary add so the
-      -- position ends up holding it rather than going empty. This is the
-      -- landfill case: mining landfill reveals the water it was covering,
-      -- which no baseline ever saw, because the landfill was already there
-      -- when the snapshot was taken. Without this the tile just disappears
-      -- and a filled lake un-fills into a hole.
+      -- What the removal uncovered, logged as an ordinary add so the position
+      -- holds it rather than going empty: mining landfill reveals water no
+      -- baseline ever saw, and without this a filled lake un-fills into a hole.
       --
-      -- Readable only because these events fire *after* the tiles have been
-      -- replaced, so `get_tile` already returns the new ground rather than
-      -- what was just mined.
-      --
-      -- Needs no new record type, which is what keeps it inside the format
-      -- freeze: it is an AddTile carrying a natural ground name instead of a
-      -- placed floor one, and the reader has never cared which.
-      --
-      -- Gated on terrain capture because that is exactly the opt-out this
-      -- would otherwise violate: with it off the timelapse deliberately shows
-      -- no natural ground, and revealing a patch of water or grass under a
-      -- removed tile would put some back.
+      -- Readable only because these events fire after the tiles are replaced,
+      -- and needs no new record type, so it stays inside the format freeze.
+      -- Gated on terrain capture, which it would otherwise violate.
       if surface and terrain_captured() then
         local ok, revealed = pcall(function()
           return surface.get_tile(pos.x, pos.y).name
@@ -616,24 +463,15 @@ M.CAPTURE_HANDLERS = {
   [defines.events.on_built_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.on_robot_built_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.script_raised_built] = function(e) log_entity("+", e.entity) end,
-  -- Rotating raises neither a build nor a removal, so without this the
-  -- capture never hears about it and the entity keeps whatever facing it had
-  -- when it was first placed, for the rest of the playthrough. That showed up
-  -- as belt corners drawing as straight belts: the corner was real in game and
-  -- the replay still had the pre-rotation direction.
+  -- Rotating raises neither a build nor a removal, so without this an entity
+  -- keeps the facing it was placed with for the rest of the playthrough.
   --
-  -- Logged as an add, which is what an add already means here: `World::insert`
-  -- updates an occupied position in place rather than making a second entity
-  -- on the tile, and skips even the revision bump when nothing actually
-  -- changed. So this costs one event per manual rotation and nothing at all
-  -- when a rotation turns out to be a no-op.
+  -- Logged as an add, which is what an add already means: `World::insert`
+  -- updates an occupied position in place and skips the revision bump when
+  -- nothing changed, so a no-op rotation costs nothing.
   --
-  -- Known limitation: this covers rotating by hand and nothing else. A belt
-  -- whose direction the game changes for you, by connecting it up as you drag
-  -- a line past it, raises no event this listens for, so it keeps its original
-  -- facing and its corner still draws as a straight belt. Rarer than manual
-  -- rotation and left for another time; a fresh baseline corrects every belt
-  -- placed so far, since a baseline reads the world as it actually is.
+  -- Covers rotating by hand only. A belt the game turns for you as you drag a
+  -- line past it raises no event this listens for.
   [defines.events.on_player_rotated_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.on_player_mined_entity] = function(e) log_entity("-", e.entity) end,
   [defines.events.on_robot_mined_entity] = function(e) log_entity("-", e.entity) end,
@@ -645,14 +483,9 @@ M.CAPTURE_HANDLERS = {
   [defines.events.on_robot_mined_tile] = function(e) log_tile_change("-", e) end,
 }
 
---- Adds a handler only if this Factorio build actually defines the event.
----
---- Written this way rather than as more entries in the literal above because
---- indexing a table with a nil key is a hard error in Lua, not a skipped
---- entry. A build whose defines lack one of the events below would therefore
---- fail to load the mod at all, turning "one kind of build goes unrecorded"
---- into "nothing works", which is a far worse trade for events that only
---- exist from 2.0 onward.
+--- Adds a handler only if this Factorio build defines the event. Indexing a
+--- table with a nil key is a hard error in Lua rather than a skipped entry, so
+--- a build missing one of these would fail to load the mod at all.
 local function capture_handler(event_name, handler)
   local id = defines.events[event_name]
   if id then
@@ -660,47 +493,28 @@ local function capture_handler(event_name, handler)
   end
 end
 
--- Space platforms are a separate event family from planet-side robots, and
--- everything on a platform is placed by platform construction bots, so
--- without these a platform's entire construction history goes unrecorded.
--- The platform still shows up, because snapshots scan every inhabited
--- surface and a platform with player entities on it qualifies, so the
--- symptom is not a missing platform but one that appears fully formed and
--- then never changes: no growth in the timelapse and no construction heat
--- while it is being built.
+-- Space platforms are a separate event family, and everything on one is placed
+-- by platform construction bots, so without these a platform's construction
+-- history goes unrecorded: it appears fully formed and never changes.
 --
--- The payloads are shaped exactly like their robot equivalents (`entity` for
--- the entity events, `surface_index`/`tile`/`tiles` for the tile ones), which
--- is why these reuse the same two handlers rather than needing their own.
+-- The payloads match their robot equivalents, which is why these reuse the
+-- same two handlers.
 capture_handler("on_space_platform_built_entity", function(e) log_entity("+", e.entity) end)
 capture_handler("on_space_platform_mined_entity", function(e) log_entity("-", e.entity) end)
 capture_handler("on_space_platform_built_tile", function(e) log_tile_change("+", e) end)
 capture_handler("on_space_platform_mined_tile", function(e) log_tile_change("-", e) end)
 
--- A ghost revived by a script rather than carried out by a bot. Vanilla bot
--- construction raises `on_robot_built_entity` and is already covered above;
--- this is the path mods use, and without it a modded construction aid places
--- entities the capture never sees.
+-- A ghost revived by a script rather than by a bot: the path mods use.
+-- Without it a modded construction aid places entities capture never sees.
 capture_handler("script_raised_revive", function(e) log_entity("+", e.entity) end)
 
---- The CAPTURE_FLUSH_TICKS periodic callback body, run from control.lua's
---- timer multiplexer while live capture is on. Calls `ensure_capture_segment`
---- directly rather than `request_baseline`: a save that starts with live
---- capture already on from its very first tick (rather than it being
---- switched on mid-session) never runs `M.on_capture_enabled`, and with
---- nothing built or mined yet, `log_event`'s own lazy init hasn't run
---- either, so this can be the first thing to ever touch
---- `storage.timelapse_capture`, which still needs to exist for
---- `capture_checked_rollover = true` below to be a true statement, and for
---- `sample_connected_players` to read a real `session_id`. Deliberately
---- does NOT call `request_baseline` itself, though: a baseline is only
---- ever taken in direct response to an explicit player action (turning
---- live capture on, or the panel's reset button, both via
---- `M.on_capture_enabled`/`M.reset_capture`), never on an unattended
---- timer. An interrupted baseline (the process killed mid-export, before
---- `baseline_tick` got set) therefore does not silently retry itself on
---- the next flush after a reload; the player has to explicitly re-trigger
---- it, the same as if it had never started.
+--- The periodic flush body, run from control.lua's timer multiplexer. Calls
+--- `ensure_capture_segment` directly because a save that starts with capture
+--- already on may reach here before anything is built.
+---
+--- Deliberately does not call `request_baseline`: a baseline is only taken in
+--- response to an explicit player action, so an interrupted one does not
+--- silently retry after a reload.
 function M.periodic_flush(tick)
   ensure_capture_segment()
   capture_checked_rollover = true
@@ -708,12 +522,9 @@ function M.periodic_flush(tick)
   export.sample_connected_players(tick, storage.timelapse_capture.session_id)
   milestones.poll(tick, storage.timelapse_capture.session_id)
   -- Rewritten only when the loaded mods differ from what the file was written
-  -- for, and the answer to that lives in `storage` rather than in a module
-  -- local. A local meant "already done this session", which assumed a session
-  -- was long: it is reset by every load, and the cost of being wrong about
-  -- that is not small, since this rebuilds a couple of hundred kilobytes of
-  -- JSON out of every loaded prototype in a single tick. Kept in the save, it
-  -- is written once per change of mods and then never again.
+  -- for, and that answer lives in `storage`. A module local meant "already
+  -- done this session", which a load resets, so this rebuilt a couple of
+  -- hundred kilobytes of JSON in one tick far more often than intended.
   local stamp = loaded_mods()
   if storage.timelapse_capture.prototypes_stamp ~= stamp then
     export.write_prototypes(storage.timelapse_capture.session_id)
@@ -721,32 +532,21 @@ function M.periodic_flush(tick)
   end
 end
 
---- Run when the save-timelapse-live-capture setting is turned on: baselines
---- immediately rather than waiting up to CAPTURE_FLUSH_TICKS for the first
---- flush. Setting `capture_checked_rollover` here (not `M.periodic_flush`'s
---- job, since this doesn't also flush or sample players) means the very
---- next `log_event` doesn't redundantly call `ensure_capture_segment` again
---- right after `request_baseline` already did.
+--- Run when live capture is turned on: baselines immediately rather than
+--- waiting for the first flush. Sets `capture_checked_rollover` so the next
+--- `log_event` does not redundantly re-check the segment.
 function M.on_capture_enabled(tick)
   capture_checked_rollover = true
   request_baseline(tick)
 end
 
---- Run when the panel's "Generate" button is clicked. Checking a surface's
---- box only records that it's now wanted (gui.lua); its pre-existing
---- state, built up while excluded or before capture ever started, was
---- never snapshotted, and its events only start logging from the moment
---- it's checked, so something still has to actually take the catch-up
---- baseline for whatever's newly included. Generate is that explicit,
---- separate step, deliberately not run automatically the instant a box is
---- checked, so checking several surfaces in a row batches into one warning
---- and one freeze instead of one per box, and ticking a box doesn't force
---- an immediate decision to pay that cost.
+--- Run when the panel's Generate button is clicked. Checking a box only records
+--- that a surface is wanted; its pre-existing state was never snapshotted, so
+--- something has to take the catch-up baseline. A separate step so checking
+--- several boxes batches into one freeze.
 ---
---- A no-op while live capture is off: nothing is being logged for this
---- save yet, and `M.on_capture_enabled`'s own `request_baseline` call will
---- see the exact same gap and cover it whenever/if the player turns
---- capture on.
+--- A no-op while capture is off, `M.on_capture_enabled` covering the same gap
+--- if the player turns it on.
 function M.generate_pending_baselines(tick)
   if settings.global["save-timelapse-live-capture"].value then
     capture_checked_rollover = true

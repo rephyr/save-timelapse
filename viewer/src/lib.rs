@@ -1,11 +1,8 @@
-//! Everything that doesn't touch macroquad's window/input globals, split out
-//! so it's unit testable: `main.rs` is thin glue over this.
+//! Everything that does not touch macroquad's window and input globals, split
+//! out so it is unit testable; `main.rs` is thin glue over this.
 //!
-//! Split by concern across these modules rather than kept as one file: each
-//! one owns its own `#[cfg(test)] mod tests`, so a test lives next to the
-//! code it exercises instead of in one undifferentiated block at the end.
-//! Re-exported here so every name is still reachable as `viewer::Name`
-//! exactly as before this split, so `main.rs` needed no import changes.
+//! Each module owns its own `#[cfg(test)] mod tests`. Re-exported here so
+//! every name is still reachable as `viewer::Name`.
 
 mod activity;
 mod avi;

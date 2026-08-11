@@ -3,12 +3,10 @@
 
 use crate::registry::TypeId;
 
-/// `quad_gl.rs::geometry` merges new geometry only into the *immediately
-/// preceding* draw call, and starts a fresh one when the bound texture
-/// differs or the index buffer would overflow. macroquad's own
-/// `telemetry::drawcalls` can't be used for a running count: `track_drawcall`
-/// allocates a 128x128 render texture per call, so counting thousands of them
-/// would cost more than the thing being measured.
+/// `quad_gl.rs::geometry` merges geometry only into the immediately preceding
+/// draw call, starting a fresh one when the texture differs or the index
+/// buffer would overflow. macroquad's own `telemetry::drawcalls` cannot be
+/// used for a running count: it allocates a 128x128 render texture per call.
 pub struct DrawCallCounter {
     max_indices: usize,
     current: Option<TypeId>,

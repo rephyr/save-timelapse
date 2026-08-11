@@ -4,13 +4,10 @@ use std::path::{Path, PathBuf};
 
 use macroquad::math::Rect;
 
-/// Vanilla/Space-Age icons follow a predictable path under the Factorio
-/// install's data directory, keyed by prototype name, verified against
-/// Wube's own base-game source (e.g. `__base__/graphics/icons/stone-furnace.png`
-/// resolves to `<data_dir>/base/graphics/icons/stone-furnace.png`). There's no
-/// runtime API a mod could use to export the exact path (checked before
-/// building this), and no reliable convention for third-party mod icons:
-/// a lookup miss just means falling back to a colored shape, never an error.
+/// Vanilla and Space Age icons follow a predictable path under the install's
+/// data directory, keyed by prototype name. No runtime API exposes the real
+/// path and there is no convention for third-party mod icons, so a miss falls
+/// back to a coloured shape rather than erroring.
 pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
     ["base", "space-age"].iter().map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png"))).collect()
 }
@@ -19,13 +16,10 @@ pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
     icon_candidates(data_dir, name).into_iter().find(|candidate| candidate.exists())
 }
 
-/// Factorio's own in-world sheet for an entity, which for a belt holds every
-/// facing and every corner drawn separately.
-///
-/// Same shape of guess as `icon_candidates` and the same failure mode: a miss
-/// just means falling back to the inventory icon. Both groups are checked
-/// because the first three belt tiers ship in `base` and turbo belts come with
-/// Space Age.
+/// Factorio's in-world sheet for an entity, holding every facing and corner
+/// drawn separately. Same guess and same failure mode as `icon_candidates`.
+/// Both groups are checked, the first three belt tiers shipping in `base` and
+/// turbo belts with Space Age.
 pub fn entity_sheet_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
     ["base", "space-age"]
         .iter()
@@ -37,11 +31,9 @@ pub fn entity_sheet_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
     entity_sheet_candidates(data_dir, name).into_iter().find(|candidate| candidate.exists())
 }
 
-/// Factorio's structure sheet for an underground belt, which holds the
-/// entrance and the exit as separate pictures.
-///
-/// A different file from the entity sheet a belt uses: an underground belt's
-/// own folder holds `<name>-structure.png` rather than `<name>.png`.
+/// Factorio's structure sheet for an underground belt, holding the entrance
+/// and exit as separate pictures. A different file from a belt's entity sheet:
+/// the folder holds `<name>-structure.png` rather than `<name>.png`.
 pub fn underground_structure_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
     ["base", "space-age"]
         .iter()
@@ -50,35 +42,26 @@ pub fn underground_structure_path(data_dir: &Path, name: &str) -> Option<PathBuf
 }
 
 /// One cell of an underground belt's structure sheet: four facings across,
-/// four variants down.
-///
-/// Both counts come from the file, the same way the belt sheet's layout does,
-/// so a tier drawn at a different resolution still lands on the right cell.
-/// All four vanilla tiers measure 768x768, four 192px cells each way.
+/// four variants down. Both counts come from the file, so a tier drawn at a
+/// different resolution still lands on the right cell.
 pub fn underground_source_rect(width: f32, height: f32, row: usize, column: usize) -> Rect {
     let cell_w = width / 4.0;
     let cell_h = height / 4.0;
     Rect::new(column as f32 * cell_w, row as f32 * cell_h, cell_w, cell_h)
 }
 
-/// Pixels per tile in Factorio's in-world art.
+/// Pixels per tile in Factorio's in-world art. Every sheet is authored at this
+/// density and declared `scale = 0.5`, so a frame's size in tiles is its pixel
+/// size over this.
 ///
-/// Every sheet here is authored at this density and declared `scale = 0.5` in
-/// the prototypes, so a frame's size in tiles is just its pixel size over this.
-/// Measured rather than assumed: a straight belt's artwork fills 68 of its
-/// 128px frame, which is the 1.06 tiles a belt should be, and an underground
-/// belt's housing fills 130 of 192, which is the 2.03 tiles it should be.
-///
-/// It matters because a frame is bigger than the thing drawn in it. Fitting
-/// the frame to the entity's footprint instead draws everything at about half
-/// size, with the leftover showing up as gaps between belt segments.
+/// It matters because a frame is bigger than the thing drawn in it: fitting
+/// the frame to the footprint draws everything at about half size, showing up
+/// as gaps between belt segments.
 pub const SPRITE_TILE_PIXELS: f32 = 64.0;
 
 /// A splitter's structure, which unlike everything else here is four separate
-/// files, one per facing, rather than one sheet with the facings inside it.
-///
-/// Ordered north, east, south, west, matching the column order of the sheets
-/// so a caller can index all of them the same way.
+/// files, one per facing. Ordered north, east, south, west, matching the
+/// column order of the sheets.
 pub fn splitter_structure_paths(data_dir: &Path, name: &str) -> Option<Vec<PathBuf>> {
     let found: Vec<PathBuf> = ["north", "east", "south", "west"]
         .iter()
@@ -102,13 +85,10 @@ pub fn splitter_source_rect(width: f32, height: f32) -> Rect {
     Rect::new(0.0, 0.0, width / SPLITTER_COLUMNS, height / SPLITTER_ROWS)
 }
 
-/// The top patch that completes a sideways splitter.
-///
-/// Facing east or west, Factorio draws a splitter in two pieces: `structure`
-/// covers the near half and `structure_patch` the far half. Facing north or
-/// south the patch is `util.empty_sprite()` and the structure is the whole
-/// thing. Drawing only the structure is why a sideways splitter showed just
-/// one of its two halves.
+/// The top patch that completes a sideways splitter. Facing east or west,
+/// Factorio draws a splitter in two pieces, `structure` covering the near half
+/// and `structure_patch` the far half; facing north or south the patch is
+/// empty. Drawing only the structure showed one half.
 pub fn splitter_patch_path(data_dir: &Path, name: &str, facing: usize) -> Option<PathBuf> {
     let side = match facing {
         1 => "east",
@@ -121,13 +101,10 @@ pub fn splitter_patch_path(data_dir: &Path, name: &str, facing: usize) -> Option
         .find(|candidate| candidate.exists())
 }
 
-/// Where each piece sits relative to the entity's centre, in the units
-/// Factorio's own `util.by_pixel` uses (thirty-seconds of a tile), read off
-/// the `shift` in the splitter prototypes.
-///
-/// Ordered north, east, south, west. Base, fast and express agree on every
-/// value except express's west being one unit narrower, which is a third of a
-/// tenth of a tile and not worth a per-tier table.
+/// Where each piece sits relative to the entity's centre, in the
+/// thirty-seconds of a tile `util.by_pixel` uses, read off the `shift` in the
+/// splitter prototypes. Ordered north, east, south, west. The tiers agree
+/// except express's west, by a third of a tenth of a tile.
 const SPLITTER_SHIFT: [(f32, f32); 4] = [(7.0, 0.0), (4.0, 13.0), (4.0, 0.0), (6.0, 12.0)];
 const SPLITTER_PATCH_SHIFT: [(f32, f32); 4] = [(0.0, 0.0), (4.0, -20.0), (0.0, 0.0), (6.0, -18.0)];
 
@@ -156,12 +133,10 @@ pub fn pipe_piece_path(data_dir: &Path, piece: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.exists())
 }
 
-/// The four pictures for an underground pipe, ordered north, east, south,
-/// west so a facing indexes straight into them.
-///
-/// Factorio names them for the side the above-ground opening faces, following
-/// the same convention as the plain pipe pieces. If every underground pipe
-/// comes out facing backwards, that reading is what to flip.
+/// The four pictures for an underground pipe, ordered north, east, south, west
+/// so a facing indexes straight in. Factorio names them for the side the
+/// above-ground opening faces; if every underground pipe faces backwards, that
+/// reading is what to flip.
 pub fn pipe_to_ground_paths(data_dir: &Path) -> Option<Vec<PathBuf>> {
     let found: Vec<PathBuf> = ["up", "right", "down", "left"]
         .iter()
@@ -179,27 +154,22 @@ pub fn pipe_to_ground_paths(data_dir: &Path) -> Option<Vec<PathBuf>> {
 
 /// The source rectangle for one row of a belt sheet.
 ///
-/// Layout is derived from the file rather than hardcoded: every belt sheet is
-/// `rows` rows of square frames animated left to right, but the four tiers run
-/// to different lengths (16, 32, 32 and 64 columns), so the frame size comes
-/// from the height and the column count falls out of the width. Column zero
-/// every time, since a timelapse frame is a still and the animation only moves
-/// the belt's surface.
+/// Layout comes from the file rather than a constant: every sheet is rows of
+/// square frames animated left to right, but the tiers run to different
+/// lengths, so the frame size comes from the height. Column zero every time, a
+/// timelapse frame being a still.
 pub fn belt_source_rect(width: f32, height: f32, rows: usize, row: usize) -> Rect {
     let frame = height / rows as f32;
     Rect::new(0.0, row as f32 * frame, frame.min(width), frame)
 }
 
-/// Vanilla and Space Age icon files are a horizontal mipmap strip, not a
-/// single image: the primary icon at full size, then progressively smaller
-/// copies laid out to its right, all sharing the strip's height (verified
-/// against real files, e.g. 64+32+16+8=120 wide, 64 tall). Drawing the
-/// whole file stretched into one entity's box renders all of them squashed
-/// together, which is what "sprites have 4 sprites in them" was.
+/// Icon files are a horizontal mipmap strip rather than one image: the primary
+/// icon, then progressively smaller copies to its right, all sharing the
+/// height. Drawing the whole file into one entity's box renders all of them
+/// squashed together.
 ///
-/// The primary icon is always the leftmost square, sized to the image's
-/// height. A single-icon file with no strip (width == height) falls out of
-/// the same rule as a no-op crop, so callers don't need to special-case it.
+/// The primary icon is the leftmost square, sized to the image's height. A
+/// file with no strip falls out of the same rule as a no-op crop.
 pub fn icon_source_rect(width: f32, height: f32) -> Rect {
     let size = width.min(height);
     Rect::new(0.0, 0.0, size, size)

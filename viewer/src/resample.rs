@@ -1,29 +1,21 @@
-//! Averaging an oversized render back down to the size that was asked for.
+//! Averaging an oversized render back down to the size asked for.
 //!
-//! Exists because a megabase does not fit its own detail into a video frame.
-//! At 1080p a 2,900 tile base puts about three tiles behind every pixel, so
-//! at one sample per pixel whichever entity a pixel lands on wins it
-//! outright and the rest of those three tiles is gone: a belt either takes a
-//! whole pixel or vanishes, and which of those happens changes frame to
-//! frame as the camera creeps. Rendering large and averaging down replaces
-//! that with each item contributing its real share.
+//! At 1080p a 2,900 tile base puts about three tiles behind every pixel, so at
+//! one sample per pixel whichever entity a pixel lands on wins it outright,
+//! and which one that is changes frame to frame as the camera creeps.
 
 use macroquad::texture::Image;
 
 /// Averages `src` down by `factor` on each axis. `factor` of 1 is a copy.
 ///
-/// A plain box filter, which here is the correct one rather than merely the
-/// cheap one: the samples being combined are a regular grid covering exactly
-/// one output pixel's area, so their unweighted mean *is* that pixel's
-/// coverage. Lanczos or bicubic would be reaching outside the pixel to
-/// reconstruct a continuous signal, and there isn't one to reconstruct; the
-/// source is flat quads with hard edges.
+/// A box filter, which here is the correct one rather than the cheap one: the
+/// samples are a regular grid covering exactly one output pixel's area, so
+/// their unweighted mean is that pixel's coverage. Bicubic would reconstruct a
+/// continuous signal, and the source is flat quads with hard edges.
 ///
-/// Any leftover row or column (a source dimension not divisible by `factor`)
-/// is dropped rather than averaged over a short window, since a partial
-/// window would be dimmer than its neighbours and read as a dark fringe
-/// along two edges. Callers size the target as an exact multiple, so this is
-/// a guard rather than a path anything takes.
+/// A leftover row or column is dropped rather than averaged over a short
+/// window, which would be dimmer than its neighbours and read as a dark
+/// fringe. Callers size the target as an exact multiple.
 pub fn downsample(src: &Image, factor: u32) -> Image {
     if factor <= 1 {
         return src.clone();

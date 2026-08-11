@@ -1,25 +1,16 @@
-//! What the tool remembers between runs, so a repeat run stops re-asking
-//! questions it already has the answer to.
+//! What the tool remembers between runs, so a repeat run stops re-asking.
 //!
-//! Deliberately small. Every field is something a user would otherwise retype
-//! identically every single time: where Factorio is (twice, since the folder
-//! and the executable are found separately), how much game time a frame
-//! covers, whether to include natural terrain, and the size and frame rate of
-//! an exported video.
+//! Deliberately small: every field is something a user would otherwise retype
+//! identically every time.
 //!
 //! **Nothing here is authoritative.** Every field is an `Option`, absent
-//! meaning "never answered", and every one is offered as a *default* that
-//! Enter accepts rather than as a decision made on the user's behalf. That
-//! matters most for the two paths: a remembered Factorio location that has
-//! since moved must not turn into a confusing failure several steps later, so
-//! it is validated before being trusted and quietly re-asked if it no longer
-//! looks right.
+//! meaning never answered, and every one is offered as a default that Enter
+//! accepts rather than a decision made for the user. A remembered Factorio
+//! location that has since moved is validated before being trusted.
 //!
-//! Plain JSON, in the user's own config directory rather than beside the
-//! executable. Beside the executable would be lost every time the release zip
-//! is replaced, which is exactly when someone least wants to redo their
-//! setup. Readable by eye and safe to delete: deleting it returns the tool to
-//! asking everything, which is also the fix for anything in it going stale.
+//! Plain JSON in the user's config directory rather than beside the
+//! executable, which the release zip replaces. Safe to delete: that returns
+//! the tool to asking everything, which is also the fix for anything stale.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,12 +41,9 @@ pub struct Settings {
     pub export_fps: Option<u32>,
 }
 
-/// Where the settings file lives, following each platform's own convention
-/// rather than inventing one.
-///
-/// `None` only when the environment gives nothing to build a path from, in
-/// which case the tool runs exactly as it did before this existed: asking
-/// everything, every time.
+/// Where the settings file lives, per platform convention. `None` only when
+/// the environment gives nothing to build a path from, in which case the tool
+/// asks everything every time, as it did before this existed.
 pub fn settings_path() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)?
@@ -70,12 +58,10 @@ pub fn settings_path() -> Option<PathBuf> {
 }
 
 impl Settings {
-    /// Reads the saved settings, or an empty set.
-    ///
-    /// A missing file is the first run and an ordinary state, not an error. A
-    /// *corrupt* file is also not an error: it is worth one warning and then
-    /// starting fresh, because the alternative is a tool that refuses to
-    /// launch until the user finds and deletes a file they never knew about.
+    /// Reads the saved settings, or an empty set. A missing file is the first
+    /// run; a corrupt one is worth a warning and a fresh start, the
+    /// alternative being a tool that refuses to launch until the user finds a
+    /// file they never knew about.
     pub fn load() -> Settings {
         let Some(path) = settings_path() else { return Settings::default() };
         let Ok(text) = std::fs::read_to_string(&path) else { return Settings::default() };
@@ -103,12 +89,9 @@ impl Settings {
         settings_path().is_some_and(|path| !path.exists())
     }
 
-    /// Writes the settings, creating the directory if needed.
-    ///
-    /// Returns the error rather than swallowing it so a caller can say so,
-    /// but no caller should treat it as fatal: failing to remember an answer
-    /// costs one prompt next time, and refusing to build somebody's timelapse
-    /// over it would be absurd.
+    /// Writes the settings, creating the directory if needed. Returns the error
+    /// so a caller can say so, but no caller should treat it as fatal: failing
+    /// to remember an answer costs one prompt next time.
     pub fn save(&self) -> io::Result<()> {
         let Some(path) = settings_path() else {
             return Err(io::Error::other("no writable configuration directory on this system"));
@@ -121,12 +104,9 @@ impl Settings {
     }
 
     /// The remembered Factorio user folder, if it still looks like one.
-    ///
-    /// Validated rather than trusted: a folder that has since been moved,
-    /// renamed, or lived on a drive that is not plugged in would otherwise
-    /// resurface as a confusing failure much later, and the whole point of
-    /// remembering it is to save the user work, not to create a new way to
-    /// waste it.
+    /// Validated rather than trusted: a folder since moved, renamed, or on an
+    /// unplugged drive would otherwise resurface as a confusing failure much
+    /// later.
     pub fn valid_factorio_dir(&self) -> Option<&Path> {
         let dir = self.factorio_dir.as_deref()?;
         dir.join("mods").is_dir().then_some(dir)

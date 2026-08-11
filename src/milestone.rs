@@ -1,22 +1,14 @@
-//! Reading the milestone log the mod writes (`milestones.jsonl`).
+//! Reading the milestone log the mod writes (`milestones.jsonl`): the first of
+//! each science pack, the first rocket, the first arrival on each planet. See
+//! `mod/milestones.lua` for how they are detected.
 //!
-//! Notable moments worth marking on the timeline rather than watching for:
-//! the first of each science pack, the first rocket, the first arrival on
-//! each planet. See `mod/milestones.lua` for how they are detected.
-//!
-//! Plain newline-delimited JSON for the same reason `player_log.rs` is: a
-//! whole playthrough produces on the order of a dozen of these, nowhere near
-//! the volume that justified a tagged binary format for frames and events,
-//! and being readable by eye is worth more than the few hundred bytes
-//! packing it would save.
-//!
-//! One line per milestone:
+//! Newline-delimited JSON, a playthrough producing about a dozen:
 //! ```text
 //! {"tick":1234567,"kind":"science","id":"logistic-science-pack"}
 //! ```
 //!
 //! `kind` and `id` rather than a prebaked sentence, so wording is this side's
-//! decision and a viewer can filter by kind without parsing prose.
+//! decision and a viewer can filter without parsing prose.
 
 use std::fs;
 use std::io;
@@ -66,13 +58,10 @@ pub struct Milestone {
 }
 
 impl Milestone {
-    /// A short human label, since `id` is a prototype name and nobody wants
-    /// to read `logistic-science-pack` on a timeline.
-    ///
-    /// Prototype names are the internal identifier, not a localised string,
-    /// and a mod cannot hand out localised names outside the game anyway
-    /// (`LocalisedString` only resolves in a running Factorio), so this
-    /// tidies the raw name rather than pretending to translate it.
+    /// A short human label, `id` being a prototype name nobody wants to read on
+    /// a timeline. Prototype names are internal identifiers, and a mod cannot
+    /// hand out localised names outside the game, so this tidies the raw name
+    /// rather than pretending to translate it.
     pub fn label(&self) -> String {
         match &self.kind {
             // Named in full rather than trimmed to "First logistic": the
@@ -105,14 +94,12 @@ struct RawMilestone {
 
 /// Every milestone in `path`, ascending by tick.
 ///
-/// A missing file is an empty list rather than an error: milestones only
-/// exist for a live capture, and one recorded before this feature (or with
-/// nothing notable yet reached) simply has no file. That is the same
-/// "nothing to show" case as terrain capture being off, not a failure.
+/// A missing file is an empty list rather than an error: milestones only exist
+/// for a live capture, and one with nothing notable reached has no file.
 ///
-/// A malformed line is skipped with a warning rather than failing the read,
-/// matching how the player log treats one: the file is appended to during
-/// play and its last line can be a partial write if the game was killed.
+/// A malformed line is skipped with a warning rather than failing the read:
+/// the file is appended to during play, so its last line can be a partial
+/// write if the game was killed.
 pub fn read(path: &Path) -> io::Result<Vec<Milestone>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -134,13 +121,11 @@ pub fn read(path: &Path) -> io::Result<Vec<Milestone>> {
     Ok(milestones)
 }
 
-/// What one save knows about milestones, read out of its export manifest
-/// (see `mod/export.lua`'s `milestone_state`).
+/// What one save knows about milestones, from its export manifest.
 ///
-/// State, not events. A save records that a science pack has been produced,
-/// never when it first was, so a single one of these cannot place a marker on
-/// a timeline. [`from_saves`] recovers the timing by comparing consecutive
-/// saves.
+/// State, not events: a save records that a pack has been produced, never when,
+/// so one of these cannot place a marker. [`from_saves`] recovers timing by
+/// comparing consecutive saves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub tick: u64,
@@ -172,12 +157,9 @@ struct RawState {
 }
 
 impl State {
-    /// Reads one save's state from its export manifest.
-    ///
-    /// `Ok(None)` means the manifest predates milestone state, which is the
-    /// ordinary case for a manifest written by an older mod. That is a
-    /// timelapse without markers, not a failure, exactly as a live capture
-    /// recorded before the feature existed has none.
+    /// Reads one save's state from its export manifest. `Ok(None)` means the
+    /// manifest predates milestone state, which is a timelapse without markers
+    /// rather than a failure.
     pub fn from_manifest(path: &Path) -> io::Result<Option<State>> {
         let text = fs::read_to_string(path)?;
         let raw: RawManifest = serde_json::from_str(&text)
@@ -188,25 +170,17 @@ impl State {
 
 /// Recovers milestone timings by comparing what consecutive saves know.
 ///
-/// A save carries totals, so the earliest tick at which something can be
-/// *proved* to have happened is the tick of the first save that reports it.
-/// That is the tick used. The practical consequence is worth being clear
-/// about: **from-saves milestones are only as precise as your save cadence.**
-/// A pack first produced an hour before the save that first mentions it is
-/// marked at that save, not an hour earlier. Live capture, which watches it
-/// happen, is exact; this cannot be, and pretending otherwise by interpolating
-/// between saves would invent a moment that no evidence supports.
+/// A save carries totals, so the earliest tick something can be proved to have
+/// happened is the tick of the first save reporting it. **From-saves
+/// milestones are therefore only as precise as your save cadence.**
+/// Interpolating between saves would invent a moment no evidence supports.
 ///
 /// Everything already true in the earliest save is emitted at that save's
-/// tick. It genuinely happened at some point at or before then, and this
-/// matches what live capture does when it is switched on mid-playthrough: the
-/// first poll records every science pack already produced (see
-/// `mod/milestones.lua`). A timelapse built from an established base
-/// therefore opens with a cluster of markers, which is accurate rather than
-/// tidy.
+/// tick, which is what live capture does when switched on mid-playthrough, so
+/// a timelapse of an established base opens with a cluster of markers.
 ///
-/// Nothing is ever un-marked. A planet whose surface stops being inhabited
-/// (everything on it mined) was still reached.
+/// Nothing is ever un-marked: a planet whose surface stops being inhabited was
+/// still reached.
 pub fn from_saves(mut states: Vec<State>) -> Vec<Milestone> {
     // By tick rather than by the order saves were picked or exported: the
     // caller may have selected them in any order, and this comparison is only

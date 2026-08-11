@@ -1,37 +1,32 @@
 //! How much got built at each point in the timelapse, for the activity graph
-//! drawn along the scrub bar.
+//! along the scrub bar.
 //!
-//! Frames are snapshots, not change lists, so "what got built here" has to be
-//! recovered by diffing consecutive frames rather than read off. Done once at
-//! load, next to `construction::growing_bounds_per_frame`, which already
-//! walks every entity of every frame for the camera.
+//! Frames are snapshots rather than change lists, so this has to be recovered
+//! by diffing consecutive frames. Done once at load, beside
+//! `construction::growing_bounds_per_frame`, which already walks the same
+//! entities.
 //!
-//! Diffed against the previous frame only, not against everything ever seen.
-//! The two differ when something is torn down and rebuilt on the same spot,
-//! and counting that again is right: rebuilding is activity, and the point of
-//! this graph is to show when the player was working, not to count distinct
-//! positions ever occupied.
+//! Diffed against the previous frame only, not against everything ever seen:
+//! rebuilding on the same spot is activity, this graph showing when the player
+//! was working rather than which positions were ever occupied.
 
 use crate::registry::TypeRegistry;
 use crate::render_frame::FrameSequence;
 
-/// Entity positions are aligned to a tenth of a tile, the same fixed point
-/// `save_timelapse::world::pos_key` keys by on the replay side. Comparing the
-/// raw f32s instead would make a position that survived a format round trip
-/// with a one-ulp difference read as a brand new entity.
+/// Entity positions align to a tenth of a tile, the fixed point
+/// `save_timelapse::world::pos_key` keys by. Comparing raw f32s would make a
+/// position that survived a round trip with a one-ulp difference read as a new
+/// entity.
 ///
-/// Packed into one integer rather than kept as an `(i32, i32)` tuple, so a
-/// frame's positions sort as plain numbers. The exact packing does not matter
-/// as long as it is injective; only equality and a total order are ever used.
+/// Packed into one integer so a frame's positions sort as plain numbers. The
+/// packing only has to be injective; only equality and order are used.
 fn pos_key(x: f32, y: f32) -> u64 {
     pack(((x as f64) * 10.0).round() as i32, ((y as f64) * 10.0).round() as i32)
 }
 
-/// World tiles per heatmap cell. Deliberately coarser than
-/// `render_frame::LOD_CELL_TILES`: that one exists to collapse chunks
-/// without visibly changing the picture, where this one wants blobs big
-/// enough to read as a region of activity rather than a scatter of
-/// individual machines.
+/// World tiles per heatmap cell. Coarser than `render_frame::LOD_CELL_TILES`,
+/// which collapses chunks without changing the picture: this wants blobs big
+/// enough to read as a region rather than a scatter of machines.
 pub const HEAT_CELL_TILES: i32 = 8;
 
 /// Tenths of a tile per cell, matching the fixed point `pos_key` packs.
@@ -46,51 +41,37 @@ pub struct HeatCell {
     pub built: u32,
 }
 
-/// Everything the activity pass produces: one walk over the frames answers
-/// both "when was the player working" (the timeline graph) and "where"
-/// (the map heatmap), since both are the same set of newly built entities
-/// counted two different ways.
+/// One walk over the frames answers both when the player was working and
+/// where, those being the same newly built entities counted two ways.
 pub struct Activity {
     /// New entities per frame, index-aligned with the frames.
     pub counts: Vec<usize>,
     /// Where those went, binned per frame. Sized by distinct positions ever
-    /// built rather than frames times entities, since a given spot is new
-    /// exactly once (bar a rebuild), so this stays a few MB even on a
-    /// megabase.
+    /// built rather than frames times entities, a spot being new exactly once,
+    /// so this stays a few MB even on a megabase.
     pub cells: Vec<Vec<HeatCell>>,
-    /// The busiest single cell of any single frame, so the heatmap can scale
-    /// against a fixed reference. Scaling against whatever is on screen
-    /// instead would make the same construction change brightness as
-    /// unrelated activity elsewhere came and went.
+    /// The busiest single cell of any frame, so the heatmap scales against a
+    /// fixed reference. Scaling to what is on screen would make the same
+    /// construction change brightness as unrelated activity scrolled by.
     pub peak_cell: u32,
 }
 
-/// How many entities appeared in each frame that were not in the one before
-/// it, index-aligned with `frames`.
+/// How many entities appeared in each frame that were not in the one before,
+/// index-aligned with `frames`.
 ///
-/// Frame 0 is always 0. Everything in it appeared before the capture was
-/// watching: for a live capture that is the whole baseline snapshot of an
-/// existing base, which would otherwise be a spike hundreds of times taller
-/// than any real construction and flatten the entire rest of the graph.
+/// Frame 0 is always 0: everything in it appeared before the capture was
+/// watching, and a live capture's whole baseline would otherwise be a spike
+/// hundreds of times taller than any real construction.
 ///
-/// Terrain scatter and resource deposits are skipped for the same reason
-/// `construction.rs` skips them: with terrain capture on, trees and ore are
-/// scattered across a wide margin around the base by map generation rather
-/// than built by anyone, and a frame that merely revealed more map would
-/// otherwise read as the busiest construction moment of the run.
+/// Terrain scatter and resources are skipped for the same reason
+/// `construction.rs` skips them: a frame that merely revealed more map would
+/// read as the busiest moment of the run.
 ///
-/// Sorted vectors rather than the hash set this obviously wants, because
-/// this runs on the load path against every entity of every frame. Measured
-/// on a 150-frame, 400k-entity sequence (see `bench` below), where the bare
-/// walk over those same entities costs 295ms in `growing_bounds_per_frame`:
-/// a `HashSet` per frame took 2.7s, and swapping in a cheap multiply hasher
-/// only brought that to 2.3s, because the cost was never the hash function.
-/// It was 30 million random-access probes and inserts into a table far
-/// larger than cache. Sorting and merging touches the same data almost
-/// entirely sequentially, which the prefetcher handles, and needs no
-/// allocation per frame once the two buffers have grown: 1.07s for the same
-/// sequence, which is the sort itself and close enough to the unavoidable
-/// walk to stop optimizing.
+/// Sorted vectors rather than the hash set this obviously wants, because this
+/// runs on the load path against every entity of every frame. On a 150-frame,
+/// 400k-entity sequence a `HashSet` per frame took 2.7s against 1.07s here:
+/// the cost was 30 million random-access probes into a table far larger than
+/// cache, not the hash function, and merging two sorted arrays is sequential.
 pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Activity {
     let mut counts = vec![0usize; frames.len()];
     let mut cells: Vec<Vec<HeatCell>> = vec![Vec::new(); frames.len()];
@@ -100,15 +81,10 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
     let mut built: Vec<u64> = Vec::new();
 
     frames.for_each_frame(|index, frame, repeat| {
-        // A repeat is identical to the frame before it, so nothing was built
-        // between them: the count is zero and the heat is empty, both known
-        // without looking. `previous` is deliberately left alone, since it
-        // already holds this frame's positions too, which is what lets the
-        // next real frame diff correctly across the whole gap.
-        //
-        // Everything below (materialise, sort, dedup, merge over every entity
-        // on the surface) would otherwise run per repeat to reach the same
-        // answer, and on a long capture repeats are most of the frames.
+        // A repeat is identical to the frame before, so nothing was built:
+        // count zero, heat empty, both known without looking. `previous` is
+        // left alone, since it already holds this frame's positions, which is
+        // what lets the next real frame diff across the whole gap.
         if repeat {
             return;
         }
@@ -138,11 +114,8 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
 }
 
 /// Appends every element of `current` missing from `previous` to `out`, both
-/// inputs sorted ascending.
-///
-/// One merge walk rather than a binary search per element: the two runs are
-/// almost identical frame to frame, so `previous` advances in step with
-/// `current` and the whole thing stays a linear scan over two sorted arrays.
+/// sorted ascending. One merge walk rather than a binary search each: the two
+/// runs are almost identical frame to frame.
 fn collect_absent_from(current: &[u64], previous: &[u64], out: &mut Vec<u64>) {
     let mut p = 0;
     for &key in current {
@@ -157,11 +130,9 @@ fn collect_absent_from(current: &[u64], previous: &[u64], out: &mut Vec<u64>) {
     }
 }
 
-/// Groups newly built positions into `HEAT_CELL_TILES`-square cells.
-///
-/// Sorted and run-length counted rather than accumulated into a map, for the
-/// same reason the diff above is a merge: this runs per frame over every new
-/// entity, and the input is already a sorted `Vec` sitting in cache.
+/// Groups newly built positions into `HEAT_CELL_TILES`-square cells. Sorted
+/// and run-length counted rather than accumulated into a map, for the same
+/// reason the diff is a merge: the input is already a sorted `Vec` in cache.
 fn bin_into_cells(built: &[u64]) -> Vec<HeatCell> {
     let mut keys: Vec<u64> = built
         .iter()
@@ -194,31 +165,23 @@ fn unpack(key: u64) -> (i32, i32) {
     ((key >> 32) as u32 as i32, key as u32 as i32)
 }
 
-/// The heat visible at `index`, as `(cell x, cell y, intensity)` with
-/// intensity already scaled to 0..1.
+/// The heat visible at `index`, as `(cell x, cell y, intensity)` scaled to
+/// 0..1.
 ///
-/// Two things happen here that the raw per-frame cells do not do on their own.
+/// The last `window` frames contribute, weighted down by age, so the glow
+/// trails the construction front rather than accumulating into a map of
+/// everywhere you have built.
 ///
-/// **A window with falloff.** The last `window` frames contribute, weighted
-/// down by age, so the glow trails the construction front and dies out behind
-/// it rather than accumulating into a map of everywhere you have ever built.
+/// Each cell also bleeds into its neighbours out to `spread`, falling off with
+/// distance: without it the overlay is a scatter of isolated lit squares,
+/// where what a player means by "building over there" is an area. The kernel
+/// deliberately does not normalize to a sum of 1, so a cell surrounded by
+/// construction saturates while an isolated machine stays dim, which is what
+/// makes density read as heat.
 ///
-/// **Spatial spread.** Each cell bleeds into its neighbours out to `spread`
-/// cells, falling off with distance. Without this the overlay is a scatter of
-/// isolated lit squares wherever individual machines happen to sit, which
-/// reads as noise rather than as a region being worked on: what a player
-/// means by "I am building over there" is an area, not a set of points. The
-/// kernel deliberately does not normalize to a sum of 1. A cell surrounded by
-/// other construction therefore collects from all of its neighbours and
-/// saturates, while an isolated machine out on its own stays dim, which is
-/// what makes density read as heat instead of merely spreading a fixed amount
-/// of ink more thinly.
-///
-/// `view` bounds the work to what is on screen (in cell coordinates, inclusive,
-/// already grown by `spread` at the caller). Skipping it is correct but does
-/// the spreading for the whole base every rendered frame, which on a megabase
-/// mid-blueprint is tens of thousands of cells against a screenful of a few
-/// hundred.
+/// `view` bounds the work to what is on screen, already grown by `spread` at
+/// the caller. Skipping it is correct but spreads the whole base every frame,
+/// which on a megabase is tens of thousands of cells against a few hundred.
 pub fn recent_heat(
     per_frame: &[Vec<HeatCell>],
     index: usize,
@@ -263,10 +226,9 @@ pub fn recent_heat(
         }
     }
 
-    // Rooted, and against the busiest single cell of the whole run rather
-    // than of this moment: scaling to whatever is currently on screen would
-    // make identical construction change brightness as unrelated activity
-    // elsewhere scrolled in and out of view.
+    // Rooted, and against the busiest cell of the whole run rather than of
+    // this moment: scaling to what is on screen would make identical
+    // construction change brightness as unrelated activity scrolled by.
     let scale = (peak as f32).sqrt();
     field
         .into_iter()
@@ -277,16 +239,13 @@ pub fn recent_heat(
 
 /// Activity scaled to 0..1 against the busiest frame, for drawing.
 ///
-/// Square rooted rather than linear. One blueprint landing a few thousand
-/// entities in a single frame is routine late in a playthrough, and against a
-/// linear scale that one frame takes the full height while every ordinary
-/// hour of hand building underneath it rounds to a flat line, which is
-/// exactly backwards for a graph whose job is showing when you were working.
-/// The root keeps the ordering intact (it is monotonic) while pulling the
-/// outlier back into the same picture as everything else.
+/// Square rooted rather than linear: one blueprint landing thousands of
+/// entities is routine late on, and linearly that frame takes the full height
+/// while every hour of hand building rounds to a flat line. The root is
+/// monotonic, so ordering survives.
 ///
-/// All zeros for a capture with no construction in it at all, rather than a
-/// division by zero.
+/// All zeros for a capture with no construction, rather than a division by
+/// zero.
 pub fn activity_heights(activity: &[usize]) -> Vec<f32> {
     let peak = activity.iter().copied().max().unwrap_or(0);
     if peak == 0 {
@@ -469,14 +428,10 @@ mod tests {
         assert!(core > near && near > far, "expected a falloff, got {core} {near} {far}");
     }
 
-    /// Density is the whole point of not normalizing the kernel: a cluster
-    /// of construction should burn hotter than the same amount of building
-    /// scattered thinly.
-    ///
-    /// `peak` is deliberately far above any single cell's count here. With a
-    /// peak equal to one cell, both arrangements clamp to full brightness
-    /// and the comparison proves nothing, which is exactly how this test
-    /// first failed.
+    /// Density is the point of not normalizing the kernel: a cluster should
+    /// burn hotter than the same amount scattered thinly. `peak` is
+    /// deliberately far above any single cell here, since with a peak equal to
+    /// one cell both arrangements clamp to full brightness.
     #[test]
     fn clustered_construction_burns_hotter_than_the_same_amount_spread_thin() {
         let peak = 400;
@@ -544,10 +499,9 @@ mod tests {
         assert!(activity_heights(&[]).is_empty());
     }
 
-    /// The synthetic frames above prove the rules; this proves the whole
-    /// thing actually finds construction in a real exported capture, which
-    /// is the part that would make the graph a flat line while every unit
-    /// test still passed.
+    /// The synthetic frames prove the rules; this proves it finds construction
+    /// in a real exported capture, which is what would leave the graph flat
+    /// while every unit test passed.
     #[test]
     fn real_exported_fixtures_produce_a_readable_graph() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
@@ -572,16 +526,11 @@ mod bench {
     use crate::registry::TypeRegistry;
     use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
-    /// Where the numbers quoted on `analyze_activity` come from, kept so
-    /// they can be re-checked rather than trusted. Prints rather than
-    /// asserts: a timing threshold would be flaky on shared or throttled
-    /// hardware, and the useful signal is the ratio against
-    /// `growing_bounds_per_frame`, which walks the same entities and is
-    /// already on the load path.
+    /// Where the numbers quoted on `analyze_activity` come from. Prints rather
+    /// than asserts, a timing threshold being flaky on shared hardware, and
+    /// the useful signal is the ratio against `growing_bounds_per_frame`.
     ///
-    /// `#[ignore]`d because it builds ~30 million entities (roughly half a
-    /// gigabyte) and takes a few seconds. Run it, in release, whenever this
-    /// module's data structures change:
+    /// `#[ignore]`d because it builds ~30 million entities. Run in release:
     ///
     /// ```text
     /// cargo test --release -p viewer --lib measure_cost -- --ignored --nocapture

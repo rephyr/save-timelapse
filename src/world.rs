@@ -1,20 +1,9 @@
-//! Mutable world state, built from a baseline snapshot and advanced by
-//! replaying the event log.
+//! Mutable world state: a baseline snapshot advanced by replaying the event
+//! log.
 //!
-//! The flow this serves: the mod snapshots a save once, then logs only
-//! placements and removals. Reconstructing any moment means taking the
-//! baseline and applying every event up to that tick.
-//!
-//! ## Why application is forgiving
-//!
-//! The baseline is written incrementally across many ticks, so it is not an
-//! atomic picture of one instant: something built while it is being written
-//! may or may not appear, depending on whether its surface had already been
-//! flushed. Events are logged throughout that window too, so replay can see
-//! an add for something already present, or a remove for something it never
-//! saw. Both are treated as no-ops rather than errors, which turns that
-//! unavoidable smear into a non-problem instead of something the mod would
-//! have to freeze the game to prevent.
+//! Application is forgiving on purpose. The baseline is written across many
+//! ticks while events are logged, so replay sees adds for things already
+//! present and removes for things it never saw. Both are no-ops.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,20 +12,12 @@ use crate::event::Event;
 use crate::frame::{Entity, Frame, Tile};
 use crate::names::{NameId, NameTable};
 
-/// Integer position key, so lookups never hash a float or compare with an
-/// epsilon.
+/// Integer position key, so lookups never hash a float.
 ///
-/// Scaled by ten, not two. Half-tile alignment covers most entities but not
-/// all: `tests/fixtures/frames/frame_0000.stfr` has a
-/// `logistic-train-stop-lamp-control` at x=326.9 sitting beside its
-/// `logistic-train-stop` at x=327.0. Keying on half tiles collapsed the two
-/// onto one slot and silently dropped one of them, five entities out of
-/// that frame's 240. One decimal is exactly the precision entity positions
-/// are stored at (see `frame.rs`), so scaling by ten is both lossless and
-/// collision free.
-///
-/// Computed in f64: at Factorio's ±1,000,000 map limit an f32 has too few
-/// mantissa bits left to round the scaled value reliably.
+/// Scaled by ten, not two: half-tile keying collapsed a
+/// `logistic-train-stop-lamp-control` at x=326.9 onto its stop at x=327.0.
+/// Computed in f64, an f32 being unable to round the scaled value at the map
+/// limit.
 type PosKey = (i32, i32);
 
 fn pos_key(x: f32, y: f32) -> PosKey {
@@ -54,12 +35,9 @@ pub struct WorldEntity {
     pub id: Option<u64>,
 }
 
-/// Whether `name` is floor somebody laid rather than ground the map
-/// generated: what the capture itself said, or the built-in list below when it
-/// said nothing.
-///
-/// A free function rather than a method on `World`, so it borrows the one
-/// field and can be called while `load_baseline` holds a surface.
+/// Whether `name` is floor somebody laid: what the capture said, or the list
+/// below when it said nothing. A free function so it borrows one field and can
+/// be called while `load_baseline` holds a surface.
 fn is_floor(floor: &HashSet<String>, name: &str) -> bool {
     if floor.is_empty() {
         return is_placed_floor(name);
@@ -67,18 +45,10 @@ fn is_floor(floor: &HashSet<String>, name: &str) -> bool {
     floor.contains(name)
 }
 
-/// Placed floor the mod tracks incrementally (concrete, landfill, and the
-/// like), for a capture that did not say which tiles it treated that way.
-/// Anything else in a baseline's tiles is natural terrain (grass, water, sand,
-/// ...), captured once by `save-timelapse-capture-terrain` and never again:
-/// Factorio has no event for terrain changing (nobody "builds" grass), so
-/// unlike placed floor it needs no ongoing tracking, just a one-time split at
-/// baseline load time. See `Surface::terrain`.
-///
-/// These are Wube's names, which is the whole reason a capture now says for
-/// itself: the mod works its own list out from the loaded prototypes, so a
-/// platform's foundation and every modded floor are floor there and would be
-/// mistaken for permanent ground here (see `World::set_floor`).
+/// Placed floor, for a capture that did not say which tiles it treated that
+/// way. Everything else in a baseline is natural terrain, which has no events
+/// and so needs only this one-time split. Wube's names only, which is why a
+/// capture now says for itself (see `World::set_floor`).
 fn is_placed_floor(name: &str) -> bool {
     matches!(
         name,
@@ -101,11 +71,8 @@ fn is_placed_floor(name: &str) -> bool {
             | "brown-refined-concrete"
             | "cyan-refined-concrete"
             | "acid-refined-concrete"
-            // Aquilo's frozen twins of the same floors. Placed by the player
-            // exactly like the unfrozen ones, so they belong in the tracked
-            // layer rather than in the terrain that is captured once and
-            // never revisited. The game generates these seven only, not one
-            // per coloured refined concrete.
+            // Aquilo's frozen twins, placed by the player like the unfrozen
+            // ones. The game generates these seven only.
             | "frozen-stone-path"
             | "frozen-concrete"
             | "frozen-hazard-concrete-left"
@@ -116,11 +83,8 @@ fn is_placed_floor(name: &str) -> bool {
     )
 }
 
-/// One surface's contents.
-///
-/// Entities live in a slab with free-list reuse, so ids stay stable while
-/// entities come and go, iteration stays dense and cache-friendly, and a
-/// churn-heavy replay reuses slots instead of growing forever.
+/// One surface's contents. Entities live in a slab with free-list reuse, so
+/// ids stay stable and a churn-heavy replay reuses slots.
 #[derive(Debug, Default)]
 pub struct Surface {
     slots: Vec<Option<WorldEntity>>,
@@ -128,50 +92,26 @@ pub struct Surface {
     by_pos: HashMap<PosKey, usize>,
     /// What a position held before something was built on top of it.
     ///
-    /// Factorio lets two things occupy one position, and the pair that
-    /// actually happens is a resource with a machine or a belt on it. Keying
-    /// entities by position alone meant the later add evicted the ore, and the
-    /// remove that eventually followed cleared the position, so building
-    /// across a patch ate it a tile at a time and mining the building back off
-    /// never returned it.
-    ///
-    /// A second layer rather than a list per position, because the depth this
-    /// needs is two and a `Vec` per position would allocate once per entity on
-    /// a map that holds hundreds of thousands of them. Empty unless something
-    /// genuinely overlaps, which is rare enough that a real capture pays
-    /// nothing for it.
-    ///
-    /// Deliberately not "the resource layer": nothing here knows what a
-    /// resource is, and it does not need to. Covering something and then
-    /// uncovering it is the behaviour, whatever the two things are.
+    /// Factorio lets a resource and a machine share a position. Keying by
+    /// position alone let the add evict the ore and the later remove clear the
+    /// tile, so building across a patch ate it. A second layer rather than a
+    /// list per position: the depth needed is two, and a `Vec` each would
+    /// allocate per entity. Nothing here knows what a resource is.
     under: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
     /// Placed floor: seeded from the baseline, then kept current by
     /// `AddTile`/`RemoveTile` events for as long as replay runs.
     tiles: HashMap<PosKey, NameId>,
-    /// Natural terrain: seeded from the baseline and never touched again
-    /// (see `is_placed_floor`). Kept separate from `tiles` specifically so
-    /// `to_frame` (called once per emitted replay frame, potentially
-    /// hundreds of times) never has to re-serialize it: a real capture's
-    /// terrain can be large, and doing that on every single frame is what
-    /// made every emitted frame file redundantly balloon to the same huge,
-    /// unchanging size.
+    /// Natural terrain: seeded from the baseline and never touched again.
+    /// Separate from `tiles` so `to_frame`, called once per emitted frame,
+    /// never re-serializes it.
     terrain: HashMap<PosKey, NameId>,
-    /// Bumped by every mutation that actually changes this surface, and by
-    /// nothing else.
-    ///
-    /// What `replay::write_all_surfaces` compares against to decide whether a
-    /// surface needs writing at all. A counter rather than a hash of the
-    /// frame, because the entire point is to never materialise the frame: on
-    /// a nine-surface save, measured over 13 minutes of real play, 86% of the
-    /// files written were byte-identical to that surface's previous one and
-    /// 93% of the bytes were, since you can only build on one surface at a
-    /// time but every surface was written every frame. Hashing to detect that
-    /// would mean doing the expensive work first and then throwing it away.
-    ///
-    /// Precision matters more than it looks: a spurious bump costs a whole
-    /// duplicate file, which is why `insert` below checks for a genuinely
-    /// unchanged re-add rather than blindly overwriting.
+    /// Bumped by every mutation that actually changes this surface, which is
+    /// what `replay::write_all_surfaces` compares to decide whether to write at
+    /// all: on a nine-surface save 86% of files were identical to the previous
+    /// one. A counter rather than a hash, the point being never to materialise
+    /// the frame. A spurious bump costs a duplicate file, which is why `insert`
+    /// checks for an unchanged re-add.
     revision: u64,
 }
 
@@ -182,17 +122,14 @@ impl Surface {
         self.slots.len() - self.free.len()
     }
 
-    /// See the field's own comment. Only ever compared against a previously
-    /// observed value from the same surface; the absolute number means
-    /// nothing.
+    /// Only meaningful compared against a previously observed value from the
+    /// same surface.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Both layers together: what a baseline's "tiles" count means to
-    /// someone reading it, before they have any reason to know the two
-    /// layers exist internally. See `floor_tile_count`/`terrain_tile_count`
-    /// for the split.
+    /// Both layers together, which is what a baseline's "tiles" count means to
+    /// a reader. See `floor_tile_count`/`terrain_tile_count` for the split.
     pub fn tile_count(&self) -> usize {
         self.tiles.len() + self.terrain.len()
     }
@@ -213,20 +150,14 @@ impl Surface {
         let key = pos_key(entity.x, entity.y);
 
         if let Some(&slot) = self.by_pos.get(&key) {
-            // An add landing on exactly what is already there changed
-            // nothing, so it must not bump `revision`. Checked rather than
-            // assumed because a spurious bump costs a whole redundant frame
-            // file, and re-adds are not rare: the baseline smear (a snapshot
-            // taken slightly after the events describing the same
-            // construction) produces them by design.
+            // An unchanged re-add must not bump `revision`: the baseline
+            // smear produces them by design, and a bump costs a whole file.
             if self.slots[slot] == Some(entity) {
                 return;
             }
-            // Something different landing on an occupied position covers what
-            // was there rather than replacing it. Only one thing can be
-            // covered: a third arrival displaces whatever the second one was
-            // hiding, which is the old behaviour applied one level down and is
-            // as deep as the game gives any reason to go.
+            // Something different covers what was there rather than replacing
+            // it. Only one thing can be covered; a third arrival displaces
+            // whatever the second was hiding.
             if let Some(buried) = self.under.insert(key, slot) {
                 self.free_slot(buried);
             }
@@ -249,10 +180,8 @@ impl Surface {
         self.revision += 1;
     }
 
-    /// Return a slot to the free list, forgetting the entity in it. Does not
-    /// touch either position index, so the caller has to have dealt with those
-    /// already, and does not bump `revision`, since every caller is part of a
-    /// larger change that bumps it once.
+    /// Return a slot to the free list. Touches neither position index and does
+    /// not bump `revision`; the caller owns both.
     fn free_slot(&mut self, slot: usize) {
         if let Some(entity) = self.slots[slot].take() {
             if let Some(id) = entity.id {
@@ -266,17 +195,14 @@ impl Surface {
         let Some(entity) = self.slots[slot].take() else { return };
         let key = pos_key(entity.x, entity.y);
 
-        // Uncovering, when this was the thing on top: what it was covering
-        // takes the position back. This is the whole point of the second
-        // layer, and it is why removal cannot just clear the key.
+        // Uncovering: what this was covering takes the position back.
         if self.by_pos.get(&key) == Some(&slot) {
             match self.under.remove(&key) {
                 Some(buried) => self.by_pos.insert(key, buried),
                 None => self.by_pos.remove(&key),
             };
         } else if self.under.get(&key) == Some(&slot) {
-            // Removed by id from underneath whatever is standing on it, which
-            // leaves the covering entity exactly where it was.
+            // Removed by id from underneath whatever stands on it.
             self.under.remove(&key);
         }
 
@@ -313,11 +239,11 @@ impl Surface {
 pub struct World {
     names: NameTable,
     surfaces: HashMap<String, Surface>,
-    /// The surface events fall back to when they name none: logs written
-    /// before events carried a surface, and removals keyed by id.
+    /// Surface events fall back to when they name none: logs predating
+    /// per-event surfaces, and removals keyed by id.
     default_surface: Option<String>,
-    /// Which tiles this capture called placed floor, when it said. See
-    /// `set_floor`; empty means fall back to `is_placed_floor`.
+    /// Which tiles this capture called placed floor. Empty falls back to
+    /// `is_placed_floor`.
     floor: HashSet<String>,
     pub tick: u64,
 }
@@ -327,19 +253,10 @@ impl World {
         Self::default()
     }
 
-    /// Adopt the capture's own idea of which tiles are placed floor, from the
-    /// `prototypes.json` written beside it.
-    ///
-    /// Must be set before any baseline is loaded, since the split happens once
-    /// as tiles arrive and a later answer would apply to nothing.
-    ///
-    /// The mod works this out from the loaded prototypes rather than from a
-    /// list, so it is the only side that can be right about a modded floor or
-    /// a platform's foundation. Reproducing that here by keeping a copy of the
-    /// list in step was fine while the mod's was also stated and is not now:
-    /// the two would disagree, and whichever lost would file floor somebody
-    /// laid as ground that can never change, so removing it would leave it on
-    /// screen forever.
+    /// Adopt the capture's own list of placed floor, from `prototypes.json`.
+    /// Must be set before any baseline loads, the split happening as tiles
+    /// arrive. Only the mod can be right about a modded floor, and floor filed
+    /// as terrain can never be removed again.
     pub fn set_floor(&mut self, floor: HashSet<String>) {
         debug_assert!(self.surfaces.is_empty(), "floor must be set before loading a baseline");
         self.floor = floor;
@@ -367,9 +284,9 @@ impl World {
         self.surfaces.values().map(Surface::tile_count).sum()
     }
 
-    /// Seed a surface from one baseline frame. The first frame loaded becomes
-    /// the default surface, and the CLI loads the largest first, so untagged
-    /// events land on the busiest surface rather than an arbitrary one.
+    /// Seed a surface from one baseline frame. The first loaded becomes the
+    /// default surface, and the CLI loads the largest first, so untagged events
+    /// land on the busiest one.
     pub fn load_baseline(&mut self, frame: &Frame) {
         let surface = self.surfaces.entry(frame.surface.clone()).or_default();
         if self.default_surface.is_none() {
@@ -386,8 +303,7 @@ impl World {
                 w: entity.w,
                 h: entity.h,
                 // Snapshots carry no unit_number, so a baseline entity can
-                // only ever be removed by position. That is why the mod
-                // prefers id on removal but always has the position path.
+                // only ever be removed by position.
                 id: None,
             });
         }
@@ -401,11 +317,9 @@ impl World {
             }
         }
 
-        // Bumped once for the whole load rather than per tile above, and
-        // unconditionally: a catch-up baseline landing mid-replay is a change
-        // to this surface however much of it happens to match what was
-        // already there, and the entity loop's own bumps do not cover a
-        // baseline that is only tiles.
+        // Once for the whole load and unconditionally: a catch-up baseline is
+        // a change however much of it matches, and the entity loop's bumps do
+        // not cover a baseline that is only tiles.
         surface.revision += 1;
 
         self.tick = self.tick.max(frame.tick);
@@ -416,9 +330,8 @@ impl World {
         Some(self.surfaces.entry(key).or_default())
     }
 
-    /// Apply one event. Returns whether it changed anything, which is what
-    /// the replay uses to decide a chunk is dirty, and what makes the
-    /// baseline smear visible as a count rather than silently absorbed.
+    /// Apply one event. Returns whether it changed anything, which is how
+    /// replay decides a chunk is dirty.
     pub fn apply(&mut self, surface: Option<&str>, event: &Event) -> bool {
         match event {
             Event::AddEntity { name, x, y, d, w, h, id } => {
@@ -432,15 +345,9 @@ impl World {
                     None => false,
                 }
             }
-            // Id first: unit_number is unique game-wide (so this searches
-            // every surface, not just `surface`) and resolves in O(1) for
-            // anything replay already has registered, which is anything
-            // built after capture began, since its AddEntity carried the
-            // same id. Position is the fallback, and the only thing that
-            // can resolve an entity that already existed when the baseline
-            // was taken: a snapshot records no ids, so no id lookup can ever
-            // find a baseline-original entity no matter what id Factorio
-            // reports it removed by.
+            // Id first: unique game-wide, so this searches every surface, and
+            // O(1) for anything built after capture began. Position is the
+            // only thing that can resolve a baseline entity, which has no id.
             Event::RemoveEntity { id, pos } => {
                 if let Some(id) = id {
                     if self.surfaces.values_mut().any(|s| s.remove_by_id(*id)) {
@@ -463,20 +370,11 @@ impl World {
                     None => false,
                 }
             }
-            // Clears the position rather than reverting it, because this
-            // record cannot say what was underneath and nothing on this side
-            // can know: a baseline taken while landfill was already down
-            // never saw the water it covered.
-            //
-            // The revert is the mod's job instead, and it does it without
-            // needing a record type for it (see `capture.lua`'s
-            // `log_tile_change`): these events fire after the tiles have
-            // already been replaced, so it reads the uncovered ground and
-            // logs an ordinary `AddTile` for it immediately after this one.
-            // Applied in order, the position ends up holding what was
-            // revealed. Only when terrain capture is on, since with it off
-            // there is deliberately no natural ground in the timelapse to
-            // reveal.
+            // Clears the position rather than reverting it: this record cannot
+            // say what was underneath, and a baseline taken while landfill was
+            // down never saw the water. The mod does the revert instead,
+            // logging an ordinary `AddTile` immediately after this one, and
+            // only when terrain capture is on.
             Event::RemoveTile { x, y } => self.target(surface).is_some_and(|s| {
                 let changed = s.tiles.remove(&(*x, *y)).is_some();
                 if changed {
@@ -487,14 +385,10 @@ impl World {
         }
     }
 
-    /// Materialise one surface as a `Frame`, the format the viewer already
-    /// reads, so replay is an offline step that produces ordinary frames
-    /// rather than a second thing the viewer has to understand. Placed
-    /// floor only: natural terrain lives in a separate, unchanging layer
-    /// (see `Surface::terrain`) that this deliberately never touches, since
-    /// this gets called once per emitted replay frame (potentially
-    /// hundreds of times) and terrain hasn't changed since the baseline
-    /// loaded it. Use `terrain_frame` to get that layer, once.
+    /// Materialise one surface as a `Frame`, so replay produces ordinary
+    /// frames rather than a second format the viewer must understand. Placed
+    /// floor only: terrain is a separate unchanging layer, and this runs once
+    /// per emitted frame. Use `terrain_frame` for that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
             return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
@@ -512,12 +406,9 @@ impl World {
         Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles }
     }
 
-    /// Materialise one surface's natural-terrain layer as a `Frame`-shaped
-    /// snapshot in the same format `to_frame` uses (`entities` always
-    /// empty). Terrain never changes after the baseline loads it (see
-    /// `Surface::terrain`), so unlike `to_frame` this only ever needs
-    /// calling once per surface, right after loading the baseline, not once
-    /// per replayed frame.
+    /// The natural-terrain layer as a `Frame` (`entities` always empty).
+    /// Terrain never changes after the baseline, so unlike `to_frame` this is
+    /// called once per surface rather than once per replayed frame.
     pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
             return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
@@ -528,11 +419,8 @@ impl World {
         Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles }
     }
 
-    /// Resolved once per call rather than once per entity/tile: a real
-    /// surface has a few dozen distinct names against hundreds of thousands
-    /// of entities (or millions of tiles), so re-allocating the same name
-    /// string on every entity/tile of every frame is pure waste `Arc::clone`
-    /// skips.
+    /// Resolved once per call rather than per item: a surface has a few dozen
+    /// names against hundreds of thousands of entities.
     fn name_table(&self) -> Vec<Arc<str>> {
         (0..self.names.len()).map(|id| Arc::from(self.names.name(id as NameId))).collect()
     }
@@ -609,12 +497,10 @@ mod tests {
 
     /// Mining landfill has to put the water back, not leave a hole.
     ///
-    /// The mod logs the removal and then an add for whatever the removal
-    /// uncovered (see `capture.lua`'s `log_tile_change`), because only it can
-    /// see that: a baseline taken while the landfill was already down never
-    /// saw the water underneath, so nothing on this side could reconstruct
-    /// it. This pins the pair applying in order to the right result, which is
-    /// the behaviour the two halves only have together.
+    /// The mod logs the removal and then an add for what it uncovered, because
+    /// only it can see that: a baseline taken while the landfill was down never
+    /// saw the water. This pins the pair applying in order to the right result,
+    /// which is behaviour the two halves only have together.
     #[test]
     fn a_removed_tile_reverts_to_whatever_the_mod_says_was_uncovered() {
         let mut world = World::new();
@@ -678,14 +564,11 @@ mod tests {
         assert_eq!(world.entity_count(), 0);
     }
 
-    /// The bug this fixes: an entity from the baseline carries no id in
-    /// replay's world state, but Factorio still reports its *real*
-    /// unit_number (assigned whenever it was originally built) when it's
-    /// later mined. The removal event therefore carries an id lookup can
-    /// never resolve, alongside the position that can. Before the fix, the
-    /// mod sent id alone whenever one was available and this removal was a
-    /// silent no-op forever: the entity never disappeared from the
-    /// replayed timeline.
+    /// An entity from the baseline carries no id in replay's world state, but
+    /// Factorio still reports its real unit_number when it is later mined, so
+    /// the removal carries an id lookup can never resolve alongside the
+    /// position that can. Sending id alone made such a removal a silent no-op
+    /// forever.
     #[test]
     fn removing_a_baseline_entity_by_an_id_replay_never_registered_falls_back_to_position() {
         let mut world = World::new();
@@ -727,11 +610,9 @@ mod tests {
         assert_eq!(world.entity_count(), 0);
     }
 
-    /// A re-add of the same thing must not bury a copy of it. The baseline
-    /// smear produces these by design, and burying one would leave a
-    /// duplicate behind forever once the visible one was removed. The
-    /// baseline is written over many ticks while events are logged, so an add
-    /// for something already captured is expected, not a bug.
+    /// A re-add of the same thing must not bury a copy of it: the baseline
+    /// smear produces these by design, and a buried duplicate would outlive the
+    /// visible one.
     #[test]
     fn re_adding_the_same_entity_covers_nothing() {
         let mut world = World::new();
@@ -913,14 +794,13 @@ mod tests {
         }
     }
 
-    /// What the capture says outranks the list above, which is the point: the
-    /// mod works its own answer out from the loaded prototypes, so it is the
-    /// only side that can know a platform's foundation or a modded floor is
-    /// something somebody laid rather than ground that was always there.
+    /// What the capture says outranks the list above: the mod works its answer
+    /// out from the loaded prototypes, so it is the only side that can know a
+    /// platform's foundation is something somebody laid.
     ///
-    /// Getting it wrong is not cosmetic. Terrain is seeded once and never
-    /// touched again, so floor filed as terrain can never be removed: mining
-    /// it up would leave it on screen for the rest of the timelapse.
+    /// Not cosmetic. Terrain is seeded once and never touched again, so floor
+    /// filed as terrain can never be removed: mining it up would leave it on
+    /// screen for the rest of the timelapse.
     #[test]
     fn the_captures_own_floor_list_decides_the_split() {
         let tiles = vec![

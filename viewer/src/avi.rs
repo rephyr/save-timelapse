@@ -1,15 +1,13 @@
 //! Writing Motion JPEG video into an AVI container, by hand.
 //!
-//! The point of doing this rather than reaching for an encoder library is the
-//! promise on the tin: you run the executable and that is it, nothing to
-//! install. AVI is old and simple enough that writing it is a few hundred
-//! lines of laying out headers, and MJPEG is just "every frame is a complete
-//! JPEG", so there is no inter-frame prediction, no bitrate control and no
-//! state to get wrong. Every mainstream player and browser reads it.
+//! Doing this rather than reaching for an encoder keeps the promise on the
+//! tin: run the executable and that is it. AVI is simple enough to be a few
+//! hundred lines of headers, and MJPEG is "every frame is a complete JPEG", so
+//! there is no inter-frame prediction, no bitrate control and no state to get
+//! wrong. Every mainstream player reads it.
 //!
-//! The cost is size: with no prediction between frames, an MJPEG file is
-//! roughly the sum of its frames. That is a real trade, and it is the right
-//! one here only because a timelapse is flat colour on a dark background,
+//! The cost is size, a file being roughly the sum of its frames. That is the
+//! right trade only because a timelapse is flat colour on a dark background,
 //! which JPEG compresses hard.
 //!
 //! ## Layout
@@ -26,11 +24,9 @@
 //!   idx1 <size>            16 bytes per frame: id, flags, offset, length
 //! ```
 //!
-//! Four fields cannot be known until the last frame has been written (the
-//! RIFF size, the movi list size, and the frame count in two separate
-//! headers), so they are written as zero and patched by seeking back in
-//! [`AviWriter::finish`]. That is why this takes a path rather than a writer:
-//! it needs to seek.
+//! Four fields cannot be known until the last frame lands (the RIFF size, the
+//! movi size, and the frame count in two headers), so they are written as zero
+//! and patched by seeking back, which is why this takes a path.
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -134,16 +130,13 @@ impl AviWriter {
         file.write_all(&STRF_SIZE.to_le_bytes())?;
         file.write_all(&STRF_SIZE.to_le_bytes())?; // biSize
         file.write_all(&(width as i32).to_le_bytes())?;
-        // Negative biHeight, and this is the field that decides which way up
-        // the video plays. A BITMAPINFOHEADER's height carries the row order
-        // in its sign: positive means bottom-up, which is the DIB convention
-        // and the one everybody writes by accident, and negative means
-        // top-down. Our rows come off the render target top-down, so a
-        // positive value here is a lie about the data, and a player that
-        // believes it renders the whole video upside down. Declaring the
-        // truth is also the more compatible of the two fixes: a player that
-        // ignores the sign treats MJPEG as top-down anyway, which is what
-        // these frames already are, so both kinds of player agree.
+        // Negative biHeight, the field that decides which way up the video
+        // plays: a BITMAPINFOHEADER carries row order in its sign, positive
+        // meaning bottom-up (the DIB convention, and what everybody writes by
+        // accident). These rows come off the render target top-down, so a
+        // positive value is a lie the player renders upside down. Declaring
+        // the truth is also the more compatible fix, a player that ignores the
+        // sign treating MJPEG as top-down anyway.
         file.write_all(&(-(height as i32)).to_le_bytes())?;
         file.write_all(&1u16.to_le_bytes())?; // planes
         file.write_all(&24u16.to_le_bytes())?; // bits per pixel
@@ -255,12 +248,9 @@ mod tests {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
 
-    /// Walks the file the way a player does and hands back every frame.
-    ///
-    /// Deliberately parses rather than checking bytes at fixed offsets: a
-    /// player follows chunk sizes, so a size that is wrong by one is exactly
-    /// the bug worth catching, and a fixed-offset assertion would sail past
-    /// it.
+    /// Walks the file the way a player does. Parses rather than checking fixed
+    /// offsets: a player follows chunk sizes, so a size wrong by one is the
+    /// bug worth catching and a fixed-offset assertion sails past it.
     fn frames_in(bytes: &[u8]) -> Vec<Vec<u8>> {
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"AVI ");
@@ -312,12 +302,9 @@ mod tests {
         (read(at + 4), read(at + 8))
     }
 
-    /// The field that decides which way up the video plays, and the one that
-    /// shipped wrong: a positive `biHeight` declares bottom-up rows, and the
-    /// frames written here are top-down, so a player that believes the
-    /// header renders the entire video upside down. Nothing about the file
-    /// looks broken when this is wrong, which is exactly why it needs a test
-    /// rather than a careful reading.
+    /// The field that decides which way up the video plays. Nothing about the
+    /// file looks broken when it is wrong, which is why it needs a test rather
+    /// than a careful reading.
     #[test]
     fn the_header_declares_top_down_rows_so_the_video_is_not_upside_down() {
         let (_dir, bytes) = write(&[fake_jpeg(64)]);

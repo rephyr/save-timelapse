@@ -1,24 +1,16 @@
 //! Which way a belt bends, and which frame of Factorio's own belt sheet draws
 //! it.
 //!
-//! Belts were the one entity already rotated on screen, because their icon is
-//! a flat top-down chevron that reads as directional. That got the four
-//! straight facings right and every corner wrong: an item icon is a *straight*
-//! belt, so a corner rendered as a straight belt at an angle, chevrons
-//! pointing off into nothing.
+//! Factorio draws corners from a separate picture rather than a rotated
+//! straight one: `transport-belt.png` is 20 rows of square frames, four
+//! straight facings, eight corners and eight end caps, each animated across
+//! its row. Every orientation is drawn separately, which is why nothing here
+//! mirrors or rotates anything. Picking the row is the whole job.
 //!
-//! Factorio draws corners from a different picture entirely, not from a
-//! rotated straight one. `base/graphics/entity/transport-belt/transport-belt.png`
-//! is 20 rows of square frames: four straight facings, eight corners, and
-//! eight end caps, each animated across the row. Every orientation is drawn
-//! separately, which is why nothing here mirrors or rotates anything. Picking
-//! the right row is the whole job.
-//!
-//! Nothing about a belt's own record says whether it is curved. Factorio does
-//! not store that either: it derives the shape from the neighbours every time,
-//! and so does `infer_shapes` below. That keeps this working on captures
-//! recorded long before this file existed, and it costs nothing during play,
-//! which is the trade this project makes everywhere else too.
+//! Nothing in a belt's record says whether it is curved, and Factorio does not
+//! store that either: it derives the shape from the neighbours every time, and
+//! so does `infer_shapes`. That keeps this working on captures recorded long
+//! before this file existed.
 
 use std::collections::HashMap;
 
@@ -62,23 +54,13 @@ impl BeltShape {
     }
 }
 
-/// Rows in the belt sheet, zero based.
+/// Rows in the belt sheet, zero based, from Factorio's own
+/// `basic_belt_animation_set`, which lists them one based.
 ///
-/// Taken from Factorio's own `basic_belt_animation_set` in
-/// `base/prototypes/entity/transport-belts.lua`, which lists them one based:
-/// east 1, west 2, north 3, south 4, then the eight corners, then eight
-/// starting/ending caps. Read from the installed game rather than counted off
-/// the picture by eye, because the two halves of each corner pair look nearly
-/// identical at a glance and getting one backwards would be invisible until
-/// somebody looked closely at a real factory.
-///
-/// A corner is named for the two *sides* it joins, not for the headings of the
+/// A corner is named for the two sides it joins, not for the headings of the
 /// items crossing it: `EAST_TO_NORTH` takes items in through its east edge and
-/// puts them out through its north edge. Those two readings are opposites,
-/// because an item entering through the east edge is travelling west, and
-/// reading it the other way is what drew every corner mirrored on its first
-/// outing. Confirmed against real corners in a real factory rather than from
-/// the name alone.
+/// out through its north. Those readings are opposites, an item entering
+/// through the east edge being one travelling west.
 const EAST_ROW: usize = 0;
 const WEST_ROW: usize = 1;
 const NORTH_ROW: usize = 2;
@@ -93,16 +75,13 @@ const SOUTH_TO_WEST: usize = 10;
 const WEST_TO_SOUTH: usize = 11;
 
 /// How many rows the sheet has, including the end caps this does not use.
-/// Layout is derived from the file's own dimensions at load time rather than
-/// hardcoded, since the four belt tiers have different animation lengths (16,
-/// 32, 32 and 64 columns) while all sharing these 20 rows.
+/// Layout is derived from the file's own dimensions, the four tiers having
+/// different animation lengths while sharing these 20 rows.
 pub const SHEET_ROWS: usize = 20;
 
 /// The sheet row that draws a belt facing `direction` with shape `shape`.
-///
-/// `None` for a direction that is not one of the four cardinals, which a belt
-/// should never be; the caller falls back to its old behaviour rather than
-/// guessing a row.
+/// `None` for a non-cardinal direction, which a belt should never be; the
+/// caller falls back rather than guessing a row.
 pub fn sheet_row(direction: u8, shape: BeltShape) -> Option<usize> {
     let row = match (direction, shape) {
         (NORTH, BeltShape::Straight) => NORTH_ROW,
@@ -112,12 +91,8 @@ pub fn sheet_row(direction: u8, shape: BeltShape) -> Option<usize> {
 
         // A left turn is fed from the belt's left side, so the frame wanted is
         // the one named for that side. Facing north, left is west, which is
-        // `WEST_TO_NORTH`: in through the west edge, out through the north.
-        //
-        // Naming it for the arriving heading instead gives exactly the
-        // opposite frame every time, and the shapes are similar enough that
-        // the mistake only shows up as corners bending the wrong way in a real
-        // factory.
+        // `WEST_TO_NORTH`. Naming it for the arriving heading gives exactly
+        // the opposite frame.
         (NORTH, BeltShape::Left) => WEST_TO_NORTH,
         (EAST, BeltShape::Left) => NORTH_TO_EAST,
         (SOUTH, BeltShape::Left) => EAST_TO_SOUTH,
@@ -159,15 +134,11 @@ fn tile_of(entity: &RenderEntity) -> (i32, i32) {
     (entity.x.floor() as i32, entity.y.floor() as i32)
 }
 
-/// The two tiles a splitter covers, worked out from its facing rather than
-/// from its reported footprint.
-///
-/// A splitter is always two tiles across its facing and one deep along it,
-/// which is a fact about splitters and needs no field to confirm. Reading the
-/// captured width and height instead makes this depend on those arriving the
-/// right way round for a rotated entity, and if they ever arrive swapped the
-/// splitter covers one column instead of two and exactly one of its two
-/// outputs stops feeding.
+/// The two tiles a splitter covers, from its facing rather than its reported
+/// footprint: a splitter is always two across its facing and one deep, which
+/// needs no field to confirm. Reading width and height instead depends on
+/// those arriving the right way round for a rotated entity, and swapped they
+/// leave exactly one of its two outputs feeding.
 fn splitter_tiles(entity: &RenderEntity) -> Vec<(i32, i32)> {
     let (across_x, across_y) = if step(entity.d).0 == 0 { (2, 1) } else { (1, 2) };
     let x0 = (entity.x - across_x as f32 / 2.0).round() as i32;
@@ -187,29 +158,23 @@ pub enum Carrier {
 /// Works out every belt's curve from its neighbours and writes it into
 /// `RenderEntity::shape`.
 ///
-/// The rule is Factorio's: a belt fed from directly behind runs straight, and
-/// otherwise a belt fed from exactly one side curves towards the side it is
-/// fed from. Fed from both sides with nothing behind is a merge, which draws
-/// straight, and so does a belt fed by nothing at all.
+/// Factorio's rule: a belt fed from directly behind runs straight, one fed
+/// from exactly one side curves towards that side, and anything else (fed from
+/// both, or from nothing) draws straight.
 ///
-/// `is_belt` marks which entries are belts by index, since a `RenderEntity`
-/// does not carry its own type: the type lives on the run that owns it.
+/// `is_belt` marks which entries are belts by index, a `RenderEntity` not
+/// carrying its own type.
 ///
 /// Anything that puts items on the ground counts as a feeder, not just belts:
-/// a splitter's output and the far end of an underground crossing bend a belt
-/// exactly as another belt would. Leaving them out was a visible asymmetry,
-/// since a belt running *into* a splitter curved and the one coming out of it
-/// never did. Loaders are still missing, being rare enough not to have come up.
-///
-/// This is also why underground ends are worked out before this runs: an exit
-/// only counts as a feeder once it is known to be an exit.
+/// a splitter's output and an underground exit bend a belt exactly as another
+/// belt would. Loaders are still missing. This is also why underground ends
+/// are resolved first: an exit only counts as a feeder once known to be one.
 pub fn infer_shapes(entities: &mut [RenderEntity], kinds: &[Option<Carrier>]) {
     debug_assert_eq!(entities.len(), kinds.len());
 
-    // Every tile that pushes items out, and which way it pushes them. Built
-    // over carriers alone: a megabase is mostly not belts, every lookup below
-    // is a miss for anything else, and keeping the rest out costs one pass and
-    // saves the map most of its size.
+    // Every tile that pushes items out, and which way. Built over carriers
+    // alone: a megabase is mostly not belts, so keeping the rest out saves the
+    // map most of its size for one pass.
     let mut belts: HashMap<(i32, i32), u8> = HashMap::new();
     for (entity, kind) in entities.iter().zip(kinds) {
         match kind {
@@ -274,12 +239,9 @@ pub fn infer_shapes(entities: &mut [RenderEntity], kinds: &[Option<Carrier>]) {
 
 /// Which end of an underground belt crossing this is.
 ///
-/// Both ends carry the same direction, because both move items the same way,
-/// so the direction alone cannot tell them apart. That is why they used to
-/// draw identically: one picture, used twice. Factorio draws them as two
-/// separate structures, `direction_in` and `direction_out`, facing opposite
-/// ways so the pair reads as a thing items go into and a thing they come out
-/// of.
+/// Both ends carry the same direction, both moving items the same way, so
+/// direction alone cannot tell them apart. Factorio draws them as two separate
+/// structures, `direction_in` and `direction_out`, facing opposite ways.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum UndergroundEnd {
     /// Where items go down. Factorio's `direction_in`.
@@ -298,9 +260,9 @@ impl UndergroundEnd {
     }
 
     /// Row in the structure sheet, whose four rows are `direction_out`,
-    /// `direction_in`, and the two side-loading variants this does not use.
-    /// Read off the prototype's own `y` offsets rather than guessed, since
-    /// out coming before in is the opposite of the order the names suggest.
+    /// `direction_in`, and two side-loading variants this does not use. Read
+    /// off the prototype's `y` offsets, out coming before in being the
+    /// opposite of what the names suggest.
     pub fn sheet_row(self) -> usize {
         match self {
             UndergroundEnd::Exit => 0,
@@ -309,17 +271,15 @@ impl UndergroundEnd {
     }
 }
 
-/// Sorts each line of underground belts into flow order and pairs them up, so
-/// each crossing gets one entrance and one exit.
+/// Sorts each line of underground belts into flow order and pairs them, so a
+/// crossing gets one entrance and one exit.
 ///
-/// Pairing rather than looking at each one alone, because a lone underground
-/// belt cannot tell you which end it is: an entrance and an exit facing the
-/// same way are the same record. Walking a line in flow order and taking them
-/// two at a time is how the game pairs them too, which also handles several
-/// separate crossings sharing one line.
+/// Pairing rather than judging each alone, since an entrance and an exit
+/// facing the same way are the same record. Walking a line in flow order two
+/// at a time is how the game pairs them, and handles several crossings sharing
+/// one line.
 ///
-/// `kinds` gives the tier and its reach for each underground belt, and `None`
-/// for everything else.
+/// `kinds` gives the tier and reach per underground belt, `None` otherwise.
 pub fn infer_underground_ends(entities: &mut [RenderEntity], kinds: &[Option<(u16, i32)>]) {
     debug_assert_eq!(entities.len(), kinds.len());
 
@@ -375,10 +335,9 @@ pub fn infer_underground_ends(entities: &mut [RenderEntity], kinds: &[Option<(u1
 mod tests {
     use super::*;
 
-    /// The shape byte has to be free, or this feature costs a byte on every
-    /// entity of a megabase to describe four prototypes. `RenderEntity` was
-    /// two f32s and three bytes, which a four byte alignment already rounded
-    /// up, so the fourth byte lands in padding that was there anyway.
+    /// The shape byte has to be free, or this costs a byte on every entity of a
+    /// megabase to describe four prototypes. `RenderEntity`'s four byte
+    /// alignment already left one spare.
     #[test]
     fn the_shape_byte_costs_no_memory() {
         assert_eq!(std::mem::size_of::<RenderEntity>(), 12);
@@ -442,13 +401,9 @@ mod tests {
         assert_eq!(sheet_row(NORTH, found[1]), Some(EAST_TO_NORTH));
     }
 
-    /// Both corners reported wrong from a real factory, kept as the check on
-    /// the naming that caused it.
-    ///
-    /// Every corner drew with its incoming edge flipped: a corner taking items
-    /// in at the top and out to the left drew as though they came in at the
-    /// bottom. The cause was reading `east_to_north` as "arrives heading east"
-    /// when it means "enters through the east edge", which is its opposite.
+    /// Every corner drew with its incoming edge flipped, from reading
+    /// `east_to_north` as "arrives heading east" when it means "enters through
+    /// the east edge".
     #[test]
     fn corners_take_items_in_by_the_edge_they_are_fed_from() {
         // Fed from above, out to the left: in through the north edge.
@@ -493,20 +448,15 @@ mod tests {
         assert_eq!(found, vec![BeltShape::Straight; 4]);
     }
 
-    /// A belt leaving a splitter or an underground exit bends just like one
-    /// leaving another belt.
-    ///
-    /// The gap this closes was one-sided in a way that showed: a belt running
-    /// *into* a splitter curved, because its own feeder was a belt, while the
-    /// one coming out never did, because the splitter was not in the map.
+    /// A belt leaving a splitter or an underground exit bends like one leaving
+    /// another belt. The gap was one-sided: a belt running into a splitter
+    /// curved, the one coming out did not.
     #[test]
     fn a_belt_fed_by_a_splitter_or_an_underground_exit_curves() {
-        // A splitter facing north, two tiles wide, centred on the boundary
-        // between tiles 0 and 1. It feeds both tiles above it, and the belt on
-        // one of them turns west, so it is fed through its east edge.
-        // The splitter is south of that belt, and facing west the left side is
-        // south, so it is fed through its south edge: a left turn, drawn by
-        // the frame that goes in at the south and out at the west.
+        // A splitter facing north, centred on the boundary between tiles 0 and
+        // 1, feeds both tiles above it. The belt on one turns west, so it is
+        // fed through its east edge; the splitter is south of it, and facing
+        // west the left side is south.
         let splitter = RenderEntity { x: 1.0, y: 0.5, w: 2, h: 1, d: NORTH, shape: 0 };
         let mut entities = vec![splitter, belt(1, -1, WEST)];
         infer_shapes(&mut entities, &[Some(Carrier::Splitter), Some(Carrier::Belt)]);
@@ -578,12 +528,9 @@ mod tests {
         assert_eq!(shape(6), BeltShape::Right, "lower output turning south");
     }
 
-    /// Both output tiles of an upward splitter feed, not just one.
-    ///
-    /// A splitter facing north is two tiles wide, and its centre therefore
-    /// sits on the boundary between them. Getting that corner tile wrong by
-    /// one would leave exactly one of its two outputs working, which is what a
-    /// real factory reported.
+    /// Both output tiles of an upward splitter feed, not just one. Its centre
+    /// sits on the boundary between them, and getting that tile wrong by one
+    /// leaves exactly one output working.
     #[test]
     fn both_outputs_of_an_upward_splitter_feed() {
         // Covers tiles (9, 20) and (10, 20), so it feeds (9, 19) and (10, 19).

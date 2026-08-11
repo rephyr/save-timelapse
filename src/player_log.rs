@@ -1,15 +1,11 @@
 //! Reading the player-position log the mod writes (`players.jsonl`, or the
-//! session-tagged `players_<session>.jsonl` inside a live capture
-//! directory before `save-timelapse.exe` relocates it).
+//! session-tagged name inside a live capture directory before
+//! `save-timelapse.exe` relocates it).
 //!
-//! Deliberately plain newline-delimited JSON, not a tagged binary format
-//! like `frame.rs`/`event.rs`: a sample happens at most once every several
-//! seconds by design (see mod/export.lua), nowhere near the per-tick
-//! construction volume that actually justified a binary format there. The
-//! same shape is both what the mod writes and what this reads directly,
-//! so save-timelapse.exe only ever relocates the file, never rewrites it.
+//! Newline-delimited JSON rather than a binary format: a sample happens at
+//! most every few seconds. The mod writes and this reads the same shape, so
+//! the file is relocated rather than rewritten.
 //!
-//! One line per sample:
 //! ```text
 //! {"tick":123456,"players":[{"name":"Alice","surface":"nauvis","x":10.5,"y":-3.2}]}
 //! ```
@@ -46,12 +42,9 @@ struct LinePlayer {
     y: f32,
 }
 
-/// Reads every sample from every line, in file order (callers that care
-/// about tick order, e.g. the viewer's nearest-preceding lookup, sort
-/// first rather than assuming it). A malformed line is skipped rather than
-/// failing the whole file, the same tolerance `event.rs` gives a truncated
-/// last record: the log is appended to live during real play, so a killed
-/// process can leave a partial last line.
+/// Reads every sample in file order; callers that need tick order sort. A
+/// malformed line is skipped rather than failing the file, the log being
+/// appended to during play so a killed process leaves a partial last line.
 pub fn read_jsonl(path: &Path) -> io::Result<Vec<PlayerSample>> {
     let text = fs::read_to_string(path)?;
     let mut samples = Vec::new();

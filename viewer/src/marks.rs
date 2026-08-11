@@ -1,18 +1,10 @@
-//! Points worth jumping to, and the jumping itself.
+//! Points worth jumping to, and the jumping itself. Three kinds, answering
+//! different questions: milestones come from the capture, bookmarks are
+//! whatever the viewer decided was worth returning to, and busy stretches are
+//! derived from the activity data.
 //!
-//! Three kinds, which the viewer treats differently because they answer
-//! different questions:
-//!
-//! - **Milestones** come from the capture (`milestone.rs`): the first of each
-//!   science pack, the first rocket, each planet reached.
-//! - **Bookmarks** are whatever the person watching decided was worth
-//!   returning to.
-//! - **Busy stretches** are derived from the activity data: where the most
-//!   was built.
-//!
-//! Everything here is pure and index-based so it can be tested without a
-//! window, apart from bookmark persistence, which is a small file next to the
-//! frames.
+//! Pure and index-based so it can be tested without a window, apart from
+//! bookmark persistence.
 
 use std::path::{Path, PathBuf};
 
@@ -44,13 +36,12 @@ const BUSY_FRACTION: f64 = 0.25;
 
 /// The busiest frame of each stretch of sustained construction.
 ///
-/// Consecutive busy frames collapse to one mark rather than one per frame,
-/// because a five minute building session is one place somebody wants to go,
-/// not thirty. The mark lands on the busiest frame *within* the stretch
-/// rather than its start, since that is the moment the stretch is about.
+/// Consecutive busy frames collapse to one mark: a five minute building
+/// session is one place somebody wants to go, not thirty. The mark lands on
+/// the busiest frame within the stretch rather than its start.
 ///
-/// Empty for a capture with no construction at all, which is also what stops
-/// the threshold below from dividing by zero.
+/// Empty for a capture with no construction, which is also what stops the
+/// threshold below dividing by zero.
 pub fn busy_stretches(counts: &[usize]) -> Vec<usize> {
     let peak = counts.iter().copied().max().unwrap_or(0);
     if peak == 0 {
@@ -85,14 +76,10 @@ pub fn bookmarks_path(dir: &Path) -> PathBuf {
     dir.join("bookmarks.txt")
 }
 
-/// Bookmarks are stored as **ticks, not frame indices**.
-///
-/// A rebuild at a different seconds-per-frame renumbers every index, so
-/// index-based bookmarks would silently point at unrelated moments. A tick is
-/// a fact about the playthrough and survives any amount of re-exporting, which
-/// matters now that a timelapse can be rebuilt in place under the same name.
-/// Unparseable lines are skipped rather than failing the read, so a
-/// hand-edited file with a stray blank line or comment still works.
+/// Bookmarks are stored as ticks, not frame indices: a rebuild at a different
+/// seconds-per-frame renumbers every index, where a tick is a fact about the
+/// playthrough and survives re-exporting. Unparseable lines are skipped, so a
+/// hand-edited file with a stray blank line still works.
 pub fn read_bookmarks(dir: &Path) -> Vec<u64> {
     let Ok(text) = std::fs::read_to_string(bookmarks_path(dir)) else { return Vec::new() };
     let mut ticks: Vec<u64> = text.lines().filter_map(|line| line.trim().parse().ok()).collect();
@@ -111,12 +98,10 @@ pub fn write_bookmarks(dir: &Path, ticks: &[u64]) {
     }
 }
 
-/// Resolves ticks to the frames that actually exist, since a bookmarked tick
-/// need not have a frame of its own.
-///
-/// Nearest frame rather than the next one after: a bookmark half a frame past
-/// where somebody set it should come back to the frame they were looking at,
-/// not the one after it.
+/// Resolves ticks to frames that exist, a bookmarked tick needing no frame of
+/// its own. Nearest rather than the next one after: a bookmark half a frame
+/// past where somebody set it should return to the frame they were looking
+/// at.
 pub fn frames_for_ticks(ticks: &[u64], frame_ticks: &[u64]) -> Vec<usize> {
     if frame_ticks.is_empty() {
         return Vec::new();

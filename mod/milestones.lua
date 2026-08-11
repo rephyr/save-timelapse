@@ -1,21 +1,10 @@
--- save-timelapse: milestones, the handful of moments in a playthrough worth
--- marking on the timeline rather than watching for.
+-- save-timelapse: milestones, the few moments in a playthrough worth marking
+-- on the timeline: each science pack the first time it is produced, the first
+-- rocket, and each planet the first time it is reached. Anything already
+-- visible in the frames is deliberately absent.
 --
--- Three of them, all first-time-only: each science pack the first time it is
--- produced, the first rocket launched, and each planet the first time it is
--- reached. Anything already visible in the frames themselves (a rocket silo
--- being built, a base spreading) is deliberately not here: those are what the
--- timelapse is, and repeating them as markers would only add noise.
---
--- Written as plain newline-delimited JSON. A whole playthrough produces on
--- the order of a dozen lines, nowhere near the volume that justified a binary
--- format for frames and events, and being readable by eye is worth more here
--- than the few hundred bytes packing it would save.
---
--- Nothing here is on a hot path. A rocket launches once in a while, a planet
--- is reached a handful of times ever, and the science check runs on the
--- capture flush that already ticks every few seconds. That is why it can
--- afford to be as simple as it is.
+-- Newline-delimited JSON. A playthrough produces about a dozen lines, and
+-- nothing here is on a hot path.
 
 local encode = require("encode")
 local export = require("export")
@@ -24,13 +13,10 @@ local M = {}
 
 --- Which milestones have already been recorded, so each fires once.
 ---
---- Its own top-level storage key, sibling to `storage.timelapse_capture`
---- rather than nested inside it: capture reset (see capture.lua's
---- `M.reset_capture`) wipes that key wholesale to force a fresh baseline, and
---- it should wipe this too, since the milestone file is deleted along with
---- the rest of the session folder. Keeping them separate would leave this
---- believing every milestone had already fired while the file recording them
---- was gone, and none would ever be written again.
+--- Its own storage key rather than nested in `storage.timelapse_capture`,
+--- which a capture reset wipes: the milestone file goes with the session
+--- folder, so this has to go with it. Kept separate, this would believe every
+--- milestone had fired while the file recording them was gone.
 local function seen()
   storage.timelapse_milestones = storage.timelapse_milestones or {}
   return storage.timelapse_milestones
@@ -47,11 +33,9 @@ local function milestone_path(session_id)
   return export.EXPORT_DIR .. encode.milestone_name(session_id)
 end
 
---- Records `kind`/`id` once, at `tick`. A repeat is a no-op, which is what
---- makes every caller below able to fire bluntly without checking first.
----
---- `pcall`'d like every other capture write in this mod: a failed write
---- degrades to a missing marker, never a crash mid-game.
+--- Records `kind`/`id` once, at `tick`; a repeat is a no-op, which is what
+--- lets every caller fire bluntly. `pcall`'d like every capture write, so a
+--- failure costs a marker rather than the game.
 local function record(tick, kind, id, session_id)
   local key = kind .. ":" .. id
   local already = seen()
@@ -67,19 +51,14 @@ M.record = record
 
 --- The first time each science pack is produced.
 ---
---- Polled rather than driven by an event, because there is no event for "an
---- assembling machine finished an item": `on_player_crafted_item` only covers
---- hand crafting, which is not how science gets made past the first hour.
+--- Polled rather than evented: there is no "an assembling machine finished an
+--- item" event, and `on_player_crafted_item` covers hand crafting only.
 --- Production statistics are the only place the game exposes it, and
---- `input_counts` hands back every item ever produced in one table, so the
---- check is a scan of a few hundred entries against a set.
+--- `input_counts` hands back everything ever produced in one table.
 ---
---- Statistics are per surface in 2.0, so this unions across them: a pack
---- first assembled on Vulcanus counts as first produced.
----
---- Called from the capture flush (every few seconds), not on_tick. A science
---- pack marker being a few seconds late is invisible against a timelapse
---- where one frame is a minute of game time.
+--- Statistics are per surface in 2.0, so this unions across them. Called from
+--- the capture flush, so a marker can be a few seconds late, which is
+--- invisible against frames a minute of game time apart.
 function M.poll_science(tick, session_id)
   local force = game.forces["player"]
   if not force then
@@ -103,13 +82,9 @@ end
 --- Every planet reached, the first time a player is on it.
 ---
 --- Checked against `surface.planet` rather than by name, so a space platform
---- passing through does not count as arriving somewhere: a platform is a
---- surface too, and only a planet has that field set.
----
---- Swept over connected players rather than hooked to
---- `on_player_changed_surface` alone, so the planet a capture *starts* on is
---- recorded too. That event only fires on a change, and nobody changes
---- surface to arrive on Nauvis at the beginning.
+--- passing through does not count as arriving. Swept over connected players
+--- rather than hooked to `on_player_changed_surface`, which only fires on a
+--- change and so would miss the planet a capture starts on.
 function M.poll_planets(tick, session_id)
   for _, player in pairs(game.connected_players) do
     local ok, planet = pcall(function()

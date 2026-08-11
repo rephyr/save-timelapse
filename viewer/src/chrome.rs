@@ -1,15 +1,13 @@
 //! The viewer's on-screen chrome: the surface switcher, the clock, the
 //! playback controls, and the keyboard panel behind `?`.
 //!
-//! Split out of main.rs because every control here needs its geometry twice,
-//! once to draw it and once to hit-test a click on it. Keeping both in one
-//! place is what stops a button drifting away from the region that activates
-//! it. `Chrome::layout` computes every rect once per frame, and `draw` and
-//! `hit` only ever read what it produced.
+//! Split out of main.rs because every control needs its geometry twice, to
+//! draw it and to hit-test it, and keeping both here is what stops a button
+//! drifting from the region that activates it. `Chrome::layout` computes every
+//! rect once per frame; `draw` and `hit` only read what it produced.
 //!
-//! The guiding rule for what belongs on screen at all: an element earns its
-//! place by answering where am I, when am I, or what can I do. Anything that
-//! answers "how is the renderer doing" lives behind `F3` instead.
+//! What belongs on screen: an element earns its place by answering where am I,
+//! when am I, or what can I do. "How is the renderer doing" lives behind `F3`.
 
 use macroquad::prelude::*;
 
@@ -20,12 +18,11 @@ const INK: Color = Color::new(1.0, 1.0, 1.0, 1.0);
 /// Chrome text that is present without asking for attention. Used where
 /// there is a fill behind it, or a quiet corner around it.
 const INK_DIM: Color = Color::new(1.0, 1.0, 1.0, 0.55);
-/// The same idea for an inactive surface chip, which has neither.
+/// The same for an inactive surface chip, which has neither.
 ///
 /// Brighter than `INK_DIM` because it is the one dim thing painted straight
-/// onto the factory: over open ground 55% reads fine, and over a screen full
-/// of machine icons it starts to disappear. This is as far as it can go while
-/// still losing clearly to the active chip beside it.
+/// onto the factory: over a screen full of machine icons 55% disappears. As
+/// far as it can go while still losing clearly to the active chip.
 const INK_CHIP: Color = Color::new(1.0, 1.0, 1.0, 0.72);
 /// An inactive control under the cursor, part way to `INK`.
 const INK_HOVER: Color = Color::new(1.0, 1.0, 1.0, 0.85);
@@ -33,11 +30,9 @@ const INK_HOVER: Color = Color::new(1.0, 1.0, 1.0, 0.85);
 /// Fill behind the active surface chip, the key panel, and any hovered
 /// control.
 ///
-/// Nearly opaque on purpose. Chrome is painted straight onto the rendered
-/// world, which is dark grass in one place and a white space platform in the
-/// next. A fill that lets much of that through stops being a background and
-/// becomes a tint, which is exactly the failure that makes brightness alone
-/// useless as the "this one is active" signal.
+/// Nearly opaque on purpose: chrome is painted onto the rendered world, dark
+/// grass in one place and a white platform in the next, and a fill that lets
+/// much through becomes a tint rather than a background.
 const SURFACE: Color = Color::new(0.09, 0.10, 0.13, 0.92);
 /// The same surface at the weight used for a hover, which should read as a
 /// control waking up rather than as a second active chip.
@@ -72,13 +67,10 @@ const PANEL_PAD: f32 = 26.0;
 const PANEL_ROW: f32 = 26.0;
 const PANEL_COLUMN_GAP: f32 = 34.0;
 
-/// Fonts to try, best first.
-///
-/// A file beside the executable wins, so a release can ship one exact face
-/// without this code changing. Failing that the platform's own UI font, which
-/// is already on every machine and carries no redistribution obligation.
-/// Failing that `None`, which leaves macroquad's built-in ProggyClean: a
-/// bitmap face from the early 2000s that works and looks it.
+/// Fonts to try, best first. A file beside the executable wins, so a release
+/// can ship one exact face without changing this. Failing that the platform's
+/// own UI font, which carries no redistribution obligation. Failing that
+/// macroquad's built-in ProggyClean.
 fn font_candidates() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -102,10 +94,8 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// The font and the two panels that are toggled rather than always drawn.
-///
-/// Held for the whole run because a `Font` is a GPU glyph atlas, not a value
-/// worth rebuilding per frame.
+/// The font and the two panels that are toggled rather than always drawn. Held
+/// for the whole run, a `Font` being a GPU glyph atlas.
 pub struct Ui {
     font: Option<Font>,
     /// The `?` panel. Opens itself once on a first ever run and is otherwise
@@ -147,9 +137,8 @@ impl Ui {
     }
 
     /// Text with a dark backing, for anything painted onto the world with no
-    /// fill of its own. Same reasoning as main.rs's `draw_text_legible`: a
-    /// thin light glyph has no edge against a bright background, and raising
-    /// alpha does not give it one.
+    /// fill of its own: a thin light glyph has no edge against a bright
+    /// background, and raising alpha does not give it one.
     pub fn text_legible(&self, text: &str, x: f32, y: f32, size: f32, color: Color) {
         let shadow = Color::new(0.0, 0.0, 0.0, 0.8);
         self.text(text, x + 1.0, y + 1.0, size, shadow);
@@ -157,11 +146,9 @@ impl Ui {
         self.text(text, x, y, size, color);
     }
 
-    /// Draws `text` centered in `rect`, both axes.
-    ///
-    /// Vertical centering goes through `offset_y` (the ascent) rather than
-    /// halving the font size, because the two disagree by several pixels on a
-    /// real face and the error is obvious once a glyph sits inside a pill.
+    /// Draws `text` centered in `rect`, both axes. Vertical centering uses
+    /// `offset_y` rather than half the font size, the two disagreeing by
+    /// several pixels on a real face.
     fn text_centered(&self, text: &str, rect: Rect, size: f32, color: Color) {
         let dims = measure_text(text, self.font.as_ref(), size as u16, 1.0);
         let x = rect.x + (rect.w - dims.width) / 2.0;
@@ -248,11 +235,10 @@ impl Chrome {
     /// The surface switcher, top left.
     ///
     /// Chips keep their natural order rather than floating the active one to
-    /// the front: reordering on every switch would make the row rearrange
-    /// itself under the cursor, which is worse than an occasional overflow.
-    /// The one exception is an active surface that did not fit, which is
-    /// swapped in for the last visible chip, because a switcher that cannot
-    /// show where you currently are has failed at its only job.
+    /// the front, which would rearrange the row under the cursor. The
+    /// exception is an active surface that did not fit, swapped in for the
+    /// last visible chip: a switcher that cannot show where you are has failed
+    /// at its only job.
     fn layout_chips(&mut self, ui: &Ui, state: &ChromeState) {
         if state.surfaces.len() <= 1 {
             return;
@@ -316,15 +302,13 @@ impl Chrome {
         }
     }
 
-    /// Playback controls in the empty gutter left of the scrub bar, and the
-    /// view controls in the one right of it.
+    /// Playback controls in the gutter left of the scrub bar, view controls in
+    /// the one right of it.
     ///
-    /// The bar is 60% of the window and centered (see `Timeline::for_screen`),
-    /// so both gutters are already dead space, and putting the controls there
-    /// costs no vertical room and cannot collide with the labels stacked
-    /// above and below the bar. A row centered over the bar instead would
-    /// have to clear the activity graph, the playhead label, and the hover
-    /// tooltip, all of which live in that column.
+    /// The bar is 60% of the window and centered, so both gutters are dead
+    /// space, and putting controls there costs no vertical room. A row over
+    /// the bar would have to clear the activity graph, the playhead label and
+    /// the hover tooltip, all of which live in that column.
     fn layout_transport(&mut self, ui: &Ui, timeline: &Timeline, state: &ChromeState) {
         let y = timeline.y;
         let speed_label = format!("{}x", state.play_speed);
@@ -382,11 +366,9 @@ impl Chrome {
         });
     }
 
-    /// What a click at `point` hits, or `None` for a click that should fall
-    /// through to the world behind it.
-    ///
-    /// The expanded surface list is tested before everything else: while it is
-    /// open it overlaps whatever is underneath, and the thing on top wins.
+    /// What a click at `point` hits, or `None` for one that should fall
+    /// through to the world. The expanded surface list is tested first: while
+    /// open it overlaps whatever is underneath.
     pub fn hit(&self, point: Vec2) -> Option<Click> {
         for chip in &self.expanded {
             if chip.rect.contains(point) {
@@ -442,10 +424,8 @@ impl Chrome {
         }
     }
 
-    /// Elapsed game time top right, with the building count under it.
-    ///
-    /// Right aligned rather than left, so both grow away from the window edge
-    /// instead of drifting across it as the numbers get longer.
+    /// Elapsed game time top right, with the building count under it. Right
+    /// aligned so both grow away from the window edge rather than across it.
     fn draw_clock(&self, ui: &Ui, state: &ChromeState) {
         let right = screen_width() - MARGIN;
 
@@ -459,10 +439,9 @@ impl Chrome {
 }
 
 /// One surface chip. The active one gets a filled pill and the rest get
-/// nothing, because the chips sit on the rendered world and a fill is the
-/// only signal that survives both dark ground and a white space platform.
-/// Brightness carries the hover state, where being wrong for one frame on an
-/// unlucky background costs nothing.
+/// nothing: the chips sit on the rendered world, and a fill is the only signal
+/// that survives both dark ground and a white platform. Brightness carries
+/// hover, where being wrong for one frame costs nothing.
 fn draw_chip(ui: &Ui, label: &str, rect: Rect, active: bool, hovered: bool) {
     if active {
         draw_pill(rect, rect.h / 2.0, SURFACE, Some(EDGE));
@@ -563,10 +542,9 @@ fn draw_rounded_rect(rect: Rect, radius: f32, color: Color) {
 
 /// A filled rounded shape with an optional hairline edge.
 ///
-/// The edge is a second rounded rect one pixel larger drawn underneath,
-/// rather than a stroked outline: macroquad has no rounded stroke either, and
-/// stroking this shape by hand would mean four lines and four arcs that have
-/// to meet exactly. Drawing the same shape twice cannot fail to line up.
+/// The edge is a second rounded rect one pixel larger drawn underneath:
+/// macroquad has no rounded stroke, and stroking by hand would mean four lines
+/// and four arcs that have to meet exactly.
 fn draw_pill(rect: Rect, radius: f32, fill: Color, edge: Option<Color>) {
     if let Some(edge) = edge {
         let outer = Rect::new(rect.x - 1.0, rect.y - 1.0, rect.w + 2.0, rect.h + 2.0);
@@ -589,19 +567,15 @@ fn with_thousands(n: usize) -> String {
     out
 }
 
-/// True the first time the viewer is ever opened on this machine, false
-/// forever after.
+/// True the first time the viewer is opened on this machine, false after.
 ///
-/// A marker beside the tool's own settings file rather than a field inside
-/// it: `Settings` is documented as holding only answers a user would
-/// otherwise retype, and "has seen the controls once" is not one of those.
-/// A sibling file also means deleting it is an obvious way to get the panel
-/// back, which a JSON field would not be.
+/// A marker beside the settings file rather than a field inside it:
+/// `Settings` holds only answers a user would otherwise retype. A sibling file
+/// also makes deleting it an obvious way to get the panel back.
 ///
-/// Failing to write the marker leaves this returning true again next launch,
-/// which is the right way round: a panel that reappears is a nuisance, and
-/// one that never appears leaves a first-time viewer with nothing but a `?`
-/// in the corner and no reason to suspect it matters.
+/// Failing to write the marker leaves this true next launch, which is the
+/// right way round: a panel that reappears is a nuisance, one that never
+/// appears leaves a first-time viewer with nothing but a `?` in the corner.
 pub fn first_run() -> bool {
     let Some(marker) = save_timelapse::settings::settings_path().map(|p| p.with_file_name("seen-controls")) else {
         return false;
@@ -619,14 +593,12 @@ pub fn first_run() -> bool {
 /// One row of the key panel: the key itself and what it does.
 type Binding = (&'static str, &'static str);
 
-/// Everything the viewer responds to, grouped so the panel scans instead of
+/// Everything the viewer responds to, grouped so the panel scans rather than
 /// reading as a wall.
 ///
-/// `m`, `c` and `b` are shipped features that the old always-visible hint
-/// line never mentioned, so for most of their life they have been undiscover-
-/// able. This table is the fix. `s` and `l` are deliberately absent: they are
-/// renderer A/B toggles that make the factory look broken, and they live with
-/// the rest of the diagnostics behind `F3`.
+/// `m`, `c` and `b` are shipped features the old hint line never mentioned.
+/// `s` and `l` are deliberately absent: renderer A/B toggles that make the
+/// factory look broken, and they live behind `F3`.
 const KEY_GROUPS: &[(&str, &[Binding])] = &[
     (
         "Playback",
@@ -661,11 +633,9 @@ const KEY_GROUPS: &[(&str, &[Binding])] = &[
     ),
 ];
 
-/// The `?` panel: everything the viewer does, on request and never otherwise.
-///
-/// Drawn over a full-window scrim rather than as a floating box alone, which
-/// both makes the text legible over any factory and signals that the view
-/// underneath is paused for attention rather than gone.
+/// The `?` panel, on request and never otherwise. Drawn over a full-window
+/// scrim rather than as a floating box, which makes the text legible over any
+/// factory and signals that the view underneath is paused.
 pub fn draw_key_panel(ui: &Ui) {
     let mut column_widths = Vec::new();
     let mut rows = 0usize;

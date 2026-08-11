@@ -1,17 +1,11 @@
-//! Little endian byte reader and writer shared by the binary wire formats in
-//! this project: frame files (see `frame.rs`) and live capture event
-//! segments (see `event.rs`). Both are written by `mod/control.lua`, whose
-//! Lua runtime has no `string.pack`, so the formats stick to fixed width
-//! integers and length prefixed strings rather than anything a packer would
-//! normally reach for.
+//! Little endian byte reader and writer shared by this project's binary
+//! formats. Both are written by Lua, which has no `string.pack`, so the
+//! formats stick to fixed width integers and length prefixed strings.
 //!
-//! `settings_dat.rs` already has a private cursor of this shape for
-//! `mod-settings.dat`. This is a separate, slightly more general version
-//! rather than a shared one, since that file's cursor returns `io::Result`
-//! for a format that is always read whole, while the formats here need the
-//! softer "not enough bytes left" signal a reader can choose to treat as
-//! either a hard error (a frame file) or a normal end of stream (an event
-//! segment whose last record was cut off by a killed process).
+//! Separate from `settings_dat.rs`'s private cursor rather than shared: that
+//! one returns `io::Result` for a format always read whole, where these need
+//! the softer "not enough bytes left" signal a reader can treat as either a
+//! hard error or a normal end of stream.
 
 pub struct ByteReader<'a> {
     bytes: &'a [u8],
@@ -42,13 +36,10 @@ impl<'a> ByteReader<'a> {
         Some(slice)
     }
 
-    /// Steps over `n` bytes without interpreting them.
-    ///
-    /// This is what makes an extension record skippable: a reader that does
-    /// not recognise a tag still knows how many bytes the record occupies, so
-    /// it can resume at the next one instead of desynchronising. `None` means
-    /// the record claimed more bytes than the file has left, which is a
-    /// truncated file rather than merely an unfamiliar feature.
+    /// Steps over `n` bytes without interpreting them, which is what makes an
+    /// extension record skippable. `None` means the record claimed more bytes
+    /// than the file has left, which is truncation rather than an unfamiliar
+    /// feature.
     pub fn skip(&mut self, n: usize) -> Option<()> {
         self.take(n).map(|_| ())
     }

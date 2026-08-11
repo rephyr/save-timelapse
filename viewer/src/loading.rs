@@ -43,11 +43,9 @@ pub fn synthetic_tiles(count: usize) -> Vec<Tile> {
 /// zero-padded `frame_NNNN.stfr` output, so plain lexicographic sort is
 /// enough) or a single frame file.
 fn frame_is_candidate(path: &Path) -> bool {
-    // Extension first. Live capture writes a `frame_<tick>_<surface>.stfr.done`
-    // marker beside each finished snapshot, and its *stem* is
-    // `frame_<tick>_<surface>.stfr`, which passes every check below, so
-    // without this the viewer treats every marker as a frame and warns about
-    // failing to parse an empty file.
+    // Extension first. Live capture writes a `.stfr.done` marker beside each
+    // finished snapshot, whose stem passes every check below, so without this
+    // every marker reads as a frame that fails to parse.
     if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
         return false;
     }
@@ -108,11 +106,9 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
     }
 }
 
-/// Where `surface`'s one-time terrain snapshot lives, next to its
-/// `frame_*.stfr` files. Never matched by `frame_is_candidate` (its stem
-/// starts with `"terrain_"`, not `"frame_"`), even for a surface literally
-/// named "frame" or "terrain", so it can sit in the same directory without
-/// being picked up as an extra frame.
+/// Where `surface`'s one-time terrain snapshot lives, beside its frame files.
+/// Never matched by `frame_is_candidate`, even for a surface named "frame" or
+/// "terrain", so it can share a directory without being picked up.
 pub fn terrain_path(dir: &Path, surface: &str) -> PathBuf {
     dir.join(format!("terrain_{surface}.stfr"))
 }
@@ -125,14 +121,10 @@ pub fn load_terrain(dir: &Path, surface: &str) -> Option<Frame> {
     load_frame(&terrain_path(dir, surface))
 }
 
-/// Every `terrain_<surface>.stfr` file directly in `dir`, for loading all of
-/// a capture's terrain in one batch via `ParallelFrameLoad`, the same way
-/// `frame_paths` finds all of its per-tick frames. Deliberately independent
-/// of which surfaces the regular frames turn out to have: discovering
-/// terrain this way, straight from the directory, is what lets terrain
-/// loading start immediately, in parallel with frame loading, instead of
-/// waiting to first learn the surface list from the (unrelated) frame
-/// files.
+/// Every `terrain_<surface>.stfr` directly in `dir`, for loading a capture's
+/// terrain in one batch. Deliberately independent of which surfaces the frames
+/// turn out to have, which is what lets terrain loading start immediately
+/// rather than waiting to learn the surface list from the frame files.
 pub fn terrain_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -149,18 +141,15 @@ pub fn terrain_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(entries)
 }
 
-/// Loads many frame files across every available CPU core instead of one at
-/// a time. Reading and parsing a `.stfr` file is pure, independent work with
-/// nothing shared until frames become `RenderFrame`s (which need a single
-/// `TypeRegistry` handing out consistent type ids across the whole
-/// sequence), so parsing is what parallelises: on a real megabase capture
-/// (millions of tiles per frame, dozens of frames), it was the dominant cost
-/// of opening the viewer, roughly halved by this on an 8 core machine.
+/// Loads many frame files across every core rather than one at a time.
 ///
-/// Runs on a fresh OS thread rather than blocking the caller, so a caller
-/// driving macroquad's `next_frame`-based render loop can keep drawing a
-/// progress bar while this proceeds. `done`/`total` report progress as files
-/// finish; `poll` is how the caller collects the result once ready.
+/// Reading and parsing is pure independent work with nothing shared until
+/// frames become `RenderFrame`s, which need one `TypeRegistry` handing out
+/// consistent ids. On a real megabase capture parsing was the dominant cost of
+/// opening the viewer, roughly halved on an 8 core machine.
+///
+/// Runs on a fresh thread rather than blocking, so a caller driving macroquad's
+/// render loop can keep drawing a progress bar. `poll` collects the result.
 pub struct ParallelFrameLoad {
     progress: Arc<AtomicUsize>,
     total: usize,
@@ -232,14 +221,13 @@ fn load_all(paths: &[PathBuf], progress: &AtomicUsize) -> Vec<Frame> {
 
 /// Order a loaded sequence by in-game tick, keeping one surface per tick.
 ///
-/// Filenames cannot be trusted for ordering. The CLI writes zero-padded
-/// `frame_0000.stfr` in save order, where lexicographic sort happens to work,
-/// but the mod writes `frame_<tick>_<surface>.stfr` with a raw unpadded tick,
-/// so sorting names puts tick 1200 and 12600 before 600. The parsed `tick`
-/// is the one thing both schemes carry.
+/// Filenames cannot be trusted: the CLI writes zero-padded names where
+/// lexicographic sort works, but the mod writes a raw unpadded tick, so
+/// sorting names puts 1200 and 12600 before 600. The parsed tick is the one
+/// thing both carry.
 ///
-/// When several surfaces were exported at the same tick, the busiest wins:
-/// showing them in sequence would make the camera jump between planets.
+/// When several surfaces share a tick the busiest wins, showing them in
+/// sequence would make the camera jump between planets.
 pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: impl Fn(&T) -> usize) {
     frames.sort_by(|a, b| tick(a).cmp(&tick(b)).then(count(b).cmp(&count(a))));
 
@@ -251,37 +239,29 @@ pub fn order_by_tick<T>(frames: &mut Vec<T>, tick: impl Fn(&T) -> u64, count: im
     });
 }
 
-/// Splits a loaded batch of frames into one timeline per surface, each
-/// ordered and deduplicated by tick exactly like `order_by_tick` already
-/// does for a single sequence. Multiple surfaces sharing a tick (the
-/// mod's raw baseline output, six surfaces all named `frame_<tick>_<surface>`)
-/// is exactly the case that needs separating rather than collapsing.
+/// Splits a loaded batch into one timeline per surface, each ordered and
+/// deduplicated by tick. Several surfaces sharing a tick, which is the mod's
+/// raw baseline output, is exactly the case that needs separating rather than
+/// collapsing.
 ///
-/// A `Frame`'s surface comes from its parsed content, not its filename, so
-/// this groups correctly whether the directory is the mod's own multi-surface
-/// output or `save-timelapse-replay --all-surfaces`'s equivalent.
+/// A `Frame`'s surface comes from its parsed content rather than its filename.
+/// Surfaces come back busiest first, so a caller that only shows the first
+/// gets the surface loading used to always pick.
+/// Groups frame paths by surface and orders each group by tick, reading only
+/// each file's header.
 ///
-/// Surfaces are returned busiest-first (by peak entity count), so a caller
-/// that only ever shows the first one gets the same surface loading used to
-/// always pick before there was any way to see the others.
-/// Groups frame *paths* by surface and orders each group by tick, reading
-/// only each file's header rather than parsing it.
+/// The path-based twin of [`group_by_surface`], and what makes a streaming
+/// load possible: a loader has to know surface and order before it can fold
+/// frames in one at a time, and grouping parsed frames means every frame is
+/// resident at exactly the moment that is being avoided. Headers are a bounded
+/// read per file.
 ///
-/// The path-based twin of [`group_by_surface`], and the piece that makes a
-/// streaming load possible at all: a loader has to know which surface each
-/// file belongs to and what order they go in before it can fold them in one
-/// at a time, and grouping parsed frames means every frame is resident at
-/// exactly the moment that is trying to be avoided. Headers are a bounded
-/// read per file (see `frame::read_header`), so this costs roughly a
-/// directory scan.
+/// Busiest first, matched to `group_by_surface` so the default world is the
+/// same either way. Busiest is by file size here, since counting entities
+/// would mean parsing, and the two agree closely.
 ///
-/// Surfaces come back busiest first, matched to `group_by_surface`'s ordering
-/// so the default world is the same either way. "Busiest" is by file size
-/// here rather than entity count, since counting entities would mean parsing:
-/// the two agree closely, both being dominated by entity records.
-///
-/// A file whose header will not read is dropped with a warning rather than
-/// failing the load, matching how the full parse already treats one.
+/// A file whose header will not read is dropped with a warning, matching how
+/// the full parse treats one.
 pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<(u64, PathBuf)>)> {
     /// One frame file as this needs it before parsing: when it is, how big
     /// it is (standing in for how busy), and where it lives.
@@ -307,13 +287,10 @@ pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<(u64, Pat
     }
     surfaces.sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|(_, size, _)| *size).max().unwrap_or(0)));
 
-    // The tick is kept rather than dropped here because the loader needs it
-    // to put back the frames an export deliberately omitted: a surface is not
-    // written at a moment nothing on it changed (see
-    // `replay::write_all_surfaces`), so a surface's files carry only the ticks
-    // it actually moved at, and the gaps have to be filled against the union
-    // of every surface's ticks. Reading the headers again to recover
-    // something this function already had would be the only alternative.
+    // The tick is kept because the loader needs it to put back the frames an
+    // export omitted: a surface is not written at a moment nothing on it
+    // changed, so the gaps have to be filled against the union of every
+    // surface's ticks.
     surfaces.into_iter().map(|(name, group)| (name, group.into_iter().map(|(tick, _, path)| (tick, path)).collect())).collect()
 }
 
@@ -340,14 +317,12 @@ pub fn group_by_surface(frames: Vec<Frame>) -> Vec<(String, Vec<Frame>)> {
     surfaces
 }
 
-/// Every moment an export covers, ascending and deduplicated: the union of
-/// the ticks each surface has a frame at.
+/// Every moment an export covers, ascending and deduplicated: the union of the
+/// ticks each surface has a frame at.
 ///
-/// This is the timeline all surfaces share. It cannot be taken from any one
-/// surface, because a surface is only written at moments something on it
-/// changed, so each has an arbitrary subset of the whole. The union is what
-/// each surface's gaps get filled against, which is what keeps the
-/// index-addressed timeline meaning the same thing on every surface.
+/// It cannot be taken from any one surface, each being written only when
+/// something on it changed and so holding an arbitrary subset. The union is
+/// what each surface's gaps are filled against.
 pub fn timeline_ticks(surfaces: &[(String, Vec<(u64, PathBuf)>)]) -> Vec<u64> {
     let mut ticks: Vec<u64> = surfaces.iter().flat_map(|(_, group)| group.iter().map(|&(tick, _)| tick)).collect();
     ticks.sort_unstable();
@@ -565,11 +540,8 @@ mod tests {
         assert_eq!(frames[0].surface, "nauvis");
     }
 
-    /// The multi-surface counterpart of the busiest-per-tick test above:
-    /// same six-surfaces-one-tick shape the mod's raw baseline output has,
-    /// but nothing should be discarded, since this is exactly the case that
-    /// motivated switching worlds in the viewer instead of only ever seeing
-    /// the busiest one.
+    /// The multi-surface counterpart of the busiest-per-tick test above: the
+    /// same six-surfaces-one-tick shape, but nothing may be discarded.
     #[test]
     fn group_by_surface_keeps_every_surface_sharing_a_tick() {
         let dir = tempfile::tempdir().unwrap();

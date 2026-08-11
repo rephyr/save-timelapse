@@ -1,17 +1,14 @@
 //! Which way a pipe joins its neighbours, and which of Factorio's pipe
 //! pictures draws that.
 //!
-//! The same shape of problem as belt corners, and solved the same way. A pipe
-//! has no direction of its own worth drawing: what it looks like depends
-//! entirely on which of its four sides something joins onto. Factorio works
-//! that out from the neighbours every time it redraws, and so does this, which
-//! is what keeps it working on captures recorded long before this file existed
-//! and costs nothing during play.
+//! The same problem as belt corners, solved the same way: a pipe's appearance
+//! depends entirely on which of its four sides something joins onto, worked
+//! out from the neighbours rather than stored, which keeps it working on
+//! captures recorded long before this file existed.
 //!
-//! Unlike belts, every piece is its own file rather than a row of one sheet:
-//! `base/graphics/entity/pipe/` holds sixteen 128px pictures, one per
-//! combination of the four sides. So a pipe's whole appearance is a four bit
-//! mask, and drawing one is a table lookup.
+//! Unlike belts, every piece is its own file: sixteen 128px pictures, one per
+//! combination of sides. So a pipe's appearance is a four bit mask and drawing
+//! one is a table lookup.
 
 use std::collections::HashMap;
 
@@ -25,18 +22,14 @@ pub const WEST: u8 = 8;
 
 /// The picture for a pipe joined on exactly the sides in `mask`.
 ///
-/// Every name lists the sides it connects, which is the reading the vertical
-/// endings confirm: `pipe-ending-up` reaches the top of its frame exactly as
-/// `pipe-straight-vertical` does, so "up" is the side it joins onto rather
-/// than the side it is capped on.
+/// Every name lists the sides it connects, which the vertical endings confirm:
+/// `pipe-ending-up` reaches the top of its frame exactly as
+/// `pipe-straight-vertical` does.
 ///
-/// The horizontal pair could not be settled the same way, because Factorio's
-/// drop shadow falls to the lower right and inflates the right edge of every
-/// sprite, so the bounding boxes disagree with the names until the shadow is
-/// subtracted. This follows the vertical reading for consistency. If every
-/// horizontal pipe end and corner comes out backwards in a real factory, that
-/// is this decision, and flipping it is a matter of swapping the four names
-/// that mention left and right.
+/// The horizontal pair could not be settled the same way, Factorio's drop
+/// shadow inflating the right edge of every sprite, so this follows the
+/// vertical reading. If every horizontal pipe end comes out backwards, that is
+/// this decision.
 pub fn piece_name(mask: u8) -> &'static str {
     match mask & 0b1111 {
         0 => "pipe-straight-vertical-single",
@@ -94,12 +87,9 @@ fn tile_of(entity: &RenderEntity) -> (i32, i32) {
 /// Works out every pipe's connections and writes the mask into
 /// `RenderEntity::shape`.
 ///
-/// Only pipes joining pipes for now. A pipe also joins a `pipe-to-ground`
-/// facing it and every fluid machine it touches, so a pipe running into a tank
-/// or a pump draws as though it simply ended. That is the same trade the belt
-/// corners started from: get the ordinary case right everywhere, on every
-/// capture ever recorded, and add the rarer feeders once the common one is
-/// known good.
+/// Only pipes joining pipes for now: a pipe also joins a `pipe-to-ground`
+/// facing it and every fluid machine it touches, so one running into a tank
+/// draws as though it ended.
 pub fn infer_connections(entities: &mut [RenderEntity], is_pipe: &[bool]) {
     debug_assert_eq!(entities.len(), is_pipe.len());
 

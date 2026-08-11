@@ -1,7 +1,6 @@
-//! The renderer-facing frame representation: items grouped into contiguous
-//! per-type runs with names interned away, plus the chunk-level
-//! level-of-detail data computed alongside it, and a sequence of these to
-//! scrub through.
+//! The renderer-facing frame: items grouped into per-type runs with names
+//! interned away, the chunk-level LOD data computed alongside, and a sequence
+//! of these to scrub through.
 
 use std::collections::HashMap;
 
@@ -11,10 +10,9 @@ use save_timelapse::frame::Frame;
 use crate::registry::{TypeId, TypeRegistry};
 use crate::spans::{SpanBuilder, SpanSet};
 
-/// A contiguous span of one type within a [`RenderFrame`]'s entity or tile
-/// array. Draws iterate runs rather than individual items, so the texture is
-/// bound once per type instead of being re-decided per entity, which is
-/// what keeps macroquad from breaking the batch. See [`crate::DrawCallCounter`].
+/// A contiguous span of one type within a [`RenderFrame`]'s array. Draws
+/// iterate runs rather than items, so the texture is bound once per type,
+/// which is what keeps macroquad from breaking the batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
     pub type_id: TypeId,
@@ -36,10 +34,9 @@ impl Run {
     }
 }
 
-/// An entity stripped to what drawing actually reads. The name is gone (the
-/// enclosing [`Run`] carries it), so this is 12 bytes against roughly 80 for
-/// a `frame::Entity`: 48 for the struct plus a heap allocation for a name
-/// that was one of a few dozen repeated strings.
+/// An entity stripped to what drawing reads. The name is gone, the enclosing
+/// [`Run`] carrying it, so this is 12 bytes against roughly 80 for a
+/// `frame::Entity`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderEntity {
     pub x: f32,
@@ -53,12 +50,9 @@ pub struct RenderEntity {
     /// See `entity_rotation_radians` in `camera.rs`.
     pub d: u8,
     /// Which way a belt bends, as a `BeltShape` byte. Worked out from the
-    /// neighbours after a frame is read (see `belts::infer_shapes`), never
-    /// stored in a capture, so it is correct on captures recorded long before
-    /// this field existed.
-    ///
-    /// Free: the two `f32`s force four byte alignment, so the three bytes
-    /// above already sat in a four byte slot with one spare.
+    /// neighbours after a frame is read (see `belts::infer_shapes`) rather
+    /// than stored, so it is correct on captures older than the field. Free:
+    /// the two `f32`s already forced a spare byte here.
     pub shape: u8,
 }
 
@@ -68,34 +62,18 @@ pub struct RenderTile {
     pub y: i32,
 }
 
-/// Granularity of the level-of-detail pass below: an `LOD_CELL_TILES`^2
-/// square of the world collapses to one flat-colored quad, showing whichever
-/// type is most common in it and discarding the rest.
-///
-/// Independent of Factorio's own 32-tile chunk size, despite starting out
-/// equal to it: that was borrowed as a convenient existing grid, not
-/// because rendering needs to align with it. 32 turned out too coarse:
-/// aggregating 1,024 tiles into one dominant-type color loses so much that a
-/// paved area with belts and machines running through it just reads as a
-/// solid gray block. Smaller cells keep more structure recognizable, at the
-/// cost of more (but still vastly fewer than full-detail) quads submitted,
-/// halved again from 8 to 4 once 8 measured with FPS to spare.
+/// Granularity of the LOD pass: an `LOD_CELL_TILES`^2 square collapses to one
+/// flat quad showing its dominant type. Independent of Factorio's 32-tile
+/// chunk, which was only borrowed as a grid and is far too coarse: 1,024 tiles
+/// per cell made a paved area with belts through it read as a grey block.
 pub const LOD_CELL_TILES: i32 = 4;
 
-/// Below this on-screen tile size (in pixels), draw chunk-aggregated
-/// [`LodCell`]s instead of individual items. At this scale a 1x1 entity
-/// spans a fraction of a pixel anyway, so individual items are already
-/// imperceptible, and the only question is whether the CPU still pays to
-/// transform and submit each one. Comfortably below `SPRITE_MIN_PIXELS`, so
-/// sprites are never in play once LOD is.
+/// Below this on-screen tile size, draw aggregated [`LodCell`]s instead of
+/// items, a 1x1 entity being a fraction of a pixel by then. Comfortably below
+/// `SPRITE_MIN_PIXELS`, so sprites are never in play at the same time.
 ///
-/// A *tile's* pixel size, not a *chunk's*: a chunk is 32 tiles across, so
-/// gating on the chunk's on-screen size instead would only trigger LOD 32x
-/// later than intended: a real base at the zoom level that motivated this
-/// (0.32 px/tile, individual tiles long since imperceptible) measured 3.27M
-/// quads submitted and 7 fps with that version of the check, because a
-/// 10px chunk still looked "big enough" even though every tile inside it was
-/// a third of a pixel.
+/// A *tile's* pixel size, not a *chunk's*: gating on the chunk engages LOD 32x
+/// further out, where a base at 0.32 px/tile measured 3.27M quads and 7 fps.
 pub const LOD_MAX_TILE_PIXELS: f32 = 2.0;
 
 pub fn use_chunk_lod(pixels_per_tile: f32) -> bool {
@@ -131,40 +109,31 @@ pub struct RenderFrame {
     pub entity_runs: Vec<Run>,
     pub tiles: Vec<RenderTile>,
     pub tile_runs: Vec<Run>,
-    /// Chunk-level level of detail, precomputed once at load rather than
-    /// per rendered frame: at millions of tiles, even a cheap per-item
-    /// binning pass is too slow to redo 60 times a second, but paid once
-    /// while parsing it's the same order of cost as parsing itself.
+    /// Chunk-level LOD, precomputed at load: at millions of tiles even a
+    /// cheap per-item binning pass is too slow to redo 60 times a second.
     pub tile_lod: Vec<LodCell>,
     pub tile_lod_runs: Vec<Run>,
     pub entity_lod: Vec<LodCell>,
     pub entity_lod_runs: Vec<Run>,
-    /// Corner-to-corner extent of this frame's tiles, or `None` if it has
-    /// none. Computed here, once, because the only consumer needs it on a
-    /// terrain layer that can hold millions of tiles and asks for it on every
-    /// rendered frame: see `draw_world`, which culls scenery against the
-    /// ground so trees stop where the grass does.
+    /// Corner-to-corner extent of this frame's tiles. Computed once, because
+    /// the only consumer asks for it on a terrain layer of millions of tiles
+    /// on every rendered frame: `draw_world` culls scenery against the ground
+    /// so trees stop where the grass does.
     pub tile_bounds: Option<(Vec2, Vec2)>,
 }
 
-/// Below this many items, `group_by_type`/`build_chunk_lod` just run
-/// single-threaded: thread-spawn overhead would dwarf the actual work for
-/// an ordinary per-tick frame, which is exactly the common case. Above it
-/// (realistically only ever a large baseline or a terrain scan spanning
-/// millions of tiles) they split across every available core instead.
+/// Below this many items the grouping passes run single-threaded, thread-spawn
+/// overhead dwarfing the work for an ordinary frame. Above it (a large
+/// baseline or a terrain scan) they split across every core.
 const PARALLEL_THRESHOLD: usize = 10_000;
 
 fn worker_count() -> usize {
     std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1)
 }
 
-/// Group `items` by type into contiguous runs, by counting sort.
-///
-/// Counting sort rather than `sort_by_key` because this is O(n) with one
-/// pass to count and one to scatter, needs no comparisons, and avoids the
-/// temporary `Vec<(TypeId, T)>` that sorting in place would require, which
-/// at megabase entity counts is the difference between a brief allocation
-/// spike and none.
+/// Group `items` by type into contiguous runs, by counting sort: O(n) with no
+/// comparisons and no temporary `Vec<(TypeId, T)>`, which at megabase counts
+/// is the difference between an allocation spike and none.
 fn group_by_type_sequential<T: Copy + Default>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
     let mut counts = vec![0u32; type_count + 1];
     for &id in ids {
@@ -190,16 +159,10 @@ fn group_by_type_sequential<T: Copy + Default>(ids: &[TypeId], items: &[T], type
     (grouped, runs)
 }
 
-/// Same result as `group_by_type_sequential`, computed across every
-/// available core once there's enough work to be worth it. Splits `ids`/
-/// `items` into contiguous chunks (one per core) and runs the existing
-/// sequential algorithm on each chunk in its own thread, reusing it as the
-/// per-chunk worker rather than a separate parallel implementation, then
-/// concatenates each type's slice across chunks *in chunk order*. Chunks
-/// are contiguous slices of the original arrays in original order, so this
-/// preserves the same stable within-type ordering the sequential version
-/// produces (an item that came before another of the same type keeps
-/// coming before it).
+/// Same result as `group_by_type_sequential`, across every core once there is
+/// enough work. Splits into contiguous chunks, runs the sequential algorithm
+/// on each, and concatenates each type's slice in chunk order, which preserves
+/// the same stable within-type ordering.
 fn group_by_type<T: Copy + Default + Send + Sync>(ids: &[TypeId], items: &[T], type_count: usize) -> (Vec<T>, Vec<Run>) {
     let workers = worker_count();
     if ids.len() < PARALLEL_THRESHOLD || workers <= 1 {
@@ -234,19 +197,11 @@ fn group_by_type<T: Copy + Default + Send + Sync>(ids: &[TypeId], items: &[T], t
     (grouped, runs)
 }
 
-/// The per-item counting pass `build_chunk_lod` splits out from its own
-/// finalization, so a large scan can run this half in parallel: see
-/// `build_chunk_lod`'s own doc comment for why merging partial results
-/// needs to sum rather than concatenate.
-///
-/// A per-chunk `Vec<(TypeId, count)>` rather than a `type_count`-sized array
-/// per chunk: a chunk of floor tiles is realistically one or two types, and
-/// a real base can have thousands of occupied chunks, so a dense per-chunk
-/// array (tens of entries, nearly all zero) would waste far more than the
-/// linear scan through a handful of real entries costs.
-/// Per-chunk counts keyed by chunk coordinate, each value a list of
-/// `(type, count)` pairs actually seen in that chunk (see `chunk_lod_counts`'s
-/// own doc comment for why a short list beats a dense per-type array here).
+/// The per-item counting pass, split out so a large scan can run this half in
+/// parallel. A per-chunk `Vec<(TypeId, count)>` rather than a dense
+/// `type_count`-sized array: a chunk is realistically one or two types, and a
+/// base has thousands of occupied chunks.
+/// Per-chunk counts keyed by chunk coordinate.
 type ChunkCounts = HashMap<(i32, i32), Vec<(TypeId, u32)>>;
 
 fn chunk_lod_counts(ids: &[TypeId], chunk_coords: &[(i32, i32)]) -> ChunkCounts {
@@ -261,19 +216,12 @@ fn chunk_lod_counts(ids: &[TypeId], chunk_coords: &[(i32, i32)]) -> ChunkCounts 
     counts
 }
 
-/// Which single type stands for a cell, once counted.
-///
-/// The most common one, except that a resource never speaks for a cell that
-/// holds anything else. Ore is ground a factory is built over, and by count it
-/// wins easily: a 4x4 cell on a patch is sixteen ore against the two or three
-/// entities of an outpost, so plain majority erases the outpost and shows the
-/// patch it stands in. That is the failure `LOD_CELL_TILES` was already
-/// shrunk to reduce, in its sharpest form, and it is the same rule the
-/// full-detail draw order states (see `draw_world`): built things go over ore,
-/// never under it.
-///
-/// A cell of nothing but ore still reads as ore, which is why this falls back
-/// rather than filtering.
+/// Which single type stands for a cell: the most common, except that a
+/// resource never speaks for a cell holding anything else. By count ore wins
+/// easily, a 4x4 cell on a patch being sixteen ore against an outpost's two or
+/// three entities. Same rule the full-detail draw order states in
+/// `draw_world`. A cell of nothing but ore still reads as ore, which is why
+/// this falls back rather than filtering.
 fn dominant_type(counts: &[(TypeId, u32)], registry: &TypeRegistry) -> TypeId {
     let most_common = |resource: bool| {
         counts
@@ -300,20 +248,13 @@ fn finalize_chunk_lod(counts: ChunkCounts, type_count: usize, registry: &TypeReg
     group_by_type(&cell_ids, &cells, type_count)
 }
 
-/// Aggregate items into one dominant type per `LOD_CELL_TILES`-square chunk,
-/// for the level-of-detail pass. `chunk_coords[i]` is the chunk containing
-/// `ids[i]`/the item at the same index in whatever array these came from.
+/// Aggregate items into one dominant type per chunk. `chunk_coords[i]` is the
+/// chunk containing `ids[i]`.
 ///
-/// Below `PARALLEL_THRESHOLD` this is just `chunk_lod_counts` then
-/// `finalize_chunk_lod`, unchanged from before the split. Above it, each
-/// core computes its own *partial* counts on a slice of the input (chunks
-/// split by item index, not by chunk coordinate, so the same `(cx, cy)`
-/// can and does land in more than one thread's slice), and the partials
-/// are merged by summing matching `(coord, type)` entries rather than
-/// concatenating: summing is commutative, so correctness never depends on
-/// which thread happened to see which tiles. That merge is bounded by
-/// however many distinct chunks exist times the worker count, not by item
-/// count, so it stays cheap even done single-threaded.
+/// Above `PARALLEL_THRESHOLD` each core counts a slice split by item index
+/// rather than chunk coordinate, so the same `(cx, cy)` lands in more than one
+/// slice. Partials merge by summing, which is commutative, so correctness
+/// never depends on which thread saw which tiles.
 fn build_chunk_lod(
     ids: &[TypeId],
     chunk_coords: &[(i32, i32)],
@@ -390,17 +331,11 @@ impl RenderFrame {
             })
             .collect();
 
-        // Before grouping, while entities are still in scan order and their
-        // ids line up one to one. A belt's shape depends on its neighbours,
-        // not on itself, so this is the only place in the pipeline that has
-        // every belt in one list at once.
-        // Underground belts share the same `shape` byte, meaning which end of
-        // a crossing this is rather than which way a corner bends. The two
-        // never touch the same entity, since nothing is both.
-        //
-        // This runs first because belt corners depend on it: the far end of a
-        // crossing feeds the belt in front of it and can therefore bend it,
-        // which cannot be known until the ends have been told apart.
+        // Before grouping, while entities are still in scan order and their ids
+        // line up: a belt's shape depends on its neighbours, so this is the
+        // only place with every belt in one list. Undergrounds share the
+        // `shape` byte and nothing is both. This runs first because the far
+        // end of a crossing feeds the belt in front of it and can bend it.
         let underground_kinds: Vec<Option<(TypeId, i32)>> =
             entity_ids.iter().map(|&id| registry.underground_reach(id).map(|reach| (id, reach))).collect();
         crate::belts::infer_underground_ends(&mut entities, &underground_kinds);
@@ -478,16 +413,11 @@ fn span_key(x: f32, y: f32) -> u64 {
     ((qx as u32 as u64) << 32) | (qy as u32 as u64)
 }
 
-/// A loaded sequence of frames with a current position. Always non-empty:
-/// construction from zero frames is rejected rather than leaving every
-/// accessor to guard against it.
+/// A loaded sequence of frames with a current position. Always non-empty.
 ///
-/// Stores the whole run as spans (see `spans`) rather than one materialized
-/// `RenderFrame` per frame, since consecutive frames of a real capture are
-/// nearly identical and keeping every copy is what put a ceiling on how long
-/// a capture could be. The frame being displayed is materialized into
-/// `current`, and only when the position actually moves: rendering reads it
-/// once per drawn frame, seeking rebuilds it a few times a second.
+/// Stores the run as spans rather than a materialized `RenderFrame` each,
+/// consecutive frames being nearly identical, which is what put a ceiling on
+/// capture length. The displayed frame is materialized only when it moves.
 pub struct FrameSequence {
     entities: SpanSet<RenderEntity>,
     tiles: SpanSet<RenderTile>,
@@ -507,12 +437,9 @@ pub struct FrameSequence {
 }
 
 impl FrameSequence {
-    /// Folds `frames` into spans, dropping each one as it goes.
-    ///
-    /// Takes them all at once for the convenience of tests and of callers
-    /// that already have a vec; a loader wanting the memory win at load time
-    /// too should fold frame by frame as it parses, since this still sees
-    /// every frame alive at once.
+    /// Folds `frames` into spans, dropping each as it goes. Takes them all at
+    /// once for tests and callers that already have a vec; a loader wanting
+    /// the memory win should fold frame by frame as it parses.
     pub fn new(frames: Vec<RenderFrame>) -> Option<Self> {
         let mut builder = SequenceBuilder::new();
         for frame in frames {
@@ -542,17 +469,13 @@ impl FrameSequence {
     }
 
     /// Spans across all four layers, which is what this sequence's memory is
-    /// proportional to. An item standing through a thousand frames is one
-    /// span, not a thousand copies, so this staying flat while the frame
-    /// count grows is the whole property the layout exists for.
-    /// Whether this frame was reconstructed rather than read: the export
-    /// omitted it because nothing on this surface changed (see
-    /// `replay::write_all_surfaces`), and the loader put it back.
+    /// proportional to: an item standing through a thousand frames is one span.
+    /// Whether this frame was reconstructed rather than read, the export having
+    /// omitted it because nothing on this surface changed.
     ///
-    /// Worth carrying forward rather than recomputing, because it is the
-    /// premise the load-time passes short-circuit on: a frame identical to
-    /// the one before it cannot have new construction in it and cannot extend
-    /// a bounding box, so both answers are known without looking.
+    /// Carried forward rather than recomputed, being the premise the load-time
+    /// passes short-circuit on: a frame identical to the one before cannot have
+    /// new construction or extend a bounding box.
     pub fn is_repeat(&self, index: usize) -> bool {
         self.repeats.get(index).copied().unwrap_or(false)
     }
@@ -563,23 +486,15 @@ impl FrameSequence {
         self.ticks.get(index).copied()
     }
 
-    /// Walks every frame in order, materializing each into a scratch buffer
-    /// that is reused throughout, for the load-time passes that need to see
-    /// the whole run once (camera fit, growing bounds, activity).
+    /// Walks every frame in order into a reused scratch buffer, for the
+    /// load-time passes that need one look at the whole run. A callback rather
+    /// than an iterator, each frame being a temporary with no storage to hand
+    /// out a borrow of.
     ///
-    /// A callback rather than an iterator because each frame is a temporary:
-    /// there is no per-frame storage left to hand out a borrow of, which is
-    /// the entire point.
-    ///
-    /// A repeat frame is **not re-materialized**. The scratch buffer already
-    /// holds the previous frame's contents, and a repeat is by definition
-    /// identical to it, so the callback still sees exactly the right data
-    /// having done no work to get it. On a long capture most frames are
-    /// repeats, so this is the difference between the load-time passes
-    /// costing one walk per file and one per reconstructed frame.
-    ///
-    /// The third argument says which kind this is, so a caller whose answer
-    /// is also known in advance for a repeat can skip its own work too.
+    /// A repeat frame is not re-materialized: the scratch buffer already holds
+    /// the previous frame and a repeat is identical to it. The third argument
+    /// says which kind it is, so a caller whose answer is also known in advance
+    /// can skip its own work.
     pub fn for_each_frame(&self, mut visit: impl FnMut(usize, &RenderFrame, bool)) {
         let mut scratch = RenderFrame::empty();
         for index in 0..self.len() {
@@ -631,14 +546,10 @@ impl FrameSequence {
     }
 }
 
-/// Builds a [`FrameSequence`] frame by frame.
-///
-/// The whole point of the span layout is that a capture never has to be fully
-/// resident, and `FrameSequence::new` taking a `Vec<RenderFrame>` gives that
-/// away at exactly the moment it matters: every frame is alive at once right
-/// before they are folded down. A loader that parses in bounded batches and
-/// pushes here keeps peak memory at one batch plus the spans, which is what
-/// actually lifts the ceiling on capture size.
+/// Builds a [`FrameSequence`] frame by frame. `FrameSequence::new` taking a
+/// `Vec<RenderFrame>` gives away the whole point of the span layout at the
+/// moment it matters, every frame being alive at once just before folding.
+/// Parsing in batches and pushing here keeps peak memory at one batch.
 #[derive(Default)]
 pub struct SequenceBuilder {
     entities: SpanBuilder<RenderEntity>,
@@ -647,10 +558,9 @@ pub struct SequenceBuilder {
     tile_lod: SpanBuilder<LodCell>,
     ticks: Vec<u64>,
     counts: Vec<usize>,
-    /// Which frames were reconstructed rather than read. Recorded here
-    /// because this is the only place that knows: by the time a
-    /// `FrameSequence` exists, a repeat is indistinguishable from a frame
-    /// that happened to be identical.
+    /// Which frames were reconstructed rather than read. Recorded here because
+    /// this is the only place that knows: once a `FrameSequence` exists, a
+    /// repeat is indistinguishable from a frame that happened to match.
     repeats: Vec<bool>,
 }
 
@@ -672,22 +582,13 @@ impl SequenceBuilder {
         self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
     }
 
-    /// Repeats the frame just pushed at each of `ticks`, without that frame's
-    /// contents having to be read, parsed or folded in again.
+    /// Repeats the frame just pushed at each of `ticks`, without that frame
+    /// being read, parsed or folded in again.
     ///
-    /// An export omits a surface's file entirely for a moment when nothing on
-    /// that surface changed, so a surface's files carry only the ticks it
-    /// actually moved at. The timeline is index-addressed and every surface
-    /// has to agree on how many moments there were, so the omitted ones are
-    /// put back here.
-    ///
-    /// The cheap half of the saving: the file was never written, never read
-    /// and never parsed, and restoring it costs one pass over what is
-    /// standing per gap rather than per frame (see
-    /// `SpanBuilder::push_repeats`).
-    ///
-    /// A no-op before any frame has been pushed, since there is nothing to
-    /// repeat: a surface's own first frame is always present.
+    /// An export omits a surface's file when nothing on it changed, but the
+    /// timeline is index-addressed and every surface has to agree on how many
+    /// moments there were. Restoring costs one pass per gap rather than per
+    /// frame. A no-op before any frame has been pushed.
     pub fn push_repeats(&mut self, ticks: &[u64]) {
         let Some(&count) = self.counts.last() else { return };
         if ticks.is_empty() {
@@ -766,13 +667,9 @@ mod tests {
         render(Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() })
     }
 
-    /// The equivalence the whole skip-unchanged-frames scheme rests on.
-    ///
-    /// An export omits a surface's frame when nothing on that surface
-    /// changed, and the loader restores it with `push_repeats`. That is only
-    /// safe if the restored sequence is indistinguishable from the one an
-    /// export that wrote every frame would have produced, index for index,
-    /// contents and ticks alike. If it ever stops being, the saving is being
+    /// The equivalence the skip-unchanged-frames scheme rests on: the restored
+    /// sequence must be indistinguishable from what an export writing every
+    /// frame would have produced, index for index. Otherwise the saving is
     /// paid for with a subtly different timelapse.
     #[test]
     fn repeats_produce_the_same_sequence_as_writing_every_frame() {
@@ -899,11 +796,8 @@ mod tests {
         assert_eq!(coords, vec![(-6, 3), (-5, 1)]);
     }
 
-    /// The existing tests above all use small item counts, so none of them
-    /// ever cross `PARALLEL_THRESHOLD` and exercise the parallel path at
-    /// all. This is the one that actually does, checking it against the
-    /// known-correct sequential implementation directly rather than just
-    /// checking it doesn't crash.
+    /// The tests above all stay under `PARALLEL_THRESHOLD`, so this is the one
+    /// that exercises the parallel path, against the sequential result.
     #[test]
     fn group_by_type_parallel_path_matches_sequential_at_scale() {
         let type_count = 5;
@@ -918,19 +812,11 @@ mod tests {
         assert_eq!(parallel_runs, sequential_runs);
     }
 
-    /// Same idea for `build_chunk_lod`, with chunk coordinates deliberately
-    /// cycled across the whole array (not clustered) so any index-based
-    /// worker split still has more than one worker see the same chunk
-    /// coordinate, exercising the summed merge the parallel path needs
-    /// (see `build_chunk_lod`'s own doc comment for why). Compared by
-    /// content rather than position: `finalize_chunk_lod` iterates a
-    /// `HashMap`, whose order isn't guaranteed stable between the
-    /// sequential and parallel paths' separately-constructed maps even for
-    /// identical input.
-    /// A mining outpost stands in an ore patch, so by count the ore wins a
-    /// cell easily and plain majority erased the outpost, showing the patch it
-    /// was built in. What was built speaks for the cell instead, matching the
-    /// order the full-detail path draws them in.
+    /// Same for `build_chunk_lod`, with chunk coordinates cycled rather than
+    /// clustered so more than one worker sees the same coordinate, exercising
+    /// the summed merge. Compared by content, `finalize_chunk_lod` iterating a
+    /// `HashMap`.
+    /// A mining outpost stands in an ore patch, so by count the ore wins.
     #[test]
     fn ore_never_speaks_for_a_cell_that_holds_something_built() {
         let mut registry = TypeRegistry::new();
@@ -1000,10 +886,9 @@ mod tests {
         assert!(use_chunk_lod(0.5), "0.5px tiles are already sub-pixel");
     }
 
-    /// Regression: gating on the *chunk's* on-screen size (chunk being 32
-    /// tiles) instead of the tile's meant LOD only engaged 32x further out
-    /// than intended. 0.32 px/tile is a real measurement from a base that
-    /// stayed in full detail (3.27M quads, 7 fps) under that version.
+    /// Regression: gating on the chunk's on-screen size rather than the
+    /// tile's engaged LOD 32x too far out. 0.32 px/tile is a real measurement
+    /// from a base that stayed in full detail at 3.27M quads and 7 fps.
     #[test]
     fn use_chunk_lod_engages_well_before_a_tile_is_sub_pixel() {
         assert!(use_chunk_lod(0.32));
@@ -1012,10 +897,9 @@ mod tests {
     #[test]
     fn chunk_lod_aggregates_a_dense_area_into_one_cell_per_chunk() {
         let mut registry = TypeRegistry::new();
-        // A strip of concrete spanning one chunk plus one tile into the
-        // next, so this must produce exactly two cells, not one per tile.
-        // The spill must stay under one cell's width or this would land in
-        // three-plus chunks instead of two, regardless of LOD_CELL_TILES.
+        // A strip spanning one chunk plus one tile, so this must produce two
+        // cells. The spill stays under one cell's width, or it would land in
+        // three chunks regardless of LOD_CELL_TILES.
         let tiles: Vec<Tile> = (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".into(), x, y: 0 }).collect();
         let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
@@ -1046,10 +930,8 @@ mod tests {
             tick: 0,
             surface: "nauvis".to_string(),
             count: 2,
-            // -0.5 floors to -1, landing in the chunk to the left of origin.
-            // Exercises div_euclid rather than plain integer division,
-            // which would incorrectly floor a negative toward zero. The
-            // second entity sits in the last column of chunk (0,0).
+            // -0.5 floors to -1, exercising div_euclid rather than integer
+            // division, which would floor a negative toward zero.
             entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],
             tiles: Vec::new(),
         };

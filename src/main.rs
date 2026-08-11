@@ -1,11 +1,6 @@
-//! save-timelapse: one interactive tool, no flags to learn.
-//!
-//! Asks what you want to do (rebuild from live capture, or build from
-//! existing saves), asks whatever it couldn't auto-detect (Factorio's
-//! folder, which surface, which saves belong to one playthrough), then
-//! opens the viewer on the result automatically.
-//!
-//!     save-timelapse.exe
+//! save-timelapse: one interactive tool, no flags to learn. Asks what you want
+//! to do, asks whatever it could not auto-detect, then opens the viewer on the
+//! result.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -29,20 +24,18 @@ const TICKS_PER_SECOND: u64 = 60;
 
 const MAX_FRAMES: usize = 100_000;
 
-/// Offered when nothing has been exported yet, and remembered afterwards.
-/// 1080p rather than the largest option: it is what video sites expect, and
-/// a 4K export of a long playthrough is several gigabytes and many minutes
-/// of rendering, which is a bad thing to pick for somebody by default.
+/// Offered when nothing has been exported yet, then remembered. 1080p rather
+/// than the largest: a 4K export of a long playthrough is several gigabytes
+/// and many minutes, which is a bad default to pick for somebody.
 const DEFAULT_EXPORT_SIZE: (u32, u32) = (1920, 1080);
 
 /// Smooth without being wasteful. Frames are spaced by game time, not by
 /// this, so it only sets how fast the finished file plays back.
 const DEFAULT_EXPORT_FPS: u32 = 30;
 
-/// How many saves to list when asking which one the ground comes from.
-/// A saves folder holds every autosave, which on a long playthrough is far
-/// more than anybody wants to read; the ones worth choosing between are
-/// always the most recent few.
+/// How many saves to list when asking which one the ground comes from. A
+/// saves folder holds every autosave; the ones worth choosing between are the
+/// most recent few.
 const TERRAIN_SAVE_CHOICES: usize = 15;
 
 enum Mode {
@@ -54,11 +47,8 @@ enum Mode {
     Quit,
 }
 
-/// Prints `question`, reads one line, and trims it. An empty `Ok` on EOF
-/// (stdin closed, e.g. `< /dev/null`) would spin the retry loops below
-/// forever with no way to make progress, so that comes back as an error
-/// instead, which unwinds out through the same friendly-failure path as
-/// everything else.
+/// Prints `question`, reads one line, trims it. EOF comes back as an error
+/// rather than an empty `Ok`, which would spin the retry loops forever.
 fn prompt(question: &str) -> io::Result<String> {
     print!("{question} ");
     io::stdout().flush()?;
@@ -70,23 +60,16 @@ fn prompt(question: &str) -> io::Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// Whether an error means there is nobody left to ask.
-///
-/// Matters because a failed action now returns to the menu instead of ending
-/// the program. Without this, a closed stdin would fail the action, return to
-/// the menu, fail the menu's own prompt, and spin forever printing the same
-/// message. Every other kind of failure is something the user can react to, so
-/// only this one still ends the run.
+/// Whether an error means there is nobody left to ask. A failed action returns
+/// to the menu, so without this a closed stdin would fail the action, fail the
+/// menu's prompt, and spin forever.
 fn input_closed(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::UnexpectedEof
 }
 
-/// Reports a failed action and waits, then hands control back to the menu.
-///
-/// A double-clicked console gives no scrollback, so a message that is not
-/// paused on is a message nobody read. This is the only place a failure is
-/// printed now: individual flows return their error rather than announcing it
-/// and exiting, so "what went wrong" and "what happens next" stay in one place.
+/// Reports a failed action and waits, then hands back to the menu. A
+/// double-clicked console has no scrollback, so a message not paused on is a
+/// message nobody read. The only place a failure is printed.
 fn show_problem(e: &io::Error) {
     println!("\nThat didn't work.\n\n{e}\n");
     print!("Press Enter to go back to the menu...");
@@ -96,15 +79,9 @@ fn show_problem(e: &io::Error) {
     println!();
 }
 
-/// Announces a step and leaves the line open, so whatever the step finds
-/// finishes the sentence.
-///
-/// Every one of these was previously silent, which is fine when it takes no
-/// time and awful when it does: loading a megabase baseline is tens of
-/// seconds of a blank screen, and "is this doing anything?" is not a question
-/// a tool should make anyone ask. Flushed explicitly because stdout is line
-/// buffered, so without it the announcement would appear *after* the work it
-/// is announcing, which is worse than not printing it at all.
+/// Announces a step and leaves the line open, so what the step finds finishes
+/// the sentence. Loading a megabase baseline is tens of seconds of blank
+/// screen otherwise. Flushed explicitly, stdout being line buffered.
 fn step(what: &str) {
     // Callers prefix a blank line to separate one stage of a flow from the
     // last. That has to stay in front of the indent, or the indent lands on
@@ -115,17 +92,10 @@ fn step(what: &str) {
     io::stdout().flush().ok();
 }
 
-/// `already_built` only changes what option 1 *says*, never the numbering.
-/// Hiding it when there is nothing to open would renumber everything else
-/// depending on state, and a menu whose option 2 means different things on
-/// different days is worse than one line that sometimes reads "none yet".
-///
-/// Every line names a thing the user wants, not a thing the tool does, and
-/// none of them explains itself in brackets: an option that needs a sentence
-/// of justification beside it is one nobody can choose between at a glance.
-/// Quit is a numbered option rather than only a bare Enter, because "press
-/// Enter to quit" is an instruction somebody has to read and remember, and a
-/// menu that cannot be left the same way it is used is a trap.
+/// `already_built` changes what option 1 says, never the numbering: a menu
+/// whose option 2 means different things on different days is worse than a line
+/// that sometimes reads "none yet". Quit is numbered rather than a bare Enter,
+/// a menu that cannot be left the same way it is used being a trap.
 fn ask_mode(already_built: usize) -> io::Result<Mode> {
     let ready = match already_built {
         0 => String::new(),
@@ -158,26 +128,15 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
     }
 }
 
-/// Factorio's data folder (saves/mods/script-output): remembered answer
-/// first, then auto-detection, then asking.
-///
-/// Validated by checking for a `mods` subfolder rather than accepting any
-/// path, since a wrong answer here would otherwise only surface as a
-/// confusing failure several steps later. That applies to the remembered
-/// path too (see
-/// `Settings::valid_factorio_dir`), so a folder that has since moved falls
-/// through to detection rather than becoming a confusing failure several
-/// steps later. Whatever ends up resolving is written back, which is what
-/// makes this a question asked once rather than every run: the case that
-/// actually hurt was auto-detection failing, since that meant retyping the
-/// same path forever.
+/// Factorio's data folder: remembered answer first, then auto-detection, then
+/// asking. Validated by checking for a `mods` subfolder, including the
+/// remembered path, so a folder that has since moved falls through to detection
+/// rather than failing confusingly later. Whatever resolves is written back.
 fn locate_factorio_user_dir_interactive(settings: &mut Settings) -> io::Result<PathBuf> {
     step("Finding your Factorio folder");
 
-    // Says which of the three it was. "Remembered" versus "found" is the
-    // difference between the tool knowing something about this machine and
-    // having just worked it out, and it is the only clue anyone gets that a
-    // saved setting is in play at all.
+    // Says which of the three it was. "Remembered" versus "found" is the only
+    // clue anyone gets that a saved setting is in play.
     if let Some(dir) = settings.valid_factorio_dir() {
         println!("found");
         return Ok(dir.to_path_buf());
@@ -242,10 +201,8 @@ fn find_surface<'a>(input: &str, surfaces: &'a [String]) -> Option<&'a str> {
     surfaces.iter().find(|s| s.eq_ignore_ascii_case(input)).map(String::as_str)
 }
 
-/// `None` for anything that isn't a recognized yes/no word, including empty
-/// input: whether a blank answer means "yes" or "no" is the caller's
-/// business (`ask_yes_no` treats it as "use the default"), not something
-/// this pure parser should decide on its own.
+/// `None` for anything that is not a recognized yes/no word, including empty
+/// input: whether blank means yes is the caller's business.
 fn parse_yes_no(input: &str) -> Option<bool> {
     match input.trim().to_lowercase().as_str() {
         "y" | "yes" => Some(true),
@@ -311,10 +268,8 @@ fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
     }
 }
 
-/// A coarse "how long ago" label for a session's `last_modified`, good
-/// enough to help someone recognise their own playthrough in a list without
-/// a mod-side save name to show instead (Factorio gives mods no way to read
-/// one).
+/// A coarse "how long ago" label, good enough to recognise your own
+/// playthrough in a list. Factorio gives mods no way to read a save name.
 fn describe_age(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     if secs < 60 {
@@ -341,11 +296,9 @@ fn parse_session_index(input: &str, count: usize) -> Option<usize> {
     (index < count).then_some(index)
 }
 
-/// Only reached when more than one playthrough has live capture data
-/// waiting: combining them would jump between different bases in one
-/// timelapse, exactly what tagging playthroughs by session is meant to
-/// prevent, so this always picks exactly one rather than offering "all"
-/// the way `ask_surface_choice` and the from-saves flow's selection do.
+/// Only reached when more than one playthrough has capture data waiting.
+/// Always picks exactly one rather than offering "all": combining them would
+/// jump between different bases in one timelapse.
 fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
     println!("\n  You have {} recordings:\n", sessions.len());
     let now = SystemTime::now();
@@ -369,15 +322,10 @@ fn ordering_key(path: &Path) -> (u64, String) {
     (digits.parse().unwrap_or(0), stem.to_lowercase())
 }
 
-/// `all` (case-insensitive) selects everything. Otherwise, if every
-/// comma-separated part parses as a number, those are 1-based indices into
-/// `saves` (out-of-range ones are dropped rather than erroring, so a typo'd
-/// extra index doesn't throw away the rest of a valid selection).
-/// Otherwise, a case-insensitive substring filter against each save's
-/// filename, the same matching `--match-name` used to do. Blank input
-/// selects nothing rather than matching every filename via an empty
-/// substring, since the whole point of asking is to make a blank answer
-/// something the caller reprompts on, not a silent "combine everything".
+/// `all` selects everything. Otherwise, if every comma-separated part parses as
+/// a number, those are 1-based indices, out-of-range ones dropped so a typo does
+/// not throw away a valid selection; otherwise a case-insensitive substring
+/// filter. Blank selects nothing, so the caller can reprompt.
 fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -405,11 +353,9 @@ fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The Lua mod's source, needed to stage a headless export. Tried next to
-/// this program first (how it travels once distributed), then the project
-/// root baked in at compile time (how it's found running the built exe
-/// straight out of target/release, regardless of the working directory),
-/// then the current folder as a last resort.
+/// The Lua mod's source. Tried next to this program first (how it travels
+/// once distributed), then the compile-time project root (running straight out
+/// of target/release), then the current folder.
 fn mod_source_dir() -> io::Result<PathBuf> {
     let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
     if let Some(dir) = &exe_sibling {
@@ -431,20 +377,16 @@ fn mod_source_dir() -> io::Result<PathBuf> {
     ))
 }
 
-/// Where a mode writes its output: a folder beside the running exe, so the
-/// result is easy to find regardless of where Factorio's own user data
-/// happens to live. Falls back to the current directory only if the exe's
-/// own path can't be determined, which realistically never happens.
+/// Where a mode writes its output: beside the running exe, so the result is
+/// easy to find wherever Factorio's user data lives. Falls back to the current
+/// directory only if the exe's path cannot be determined.
 fn output_dir_next_to_exe(name: &str) -> PathBuf {
     std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
 }
 
-/// Where built timelapses are kept, one subfolder each.
-///
-/// Built results used to go to a single fixed folder that every run deleted
-/// and rebuilt, which meant reopening yesterday's timelapse was impossible:
-/// the only way to look at one was to make it again. Keeping them apart by
-/// name is what lets the tool open one instead of always building.
+/// Where built timelapses are kept, one subfolder each. A single fixed folder
+/// that every run rebuilt meant reopening yesterday's timelapse was
+/// impossible: the only way to see one was to make it again.
 fn timelapses_root() -> PathBuf {
     output_dir_next_to_exe("timelapses")
 }
@@ -452,11 +394,8 @@ fn timelapses_root() -> PathBuf {
 /// Turns a playthrough name or save name into something safe to use as a
 /// folder name, since both come from the user and can hold anything.
 fn as_folder_name(raw: &str) -> String {
-    // Dots are kept, since a name like "v1.2 run" is perfectly ordinary and
-    // mangling it would be gratuitous. They are trimmed from the ends
-    // afterwards, which is the case that actually matters: "." and ".." name
-    // the current and parent directory, so a name of nothing but dots would
-    // produce one of those rather than a folder of its own.
+    // Dots are kept, a name like "v1.2 run" being ordinary, and trimmed from
+    // the ends, since "." and ".." name directories.
     let cleaned: String =
         raw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
     let trimmed = cleaned.trim().trim_matches('.').trim();
@@ -476,11 +415,9 @@ struct BuiltTimelapse {
     modified: SystemTime,
 }
 
-/// Every built timelapse, newest first.
-///
-/// Counts frames and weighs the folder rather than only listing names: which
-/// of two timelapses somebody wants is usually answered by how big and how
-/// recent it is, and neither is visible from a folder name.
+/// Every built timelapse, newest first. Counts frames and weighs the folder,
+/// since which of two somebody wants is usually answered by how big and how
+/// recent it is, neither visible from a name.
 fn list_timelapses() -> Vec<BuiltTimelapse> {
     list_timelapses_in(&timelapses_root())
 }
@@ -532,10 +469,9 @@ fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<
     }
 }
 
-/// `viewer` is a sibling binary, not a library this crate can call into
-/// directly (it depends on this one, not the other way around, and its
-/// `main` is a macroquad event loop besides), so launching it means finding
-/// the executable cargo already built next to this one.
+/// `viewer` is a sibling binary rather than a library this crate can call: it
+/// depends on this one, and its `main` is a macroquad event loop. So launching
+/// it means finding the executable cargo built next to this one.
 fn viewer_path() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or_else(|| io::Error::other("could not determine this program's own folder"))?;
@@ -550,15 +486,10 @@ fn viewer_path() -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
-/// The surfaces a built timelapse holds, read off its own filenames.
-///
-/// A multi-surface build writes `frame_0000_nauvis.stfr`; a single-surface
-/// one writes `frame_0000.stfr` with no name in it at all. So an empty
-/// result means "one surface, whose name is not recorded here", not "none",
-/// which is exactly the case where there is nothing worth asking about.
-///
-/// Split at the *first* underscore after the index rather than the last, so
-/// a surface whose own name contains one survives intact.
+/// The surfaces a built timelapse holds, read off its filenames. A
+/// single-surface build writes `frame_0000.stfr` with no name in it, so an
+/// empty result means "one surface, unnamed" rather than "none". Split at the
+/// first underscore after the index, so a name containing one survives.
 fn surfaces_in(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut names: Vec<String> = entries
@@ -567,10 +498,9 @@ fn surfaces_in(dir: &Path) -> Vec<String> {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
         .filter_map(|p| {
             let stem = p.file_stem()?.to_str()?.to_string();
-            // Terrain files are named per surface too, and a timelapse can
-            // have terrain for a surface it has frames for, so counting both
-            // would list the same name twice. Deduped below either way, but
-            // terrain alone is not a surface anyone can export.
+            // Terrain files are named per surface too, so counting both would
+            // list a name twice. Terrain alone is not a surface anyone can
+            // export.
             let rest = stem.strip_prefix("frame_")?;
             let (_index, surface) = rest.split_once('_')?;
             (!surface.is_empty()).then(|| surface.to_string())
@@ -616,10 +546,7 @@ const RESOLUTION_PRESETS: [(u32, u32, &str); 4] = [
 ];
 
 /// A preset number, or a literal `WIDTHxHEIGHT`. `None` for anything else,
-/// including a size with a zero in it, which would make an unusable video.
-///
-/// Accepts `x` in either case because "1920X1080" is a perfectly reasonable
-/// thing to type and refusing it would teach nobody anything.
+/// including a size with a zero in it. Accepts `x` in either case.
 fn parse_resolution(input: &str) -> Option<(u32, u32)> {
     let trimmed = input.trim();
     if let Ok(n) = trimmed.parse::<usize>() {
@@ -674,21 +601,15 @@ fn ask_fps(default: u32) -> io::Result<u32> {
     }
 }
 
-/// Where finished videos and image sequences are put: one folder next to the
-/// executable, the same way `timelapses/` works, so the answer to "where did
-/// it go" is always the same place rather than wherever the shell happened
-/// to be when the tool started.
+/// Where finished videos and image sequences go: one folder next to the
+/// executable, like `timelapses/`, so "where did it go" has one answer.
 fn videos_root() -> PathBuf {
     output_dir_next_to_exe("videos")
 }
 
-/// Renders a built timelapse to a video file or an image sequence.
-///
-/// Runs the viewer rather than reimplementing any of it: rendering needs a
-/// GPU context and the whole sprite and palette pipeline, all of which live
-/// there. This is the part that was missing, which is not the ability to
-/// export (the viewer has had it) but a way to reach it without knowing the
-/// viewer exists, where the frames are, or what flags to type.
+/// Renders a built timelapse to a video file or an image sequence, by running
+/// the viewer rather than reimplementing it: rendering needs a GPU context and
+/// the whole sprite pipeline.
 fn run_export(settings: &mut Settings) -> io::Result<()> {
     let built = list_timelapses();
     if built.is_empty() {
@@ -768,10 +689,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     let user_dir = locate_factorio_user_dir_interactive(settings)?;
 
     let capture = user_dir.join("script-output").join("save-timelapse");
-    // A missing capture folder (nothing has ever been captured) and one that
-    // exists but names no finished baseline are the same "not started yet"
-    // state from here, so a read_dir failure is folded into the empty case
-    // rather than surfaced as a raw IO error.
+    // A missing capture folder and one naming no finished baseline are the
+    // same "not started yet" state, so a read_dir failure folds into the
+    // empty case rather than surfacing as an IO error.
     step("Looking for recordings");
     let sessions = replay::discover_sessions(&capture).unwrap_or_default();
     println!("{} found", sessions.len());
@@ -783,10 +703,8 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         ));
     }
 
-    // Different playthroughs are tagged separately precisely so they never
-    // get combined into one timelapse; only ask which one when there is
-    // more than one to choose from, so the common single-playthrough case
-    // stays exactly as simple as it always was.
+    // Playthroughs are tagged separately precisely so they are never
+    // combined, so only ask when there is more than one.
     let chosen = if sessions.len() == 1 {
         sessions.into_iter().next().expect("checked non-empty above")
     } else {
@@ -808,28 +726,17 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     let chosen_surface = ask_surface_choice(&surfaces)?;
     let frame_seconds = ask_frame_seconds(settings.frame_seconds.unwrap_or(DEFAULT_FRAME_SECONDS))?;
 
-    // Saved here rather than after the export, so an answer survives even if
-    // the build that follows fails or is interrupted. Retyping preferences
-    // because something else went wrong is exactly the friction this exists
-    // to remove.
-    //
+    // Saved before the export, so an answer survives a build that fails.
     // Surface choice is deliberately not remembered: which surfaces a capture
-    // has changes as a playthrough reaches new planets, so a remembered one
-    // would silently pick a stale answer, and picking the wrong world is far
-    // more annoying than being asked.
+    // has changes as a playthrough reaches new planets.
     settings.frame_seconds = Some(frame_seconds);
     remember(settings);
 
-    // Named after the playthrough, so rebuilding one leaves every other
-    // timelapse alone and reopening it later is possible at all. Clearing
-    // just this one before writing is still right: a shorter capture than
-    // last time cannot leave stale, higher-numbered frames behind for the
-    // viewer to mix in with current data.
-    // Falls back to where the playthrough happened rather than to its session
-    // id. This name becomes a folder the user sees and later picks from a
-    // list, and "playthrough-cab96f9f" tells them nothing about which one it
-    // is. The id stays as the last resort, since two unnamed playthroughs on
-    // the same planets would otherwise collide on one folder.
+    // Named after the playthrough, so rebuilding one leaves the others alone.
+    // Clearing just this one first is still right: a shorter capture must not
+    // leave stale higher-numbered frames behind. Falls back to where the
+    // playthrough happened rather than its session id, which tells the user
+    // nothing; the id stays as the last resort against a collision.
     let name = chosen.label().unwrap_or_else(|| match chosen.baseline.surfaces.as_slice() {
         [] => format!("playthrough-{:08x}", chosen.session_id),
         surfaces => format!("{} ({:08x})", describe_places(surfaces), chosen.session_id),
@@ -838,18 +745,11 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
-    // Terrain is fixed the instant the baseline loads (see
-    // `World::terrain_frame`), so it is written once here rather than once
-    // per emitted frame like `replay::run`'s per-tick callback below does.
-    //
-    // Only ever finds anything for a capture recorded before ground moved out
-    // of the baseline and into its own scan: a mod from this version onward
-    // puts no ground in a frame, so the world has none and this writes
-    // nothing. Kept, and kept first, precisely for those older captures.
-    // `offer_terrain_for_capture` runs after the replay and copies over
-    // whatever lands here, which is the right precedence: a scan covers the
-    // factory's final extent, while a baseline only ever covered how far it
-    // had reached on the day it was taken.
+    // Terrain is fixed the instant the baseline loads, so it is written once
+    // here rather than per emitted frame. Only finds anything for a capture
+    // recorded before ground moved into its own scan. Kept first because
+    // `offer_terrain_for_capture` overwrites it afterwards, which is the right
+    // precedence, a scan covering the factory's final extent.
     match &chosen_surface {
         None => replay::write_all_terrain(&replay_state.world, replay_state.baseline.tick, &out)?,
         Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
@@ -860,10 +760,8 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
     let mut written = 0usize;
     let mut error: Option<io::Error> = None;
-    // Last revision written per surface, carried across the whole run so
-    // `write_all_surfaces` can skip a surface nothing has touched since. See
-    // its doc comment: this is what turns "every surface, every frame" into
-    // "every surface that changed".
+    // Last revision written per surface, carried across the run so
+    // `write_all_surfaces` can skip a surface nothing has touched.
     let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
 
     let emitted = match &chosen_surface {
@@ -914,16 +812,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     );
     println!("  Saved in {}", out.display());
 
-    // What used to print here was six paragraphs, of which four reported that
-    // the replay had handled something correctly: catch-up baselines applied,
-    // events superseded by a reload, segments holding more than one attempt at
-    // the same stretch of play. Those are real and hard-won (see the reloading
-    // section in ARCHITECTURE.md), and they are also nothing the person who
-    // just wanted a timelapse can do anything about. Correct behaviour does
-    // not need announcing.
-    //
-    // What survives is only what changes what somebody should do next, and
-    // each one says what to do rather than what was counted.
+    // Only what changes what somebody should do next, said as what to do
+    // rather than what was counted. The replay handling something correctly is
+    // not news to the person who wanted a timelapse.
     let mut acted = false;
 
     // Deliberately not phrased as corruption: a skipped extension record only
@@ -958,27 +849,15 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 /// Offer to read the ground for a live capture, from a save of the same
 /// playthrough.
 ///
-/// Live capture records what changes, and ground never does, so it is not
-/// recorded at all: it is read afterwards from any single save. That keeps
-/// the most expensive part of an export out of the game entirely, at the cost
-/// of the one thing this flow otherwise never needs, which is Factorio
-/// itself. So it is asked rather than assumed, at the moment the cost is
-/// actually incurred.
-///
-/// The newest save is offered first because it has the most map generated and
-/// the furthest-reaching factory, so its ground covers every earlier frame.
-/// Whether it is really the same playthrough is checked by the scan, not
-/// guessed from the filename.
+/// Live capture records what changes and ground does not, so it is read
+/// afterwards from any single save. That keeps the most expensive part out of
+/// the game, at the cost of the one thing this flow otherwise never needs,
+/// which is Factorio itself, so it is asked rather than assumed.
 /// Which save to read the ground from.
 ///
-/// Offered rather than assumed, because the newest save is only usually the
-/// right one. Somebody who has since started a different game, or who keeps a
-/// "before I wrecked it" save around, needs to be able to say so. Picking
-/// wrong is caught either way, since the scan reports which playthrough the
-/// save actually belongs to, but being asked beats being refused.
-///
-/// `saves` must be newest first, which is also the default: pressing Enter
-/// takes it, so the common case stays one keystroke.
+/// Offered rather than assumed: somebody may have started a different game
+/// since, or keep a "before I wrecked it" save. Picking wrong is caught by the
+/// scan. `saves` must be newest first, so Enter takes the common case.
 fn ask_terrain_save(saves: &[PathBuf]) -> io::Result<&Path> {
     let now = SystemTime::now();
     // The caveat lives here rather than beside the yes/no above, because this
@@ -1060,20 +939,14 @@ fn offer_terrain_for_capture(
 
 /// Scan one save for natural ground and put it beside the frames.
 ///
-/// Ground does not change over a playthrough, so one save describes it for
-/// the whole timelapse. That is why this is a separate pass rather than part
-/// of the export: doing it per frame would repeat the same answer, and doing
-/// it during live capture would charge somebody's game for it.
+/// Ground does not change, so one save describes it for the whole timelapse:
+/// doing it per frame would repeat the same answer, and during live capture
+/// would charge somebody's game for it.
 ///
-/// `expect_session` is the playthrough the caller believes this save belongs
-/// to. The mod writes into a folder named for the map seed, so a save from a
-/// different game lands somewhere else and gets refused here rather than
-/// laying an unrelated landscape under the factory. `None` skips the check,
-/// which is right for the from-saves flow: the saves *are* the playthrough,
-/// so there is nothing to disagree with.
-///
-/// Best effort throughout. A timelapse with no ground is a working timelapse,
-/// so nothing here fails a build that has already succeeded.
+/// `expect_session` is the playthrough the caller believes the save belongs to.
+/// The mod writes into a folder named for the map seed, so a save from a
+/// different game is refused rather than laying an unrelated landscape under
+/// the factory. Best effort throughout.
 fn add_terrain(
     save: &Path,
     out: &Path,
@@ -1109,13 +982,10 @@ fn add_terrain(
                 }
                 println!("{copied} surface(s) of ground in {:.1}s", scan.seconds);
 
-                // The one failure this cannot prevent and can always see. A
-                // scan knows only what its save knew, and Factorio generates
-                // chunks as somebody goes, so ground simply does not exist for
-                // anywhere they had not reached yet. Play on past the last
-                // save and the factory grows into territory the save has never
-                // heard of, leaving buildings on nothing with no error
-                // anywhere. Both ticks are right here, so say so.
+                // The one failure this cannot prevent and can always see:
+                // Factorio generates chunks as somebody goes, so playing past
+                // the last save grows the factory into territory that save
+                // never heard of, leaving buildings on nothing.
                 if let Some(end) = capture_tick {
                     if scan.tick + TICKS_PER_SECOND * 60 < end {
                         let minutes = (end - scan.tick) / (TICKS_PER_SECOND * 60);
@@ -1196,10 +1066,9 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     settings.capture_terrain = Some(capture_terrain);
     remember(settings);
 
-    // Named after the first save chosen, which is the earliest one and so
-    // usually names the playthrough rather than the moment. Asking for a name
-    // would be one more question in a flow that already has several, and this
-    // is renameable by renaming the folder.
+    // Named after the first save chosen, the earliest one, which usually names
+    // the playthrough rather than the moment. Renameable by renaming the
+    // folder.
     let name = chosen
         .first()
         .and_then(|p| p.file_stem())
@@ -1233,9 +1102,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
                 // Appended, not overwritten: each save contributes its own
-                // one-shot sample (its own real game.tick), so a multi-save
-                // playthrough builds up one line per save in the shared
-                // output file, the same as a live capture's many samples.
+                // one-shot sample at its own real tick.
                 if let Some(log) = &outcome.players_log {
                     let mut combined = std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
                     combined.write_all(&std::fs::read(log)?)?;
@@ -1258,20 +1125,16 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
         return Err(io::Error::other("none of the selected saves exported successfully"));
     }
 
-    // The last save chosen, because ground is scanned once for the whole
-    // timelapse and the latest save is the one whose map has been generated
-    // furthest out and whose factory reached furthest, so its box covers
-    // every earlier frame too.
+    // The last save chosen: ground is scanned once for the whole timelapse,
+    // and the latest save's map is generated furthest out.
     if capture_terrain {
         if let Some(last) = chosen.last() {
             add_terrain(last, &out, &config, None, None);
         }
     }
 
-    // Milestones are the one output that cannot be derived from a single
-    // save, so it is written here rather than per-export: each save reports
-    // only totals, and when something first became true is recoverable only
-    // by comparing consecutive ones.
+    // Milestones cannot be derived from a single save, which reports only
+    // totals. When something first became true needs consecutive ones.
     let milestones = milestone::from_saves(milestone_states);
     if !milestones.is_empty() {
         match milestone::write_jsonl(&out.join("milestones.jsonl"), &milestones) {
@@ -1290,45 +1153,31 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     Ok(out)
 }
 
-/// Writes the settings, reporting a failure without treating it as one.
-///
-/// Not being able to remember an answer costs one prompt next time. Refusing
-/// to build somebody's timelapse over it would be absurd, so this never
-/// returns an error to a caller who would only have to ignore it.
+/// Writes the settings, reporting a failure without treating it as one. Not
+/// remembering an answer costs one prompt next time, which is no reason to
+/// refuse to build somebody's timelapse.
 fn remember(settings: &Settings) {
     if let Err(e) = settings.save() {
         eprintln!("warning: could not save your preferences ({e}); they will be asked again next time");
     }
 }
 
-/// Opens the viewer on a finished timelapse without waiting for it.
-///
-/// `spawn`, not `status`: the viewer is a window somebody keeps open and comes
-/// back to, so blocking on it would leave this program frozen behind a window
-/// that has nothing more to do with it. Detaching is also what lets the menu
-/// come straight back, so a timelapse can be watched and another one started
-/// without running the tool again.
+/// Opens the viewer without waiting. `spawn`, not `status`: the viewer is a
+/// window somebody keeps open, so blocking would freeze this program behind it,
+/// and detaching is what lets the menu come straight back.
 fn open_viewer(path: &Path) -> io::Result<()> {
     let viewer = viewer_path()?;
     println!("\n  Opening the viewer.\n");
-    // The viewer narrates its own loading on stdout ("1 world(s) loaded", the
-    // sprite count, and so on), and it inherits this console, so all of that
-    // lands on top of the menu that has just come back. Discarding stdout and
-    // keeping stderr is what silences the narration without silencing a viewer
-    // that actually failed to open anything.
+    // The viewer narrates its loading on stdout and inherits this console, so
+    // it would land on top of the menu. Discarding stdout and keeping stderr
+    // silences the narration without silencing a viewer that failed.
     Command::new(&viewer).arg(path).stdout(Stdio::null()).spawn()?;
     Ok(())
 }
 
-/// The menu. Returns only when the user asks to leave, or when there is
-/// nobody left to ask.
-///
-/// Every action returns here afterwards, including the ones that finish by
-/// opening the viewer and including the ones that fail. The old shape ended
-/// the program after a build, which meant that watching a timelapse and then
-/// making another one was two separate runs of the tool, and that any failure
-/// closed the window on the way out. Nothing here is a one-shot job from the
-/// user's point of view, so nothing here ends the program on its own.
+/// The menu. Returns only when the user asks to leave, or when there is nobody
+/// left to ask. Every action returns here, including ones that open the viewer
+/// and ones that fail.
 fn run() -> io::Result<()> {
     // Said once, on the run that has nothing saved yet, so the questions that
     // follow read as setup rather than as something that happens forever.
@@ -1412,12 +1261,9 @@ fn pretty_place(name: &str) -> String {
     }
 }
 
-/// The places in a recording, named rather than listed exhaustively.
-///
-/// A Space Age playthrough reaches five planets and any number of space
-/// platforms, and the full list ran to nine comma-separated names on a real
-/// capture here. Two names and a count says the same thing in a width somebody
-/// can actually scan.
+/// The places in a recording, named rather than listed exhaustively. A Space
+/// Age playthrough reaches five planets and any number of platforms, which ran
+/// to nine names on a real capture. Two and a count says the same thing.
 fn describe_places(surfaces: &[String]) -> String {
     match surfaces {
         [] => "nothing yet".to_string(),
@@ -1467,18 +1313,11 @@ fn describe_play_time(tick: u64) -> String {
     }
 }
 
-/// One line describing a recording, for the picker before a rebuild.
-///
-/// Leads with the name when there is one, and with the places when there is
-/// not. It used to lead with a hex session id, which identifies a recording
-/// perfectly and tells the person choosing between two of them absolutely
-/// nothing.
-///
-/// Everything here answers "is this the playthrough I mean": where it happens,
-/// how big the factory got, and when it was last played. What it deliberately
-/// no longer shows is the baseline tick, the tile count and the size on disk,
-/// none of which help make this choice. Size returns in the management screen,
-/// where the question is what to delete and size is the whole point.
+/// One line describing a recording, for the picker before a rebuild. Leads with
+/// the name when there is one, the places when there is not: a hex session id
+/// identifies a recording perfectly and tells the person choosing between two
+/// of them nothing. Size belongs in the management screen, where the question
+/// is what to delete.
 fn describe_session(session: &replay::Session, now: SystemTime) -> String {
     let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
     let places = describe_places(&session.baseline.surfaces);
@@ -1495,14 +1334,9 @@ fn describe_session_with_size(session: &replay::Session, now: SystemTime) -> Str
     format!("{}, {}", describe_session(session, now), describe_size(session.size_on_disk()))
 }
 
-/// The capture management screen: name a playthrough so it can be told apart
-/// from the others, see what each is costing on disk, and delete ones that
-/// are finished with.
-///
-/// Deleting is offered here rather than only in game because the in-game
-/// reset only ever removes the playthrough you currently have loaded. There
-/// was no way at all to clear an old capture belonging to a save you no
-/// longer play, short of finding the folder by hand.
+/// The capture management screen: name a playthrough, see what each costs on
+/// disk, delete ones finished with. Deleting is offered here because the
+/// in-game reset only removes the playthrough currently loaded.
 fn manage_captures(capture_dir: &Path) -> io::Result<()> {
     loop {
         let mut sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
@@ -1541,12 +1375,10 @@ No captures found in {}.",
             let session = sessions.remove(index);
             let described = describe_session(&session, now);
 
-            // Spelling out what is lost, not just which folder goes. "Delete
-            // this capture" sounds like discarding a rendered video you could
-            // rebuild; it is actually the only copy of that playthrough's
-            // history, since a Factorio save stores no construction record to
-            // reconstruct it from. The freeze is worth naming too: it is the
-            // part people are surprised by when they start over.
+            // Spelling out what is lost. "Delete this capture" sounds like
+            // discarding a rendered video; it is the only copy of that
+            // playthrough's history, a save storing no construction record.
+            // The freeze is worth naming too.
             println!("\nThis permanently deletes {}", session.session_dir.display());
             println!(
                 "That is the entire capture: the baseline snapshot and every construction event \
@@ -1581,16 +1413,9 @@ No captures found in {}.",
     }
 }
 
-/// Copies the plain-JSON sidecar logs a live capture writes alongside its
-/// frames into the rendered output, so the viewer finds them next to the
-/// frames it is pointed at.
-///
-/// A straight copy, not a re-parse: the mod's raw logs and what the viewer
-/// reads are the exact same shape by design (see `player_log.rs` and
-/// `milestone.rs`), so there is nothing to convert. Each one being absent is
-/// normal rather than an error: nobody was connected during the capture, or
-/// nothing milestone-worthy happened yet, or the capture predates the file
-/// existing at all.
+/// Copies the plain-JSON sidecar logs a live capture writes into the rendered
+/// output. A straight copy rather than a re-parse, the mod's logs and what the
+/// viewer reads being the same shape by design. Each being absent is normal.
 fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
     let mut copied = Vec::new();
     for name in ["players.jsonl", "milestones.jsonl", "prototypes.json"] {
@@ -1603,11 +1428,9 @@ fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'sta
     Ok(copied)
 }
 
-/// A double-clicked console window closes the instant the process exits,
-/// which for an error message is worse than useless: the user sees a flash
-/// and nothing else. Waiting for Enter is what actually gives a double-click
-/// user, who never typed a command to begin with, a chance to read what went
-/// wrong.
+/// A double-clicked console closes the instant the process exits, so an error
+/// message is a flash and nothing else. Waiting for Enter gives somebody who
+/// never typed a command a chance to read it.
 fn wait_for_enter() {
     print!("\nPress Enter to close this window...");
     io::stdout().flush().ok();
@@ -1616,13 +1439,9 @@ fn wait_for_enter() {
 }
 
 fn main() {
-    // A panic (an unexpected bug, not one of the friendly errors `run`
-    // returns) would otherwise skip the pause below entirely: Rust prints
-    // the panic message and unwinds straight past the `Err` handling
-    // further down, and Windows closes the console the moment the process
-    // exits either way. Installing a hook is what catches that case too, so
-    // a bug here fails the same way a handled error does instead of just
-    // flashing shut.
+    // A panic would otherwise skip the pause below: Rust unwinds straight past
+    // the `Err` handling and Windows closes the console either way. The hook
+    // makes a bug fail the same way a handled error does.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("\nsave-timelapse hit an unexpected error: {info}");
         wait_for_enter();
@@ -1867,10 +1686,8 @@ mod tests {
         assert_eq!(describe_size(3 * (1 << 30) / 2), "1.5 GiB");
     }
 
-    /// A recording with no name has to stay identifiable, or the picker lists
-    /// rows nobody can tell apart. It used to be identified by its session id,
-    /// which is unique and completely uninformative; where the playthrough
-    /// happened is what somebody actually recognises.
+    /// A recording with no name has to stay identifiable. It used to be its
+    /// session id, which is unique and completely uninformative.
     #[test]
     fn an_unnamed_recording_is_described_by_where_it_happened() {
         let dir = tempfile::tempdir().unwrap();

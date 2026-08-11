@@ -1,9 +1,6 @@
-//! Thin macroquad glue: argument parsing, the window loop, input polling,
-//! and drawing. Everything else (camera math, color hashing, the type
-//! registry, frame grouping, the draw-call model, synthetic data, the frame
-//! sequence, sprite path resolution) lives in `lib.rs`, where it's unit
-//! tested, since none of it can be once it touches macroquad's window/input
-//! globals or does real texture loading.
+//! Thin macroquad glue: argument parsing, the window loop, input and
+//! drawing. Everything unit testable lives in `lib.rs`, since none of it can
+//! be once it touches macroquad's globals.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -25,48 +22,32 @@ use viewer::{
 
 const ZOOM_STEP: f32 = 1.1;
 const PLAY_INTERVAL_SECS: f32 = 0.25; // ~4 frames/sec auto-play
-/// Floor on how tight auto-follow can zoom in. Low rather than generous: the
-/// point is only to stop a single 1x1 entity (the very first thing ever
-/// placed, before a second one exists to give the box real size) from
-/// filling the screen. By the time a real starter cluster exists (drill,
-/// furnace, a belt or two), its own natural extent is already bigger than
-/// this and the floor stops mattering. A high floor here was fighting the
-/// exact thing auto-follow is for: hugging the base as it actually is,
-/// starting from how small it actually starts.
+/// Floor on how tight auto-follow can zoom. Low on purpose: it only stops the
+/// very first 1x1 entity from filling the screen, and a real starter cluster
+/// is already bigger than this.
 const AUTO_FOLLOW_MIN_FOCUS_TILES: f32 = 6.0;
-/// How much smaller than a bare edge-to-edge fit auto-follow zooms: tight,
-/// unlike `fit_frames`'s own, more generous margin. The point of following
-/// is to hug the actual buildings closely, with the edge of the frame only
-/// slightly beyond the furthest one placed.
+/// How much smaller than edge to edge auto-follow zooms. Tighter than
+/// `fit_frames`'s own margin, following being about hugging the buildings.
 const AUTO_FOLLOW_FIT_MARGIN: f32 = 0.92;
-/// How long, in real seconds, a camera move to the base's newly-grown extent
-/// takes, matching TLBE (the most-downloaded Factorio timelapse mod)'s own
-/// camera transition model: a fixed-duration linear glide from wherever the
-/// camera currently is, started fresh whenever the tracked area grows,
-/// rather than an exponential approach. See `Camera::CameraTransition`.
+/// How long a camera move to the newly-grown extent takes, in real seconds.
+/// A fixed-duration linear glide rather than an exponential approach,
+/// matching TLBE. See `Camera::CameraTransition`.
 const AUTO_FOLLOW_TRANSITION_SECS: f32 = 1.5;
 /// Below this, a sprite is imperceptible and not worth a texture draw over a
 /// flat rect: the zoom-based sprites/shapes split agreed back in the
 /// milestone-1 discussion.
 const SPRITE_MIN_PIXELS: f32 = 12.0;
 
-/// macroquad starts a new GPU draw call whenever its batch buffer fills, so
-/// the default capacity (10,000 vertices / 5,000 indices) caps a draw call at
-/// 833 quads, meaning even perfectly texture-sorted output costs a draw call
-/// per 833 entities. Raising it lifts that ceiling to 4,096 quads.
-///
-/// Not raised further because indices are `u16` and get offset by the running
-/// vertex count (`quad_gl.rs::geometry`), so vertex capacity cannot exceed
-/// 65,536 without corrupting geometry, and because macroquad allocates one
-/// GPU buffer of this size per draw call it has ever used.
+/// macroquad starts a new draw call when its batch fills, so the default caps
+/// one at 833 quads. Not higher than 4,096: indices are `u16` offset by the
+/// running vertex count, so capacity past 65,536 corrupts geometry, and one
+/// buffer of this size is allocated per draw call ever used.
 const BATCH_QUAD_CAPACITY: usize = 4096;
 const BATCH_VERTEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 4;
 const BATCH_INDEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 6;
 
-/// Oversampling factor an export uses unless told otherwise. See
-/// `ExportRequest::supersample` for what it buys; 2 costs four times the
-/// pixels and is the point where the averaging is clearly visible while an
-/// export still finishes in about the time it used to.
+/// Oversampling an export uses unless told otherwise. 2 costs four times the
+/// pixels and is where the averaging is clearly visible.
 const DEFAULT_SUPERSAMPLE: u32 = 2;
 
 /// Longest render target edge to ask a GPU for. Past roughly this, drivers
@@ -98,10 +79,8 @@ fn window_conf() -> macroquad::conf::Conf {
     }
 }
 
-/// Everything the draw loop tracks per world/surface: playback position,
-/// camera, and auto-follow state. A named struct rather than a growing
-/// tuple, since the fields are no longer few enough to keep straight
-/// positionally once auto-follow joined them.
+/// Everything the draw loop tracks per world: playback position, camera and
+/// auto-follow state.
 struct WorldView {
     name: String,
     sequence: FrameSequence,
@@ -109,11 +88,8 @@ struct WorldView {
     /// The whole base's bounding box as of each frame, monotonically
     /// growing, precomputed once at load. See `viewer::growing_bounds_per_frame`.
     growing_bounds: Vec<Option<GrowingBounds>>,
-    /// How much got built in each frame, already normalized to 0..1 for
-    /// drawing. Precomputed at load alongside `growing_bounds`, which walks
-    /// the same entities: recovering this needs a diff between consecutive
-    /// frames (see `viewer::activity_per_frame`), far too much to redo every
-    /// time the bar is drawn.
+    /// How much got built in each frame, normalized to 0..1. Precomputed at
+    /// load, since recovering it needs a diff between consecutive frames.
     activity: Vec<f32>,
     /// Where construction happened in each frame, binned into cells for the
     /// heatmap overlay. Same pass as `activity` above.
@@ -138,10 +114,8 @@ struct WorldView {
     /// meant an index would silently come back pointing somewhere else.
     bookmarks: Vec<u64>,
     follow: FollowState,
-    /// This surface's natural-terrain layer, loaded once (not per frame:
-    /// terrain never changes after the baseline, see
-    /// `save_timelapse::world::World::terrain_frame`). `None` when terrain
-    /// capture was off, or this capture predates it.
+    /// This surface's terrain layer, loaded once: terrain never changes after
+    /// the baseline. `None` when terrain capture was off.
     terrain: Option<RenderFrame>,
 }
 
@@ -152,16 +126,9 @@ struct FollowState {
     /// headed towards, so a new one only starts once the tracked area
     /// actually grows, not on every rendered frame.
     target_bounds: Option<GrowingBounds>,
-    /// The in-flight move to `target_bounds`, if any. Deliberately left
-    /// running to completion rather than restarted on every frame the
-    /// tracked area happens to grow a little further: during active
-    /// building, the area can grow on nearly every displayed frame, and
-    /// restarting a multi-second glide that often meant it was constantly
-    /// interrupted a fraction of the way in, always chasing a target several
-    /// steps stale, never actually centered or zoomed to the true current
-    /// extent. Waiting for one glide to finish before checking again means
-    /// it always catches up fully, straight to wherever the base currently
-    /// is, before starting the next one.
+    /// The in-flight move to `target_bounds`, left to finish rather than
+    /// restarted whenever the tracked area grows: during active building it
+    /// grows almost every frame, so retargeting chases a stale target.
     transition: Option<CameraTransition>,
 }
 
@@ -184,11 +151,8 @@ struct ViewerState {
 }
 
 /// Render every frame to an image file instead of opening for browsing.
-///
-/// Resolution is deliberately independent of the window: the export draws
-/// into an offscreen target, so a 1080p sequence comes out of a 1280x800
-/// window unchanged. Tying output size to whatever the window happened to be
-/// would make the result depend on how somebody had dragged a corner.
+/// Resolution is independent of the window, so output does not depend on how
+/// somebody dragged a corner.
 struct ExportRequest {
     dir: PathBuf,
     width: u32,
@@ -202,20 +166,10 @@ struct ExportRequest {
     /// `group_by_surface` already orders first. `Some("all")` renders every
     /// surface into its own subfolder.
     surface: Option<String>,
-    /// Render this many times oversized on each axis, then average back down
-    /// to `width` x `height`.
-    ///
-    /// A megabase does not fit its own detail into a video frame: at 1080p a
-    /// 2,900 tile base puts three tiles behind every pixel, so whichever
-    /// entity a pixel happens to land on wins it outright and everything
-    /// else in those three tiles is simply gone. Rendering large and
-    /// averaging down replaces that coin toss with a real area average, so a
-    /// belt crossing an otherwise empty pixel tints it instead of either
-    /// taking it whole or vanishing.
-    ///
-    /// It is also what makes full detail worth asking for at all in an
-    /// export (see `export_frames`), since at one sample per pixel the
-    /// individual entities LOD would have merged are exactly what aliases.
+    /// Render this many times oversized on each axis, then average down. At
+    /// 1080p a 2,900 tile base puts three tiles behind every pixel, so whichever
+    /// entity a pixel lands on wins it outright. This is also what makes full
+    /// detail worth asking for in an export.
     supersample: u32,
 }
 
@@ -296,11 +250,9 @@ fn parse_args() -> Args {
             surface,
             fps: fps.clamp(1, 240),
             video,
-            // Capped by the render target it implies, not just on its own:
-            // GPUs stop honouring texture sizes somewhere past 8192 on a
-            // side, and a silently-refused target is a black export rather
-            // than an error. Asking for 4x at 4K therefore quietly gets 2x
-            // rather than nothing.
+            // Capped by the render target it implies: GPUs stop honouring
+            // texture sizes past 8192 a side, and a refused target is a black
+            // export rather than an error.
             supersample: supersample.clamp(1, 4).min(MAX_RENDER_EDGE / width).min(MAX_RENDER_EDGE / height).max(1),
         }
     });
@@ -342,14 +294,9 @@ async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: boo
 
 /// Load frames, interning names as we go, showing progress throughout.
 ///
-/// `--synthetic-tiles` is a knob independent of `--synthetic`/a frame path:
-/// it layers a synthetic floor on top of whichever entities were requested,
-/// since the real risk case (a fully-paved megabase) is tile-heavy in a way
-/// the entity-only stress test doesn't cover. Both stay single-frame:
-/// playback is for real exported sequences, not synthetic stress tests.
-/// One timeline per surface, named, so the caller can switch between them
-/// (tab, in the running viewer) instead of only ever seeing whichever one
-/// happened to be busiest.
+/// `--synthetic-tiles` is independent of `--synthetic`, layering a synthetic
+/// floor over whichever entities were requested: the tile-heavy case the entity
+/// stress test does not cover.
 async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, FrameSequence, Option<RenderFrame>)> {
     let mut last = Instant::now();
     let mut progress = LoadProgress { phase: "reading frames", detail: String::new(), done: 0, total: 0 };
@@ -397,28 +344,21 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
         let terrain_file_paths = viewer::terrain_paths(terrain_dir).unwrap_or_default();
 
-        // Terrain starts loading here, before the frames, since it is a
-        // separate set of files with nothing shared until both are done.
-        // Two independent waits back to back would cost their sum; started
-        // together, the wait is bounded by whichever is slower. It stays on
-        // the load-everything-at-once path deliberately: there is at most one
-        // terrain file per surface, so it is bounded by surface count rather
-        // than by capture length.
+        // Terrain starts loading before the frames: two waits back to back
+        // cost their sum, started together they cost the slower.
         progress.total = paths.len() + terrain_file_paths.len();
         progress.detail = format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
 
-        // Grouped from headers rather than from parsed frames, which is what
-        // makes the streaming below possible: knowing each file's surface and
-        // tick is enough to fix the order, and that costs a bounded read per
-        // file instead of holding the whole capture in memory to sort it.
+        // Grouped from headers rather than parsed frames, which is what makes
+        // the streaming below possible: surface and tick fix the order, at a
+        // bounded read per file.
         progress.phase = "reading frame headers";
         redraw_progress(&progress, &mut last, true).await;
         let grouped = viewer::group_paths_by_surface(paths);
-        // Every moment the export covers. An export omits a surface's file at
-        // a moment nothing on that surface changed, so no single surface's
-        // files describe the whole timeline and the union has to stand in for
-        // it. See `viewer::timeline_ticks`.
+        // Every moment the export covers. A surface's file is omitted at a
+        // moment nothing on it changed, so no single surface describes the
+        // whole timeline. See `viewer::timeline_ticks`.
         let timeline = viewer::timeline_ticks(&grouped);
 
         progress.phase = "loading frames";
@@ -436,14 +376,10 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                     if let Some(n) = args.synthetic_tile_count {
                         frame.tiles = synthetic_tiles(n);
                     }
-                    // Put back the moments this surface sat unchanged, so
-                    // every surface still has one frame per moment and the
-                    // index-addressed timeline means the same thing whichever
-                    // one is being shown.
-                    //
-                    // Keyed on the parsed frame's own tick rather than the
-                    // path's, because `load_batch` drops a file it cannot
-                    // parse and the two would then be misaligned.
+                    // Put back the moments this surface sat unchanged, so the
+                    // index-addressed timeline means the same thing on every
+                    // surface. Keyed on the parsed tick, `load_batch` dropping
+                    // a file it cannot parse.
                     if let Some(offset) = timeline[filled..].iter().position(|&t| t == frame.tick) {
                         builder.push_repeats(&timeline[filled..filled + offset]);
                         filled += offset + 1;
@@ -488,11 +424,9 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
     result
 }
 
-/// A loaded icon plus the region of it that's the actual icon. Vanilla and
-/// Space Age icon files are a mipmap strip (the full-size icon followed by
-/// progressively smaller copies), not a single image, so drawing the whole
-/// texture stretched into an entity's box renders every copy squashed
-/// together. `icon_rect` crops to just the first (primary) one.
+/// A loaded icon plus the region of it that is the actual icon. Icon files are
+/// a mipmap strip, so drawing the whole texture renders every copy squashed
+/// together; `icon_rect` crops to the first.
 struct Sprite {
     /// Usually one. A splitter has four, one per facing, because that is how
     /// Factorio ships them: `splitter-north.png` and its three siblings rather
@@ -532,15 +466,9 @@ enum SheetKind {
     PipeToGround,
 }
 
-/// Where in `sprite` to read the picture for one entity, and how far to rotate
-/// what comes out.
-///
-/// A belt drawn from the in-world sheet is never rotated: every facing and
-/// every corner is a separate frame that Factorio drew the right way up, so
-/// rotating one would undo that. Everything else keeps the old behaviour, an
-/// inventory icon turned to face the way the entity does.
-/// How to draw one entity from its sprite: which part of the texture, how far
-/// to turn it, whether to mirror it, and how much of a tile it covers.
+/// Where in `sprite` to read one entity's picture, and how far to rotate it. A
+/// belt from the in-world sheet is never rotated, every facing and corner being
+/// a separate frame Factorio drew the right way up.
 struct EntityArt {
     /// Index into `Sprite::textures`. Always 0 except for a splitter, whose
     /// facings are four separate files.
@@ -549,23 +477,13 @@ struct EntityArt {
     rotation: f32,
     flip_x: bool,
     flip_y: bool,
-    /// How many tiles the chosen frame covers, when that is not simply the
-    /// entity's footprint.
-    ///
-    /// Factorio's frames are deliberately bigger than the thing inside them,
-    /// to leave room for overhang and shadow: a belt's artwork fills 68 pixels
-    /// of a 128 pixel frame, and a splitter's spills past its own 2x1
-    /// footprint on purpose. Fitting the frame to the footprint therefore
-    /// draws everything at roughly half size, which on belts shows up as gaps
-    /// between segments. `None` keeps the old behaviour for inventory icons,
-    /// which really are footprint sized.
+    /// How many tiles the chosen frame covers, when that is not the entity's
+    /// footprint: Factorio's frames are bigger than the thing inside them, so
+    /// fitting frame to footprint draws everything at roughly half size.
     tiles: Option<Vec2>,
     /// Where the frame sits relative to the entity's centre, in tiles.
-    ///
     /// Factorio's sprites carry a `shift`, and a splitter's is about a fifth
-    /// of a tile sideways. Ignoring it draws every splitter that far off
-    /// centre, which is small enough to read as a rendering fault rather than
-    /// as a field nobody applied.
+    /// of a tile sideways.
     offset: Vec2,
 }
 
@@ -622,18 +540,13 @@ fn entity_source(sprite: &Sprite, entity: &RenderEntity, rotation_allowed: bool)
             return EntityArt { offset: sprite.splitter_offsets[facing], ..EntityArt::sized(facing, source) };
         }
         Some(SheetKind::Splitter) => {}
-        // Columns run north, east, south, west, which is Factorio's own order
-        // for a four-facing sheet, so the raw 16-way byte divides straight
-        // down to a column.
+        // Columns run north, east, south, west, so the 16-way byte divides
+        // straight down to a column.
         //
-        // The exit is drawn as the entrance mirrored along the direction items
-        // travel. Factorio's own two structures are very nearly the same
-        // picture (measured: they differ only across a 67x69 patch of a 192px
-        // cell, the striping on the top face), so taking them at face value
-        // leaves a crossing looking like the same object twice. Mirroring is
-        // also what the pair really does: the entrance's mouth opens backwards
-        // towards the belt feeding it, and the exit's opens forwards towards
-        // the belt it feeds.
+        // The exit is the entrance mirrored along the direction items travel:
+        // the two structures differ only across a 67x69 patch of a 192px cell,
+        // so taking them at face value leaves a crossing looking like the same
+        // object twice.
         Some(SheetKind::UndergroundStructure) if entity.d.is_multiple_of(4) => {
             let end = UndergroundEnd::from_byte(entity.shape);
             let mirrored = end == UndergroundEnd::Exit;
@@ -648,28 +561,20 @@ fn entity_source(sprite: &Sprite, entity: &RenderEntity, rotation_allowed: bool)
     EntityArt::plain(sprite.icon_rect, rotation)
 }
 
-/// One splitter facing, assembled into a single picture.
-///
-/// Facing east or west, Factorio draws a splitter in two pieces that overlap
-/// only in the sense of sitting next to each other, and drawing just one of
-/// them shows half a splitter. They are joined here, once at load, rather than
-/// as a second quad per entity at draw time: the whole renderer is built
-/// around one quad per entity in a per-type batch, and a second texture would
-/// break the batch for every splitter in the factory.
-///
-/// The composite's own offset comes back too, since joining two differently
-/// shifted pieces moves the middle.
+/// One splitter facing, assembled into a single picture. Facing east or west
+/// Factorio draws a splitter in two pieces, joined once at load rather than as
+/// a second quad per entity, which would break the per-type batch. The
+/// composite's offset comes back too, joining two shifted pieces moving the
+/// middle.
 struct SplitterFacing {
     texture: Texture2D,
     /// Offset from the entity's centre, in tiles.
     offset: Vec2,
 }
 
-/// Combines a splitter's structure with its top patch, if it has one.
-///
-/// Both are frame zero of their own animation grid. Everything is worked out
-/// in sheet pixels and converted to tiles at the end, because that is the
-/// space Factorio's shifts are quoted in.
+/// Combines a splitter's structure with its top patch, if it has one. Worked
+/// out in sheet pixels and converted to tiles at the end, that being the space
+/// Factorio's shifts are quoted in.
 fn assemble_splitter(structure: &Image, patch: Option<&Image>, facing: usize) -> SplitterFacing {
     let frame = |image: &Image| {
         let rect = splitter_source_rect(image.width() as f32, image.height() as f32);
@@ -722,12 +627,9 @@ fn blit(canvas: &mut Image, source: &Image, at: Vec2) {
     }
 }
 
-/// Sprites indexed by `TypeId`, so drawing never hashes a name.
-///
-/// Best-effort: a Factorio install found (given or auto-detected) doesn't
-/// mean every icon resolves, since this only covers vanilla/Space-Age
-/// naming, not arbitrary mods. Missing icons just mean that type keeps
-/// using its colored shape, never an error.
+/// Sprites indexed by `TypeId`, so drawing never hashes a name. Best-effort:
+/// this only covers vanilla and Space Age naming, and a missing icon just
+/// means that type keeps its coloured shape.
 async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistry) -> Vec<Option<Sprite>> {
     let mut sprites: Vec<Option<Sprite>> = (0..registry.len()).map(|_| None).collect();
     let Some(data_dir) = data_dir else {
@@ -743,13 +645,8 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
         progress.detail = name.clone();
         redraw_progress(&progress, &mut last, false).await;
 
-        // Belts come from Factorio's own in-world sheet, which is the only
-        // place corner artwork exists at all: an inventory icon is a straight
-        // belt, so a corner drawn from one is a straight belt at an angle no
-        // matter how it is turned. Anything else, and any belt whose sheet is
-        // missing, falls back to the icon exactly as before.
-        // Splitters are assembled rather than loaded: each facing is one or
-        // two files that have to be joined before they are a whole splitter.
+        // Belts come from the in-world sheet, the only place corner artwork
+        // exists. Splitters are assembled, each facing being one or two files.
         if registry.is_splitter(type_id) {
             if let Some(paths) = splitter_structure_paths(data_dir, name) {
                 let mut facings = Vec::with_capacity(4);
@@ -821,10 +718,8 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
         let sheet = found.as_ref().map(|(_, kind)| *kind);
         let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(data_dir, name).map(|p| vec![p]));
 
-        // All or nothing: a splitter missing one of its four facings would
-        // otherwise index past the end of the list at draw time. Falling back
-        // to the icon for the whole type is the same thing that happens when
-        // no artwork is found at all.
+        // All or nothing: a splitter missing one facing would index past the
+        // end at draw time, so the whole type falls back to its icon.
         if let Some(paths) = paths {
             let mut textures = Vec::with_capacity(paths.len());
             for path in &paths {
@@ -894,22 +789,11 @@ fn draw_lod_cell(screen: Vec2, size: f32, color: Color) {
 }
 
 /// World-space view rectangle, so culling is a pair of comparisons per item
-/// instead of a full world-to-screen transform per item followed by a screen
-/// bounds test. Only survivors pay for the transform.
+/// rather than a transform and a screen bounds test.
 ///
-/// The surface size comes from `screen_center`, doubled, rather than from
-/// `screen_width()`/`screen_height()`. Those are the *window's* dimensions,
-/// which is the same thing only while drawing to the window: an export
-/// renders into an offscreen target of whatever size was asked for, and
-/// culling to the window instead threw away everything outside a
-/// window-sized corner of it. At the default 1280x800 window that silently
-/// cropped every 1080p export to its top-left two thirds, which no amount of
-/// fixing the camera's framing could have shown up, since the framing was
-/// never what was wrong.
-///
-/// Every caller already builds `screen_center` as exactly half the surface
-/// it is drawing to, so this is the same number by a route that cannot go
-/// stale, and it takes the last window global out of the draw path.
+/// Sized from `screen_center` doubled rather than `screen_width()`, which is
+/// the window: an export renders offscreen, and culling to the window cropped
+/// every 1080p export to a window-sized corner.
 fn view_bounds(camera: &Camera, screen_center: Vec2) -> (Vec2, Vec2) {
     let min = camera.screen_to_world(Vec2::ZERO, screen_center);
     let max = camera.screen_to_world(screen_center * 2.0, screen_center);
@@ -1001,16 +885,9 @@ fn handle_input(
 ) {
     let mouse: Vec2 = mouse_position().into();
 
-    // Which a drag does depends on where it started: grabbing the
-    // scrub bar seeks, a control takes the click for itself, and
-    // anywhere else pans the camera, same as a video player's
-    // scrubber taking priority over the content behind it.
-    //
-    // `on_chrome` is latched on press alongside `dragging_timeline`
-    // rather than tested every frame, so a drag that begins on a
-    // button and wanders off it does not turn into a pan halfway
-    // through. Releasing clears it, since the next press decides
-    // again.
+    // What a drag does depends on where it started: the scrub bar seeks, a
+    // control takes the click, anything else pans. `on_chrome` is latched on
+    // press so a drag beginning on a button does not become a pan halfway.
     if is_mouse_button_pressed(MouseButton::Left) {
         state.dragging_timeline = timeline.contains(mouse);
         state.on_chrome = !state.dragging_timeline && chrome.blocks_world(mouse);
@@ -1048,13 +925,9 @@ fn handle_input(
         state.playing = false;
         follow.enabled = false;
     }
-    // Jumping between marked moments. Both pairs stop playback and drop
-    // auto-follow for the same reason stepping does: a deliberate move to a
-    // specific point should stay there rather than be dragged onward.
-    //
-    // A jump with nowhere to go is silently nothing, not a wrap to the other
-    // end: wrapping from the last milestone back to the first would look like
-    // the key had jumped somewhere at random.
+    // Both pairs stop playback and drop auto-follow, a deliberate move being
+    // one that should stay put. A jump with nowhere to go does nothing rather
+    // than wrapping, which would look like the key jumped at random.
     let jump = |targets: &[usize], sequence: &mut FrameSequence, forward: bool| -> bool {
         let found =
             if forward { viewer::next_mark(targets, sequence.index()) } else { viewer::previous_mark(targets, sequence.index()) };
@@ -1067,15 +940,9 @@ fn handle_input(
         }
     };
 
-    // Letters, with shift for the reverse direction, rather than brackets or
-    // PageUp/PageDown. Bracket keys sit somewhere different on every non-US
-    // layout, and plenty of compact keyboards have no page keys at all, so
-    // both would have been a shortcut that silently does not exist for some
-    // people. A letter is in the same place everywhere, and shift is the one
-    // modifier every keyboard has.
-    //
-    // `m` for mark and `c` for construction, so the mnemonic survives not
-    // having read the key list recently.
+    // Letters with shift for reverse rather than brackets or PageUp/Down:
+    // bracket keys move between layouts and compact keyboards have no page
+    // keys. `m` for mark, `c` for construction.
     let back = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
     let mut jumped = false;
     if is_key_pressed(KeyCode::M) {
@@ -1103,22 +970,16 @@ fn handle_input(
         state.playing = !state.playing;
         state.play_accum = 0.0;
     }
-    // Toggling on clears both `target_bounds` and `transition`, so the
-    // very next iteration always starts a brand new glide from wherever
-    // the camera currently is (possibly just moved by the manual
-    // controls that disengaged follow in the first place) rather than
-    // either resuming a stale in-flight transition or, if the current
-    // frame's bounds happen to match whatever was last targeted before,
-    // seeing "no change" and doing nothing at all.
+    // Toggling on clears both, so the next iteration starts a fresh glide
+    // from wherever the camera is rather than resuming a stale transition or
+    // seeing "no change" and doing nothing.
     if is_key_pressed(KeyCode::F) {
         follow.enabled = !follow.enabled;
         follow.target_bounds = None;
         follow.transition = None;
     }
-    // Doubling/halving rather than a linear step: matches how video
-    // players commonly expose speed, and keeps the displayed value a
-    // clean power of two (0.25x, 0.5x, 1x, 2x, 4x, 8x) instead of an
-    // arbitrary decimal.
+    // Doubling rather than a linear step, keeping the displayed value a clean
+    // power of two.
     if is_key_pressed(KeyCode::Equal) {
         state.play_speed = (state.play_speed * 2.0).min(8.0);
     }
@@ -1129,11 +990,9 @@ fn handle_input(
         state.heatmap_enabled = !state.heatmap_enabled;
     }
 
-    // Both of these are renderer A/B tests, not features: turning sprites off
-    // swaps every icon for a flat rect, and turning LOD off forces full detail
-    // at any zoom. Either one makes the factory look broken to somebody who
-    // pressed the key by accident and has no idea why, so they only answer
-    // while the diagnostics they exist to serve are actually on screen.
+    // Renderer A/B tests, not features: either one makes the factory look
+    // broken to somebody who pressed the key by accident, so they only answer
+    // while the diagnostics they serve are on screen.
     if debug {
         // Same geometry, one flat-rect batch instead of one batch per type,
         // which is what texture binding costs.
@@ -1154,12 +1013,9 @@ fn advance_playback(sequence: &mut FrameSequence, state: &mut ViewerState) {
     if !state.playing {
         return;
     }
-    // A `while`, not `if`: at high speed multipliers more than one
-    // interval's worth can accumulate between two frames (e.g. at
-    // 8x and a 60fps display, ~8 frames advance in the time one
-    // used to), and stepping only once per tick would cap the
-    // visible playback rate at the display's refresh rate instead
-    // of the requested speed.
+    // A `while`, not `if`: at 8x more than one interval accumulates between
+    // two displayed frames, and stepping once per tick would cap playback at
+    // the refresh rate.
     state.play_accum += get_frame_time() * state.play_speed;
     while state.play_accum >= PLAY_INTERVAL_SECS {
         state.play_accum -= PLAY_INTERVAL_SECS;
@@ -1187,17 +1043,9 @@ fn update_auto_follow(
     if !follow.enabled {
         return;
     }
-    // A new transition only starts once any previous one has finished
-    // (`follow.transition.is_none()`) *and* the currently displayed
-    // frame's bounds differ from wherever that last glide was headed.
-    // Checking "is a transition already running" first, not just "did
-    // the target change", matters because during active building the
-    // tracked area can grow on nearly every displayed frame. Without
-    // this, a multi-frame-per-second retarget rate would restart the
-    // glide before it ever got there, permanently chasing a target
-    // several steps stale rather than ever actually landing on the
-    // true current extent. Waiting it out means every glide always
-    // finishes fully caught up before the next one begins.
+    // A new transition starts only once the previous finished and the bounds
+    // differ from where it was headed: during active building the area grows
+    // almost every frame, so eager retargeting never lands.
     if follow.transition.is_none() {
         if let Some(bounds) = growing_bounds[sequence_index] {
             if follow.target_bounds != Some(bounds) {
@@ -1222,19 +1070,13 @@ fn update_auto_follow(
     }
 }
 
-/// Draws the current frame: terrain backdrop (if loaded), then its own
-/// tiles, then entities, in either full detail or chunk-LOD depending on
-/// zoom.
+/// Draws the current frame: terrain backdrop, this frame's tiles, then
+/// entities, in full detail or chunk LOD depending on zoom.
 /// Renders every frame of `world` to a numbered PNG in `request.dir`.
 ///
-/// Draws into an offscreen target rather than the window, so the output size
-/// is whatever was asked for rather than whatever the window happens to be.
-/// Everything else is the ordinary draw path: same `draw_world`, same
-/// auto-follow, so an exported sequence looks like what browsing it looks
-/// like rather than like a second renderer that has to be kept in step.
-///
-/// Files are `frame_00000.png` upward, zero padded so any tool that takes a
-/// numbered sequence reads them in order without being told a pattern.
+/// Draws into an offscreen target, so output size is what was asked for, and
+/// otherwise the ordinary draw path, so an export looks like browsing rather
+/// than like a second renderer.
 async fn export_frames(
     world: &mut WorldView,
     registry: &TypeRegistry,
@@ -1253,10 +1095,8 @@ async fn export_frames(
         false => std::fs::create_dir_all(&request.dir)?,
     }
 
-    // Everything below draws at the oversampled size and only the final
-    // readback comes back down, so the camera, the culling and the draw code
-    // all see one consistent surface and none of them needs to know this is
-    // happening at all.
+    // Everything below draws at the oversampled size and only the readback
+    // comes down, so the camera, culling and draw code see one surface.
     let ss = request.supersample;
     let (rw, rh) = (request.width * ss, request.height * ss);
     let (w, h) = (rw as f32, rh as f32);
@@ -1267,23 +1107,14 @@ async fn export_frames(
     let target = render_target(rw, rh);
     target.texture.set_filter(FilterMode::Nearest);
 
-    // Maps the target's pixel space one to one onto the draw code's
-    // screen-space coordinates, so `draw_world` needs no notion of being
-    // rendered offscreen.
+    // Maps the target's pixel space one to one onto screen coordinates, so
+    // `draw_world` needs no notion of being offscreen. The negative y is the
+    // piece to distrust if output comes out upside down, macroquad flipping y
+    // for render targets.
     //
-    // The negative y in `zoom` is the piece to distrust if the output comes
-    // out upside down: macroquad flips y for render targets (see its
-    // `Camera2D::matrix`), and which way that lands is the one thing here
-    // that cannot be reasoned out without looking at a rendered file.
-    //
-    // `viewport` is not optional here despite being an `Option`. Left unset,
-    // macroquad falls back to the *window's* dimensions for the GL viewport
-    // (`Camera2D::viewport` defaults to `None`), not the render target's, so
-    // an export larger than the window rasterized the whole picture into a
-    // window-sized corner of the target and left the rest untouched black.
-    // At the default 1280x800 window that put a 1920x1080 export into the
-    // top-left two thirds, squashed to the wrong aspect, with the camera
-    // fitting for 16:9 while the pixels landed in 8:5.
+    // `viewport` is not optional despite the type: left unset, macroquad falls
+    // back to the window's dimensions and rasterizes a larger export into a
+    // window-sized corner.
     let camera = Camera2D {
         render_target: Some(target.clone()),
         zoom: vec2(2.0 / w, -2.0 / h),
@@ -1303,18 +1134,9 @@ async fn export_frames(
     for index in 0..total {
         world.sequence.goto(index);
 
-        // Fitted directly per frame rather than through `update_auto_follow`.
-        // That glides over wall-clock seconds, which is right when somebody
-        // is watching and wrong here: an export advances a frame per
-        // iteration as fast as the disk allows, so the camera would crawl
-        // through its 1.5 second transition while hundreds of frames went by,
-        // and the whole sequence would render framed on wherever it started.
-        //
-        // Nothing is lost by snapping. The glide exists to smooth a camera
-        // that jumps when somebody scrubs; across an exported sequence the
-        // bounds grow monotonically and gradually, so a per-frame fit *is*
-        // smooth, and it guarantees the base is framed in every single frame
-        // rather than eventually.
+        // Fitted per frame rather than through `update_auto_follow`, which
+        // glides over wall-clock seconds: an export advances as fast as the
+        // disk allows. Nothing is lost, the bounds growing monotonically.
         if let Some(bounds) = world.growing_bounds[index] {
             world.camera = Camera::fit_bounds(
                 bounds.center,
@@ -1340,19 +1162,10 @@ async fn export_frames(
             registry,
             sprites,
             pixels_per_tile > SPRITE_MIN_PIXELS,
-            // Never aggregated, unlike the interactive view. Chunk LOD exists
-            // to keep a *live* frame rate up by not transforming and
-            // submitting items too small to perceive (see
-            // `LOD_MAX_TILE_PIXELS`), and an export has no frame rate to
-            // protect: it renders one frame at a time, as slowly as it likes.
-            // What it gives up is real, since a cell keeps only its dominant
-            // type and discards the rest, and at these zooms that is a paved
-            // area swallowing the belts and machines running through it.
-            //
-            // Only sound because of supersampling. At one sample per pixel
-            // the individual items this restores are sub-pixel and would
-            // alias into speckle; averaged down from an oversized render they
-            // contribute their real share of each pixel instead.
+            // Never aggregated, unlike the interactive view: an export has no
+            // frame rate to protect, and a LOD cell keeps only its dominant
+            // type, which at these zooms is paving swallowing the belts.
+            // Sound only because of supersampling.
             false,
             None,
             &mut counter,
@@ -1383,10 +1196,8 @@ async fn export_frames(
 
     if let Some(writer) = video {
         let frames = writer.frames();
-        // Writes the index and patches the sizes that could not be known
-        // until the last frame landed. Skipping it leaves a file most players
-        // refuse outright, so a failure here is worth surfacing rather than
-        // leaving a plausible-looking but broken video behind.
+        // Writes the index and patches the sizes unknowable until the last
+        // frame. Skipping it leaves a file most players refuse outright.
         writer.finish()?;
         let size = std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
         println!("\ndone: {frames} frames, {:.1} MB, {}", size as f64 / (1024.0 * 1024.0), video_path.display());
@@ -1396,22 +1207,13 @@ async fn export_frames(
     Ok(total)
 }
 
-/// One frame as JPEG.
-///
-/// macroquad hands back RGBA and JPEG has no alpha, so the alpha byte is
-/// dropped rather than composited: every pixel here came from a `clear_background`
-/// and opaque draws, so there is nothing to composite against.
+/// One frame as JPEG. macroquad hands back RGBA and JPEG has no alpha, so the
+/// alpha byte is dropped rather than composited: every pixel came from a
+/// clear and opaque draws.
 fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
-    // Rows are emitted last to first, which is not a stylistic choice: a
-    // render target reads back bottom-up, the way OpenGL stores it.
-    // `Image::export_png` undoes that itself, so the PNG sequence was always
-    // the right way up and this path, which touches `bytes` directly, was
-    // not. That is what shipped as a video playing upside down.
-    //
-    // Reversing here rather than at readback keeps the PNG path untouched,
-    // and costs one pass over the frame, which is nothing next to encoding
-    // it. See `avi.rs`, whose header now declares these rows top-down: the
-    // two have to agree, or fixing one just moves the flip.
+    // Rows last to first, a render target reading back bottom-up.
+    // `Image::export_png` undoes that itself, so the PNG path never needed it.
+    // See `avi.rs`, whose header declares these rows top-down: the two agree.
     let (width, height) = (image.width as usize, image.height as usize);
     let mut rgb: Vec<u8> = Vec::with_capacity(width * height * 3);
     for y in (0..height).rev() {
@@ -1419,10 +1221,8 @@ fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
         rgb.extend(row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     }
     let mut out = Vec::new();
-    // 85 rather than the usual default: this content is flat colour with hard
-    // edges between entity and background, which is exactly what low-quality
-    // JPEG smears into halos. It is also cheap to be generous here, since the
-    // content compresses well to begin with.
+    // 85 rather than the usual default: flat colour with hard edges is what
+    // low-quality JPEG smears into halos, and this content compresses well.
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut std::io::Cursor::new(&mut out), 85)
         .encode(&rgb, image.width as u32, image.height as u32, image::ColorType::Rgb8)
         .map_err(std::io::Error::other)?;
@@ -1452,20 +1252,11 @@ fn draw_world(
     let pixels_per_tile = camera.pixels_per_tile();
     let (view_min, view_max) = view_bounds(camera, screen_center);
 
-    // Scenery is culled against the ground as well as against the screen, so
-    // trees and cliffs stop exactly where the grass does.
-    //
-    // They cannot be made to agree at capture time. Scenery is recorded into
-    // the frames, from a box measured while playing; ground is scanned later
-    // from one save, from a box measured then, and is additionally cut short
-    // wherever Factorio had not generated chunks yet. Two boxes, two moments,
-    // one of them clipped by something neither side controls. Measured on a
-    // real capture the scenery overhung the ground by 33 tiles on every side,
-    // which reads as a forest floating on empty black.
-    //
-    // Intersecting here is the only thing that makes the edge exact, because
-    // this is the first point where both extents are known. Costs one extra
-    // pair of comparisons on scenery runs and nothing at all on the rest.
+    // Scenery is culled against the ground as well as the screen, so trees
+    // stop where the grass does. They cannot agree at capture time: scenery is
+    // recorded while playing and ground scanned later, from two boxes at two
+    // moments, one cut short by ungenerated chunks. On a real capture scenery
+    // overhung ground by 33 tiles a side.
     let scenery_bounds = terrain.and_then(|t| t.tile_bounds).map(|(tmin, tmax)| {
         (Vec2::new(view_min.x.max(tmin.x), view_min.y.max(tmin.y)), Vec2::new(view_max.x.min(tmax.x), view_max.y.min(tmax.y)))
     });
@@ -1475,18 +1266,9 @@ fn draw_world(
     };
 
     if use_lod {
-        // Below LOD_MAX_TILE_PIXELS a full-detail tile or entity is
-        // already sub-pixel, so nothing is lost by collapsing a whole
-        // LOD_CELL_TILES-square chunk to one quad, and everything is
-        // gained: a chunk grid over the same world area this base
-        // actually spans is thousands of quads, not millions, which is
-        // the difference between paying a per-item CPU cost 3.4 million
-        // times a frame and paying it a few thousand times.
-        //
-        // Precomputed once at load (`RenderFrame::from_frame`), not
-        // here: binning millions of items into chunks is itself too
-        // slow to redo every rendered frame, which is exactly the cost
-        // this path exists to avoid.
+        // Below LOD_MAX_TILE_PIXELS an item is already sub-pixel, so
+        // collapsing a chunk to one quad loses nothing and turns millions of
+        // per-item costs into thousands. Precomputed at load.
         if let Some(terrain) = terrain {
             draw_tile_lod_layer(
                 &terrain.tile_lod,
@@ -1523,14 +1305,9 @@ fn draw_world(
             counter.quads(None, drawn);
         }
     } else {
-        // Terrain backdrop first (if loaded), then this frame's own
-        // placed floor on top of it, then buildings on top of that,
-        // matching how paving over grass looks in-game.
-        //
-        // Iterating runs rather than raw items is what keeps the batch
-        // intact: the sprite and color are decided once per type, so
-        // macroquad sees a long stretch of quads sharing one texture
-        // instead of a texture change per item.
+        // Terrain, then this frame's floor, then buildings, matching how
+        // paving over grass looks in game. Iterating runs keeps the batch
+        // intact, sprite and colour being decided once per type.
         if let Some(terrain) = terrain {
             draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
         }
@@ -1539,20 +1316,13 @@ fn draw_world(
         paint_heat(camera);
 
         // Ore before anything standing on it, for the same reason floor goes
-        // down before buildings: a resource is ground a factory is built over,
-        // not a thing that competes with it for the tile.
+        // down before buildings.
         //
-        // Stated here because nothing else states it. Runs arrive in type
-        // order (`spans::materialize` rebuilds them from type-sorted spans),
-        // and type order is intern order, which is just whichever name a
-        // capture happened to mention first. So a resource interned before a
-        // belt drew underneath it and one interned after drew over it, and
-        // with both now genuinely present on the tile (see `world.rs`'s
-        // `Surface::under`, which stopped a build from evicting the ore) that
-        // arbitrary order became visible as ore flickering over the factory.
-        //
-        // Two filtered passes rather than a sorted copy: the run count is in
-        // the tens, and this draw loop allocates nothing per frame today.
+        // Stated here because nothing else states it: runs arrive in type
+        // order, which is intern order, which is whichever name a capture
+        // mentioned first. With both present on the tile (see `Surface::under`)
+        // that showed as ore flickering over the factory. Two filtered passes
+        // rather than a sorted copy, this loop allocating nothing per frame.
         let ore = frame.entity_runs.iter().filter(|run| registry.is_resource(run.type_id));
         let built = frame.entity_runs.iter().filter(|run| !registry.is_resource(run.type_id));
         for run in ore.chain(built) {
@@ -1590,15 +1360,9 @@ fn draw_world(
     }
 }
 
-/// The renderer diagnostics, behind `F3`.
-///
-/// This is the readout that used to be the viewer's default view, and it is
-/// unchanged apart from no longer being on. It was never for the person
-/// watching their factory grow: `zoom 1.42x`, `12.3 ms` and a draw-call
-/// budget answer "how is the renderer doing", which is a question only its
-/// author asks, and it answered it in three lines of text over the middle of
-/// the picture. The control hints came off the end because the `?` panel says
-/// the same thing better and actually lists every key.
+/// The renderer diagnostics, behind `F3`. This was the default view once, and
+/// is unchanged apart from no longer being on: `zoom 1.42x` and a draw-call
+/// budget answer a question only the author asks.
 #[allow(clippy::too_many_arguments)]
 fn draw_debug_overlay(
     world_name: &str,
@@ -1613,10 +1377,8 @@ fn draw_debug_overlay(
     use_sprites: bool,
     counter: &DrawCallCounter,
 ) {
-    // `{} tiles` stays scoped to this frame's own placed floor (unchanged
-    // meaning: how much is this frame doing), with the terrain backdrop
-    // (loaded once, not per frame) called out separately rather than
-    // folded into the same number.
+    // `{} tiles` stays this frame's own placed floor, with the terrain
+    // backdrop called out separately rather than folded in.
     let terrain_suffix = if terrain_tiles > 0 { format!("  |  +{terrain_tiles} terrain tiles") } else { String::new() };
     let total_items = frame.entities.len() + frame.tiles.len() + terrain_tiles;
     // Each line reports the height it used, so the next one stacks under it
@@ -1643,14 +1405,9 @@ fn draw_debug_overlay(
         WHITE,
     );
 
-    // The profiling readout: draw calls against quads actually submitted,
-    // and how much culling threw away. Counts this viewer's own geometry
-    // only; macroquad's text rendering adds a few calls of its own.
-    //
-    // "of {total} ({culled})" only makes sense against full-detail item
-    // counts, so it's specific to that branch: in LOD mode `quads` is
-    // chunk cells, not items, and comparing it to a millions-large item
-    // count would misleadingly read as "everything culled."
+    // Draw calls against quads submitted, and what culling threw away. "of
+    // {total}" is specific to full detail: in LOD mode `quads` is cells, and
+    // comparing it to an item count would read as "everything culled".
     let detail_text = if use_lod {
         format!(
             "{} chunk cells drawn  |  {} runs  |  LOD on ({total_items} items collapsed)",
@@ -1675,19 +1432,11 @@ fn draw_debug_overlay(
     );
 }
 
-/// Draws text with a dark backing so it stays legible over whatever the world
-/// happens to be behind it.
-///
-/// The HUD and the timeline's labels are painted straight onto the rendered
-/// world, which is dark ground in one place and a bright concrete pad or a
-/// white space platform in the next, so a single text colour cannot be
-/// readable everywhere. Raising the alpha alone does not fix it: the problem
-/// is that light thin glyphs have no edge against a light background.
-///
-/// A one pixel offset shadow in near black gives every glyph that edge, which
-/// costs a second `draw_text` per label and nothing else. Cardinal offsets
-/// rather than a full outline: at these sizes the difference is invisible and
-/// this is half the draw calls.
+/// Draws text with a dark backing so it stays legible over whatever is behind
+/// it: the HUD paints onto the world, dark ground in one place and a white
+/// platform in the next, so no single colour works and raising alpha does not
+/// help. Cardinal offsets rather than a full outline, invisible at these sizes
+/// and half the draw calls.
 fn draw_text_legible(text: &str, x: f32, y: f32, size: f32, color: Color) {
     let shadow = Color::new(0.0, 0.0, 0.0, 0.85);
     draw_text(text, x + 1.0, y + 1.0, size, shadow);
@@ -1695,32 +1444,19 @@ fn draw_text_legible(text: &str, x: f32, y: f32, size: f32, color: Color) {
     draw_text(text, x, y, size, color);
 }
 
-/// Smallest the HUD is allowed to shrink to before it starts wrapping
-/// instead.
-///
-/// Deliberately close to the full size, so shrinking only ever absorbs a
-/// small overflow and anything worse wraps. Set low, a 1920 wide window
-/// squeezed the controls line down to 15px to keep it on one line, which is
-/// the wrong trade: two lines at a readable size beat one line nobody can
-/// read, and the whole reason this exists is that the HUD was hard to read.
+/// Smallest the HUD may shrink to before wrapping instead. Close to full size
+/// on purpose: set low, a 1920 wide window squeezed the controls line to 15px
+/// to keep it on one line, and two readable lines beat one nobody can read.
 const HUD_MIN_TEXT_SIZE: f32 = 16.0;
 
 /// Left margin the HUD is drawn at, and the gap left on the right so text
 /// never runs to the window edge.
 const HUD_MARGIN: f32 = 10.0;
 
-/// Draws one HUD line so it actually fits the window, and returns the height
-/// it used so the caller can stack the next one under it.
-///
-/// The HUD lines are long, and their length is not a design choice: they name
-/// every key binding and every live statistic. At 1920 wide they fit at full
-/// size; on a smaller or scaled display they used to run straight off the
-/// right edge, taking the last few readouts with them.
-///
-/// So the size is chosen from the window rather than fixed. Shrinking is
-/// tried first, down to `HUD_MIN_TEXT_SIZE`, since one line at 15px reads
-/// better than two at 21px. Past that it wraps, splitting on the `|` the HUD
-/// already separates its fields with, so a break never lands mid-phrase.
+/// Draws one HUD line so it fits the window, returning the height used so the
+/// caller can stack the next under it. Shrinking is tried first, then wrapping
+/// on the `|` the HUD already separates fields with, so a break never lands
+/// mid-phrase.
 fn draw_hud_line(text: &str, y: f32, size: f32, color: Color) -> f32 {
     let available = (screen_width() - HUD_MARGIN * 2.0).max(1.0);
     let width_at = |s: f32| measure_text(text, None, s as u16, 1.0).width;
@@ -1766,27 +1502,21 @@ fn draw_hud_line(text: &str, y: f32, size: f32, color: Color) -> f32 {
 /// are reference marks read at a glance beside the bar, not primary readouts.
 const TIMELINE_LABEL_SIZE: f32 = 16.0;
 
-/// How many frames back the construction heatmap reaches, oldest fading to
-/// nothing. Short on purpose: the point is showing where work is happening
-/// *now*, so the glow trails the construction front and dies out behind it
-/// rather than accumulating into a map of everywhere you have ever been.
+/// How many frames back the heatmap reaches, oldest fading out. Short on
+/// purpose: the glow should trail the construction front rather than
+/// accumulate into a map of everywhere you have been.
 const HEAT_WINDOW_FRAMES: usize = 10;
-/// Alpha at the hottest core. The overlay is opt-in (`h`) and draws beneath
-/// the entities, so it can afford to be genuinely bright: the factory is
-/// painted over the top of it regardless, and anything dimmer read as barely
-/// there against the ground.
+/// Alpha at the hottest core. The overlay is opt-in and draws beneath the
+/// entities, so it can afford to be bright.
 const HEAT_MAX_ALPHA: f32 = 0.85;
-/// How far heat bleeds outward from where something was actually built, in
-/// cells (so `HEAT_SPREAD_CELLS * HEAT_CELL_TILES` tiles). This is what turns
-/// a scatter of individually lit machines into one glow over the area being
-/// worked on. See `viewer::recent_heat`.
+/// How far heat bleeds outward from where something was built, in cells. This
+/// is what turns scattered lit machines into one glow. See
+/// `viewer::recent_heat`.
 const HEAT_SPREAD_CELLS: i32 = 3;
 
-// Vertical layout above the scrub bar, stacked upward from the track: the
-// activity graph sits directly on it, the current-time label clears the
-// graph, and the hover tooltip clears the label. Named and derived from each
-// other rather than written as separate magic offsets, since every one of
-// them has to move whenever the graph's height changes.
+// Vertical layout above the scrub bar, stacked upward: graph on the track,
+// time label clearing the graph, tooltip clearing the label. Derived from each
+// other, all of them moving when the graph's height changes.
 
 /// How tall the activity graph stands at its busiest frame.
 const ACTIVITY_HEIGHT: f32 = 26.0;
@@ -1798,27 +1528,16 @@ const PLAYHEAD_LABEL_OFFSET: f32 = ACTIVITY_GAP + ACTIVITY_HEIGHT + 14.0;
 /// Bottom edge of the hover tooltip, clearing the label above the graph.
 const HOVER_TOOLTIP_OFFSET: f32 = PLAYHEAD_LABEL_OFFSET + 10.0;
 
-/// Elapsed game time at `index`, or an empty string for an index the
-/// sequence does not have. Frames carry the real `game.tick` they were
-/// emitted at (see `replay::run`), so this is the capture's own clock rather
-/// than anything derived from frame numbering.
+/// Elapsed game time at `index`, or empty for an index the sequence lacks.
+/// Frames carry the real `game.tick`, so this is the capture's own clock.
 fn frame_time_label(sequence: &FrameSequence, index: usize) -> String {
     sequence.tick_at(index).map(format_game_time).unwrap_or_default()
 }
 
 /// The construction heatmap: where building happened over the last
-/// `HEAT_WINDOW_FRAMES`, as translucent warm quads, oldest faintest.
-///
-/// Drawn between the ground and the entities (see `draw_world`), which is
-/// what keeps it from covering the view in the way that actually matters:
-/// the factory itself renders on top at full brightness, so no belt or
-/// assembler is ever dimmed or hazed by it. Low alpha alone would not do
-/// that, since it would still wash over everything built.
-///
-/// Accumulated per rendered frame rather than precomputed per frame, because
-/// the window slides: cell lists are a few hundred entries each and only
-/// `HEAT_WINDOW_FRAMES` of them are ever touched, so this is a few thousand
-/// operations, unlike the per-entity pass that produced them.
+/// `HEAT_WINDOW_FRAMES`, oldest faintest. Drawn between the ground and the
+/// entities, so the factory renders on top at full brightness. Accumulated per
+/// rendered frame rather than precomputed, the window sliding.
 fn draw_construction_heat(heat: &[Vec<HeatCell>], peak: u32, index: usize, camera: &Camera, screen_center: Vec2) {
     let size = HEAT_CELL_TILES as f32;
 
@@ -1841,34 +1560,21 @@ fn draw_construction_heat(heat: &[Vec<HeatCell>], peak: u32, index: usize, camer
     }
 }
 
-/// Fire: a red core, through orange and yellow as it cools, fading out
-/// entirely at the edges.
-///
-/// Hue and alpha both move with intensity, which is what makes the edges
-/// disappear rather than ending on a visible yellow rim. Red is reserved for
-/// the hottest cells specifically because the spread above saturates dense
-/// construction and leaves isolated machines dim, so red genuinely means
-/// "a lot went up right here" rather than just "something is here".
+/// Fire: a red core through orange and yellow, fading out at the edges. Hue and
+/// alpha both move with intensity, which is what makes edges disappear rather
+/// than ending on a yellow rim.
 fn heat_color(intensity: f32) -> Color {
     let t = intensity.clamp(0.0, 1.0);
     Color::new(1.0, 0.85 - 0.70 * t, 0.25 - 0.20 * t, t * HEAT_MAX_ALPHA)
 }
 
-/// The scrub bar: a filled track up to the current frame, tick marks when
-/// there are few enough to read, a playhead circle, and the elapsed game
-/// time at the ends and at the playhead.
+/// The scrub bar: a filled track to the current frame, tick marks when few
+/// enough to read, a playhead, and elapsed time at the ends and playhead.
 ///
-/// `mouse` and `scrubbing` drive the hover readout. Hover is kept alive
-/// while a drag is in progress even once the pointer has left the bar's hit
-/// box, since dragging a scrubber pulls the pointer off it vertically almost
-/// immediately, and losing the readout at exactly that moment would take it
-/// away whenever it is being used most deliberately.
-/// A bookmark's mark on the bar: a thin upright tick above the track.
-///
-/// Deliberately unlike the milestone diamonds below the bar and the round
-/// playhead. A bookmark is somebody's own mark rather than something the
-/// capture found, and telling the two apart at a glance is the whole reason
-/// they are not drawn the same.
+/// Hover stays alive while a drag is in progress even once the pointer has left
+/// the bar, dragging pulling it off vertically almost at once.
+/// A bookmark's mark: a thin upright tick above the track, deliberately unlike
+/// the milestone diamonds below it.
 fn draw_bookmark_markers(timeline: &Timeline, sequence: &FrameSequence, bookmark_frames: &[usize]) {
     for &frame in bookmark_frames {
         let x = timeline.x_for_index(frame, sequence.len());
@@ -1908,30 +1614,19 @@ fn draw_timeline_bar(
     draw_timeline_endpoint_labels(ui, timeline, sequence);
     draw_timeline_playhead_label(ui, timeline, sequence, playhead_x);
 
-    // A hovered marker replaces the frame readout rather than stacking with
-    // it: both want the same slot above the bar, and pointing at a milestone
-    // is a request to read the milestone. The label carries the time anyway,
-    // which is most of what the frame readout would have said.
+    // A hovered marker replaces the frame readout rather than stacking: both
+    // want the slot above the bar, and the label carries the time anyway.
     let on_milestone = draw_milestone_markers(ui, timeline, sequence, milestones, mouse);
     if !on_milestone && (timeline.contains(mouse) || scrubbing) {
         draw_timeline_hover(ui, timeline, sequence, mouse);
     }
 }
 
-/// How much got built over the run, as a filled area standing on the scrub
-/// bar: tall where a lot went up, flat where nothing did.
+/// How much got built over the run, as a filled area standing on the scrub bar.
 ///
-/// Drawn as one vertical bar per screen column rather than one per frame,
-/// which is what makes it read the same at any capture length. A 40-frame
-/// capture would otherwise leave visible gaps between marks, and a
-/// 4000-frame one would pile dozens of frames onto each column and draw
-/// them all. Each column takes the loudest frame it covers rather than the
-/// mean, so a single busy frame stays visible instead of being averaged away
-/// by the quiet ones either side of it, the same reason a waveform display
-/// shows peaks.
-///
-/// Everything up to the playhead is drawn brighter, so the graph doubles as
-/// the progress fill rather than fighting with it.
+/// One bar per screen column rather than per frame, which is what makes it read
+/// the same at any capture length. Each column takes the loudest frame it
+/// covers rather than the mean, the same reason a waveform shows peaks.
 fn draw_activity_graph(timeline: &Timeline, sequence: &FrameSequence, activity: &[f32]) {
     if activity.is_empty() || sequence.len() <= 1 {
         return;
@@ -1945,12 +1640,9 @@ fn draw_activity_graph(timeline: &Timeline, sequence: &FrameSequence, activity: 
     let columns = timeline.width.max(1.0) as usize;
     for column in 0..columns {
         let x = timeline.left + column as f32;
-        // The frames this column covers, taken from the same index mapping
-        // the playhead and click path use so the graph lines up with them.
-        // Clamped against `activity` rather than trusted to match the
-        // sequence length: they are built together and do match, but this
-        // indexes a slice every column of every frame, so it should not be
-        // one refactor away from a panic in the draw loop.
+        // The frames this column covers, from the same index mapping the
+        // playhead and click path use. Clamped against `activity` rather than
+        // trusted to match: this indexes a slice every column of every frame.
         let last = activity.len() - 1;
         let from = timeline.index_for_x(x, sequence.len()).min(last);
         let to = timeline.index_for_x(x + 1.0, sequence.len()).clamp(from, last);
@@ -1964,13 +1656,9 @@ fn draw_activity_graph(timeline: &Timeline, sequence: &FrameSequence, activity: 
     }
 }
 
-/// How close the cursor has to get to a milestone marker, in pixels, before
-/// its label appears. Generous relative to the marker, which is only a few
-/// pixels wide: the label is the point of the marker, and hunting for a
-/// pixel-perfect hover on a bar you are also dragging is miserable.
-/// HUD text size. Nudged up from 20: the readouts sit over the rendered
-/// world at whatever brightness it happens to be, and a slightly larger glyph
-/// carries the shadow in `draw_text_legible` better than a thin one does.
+/// How close the cursor must get to a milestone marker before its label
+/// appears. Generous relative to the marker, which is a few pixels wide.
+/// HUD text size: a larger glyph carries `draw_text_legible`'s shadow better.
 const HUD_TEXT_SIZE: f32 = 21.0;
 
 const MILESTONE_HOVER_SLOP: f32 = 9.0;
@@ -1981,12 +1669,9 @@ const MILESTONE_HOVER_SLOP: f32 = 9.0;
 const MILESTONE_MARKER_Y: f32 = 6.0;
 const MILESTONE_MARKER_RADIUS: f32 = 3.0;
 
-/// The color a milestone reads as, by kind.
-///
-/// Science borrows Factorio's own pack colors, since that association is
-/// already in a player's head from the lab and the tech tree, and a row of
-/// them along the bar then reads as progress through the game rather than as
-/// a row of identical pins.
+/// The colour a milestone reads as, by kind. Science borrows Factorio's own
+/// pack colours, since that association is already in a player's head, so a
+/// row of them reads as progress rather than as identical pins.
 fn milestone_color(milestone: &Milestone) -> Color {
     let rgb = |r: u8, g: u8, b: u8| Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
     match &milestone.kind {
@@ -2014,14 +1699,10 @@ fn milestone_color(milestone: &Milestone) -> Color {
     }
 }
 
-/// Every frame `[` and `]` should stop at, and separately the frames the
-/// bookmarks alone sit on for drawing.
-///
-/// Milestones and bookmarks share one jump list because "take me to the next
-/// interesting thing" is one gesture rather than two. Both are stored as
-/// ticks and resolved here rather than kept as indices, since the same tick
-/// lands on a different frame depending on how coarsely the timelapse was
-/// built.
+/// Every frame `[` and `]` should stop at, and separately the frames bookmarks
+/// sit on. One jump list, "the next interesting thing" being one gesture.
+/// Resolved from ticks here, the same tick landing on a different frame
+/// depending on how coarsely the timelapse was built.
 fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -> (Vec<usize>, Vec<usize>) {
     let bookmark_frames = viewer::frames_for_ticks(bookmarks, frame_ticks);
     let ticks: Vec<u64> = milestones.iter().map(|m| m.tick).chain(bookmarks.iter().copied()).collect();
@@ -2029,16 +1710,9 @@ fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -
 }
 
 /// Milestone markers: a small diamond under the bar at each notable moment,
-/// with its label on hover.
-///
-/// Placed by frame index rather than by interpolating the tick across the
-/// bar, so a marker sits exactly where clicking would take you. The bar snaps
-/// to whole frames, so a tick-interpolated marker would sit slightly off from
-/// the frame it names, which is worst precisely when frames are sparse.
-///
-/// Below the bar rather than above it: the activity graph, playhead label and
-/// hover tooltip already stack upward, and markers want to be near the track
-/// they annotate rather than on the far side of a graph.
+/// labelled on hover. Placed by frame index rather than by interpolating the
+/// tick, so a marker sits where clicking takes you. Below the bar, the graph,
+/// label and tooltip already stacking upward.
 fn draw_milestone_markers(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, milestones: &[Milestone], mouse: Vec2) -> bool {
     // A sequence is never empty (see `FrameSequence`), so only the milestone
     // list needs guarding.
@@ -2046,10 +1720,9 @@ fn draw_milestone_markers(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence
         return false;
     }
 
-    // Tucked into the gap between the track and the endpoint time labels
-    // below it. The band is only a few pixels tall, so the diamond is sized
-    // to fit rather than the other way round: at its first size a marker
-    // landing near either end of the bar overlapped "0m" or the end time.
+    // Tucked into the gap between the track and the endpoint labels. The band
+    // is a few pixels tall, so the diamond is sized to fit: larger, a marker
+    // near either end overlapped the times.
     let marker_y = timeline.y + MILESTONE_MARKER_Y;
     let mut hovered: Option<(&Milestone, f32)> = None;
 
@@ -2083,8 +1756,7 @@ fn draw_milestone_markers(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence
 
     // Above the bar, in the frame readout's slot. Below the marker would be
     // the obvious place, but the bar sits close to the window's bottom edge
-    // and there is not room for a box down there: it clipped straight off
-    // the screen.
+    // and the box clipped off screen.
     let padding = 6.0;
     let box_width = width + padding * 2.0;
     let box_height = TIMELINE_LABEL_SIZE + padding * 2.0;
@@ -2101,10 +1773,9 @@ fn draw_milestone_markers(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence
     true
 }
 
-/// The frame a tick belongs to: the last one at or before it, so a milestone
-/// lands on the frame that was showing when it happened rather than the one
-/// after. Clamped to the ends, since a capture can start after or stop before
-/// a milestone the log still records.
+/// The frame a tick belongs to: the last at or before it, so a milestone lands
+/// on the frame that was showing when it happened. Clamped, a capture being
+/// able to start after or stop before a milestone the log records.
 fn frame_index_for_tick(sequence: &FrameSequence, tick: u64) -> usize {
     let mut index = 0;
     for i in 0..sequence.len() {
@@ -2143,15 +1814,10 @@ fn draw_timeline_playhead_label(ui: &Ui, timeline: &Timeline, sequence: &FrameSe
     ui.text_legible(&label, left, timeline.y - PLAYHEAD_LABEL_OFFSET, TIMELINE_LABEL_SIZE, WHITE);
 }
 
-/// A guide line at the hovered position plus a boxed readout of the time and
-/// frame number there, so the bar answers "what is at this point" before
-/// committing to a seek.
-///
-/// Deliberately reports the frame the cursor would actually land on, via the
-/// same `index_for_x` the click path uses, rather than interpolating time
-/// across the bar: frames are spaced by a fixed tick interval but the bar
-/// snaps to whole frames, so an interpolated label would disagree with what
-/// clicking there produces.
+/// A guide line and a boxed readout at the hovered position, so the bar answers
+/// "what is here" before committing to a seek. Reports the frame the cursor
+/// would land on, via the same `index_for_x` the click path uses: the bar snaps
+/// to whole frames.
 fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, mouse: Vec2) {
     let index = timeline.index_for_x(mouse.x, sequence.len());
     let hover_x = timeline.x_for_index(index, sequence.len());
@@ -2199,10 +1865,8 @@ async fn main() {
     let args = parse_args();
 
     let mut registry = TypeRegistry::new();
-    // Before loading anything: colours are resolved once, when a name is first
-    // interned, so this has to be in place before the first frame is read.
-    // Missing is the normal state of any capture older than this feature, and
-    // the registry's own colours cover it.
+    // Before loading anything: colours resolve when a name is first interned.
+    // Missing is the normal state of any capture older than the feature.
     if let Some(dir) = args.path.as_deref().map(std::path::Path::new) {
         if let Some(prototypes) = save_timelapse::prototypes::read(dir) {
             println!(
@@ -2242,9 +1906,7 @@ async fn main() {
     }
 
     // Bookmarks live beside the frames, like every other sidecar. `None` for
-    // a single-file or synthetic load, which has no directory to keep them
-    // in; bookmarking is simply unavailable there rather than a special case
-    // threaded through everything below.
+    // a synthetic load, which has no directory to keep them in.
     let frames_dir: Option<std::path::PathBuf> = args.path.as_deref().map(std::path::PathBuf::from).filter(|p| p.is_dir());
 
     let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
@@ -2256,10 +1918,8 @@ async fn main() {
     let with_sprites = sprites.iter().filter(|s| s.is_some()).count();
     println!("{} of {} entity/tile types have sprites", with_sprites, registry.len());
 
-    // One camera per world rather than one shared: panning/zooming vulcanus
-    // and then tabbing to nauvis with vulcanus's view still applied would be
-    // disorienting, and each world's own frames are what its camera was
-    // fitted to in the first place.
+    // One camera per world: panning vulcanus and then tabbing to nauvis with
+    // vulcanus's view applied would be disorienting.
     let mut worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence, terrain)| {
@@ -2268,21 +1928,15 @@ async fn main() {
             let measured = analyze_activity(&sequence, &registry);
             let activity = activity_heights(&measured.counts);
             let (heat, heat_peak) = (measured.cells, measured.peak_cell);
-            // On by default: opening straight into the fully-zoomed-out
-            // whole-sequence fit (see `Camera::fit_frames` above) looks
-            // exactly like broken auto-follow (big from the very first
-            // frame, never zooming out further) unless auto-follow is
-            // already active to immediately pull it in to how small the
-            // base actually starts. `f` still toggles it off for anyone who
-            // wants full manual control from the start.
+            // On by default: the fully-zoomed-out whole-sequence fit looks
+            // exactly like broken auto-follow unless follow is already active
+            // to pull it in to how small the base actually starts.
             let follow = FollowState { enabled: true, ..Default::default() };
 
             let busy = viewer::busy_stretches(&measured.counts);
-            // Milestones and bookmarks share one list because "take me to the
-            // next interesting thing" is one gesture, not two. Busy stretches
-            // stay separate: they are derived rather than chosen, and there
-            // are far more of them, so mixing them in would bury the handful
-            // of moments somebody actually marked.
+            // Milestones and bookmarks share one list, being one gesture.
+            // Busy stretches stay separate: derived rather than chosen, and
+            // numerous enough to bury the moments somebody marked.
             let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
             let bookmarks = frames_dir.as_deref().map(viewer::read_bookmarks).unwrap_or_default();
             let (jump_targets, bookmark_frames) = marks_for(&milestones, &bookmarks, &frame_ticks);
@@ -2320,16 +1974,10 @@ async fn main() {
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
 
-    // Nothing loaded means the draw loop below would index `worlds[current]`
-    // on an empty vec and panic with "index out of bounds: the len is 0",
-    // which says nothing about the actual problem. Every individual reason a
-    // frame was rejected has already been printed by now (wrong magic,
-    // unsupported version, unreadable), so this only has to name the
-    // directory and stop.
-    //
-    // Reachable through ordinary use, not just a bad argument: pointing the
-    // viewer at a directory of captures from an older format version rejects
-    // every one of them, and that is exactly what an upgrade leaves behind.
+    // Nothing loaded means the draw loop would index an empty vec and panic
+    // with a message that says nothing. Every rejection has already been
+    // printed, so this only names the directory. Reachable through ordinary
+    // use: captures from an older format version are all rejected.
     if worlds.is_empty() {
         eprintln!(
             "no loadable frames found. Every file that looked like a frame was rejected \
@@ -2339,10 +1987,9 @@ async fn main() {
         return;
     }
 
-    // Exporting is a one-shot job, not a mode of the browser, so it runs to
-    // completion and exits rather than becoming another branch inside the
-    // draw loop below. It exports the first surface, which `group_by_surface`
-    // already orders busiest-first, so the default is the one worth showing.
+    // Exporting is a one-shot job rather than a mode of the browser, so it
+    // runs to completion and exits. It exports the first surface, which
+    // `group_by_surface` already orders busiest first.
     if let Some(request) = &args.export {
         let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
         let chosen: Vec<usize> = match request.surface.as_deref() {
@@ -2397,9 +2044,8 @@ async fn main() {
         println!("no UI font found, falling back to the built-in one");
     }
     // Opened once so a first-time viewer is told what the window does, then
-    // never again. Everything else about this UI is on request; this is the
-    // one thing that has to arrive uninvited, because a `?` in the corner
-    // only helps somebody who already suspects there is something to find.
+    // never again. A `?` in the corner only helps somebody who already
+    // suspects there is something to find.
     ui.show_keys = viewer::first_run();
 
     // A click on a surface chip lands while `worlds[current]` is still
@@ -2436,11 +2082,9 @@ async fn main() {
         let screen_center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let timeline = Timeline::for_screen(screen_width(), screen_height());
 
-        // The chrome is laid out before input is read, because a click has to
-        // be tested against the rects that are actually on screen. Laying out
-        // afterwards would test this frame's click against last frame's
-        // buttons, which only shows up as a missed click on the frame a window
-        // is resized, and is exactly the kind of bug nobody ever reproduces.
+        // Laid out before input is read, a click having to be tested against
+        // the rects actually on screen. Afterwards would test this frame's
+        // click against last frame's buttons.
         let clock = frame_time_label(sequence, sequence.index());
         let chrome_state = ChromeState {
             surfaces: &surface_names,
@@ -2468,10 +2112,8 @@ async fn main() {
         }
 
         if is_mouse_button_pressed(MouseButton::Left) {
-            // A click anywhere dismisses the key panel, which is why it is
-            // tested before the chrome underneath it: the panel is modal, and
-            // a click meant to close it must not also press whatever it
-            // happens to be covering.
+            // Tested before the chrome underneath it: the panel is modal, and
+            // a click meant to close it must not also press what it covers.
             if ui.show_keys {
                 ui.show_keys = false;
             } else {
@@ -2495,18 +2137,13 @@ async fn main() {
                         state.playing = !state.playing;
                         state.play_accum = 0.0;
                     }
-                    // One direction only, wrapping at the top. A pill with no
-                    // second half cannot say which end of it means slower, so
-                    // it cycles the same powers of two the keys step through
-                    // and returns to 0.25x rather than dead-ending at 8x.
+                    // One direction, wrapping at the top. A pill with no
+                    // second half cannot say which end means slower.
                     Some(Click::Speed) => {
                         state.play_speed = if state.play_speed >= 8.0 { 0.25 } else { state.play_speed * 2.0 };
                     }
-                    // A one-shot reframe, not the same thing as `f`: it puts
-                    // the factory back on screen and then leaves the camera
-                    // alone, which is what somebody who has panned into empty
-                    // space wants. Turning follow on instead would keep
-                    // dragging them along afterwards.
+                    // A one-shot reframe, not the same as `f`: it puts the
+                    // factory back on screen and leaves the camera alone.
                     Some(Click::Fit) => {
                         if let Some(bounds) = growing_bounds[sequence.index()] {
                             *camera = Camera::fit_bounds(
@@ -2550,10 +2187,8 @@ async fn main() {
             state.last_mouse = mouse_position().into();
         }
 
-        // Toggling a bookmark at the frame on screen. Stored as that frame's
-        // tick, and written straight away rather than on exit, since the
-        // viewer is a window somebody closes rather than a program that
-        // shuts down tidily.
+        // Stored as that frame's tick, and written straight away rather than
+        // on exit, the viewer being a window somebody closes.
         if is_key_pressed(KeyCode::B) {
             if let (Some(dir), Some(tick)) = (frames_dir.as_deref(), sequence.tick_at(sequence.index())) {
                 match bookmarks.iter().position(|&t| t == tick) {
