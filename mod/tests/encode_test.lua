@@ -551,10 +551,51 @@ check("EXCLUDED_TYPES: does not contain straight-rail", excluded["straight-rail"
 check("EXCLUDED_TYPES: does not contain rail-signal", excluded["rail-signal"], nil)
 check("EXCLUDED_TYPES: does not contain train-stop", excluded["train-stop"], nil)
 
-local floor = assert_no_duplicates(encode.PLACED_FLOOR_TILES, "PLACED_FLOOR_TILES")
-check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)
-check("PLACED_FLOOR_TILES: contains landfill", floor["landfill"], true)
-check("PLACED_FLOOR_TILES: contains stone-path", floor["stone-path"], true)
+local known_floor = assert_no_duplicates(encode.KNOWN_PLACED_FLOOR_TILES, "KNOWN_PLACED_FLOOR_TILES")
+check("KNOWN_PLACED_FLOOR_TILES: contains concrete", known_floor["concrete"], true)
+check("KNOWN_PLACED_FLOOR_TILES: contains landfill", known_floor["landfill"], true)
+check("KNOWN_PLACED_FLOOR_TILES: contains stone-path", known_floor["stone-path"], true)
+
+-- placed_floor_tiles
+--
+-- Asked of the game rather than listed, because the list is Wube's names and
+-- was the last place a mod could not be seen. `space-platform-foundation` is
+-- the case that proves it and is not even modded: a platform's own floor was
+-- missing, so the tiles a player lays to grow a platform were recorded as
+-- natural ground and the platform appeared fully formed rather than growing.
+--
+-- Two properties unioned, because on a real 69 mod game neither covers it
+-- alone: nothing places a coloured refined concrete and nothing reports it
+-- minable, while the stated list knows nothing of any mod.
+
+do
+  local tile = function(props) return props end
+  prototypes = {
+    tile = {
+      -- Placed by an item. The one that was missing.
+      ["space-platform-foundation"] = tile({
+        items_to_place_this = { { name = "space-platform-foundation" } },
+        mineable_properties = { minable = false },
+      }),
+      -- Minable but placed by no item of its own, which is how most modded
+      -- floor reads.
+      ["cerys-refined-concrete"] = tile({ mineable_properties = { minable = true } }),
+      -- Neither, and floor anyway. Exactly why the stated list survives.
+      ["acid-refined-concrete"] = tile({ mineable_properties = { minable = false } }),
+      -- Ground. An empty item list must not count as an item.
+      ["vegetation-green-grass-1"] = tile({ items_to_place_this = {}, mineable_properties = { minable = false } }),
+      ["water"] = tile({ mineable_properties = { minable = false } }),
+    },
+  }
+
+  check("placed_floor_tiles: sorted, and natural ground left out", table.concat(encode.placed_floor_tiles(), ","),
+    "acid-refined-concrete,cerys-refined-concrete,space-platform-foundation")
+  -- These names are handed to find_tiles_filtered, which will not be asked
+  -- about a tile no loaded mod defines.
+  check("placed_floor_tiles: a stated name this game lacks is left out",
+    table.concat(encode.placed_floor_tiles(), ","):find("frozen%-concrete"), nil)
+  prototypes = nil
+end
 
 -- color_bytes
 --

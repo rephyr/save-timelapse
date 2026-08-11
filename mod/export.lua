@@ -342,7 +342,7 @@ local function export_surface(surface, tick, session_id)
     order, groups, pending_count = {}, {}, 0
   end
 
-  for _, tile in pairs(surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })) do
+  for _, tile in pairs(surface.find_tiles_filtered({ name = encode.placed_floor_tiles() })) do
     local pos = tile.position
     local group = tile_group_for(tile.name)
     local k = group.n + 1
@@ -406,7 +406,7 @@ local function export_terrain_to(tick, session_id, surface, area)
 
   for _, tile in pairs(surface.find_tiles_filtered({
     area = area,
-    name = encode.PLACED_FLOOR_TILES,
+    name = encode.placed_floor_tiles(),
     invert = true,
   })) do
     local pos = tile.position

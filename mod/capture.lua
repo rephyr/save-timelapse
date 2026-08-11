@@ -107,7 +107,7 @@ local placed_floor_set = nil
 local function is_placed_floor(tile_name)
   if not placed_floor_set then
     placed_floor_set = {}
-    for _, n in pairs(encode.PLACED_FLOOR_TILES) do
+    for _, n in pairs(encode.placed_floor_tiles()) do
       placed_floor_set[n] = true
     end
   end

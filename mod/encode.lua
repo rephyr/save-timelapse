@@ -137,33 +137,98 @@ function M.context_types(include_resources, capture_terrain)
   return list
 end
 
--- Natural terrain (grass, water, sand, dirt, ...) vastly outnumbers placed
--- floor types, so this is an include list rather than an exclude list, the
--- opposite of EXCLUDED_TYPES above. Verified against base/prototypes/tile/tiles.lua.
-M.PLACED_FLOOR_TILES = {
+-- Floor somebody laid down, as opposed to ground the map generated. Natural
+-- terrain (grass, water, sand, dirt, ...) vastly outnumbers it, so this is an
+-- include list rather than an exclude list, the opposite of EXCLUDED_TYPES
+-- above.
+--
+-- Names the game reports as neither placeable nor minable, and which therefore
+-- have to be stated. On a real modded game that is exactly the coloured
+-- refined concretes: they carry no item that places them and no mineable
+-- properties, so both rules in `M.placed_floor_tiles` miss all eleven.
+--
+-- The rest are here as a floor rather than a definition. Every one of them is
+-- also found by those rules, and leaving them stated means a capture can never
+-- silently lose floor it used to record because a mod changed a property.
+--
+-- The frozen twins are the reason that guarantee is worth having. Aquilo
+-- freezes placed floor into a `frozen-` copy of the same tile, still floor the
+-- player laid; without them an entire Aquilo base's paving was invisible to
+-- live capture. Seven of them, not one per floor type: the game only generates
+-- frozen variants for stone path, concrete, refined concrete and the two
+-- hazard pairs, not for the coloured refined concretes.
+M.KNOWN_PLACED_FLOOR_TILES = {
   "stone-path", "concrete",
   "hazard-concrete-left", "hazard-concrete-right",
   "refined-concrete", "refined-hazard-concrete-left", "refined-hazard-concrete-right",
   "landfill",
-  -- Space Age colored refined-concrete variants
   "red-refined-concrete", "green-refined-concrete", "blue-refined-concrete",
   "orange-refined-concrete", "yellow-refined-concrete", "pink-refined-concrete",
   "purple-refined-concrete", "black-refined-concrete", "brown-refined-concrete",
   "cyan-refined-concrete", "acid-refined-concrete",
-  -- Aquilo freezes placed floor into a `frozen-` twin of the same tile.
-  -- These are still floor the player laid, placeable and blueprintable, so
-  -- without them here an entire Aquilo base's paving is invisible to live
-  -- capture: it would only ever appear if terrain capture happened to be on,
-  -- and then only in the baseline, never as it was built.
-  --
-  -- Seven of them, not one per floor type: the game only generates frozen
-  -- variants for stone path, concrete, refined concrete and the two hazard
-  -- pairs, not for the coloured refined concretes.
   "frozen-stone-path", "frozen-concrete",
   "frozen-hazard-concrete-left", "frozen-hazard-concrete-right",
   "frozen-refined-concrete",
   "frozen-refined-hazard-concrete-left", "frozen-refined-hazard-concrete-right",
 }
+
+local placed_floor_tiles = nil
+
+--- Every tile in this game that counts as placed floor, asked of the game
+--- rather than listed.
+---
+--- The list above was the whole answer, and it is Wube's names only, which
+--- made this the last place a mod could not be seen. `space-platform-foundation`
+--- is the sharpest case and is not even modded: a platform's own floor was
+--- missing from it, so the tiles a player lays to grow a platform were never
+--- recorded as built. They arrived instead through the ground scan, which reads
+--- one save after the fact, so a platform appeared fully formed from its first
+--- frame rather than growing. Aquilo's `foundation` had the same problem, and a
+--- heavily modded game adds a couple of dozen more.
+---
+--- Two properties, unioned, because neither covers it alone. Measured against a
+--- real 69 mod game: `items_to_place_this` finds 18 tiles and misses twenty of
+--- the stated names; `mineable_properties.minable` finds 41 and misses the
+--- eleven coloured concretes. Together they miss only those eleven, which is
+--- what the list above is for. Between them they add `space-platform-foundation`,
+--- `foundation`, Gleba's artificial soils, Krastorio2's reinforced plates and
+--- every one of Cerys's floors.
+---
+--- Filtered by what this game actually has, which is not tidiness: these names
+--- are handed to `find_tiles_filtered`, and a name no loaded mod defines is not
+--- a tile the game will accept being asked about.
+---
+--- Memoized in a module local, so it is computed once per load and reset by the
+--- next one. Prototypes are fixed at load time, so that is as often as the
+--- answer can change.
+function M.placed_floor_tiles()
+  if placed_floor_tiles then
+    return placed_floor_tiles
+  end
+
+  local known = {}
+  for _, name in ipairs(M.KNOWN_PLACED_FLOOR_TILES) do
+    known[name] = true
+  end
+
+  local found = {}
+  for name, proto in pairs(prototypes.tile) do
+    local items = proto.items_to_place_this
+    local placeable = items ~= nil and #items > 0
+    -- `mineable_properties` is always a table (unlike `items_to_place_this`,
+    -- which is nil for a tile no item places), so `minable` reads directly.
+    local minable = proto.mineable_properties.minable
+    if placeable or minable or known[name] then
+      found[#found + 1] = name
+    end
+  end
+  -- Sorted so the list does not depend on `pairs` order, which Lua does not
+  -- promise and which would otherwise vary between two runs of one save.
+  table.sort(found)
+
+  placed_floor_tiles = found
+  return found
+end
 
 -- Terrain capture bounding box
 --

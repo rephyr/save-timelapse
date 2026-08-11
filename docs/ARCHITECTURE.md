@@ -303,10 +303,11 @@ omitted at their default (0 direction, 1x1 footprint): once a record is this
 compact, a variable width encoding to skip a default value costs more
 complexity than the bytes it would save.
 
-`tiles` covers placed floor (concrete, stone path, hazard/refined concrete
-variants, landfill), a short, stable include list, the opposite of entity
-filtering's exclude list, since natural terrain vastly outnumbers placed
-floor types.
+`tiles` covers placed floor (concrete, stone path, hazard and refined concrete
+variants, landfill, a platform's foundation), an include list rather than
+entity filtering's exclude list, since natural terrain vastly outnumbers placed
+floor types. The list is asked of the game rather than stated: a tile counts if
+an item places it or it can be mined (see What the game says about itself).
 
 A surface is exported when it is nauvis or contains at least one entity owned
 by the player force. A manifest listing exported surfaces accompanies each
@@ -524,6 +525,24 @@ playthrough started with. `capture.lua` refreshes it on the first flush after
 each load, which is as often as the answer can change (prototypes are fixed at
 load time). That is what lets a capture already in progress pick up a mod added
 since, or a fix to how this file is written, without a reset.
+
+**Which tiles are floor is asked the same way**, though it is asked in the mod
+rather than written down for the viewer, since it decides what a capture
+records rather than how it draws. `encode.placed_floor_tiles` unions two
+properties, because measured against a real 69 mod game neither covers it
+alone: `items_to_place_this` finds 18 tiles, `mineable_properties.minable`
+finds 41, and together they miss only the eleven coloured refined concretes,
+which no item places and which report as not minable. Those eleven are stated,
+along with the rest of the old list, as a floor that guarantees a capture can
+never lose paving it used to record.
+
+The name that made this worth doing is not modded at all.
+`space-platform-foundation` was missing from the stated list, so the tiles a
+player lays to grow a platform were never recorded as built: they arrived
+through the ground scan instead, which reads one save after the fact, and a
+platform therefore appeared fully formed from its first frame rather than
+growing. Aquilo's `foundation` had the same problem, and a heavily modded game
+adds a couple of dozen more.
 
 The viewer resolves both halves at intern time, next to where it already
 resolves colour, so a name costs one lookup rather than one per entity per

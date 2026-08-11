@@ -157,7 +157,7 @@ local function snapshot_step()
       snapshot_flush(s)
       s.checksum = export.checksummed_write(s.path, encode.frame_end_entities(), true, s.checksum)
       s.phase = "tiles"
-      s.tiles = surface.find_tiles_filtered({ name = encode.PLACED_FLOOR_TILES })
+      s.tiles = surface.find_tiles_filtered({ name = encode.placed_floor_tiles() })
       s.tile_index = 1
     end
     return
