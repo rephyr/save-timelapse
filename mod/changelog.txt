@@ -4,13 +4,18 @@ Date: 2026-08-11
   Features:
     - Save a timelapse as a video file you can share. Nothing to install: no FFmpeg, no command line tools, no separate encoder. Pick a resolution and a frame rate and the finished video lands in a videos folder next to the program
     - Export a numbered image per frame instead, at any resolution, for editing the result yourself. Both are independent of the window size, so a 1080p export comes out of a small window unchanged
+    - Terrain can be added to a capture you already have. It no longer has to be switched on before your first snapshot, so changing your mind about it does not mean resetting and losing everything recorded so far. You are asked when the timelapse is built, and you choose which save it is read from
+  Optimizations:
+    - The initial snapshot is significantly faster. Terrain is no longer recorded while you play at all: it does not change during a playthrough, so recording it was storing the same answer over and over, and it is now read once from a save afterwards instead
+    - Exports are smaller, especially across several planets, because terrain is no longer repeated in every frame
   Bugfixes:
     - The camera framed the outermost thing you had built rather than your factory. A wall on the far perimeter or a signal at the end of a rail line to an outpost decided the shot, leaving the factory small and off centre in a mostly empty frame. It now aims at where the buildings actually are
     - Biter nests no longer drag the camera. They are generated across every explored chunk, so counting them as construction stretched the view across the whole revealed map. They are still recorded and still drawn in red, they just no longer decide where to look
+    - Terrain covers the whole factory. It used to stop wherever your base reached when recording started, so anything built after that stood on nothing
+    - Trees and cliffs stop where the ground does, instead of extending past its edge
   Changes:
     - Videos are rendered at full detail rather than the simplified drawing used while browsing, and oversampled before being written. The viewer simplifies to hold a frame rate; an export has no frame rate to hold, so it does not have to. On a large factory this is the difference between belts being visible and a paved area reading as a grey block
-    - Nothing that moves is recorded any more, not just biters and robots. Gleba's pentapods and Vulcanus's demolishers were being captured because Space Age gave its enemies new prototype types that the old filter did not cover, and cars, tanks, Spidertron and trains had never been excluded at all. Every one of them was pinned wherever it happened to be while the real one carried on. Rails, signals, stations and roboports stay, being the stationary infrastructure that shows a network growing
-    - Terrain capture is measured from what you built. It was measured from everything exported, which included trees and nests scattered across every generated chunk, so a margin around your factory was really a margin around the whole explored map. That is where most of terrain capture's cost came from
+    - Nothing that moves is recorded any more, not just biters and robots. Gleba's pentapods and Vulcanus's demolishers were being captured because Space Age gave its enemies new prototype types that the old filter did not cover, and cars, tanks, Spidertron and trains had never been excluded at all. Every one of them was pinned wherever it happened to be while the real one carried on. Rails, signals, stations and roboports stay, and so do nests and worms: those are enemies that do not move
     - Captures made with 0.5 keep working and need no reset. Nothing about the capture format changed in this release
 ---------------------------------------------------------------------------------------------------
 Version: 0.5.1
