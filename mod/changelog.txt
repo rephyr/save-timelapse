@@ -2,6 +2,7 @@
 Version: 0.7.0
 Date: 2026-08-11
   Features:
+    - Your mods are recorded as themselves. The mod now writes down what the loaded prototypes are, so a timelapse takes its terrain and building colours straight from the game's own map view, and knows a modded belt is a belt, a modded ore patch is ore, and how far a modded underground belt reaches. Alien Biomes terrain looks like Alien Biomes, a Krastorio2 belt curves at corners and pairs up underground, and a modded ore field no longer drags the camera off your factory. Nothing to set up, and mods added partway through a playthrough are picked up the next time you load the save
     - Belts, underground belts, splitters and pipes are drawn with Factorio's own artwork instead of their inventory icons. Belt corners actually curve, an underground belt's two ends face opposite ways, splitters look like splitters from either side, and a run of pipe joins up with corners, tees and crossings
     - A new viewer interface. Your factory fills the window: a planet switcher in one corner, the time in the other, and playback controls you can click rather than keys you had to know. Everything else is one keypress away and nothing else is in the way
     - Press ? in the viewer for every control it has. Three of them, jumping between milestones, jumping between busy stretches, and bookmarking a moment, had never been listed anywhere

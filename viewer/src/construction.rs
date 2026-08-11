@@ -71,7 +71,7 @@
 
 use macroquad::math::Vec2;
 
-use crate::registry::{is_enemy, is_resource, is_terrain_scatter, is_vehicle, TypeRegistry};
+use crate::registry::TypeRegistry;
 use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame};
 
 /// Side of one bin in the density histograms, in tiles. A Factorio chunk,
@@ -115,8 +115,8 @@ fn counted<'a>(frame: &'a RenderFrame, registry: &'a TypeRegistry) -> impl Itera
         .entity_runs
         .iter()
         .filter(move |run| {
-            let name = registry.name(run.type_id);
-            !is_terrain_scatter(name) && !is_resource(name) && !is_enemy(name) && !is_vehicle(name)
+            let id = run.type_id;
+            !registry.is_terrain_scatter(id) && !registry.is_resource(id) && !registry.is_enemy(id) && !registry.is_vehicle(id)
         })
         .flat_map(move |run| frame.entities[run.range()].iter())
 }

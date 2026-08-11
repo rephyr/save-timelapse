@@ -373,18 +373,17 @@ impl RenderFrame {
         // crossing feeds the belt in front of it and can therefore bend it,
         // which cannot be known until the ends have been told apart.
         let underground_kinds: Vec<Option<(TypeId, i32)>> =
-            entity_ids.iter().map(|&id| crate::registry::underground_reach(registry.name(id)).map(|reach| (id, reach))).collect();
+            entity_ids.iter().map(|&id| registry.underground_reach(id).map(|reach| (id, reach))).collect();
         crate::belts::infer_underground_ends(&mut entities, &underground_kinds);
 
         let carriers: Vec<Option<crate::belts::Carrier>> = entity_ids
             .iter()
             .map(|&id| {
-                let name = registry.name(id);
-                if crate::registry::is_belt(name) {
+                if registry.is_belt(id) {
                     Some(crate::belts::Carrier::Belt)
-                } else if crate::registry::is_splitter(name) {
+                } else if registry.is_splitter(id) {
                     Some(crate::belts::Carrier::Splitter)
-                } else if crate::registry::underground_reach(name).is_some() {
+                } else if registry.underground_reach(id).is_some() {
                     Some(crate::belts::Carrier::Underground)
                 } else {
                     None
@@ -396,7 +395,7 @@ impl RenderFrame {
         // Pipes reuse the same `shape` byte again, holding a four bit mask of
         // which sides join onto them. Nothing is both a pipe and a belt, so
         // the three meanings never collide on one entity.
-        let pipe_flags: Vec<bool> = entity_ids.iter().map(|&id| crate::registry::is_pipe(registry.name(id))).collect();
+        let pipe_flags: Vec<bool> = entity_ids.iter().map(|&id| registry.is_pipe(id)).collect();
         crate::pipes::infer_connections(&mut entities, &pipe_flags);
 
         let tile_ids: Vec<TypeId> = frame.tiles.iter().map(|t| registry.intern(&t.n)).collect();

@@ -580,13 +580,17 @@ check("color_bytes: a missing component is zero", color({ r = 0.5 }), "128,0,0")
 check("color_bytes: clamped above", color({ r = 300, g = 260, b = 4 }), "255,255,4")
 check("color_bytes: clamped below", color({ r = -5, g = 5, b = 400 }), "0,5,255")
 
--- palette_json
+-- prototypes_json
 --
 -- Reads the `prototypes` global the game provides, which the test stands in
 -- for. Nests and worms take the enemy colour and everything else does not:
 -- `enemy_map_color` is set on most prototypes whatever side they are on, so
 -- preferring it painted an entire factory, belts and walls and radars alike,
 -- in biter red.
+--
+-- The type of every entity goes out verbatim, which is what lets the desktop
+-- side recognise a modded belt as a belt without this file, or that one,
+-- naming it. Reach is asked of underground belts and pipes and nothing else.
 
 do
   local tile = function(c) return { map_color = c } end
@@ -615,6 +619,13 @@ do
         type = "turret",
         enemy_map_color = { r = 255, g = 25, b = 25 },
       },
+      -- A modded tier, which is the whole point: nothing here or on the
+      -- desktop side knows this name, and it still comes out a belt.
+      ["kr-advanced-underground-belt"] = {
+        type = "underground-belt",
+        friendly_map_color = { r = 0, g = 93, b = 147 },
+        max_underground_distance = 30,
+      },
       -- Nothing to say about itself, so it says nothing and the viewer
       -- falls back for it, exactly as for a name this file never mentions.
       ["colourless"] = { type = "container" },
@@ -622,11 +633,15 @@ do
   }
 
   check(
-    "palette_json: tiles and entities, sorted, in bytes",
-    encode.palette_json(),
+    "prototypes_json: colours, types and reach, each sorted",
+    encode.prototypes_json(),
     '{"tiles":{"grass-1":[55,53,11],"water":[51,83,95]},'
-      .. '"entities":{"biter-spawner":[255,25,25],"radar":[0,93,147],'
-      .. '"small-worm-turret":[255,25,25],"transport-belt":[204,161,71]}}'
+      .. '"entities":{"biter-spawner":[255,25,25],"kr-advanced-underground-belt":[0,93,147],'
+      .. '"radar":[0,93,147],"small-worm-turret":[255,25,25],"transport-belt":[204,161,71]},'
+      .. '"types":{"biter-spawner":"unit-spawner","colourless":"container",'
+      .. '"kr-advanced-underground-belt":"underground-belt","radar":"radar",'
+      .. '"small-worm-turret":"turret","transport-belt":"transport-belt"},'
+      .. '"reach":{"kr-advanced-underground-belt":30}}'
   )
   prototypes = nil
 end

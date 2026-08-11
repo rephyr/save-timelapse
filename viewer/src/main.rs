@@ -15,12 +15,11 @@ use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
     activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
     entity_footprint_size, entity_rotation_radians, entity_sheet_path, format_game_time, growing_bounds_per_frame, icon_path,
-    icon_source_rect, is_belt, is_pipe, is_pipe_to_ground, is_rotation_allowed, is_splitter, is_terrain_scatter, pipe_piece_path,
-    pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path, splitter_source_rect,
-    splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_reach, underground_source_rect,
+    icon_source_rect, pipe_piece_path, pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path,
+    splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_source_rect,
     underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
     DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity,
-    RenderFrame, RenderTile, Run, Timeline, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES,
+    RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES,
     SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
@@ -739,6 +738,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
     let mut progress = LoadProgress { phase: "loading sprites", detail: String::new(), done: 0, total: registry.len() };
 
     for (id, name) in registry.names().iter().enumerate() {
+        let type_id = id as TypeId;
         progress.done = id;
         progress.detail = name.clone();
         redraw_progress(&progress, &mut last, false).await;
@@ -750,7 +750,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
         // missing, falls back to the icon exactly as before.
         // Splitters are assembled rather than loaded: each facing is one or
         // two files that have to be joined before they are a whole splitter.
-        if is_splitter(name) {
+        if registry.is_splitter(type_id) {
             if let Some(paths) = splitter_structure_paths(data_dir, name) {
                 let mut facings = Vec::with_capacity(4);
                 for (facing, path) in paths.iter().enumerate() {
@@ -777,7 +777,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
             }
         }
 
-        if is_pipe_to_ground(name) {
+        if registry.is_pipe_to_ground(type_id) {
             if let Some(paths) = pipe_to_ground_paths(data_dir) {
                 let mut textures = Vec::with_capacity(4);
                 for path in &paths {
@@ -796,7 +796,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
 
         // A pipe needs all sixteen of its pictures, since which one it draws
         // depends on its neighbours and changes frame to frame.
-        if is_pipe(name) {
+        if registry.is_pipe(type_id) {
             let mut textures = Vec::with_capacity(PIECES.len());
             for piece in PIECES {
                 let Some(path) = pipe_piece_path(data_dir, piece) else { break };
@@ -811,9 +811,9 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
             }
         }
 
-        let found = if is_belt(name) {
+        let found = if registry.is_belt(type_id) {
             entity_sheet_path(data_dir, name).map(|path| (vec![path], SheetKind::Belt))
-        } else if underground_reach(name).is_some() {
+        } else if registry.underground_reach(type_id).is_some() {
             underground_structure_path(data_dir, name).map(|path| (vec![path], SheetKind::UndergroundStructure))
         } else {
             None
@@ -1470,7 +1470,7 @@ fn draw_world(
         (Vec2::new(view_min.x.max(tmin.x), view_min.y.max(tmin.y)), Vec2::new(view_max.x.min(tmax.x), view_max.y.min(tmax.y)))
     });
     let bounds_for = |type_id| match scenery_bounds {
-        Some(b) if is_terrain_scatter(registry.name(type_id)) => b,
+        Some(b) if registry.is_terrain_scatter(type_id) => b,
         _ => (view_min, view_max),
     };
 
@@ -1541,7 +1541,7 @@ fn draw_world(
         for run in &frame.entity_runs {
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
             let color = registry.entity_color(run.type_id);
-            let rotation_allowed = is_rotation_allowed(registry.name(run.type_id));
+            let rotation_allowed = registry.is_rotation_allowed(run.type_id);
             let (min, max) = bounds_for(run.type_id);
             let mut drawn = 0;
             for entity in &frame.entities[run.range()] {
@@ -2187,9 +2187,14 @@ async fn main() {
     // Missing is the normal state of any capture older than this feature, and
     // the registry's own colours cover it.
     if let Some(dir) = args.path.as_deref().map(std::path::Path::new) {
-        if let Some(palette) = save_timelapse::palette::read(dir) {
-            println!("using this game's own colours for {} tiles and {} entities", palette.tiles.len(), palette.entities.len());
-            registry.set_palette(palette);
+        if let Some(prototypes) = save_timelapse::prototypes::read(dir) {
+            println!(
+                "using this game's own description of {} tiles and {} entities, {} of them typed",
+                prototypes.tiles.len(),
+                prototypes.entities.len(),
+                prototypes.types.len()
+            );
+            registry.set_prototypes(prototypes);
         }
     }
     let loaded = load_frames(&args, &mut registry).await;

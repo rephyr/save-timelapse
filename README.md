@@ -52,6 +52,12 @@ Save Timelapse does not require you to have been recording beforehand.
 
 If you have autosaves or milestone saves from an existing factory, the companion tool can use those saves to reconstruct its history. It runs Factorio in an isolated environment, exports the selected saves, and builds them into the same replay format used by live capture.
 
+### 🧩 Works with the mods you play
+
+Save Timelapse does not carry a list of the things it knows how to draw. It records what your game says its own prototypes are, so a modded playthrough replays as itself: terrain and buildings take the colours Factorio paints its own map view with, and a modded belt is still a belt, a modded ore patch is still ore, and a modded underground belt still pairs up over its real distance.
+
+That means an Alien Biomes world keeps its own terrain, a Krastorio2 belt curves at corners, and an ore field from a mod nobody has ever heard of does not pull the camera off your factory. There is nothing to configure, and a mod added partway through a playthrough is picked up the next time you load the save.
+
 ---
 
 ## Install
@@ -161,6 +167,10 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 - **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded. A belt whose direction changes because the game connected it up for you, rather than because you rotated it yourself, is not, so it keeps the facing it had when it was first placed. It shows up as an occasional corner drawn as a straight belt. Recording a fresh baseline corrects everything built so far.
 
+- **Ore built over does not come back when you remove what you built.** An ore deposit is an entity like any other, and the replay holds one entity per position, so something placed exactly on an ore tile takes that tile's place instead of covering it. Mining the building later leaves a gap in the patch rather than uncovering the ore. Only an exact overlap counts, so it reads as scattered missing tiles across a patch you have built across, not as a clean rectangle.
+
+- **Ground you covered before it was read is not recovered either.** Natural ground is scanned once, from a single save, after the fact, which is what keeps it out of your game entirely. A lake you landfilled at hour three is already landfill when that scan happens, so its water was never recorded anywhere: replayed from the beginning the lake is a hole until the tick the landfill goes down, and removing that landfill uncovers nothing. With terrain capture switched off there is deliberately no ground in the timelapse to uncover at all.
+
 ---
 
 ## Roadmap
@@ -180,6 +190,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - [x] Belts, underground belts, splitters and pipes drawn with Factorio's own artwork
 - [x] Belt rotations recorded, so corners stop drawing as straight belts
 - [x] The companion tool stays open and speaks plainly, and failures return to the menu
+- [x] Modded games recorded as themselves: colours, belts, pipes and ores taken from the game's own prototypes
 - [ ] Refreshed screenshots and demo recordings
 
 ### v1.0

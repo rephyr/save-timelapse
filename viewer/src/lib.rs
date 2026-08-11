@@ -44,10 +44,7 @@ pub use marks::{busy_stretches, frames_for_ticks, next_mark, previous_mark, read
 pub use pipes::{infer_connections, piece_name, PIECES};
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};
-pub use registry::{
-    color_for, is_belt, is_pipe, is_pipe_to_ground, is_rotation_allowed, is_splitter, is_terrain_scatter, underground_reach,
-    TypeId, TypeRegistry,
-};
+pub use registry::{color_for, TypeId, TypeRegistry};
 pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, SequenceBuilder, LOD_CELL_TILES,
     LOD_MAX_TILE_PIXELS,

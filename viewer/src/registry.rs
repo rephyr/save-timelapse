@@ -22,13 +22,16 @@ pub struct TypeRegistry {
     ids: HashMap<String, TypeId>,
     entity_colors: Vec<Color>,
     tile_colors: Vec<Color>,
-    /// The game's own map colours for this capture, when it shipped with any.
+    kinds: Vec<Kind>,
+    /// What the running game said its own prototypes are, when the capture
+    /// shipped with an answer.
     ///
-    /// Consulted before `known_color`, because it is the authority: these came
-    /// out of the running game rather than out of a table somebody typed. It is
-    /// what lets a heavily modded playthrough look like itself without this
-    /// file naming a single one of its prototypes.
-    palette: Option<save_timelapse::palette::Palette>,
+    /// Consulted before every built-in table below, because it is the
+    /// authority: it came out of the running game rather than out of a list
+    /// somebody typed. It is what lets a heavily modded playthrough look and
+    /// behave like itself without this file naming a single one of its
+    /// prototypes.
+    prototypes: Option<save_timelapse::prototypes::Prototypes>,
 }
 
 impl TypeRegistry {
@@ -36,11 +39,11 @@ impl TypeRegistry {
         Self::default()
     }
 
-    /// Must be set before anything is interned: a colour is resolved once, at
-    /// intern time, so a palette arriving later would apply to nothing.
-    pub fn set_palette(&mut self, palette: save_timelapse::palette::Palette) {
-        debug_assert!(self.names.is_empty(), "palette must be set before interning");
-        self.palette = Some(palette);
+    /// Must be set before anything is interned: a name is resolved once, at
+    /// intern time, so a description arriving later would apply to nothing.
+    pub fn set_prototypes(&mut self, prototypes: save_timelapse::prototypes::Prototypes) {
+        debug_assert!(self.names.is_empty(), "prototypes must be set before interning");
+        self.prototypes = Some(prototypes);
     }
 
     /// Both color variants are precomputed rather than one per registered
@@ -53,7 +56,7 @@ impl TypeRegistry {
         }
         let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
         self.names.push(name.to_string());
-        let from_game = self.palette.as_ref();
+        let from_game = self.prototypes.as_ref();
         let rgb = |c: &[u8; 3]| Color::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0);
         let game_entity = from_game.and_then(|p| p.entities.get(name)).map(rgb);
         let game_tile = from_game.and_then(|p| p.tiles.get(name)).map(rgb);
@@ -64,6 +67,13 @@ impl TypeRegistry {
         // blue is what the game uses for structures specifically.
         self.entity_colors.push(game_entity.or(color).unwrap_or_else(|| friendly_shade(name)));
         self.tile_colors.push(game_tile.or(color).unwrap_or_else(|| color_for(name, 0.35, 0.5)));
+        // Resolved here for the same reason the colours are: what a name is
+        // cannot change, and asking once per name beats asking once per entity
+        // per frame.
+        self.kinds.push(match from_game.and_then(|p| p.kind(name)) {
+            Some(kind) => Kind::from_prototype_type(kind, name, from_game.and_then(|p| p.reach.get(name)).copied()),
+            None => Kind::from_name(name),
+        });
         self.ids.insert(name.to_string(), id);
         id
     }
@@ -90,6 +100,130 @@ impl TypeRegistry {
 
     pub fn tile_color(&self, id: TypeId) -> Color {
         self.tile_colors[id as usize]
+    }
+
+    pub fn is_belt(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].belt
+    }
+
+    pub fn is_splitter(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].splitter
+    }
+
+    pub fn is_pipe(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].pipe
+    }
+
+    pub fn is_pipe_to_ground(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].pipe_to_ground
+    }
+
+    pub fn is_resource(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].resource
+    }
+
+    pub fn is_terrain_scatter(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].scatter
+    }
+
+    pub fn is_vehicle(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].vehicle
+    }
+
+    pub fn is_enemy(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].enemy
+    }
+
+    pub fn is_rotation_allowed(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].rotates
+    }
+
+    /// How far an underground belt of this type reaches, or `None` if it is
+    /// not one. The reach is what pairs an entrance with its exit.
+    pub fn underground_reach(&self, id: TypeId) -> Option<i32> {
+        self.kinds[id as usize].reach
+    }
+}
+
+/// What one prototype name is, as far as anything drawing it cares.
+///
+/// Every field here was once a free function matching on the name, and each
+/// one knew only the vanilla and Space Age names. That is the whole reason
+/// this type exists: a Krastorio2 belt is a belt, its ore is ore, and neither
+/// could be recognised by a list of Wube's names. The lists survive below as
+/// `from_name`, which is what a capture recorded before the mod described its
+/// own prototypes still gets.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Kind {
+    belt: bool,
+    splitter: bool,
+    pipe: bool,
+    pipe_to_ground: bool,
+    resource: bool,
+    scatter: bool,
+    vehicle: bool,
+    enemy: bool,
+    rotates: bool,
+    reach: Option<i32>,
+}
+
+impl Kind {
+    /// From the game's own prototype type, which is the answer rather than a
+    /// guess at it. Type names are Factorio's own fixed vocabulary (checked
+    /// against the install's `prototype-api.json`), not any mod's naming, so
+    /// matching on them is not the thing `from_name` had to be replaced for.
+    ///
+    /// The distinctions worth knowing: a splitter can also be a
+    /// `lane-splitter`, an `infinity-pipe` is a pipe wearing a different type,
+    /// and `heat-pipe` is deliberately not one, being different artwork
+    /// entirely. Worms are the bare `turret` type while the player's defences
+    /// are `ammo-turret`, `electric-turret` and `fluid-turret`, which is what
+    /// makes classifying enemies by type safe at all.
+    fn from_prototype_type(kind: &str, name: &str, reach: Option<i32>) -> Self {
+        let belt = kind == "transport-belt";
+        Self {
+            belt,
+            splitter: matches!(kind, "splitter" | "lane-splitter"),
+            pipe: matches!(kind, "pipe" | "infinity-pipe"),
+            pipe_to_ground: kind == "pipe-to-ground",
+            resource: kind == "resource",
+            scatter: matches!(kind, "tree" | "plant" | "cliff"),
+            vehicle: matches!(
+                kind,
+                "car" | "spider-vehicle" | "spider-leg" | "locomotive" | "cargo-wagon" | "fluid-wagon" | "artillery-wagon"
+            ),
+            // The one name still worth knowing, for the one prototype whose
+            // type genuinely lies about which side it is on: a captive biter
+            // spawner is `unit-spawner` and is player built (see
+            // `construction.rs`, which counts it as construction for exactly
+            // that reason).
+            enemy: matches!(kind, "unit" | "unit-spawner" | "turret" | "spider-unit" | "segmented-unit" | "segment")
+                && name != "captive-biter-spawner",
+            // Only belts, matching `ALWAYS_ROTATE`: a belt's chevrons are a
+            // flat top-down icon that rotates honestly, where an oblique
+            // render just spins its fixed camera angle.
+            rotates: belt,
+            reach: (kind == "underground-belt").then_some(reach).flatten(),
+        }
+    }
+
+    /// From the name alone, for a capture whose mod never described its
+    /// prototypes: everything before this feature, which is every release so
+    /// far. Each field defers to the free function it came from, so the two
+    /// paths cannot drift apart.
+    fn from_name(name: &str) -> Self {
+        Self {
+            belt: is_belt(name),
+            splitter: is_splitter(name),
+            pipe: is_pipe(name),
+            pipe_to_ground: is_pipe_to_ground(name),
+            resource: is_resource(name),
+            scatter: is_terrain_scatter(name),
+            vehicle: is_vehicle(name),
+            enemy: is_enemy(name),
+            rotates: is_rotation_allowed(name),
+            reach: underground_reach(name),
+        }
     }
 }
 
@@ -507,7 +641,7 @@ fn known_color(name: &str) -> Option<Color> {
 /// entities. `demolisher` covers the head and its `-segment` bodies at all
 /// three sizes together, the same way `pentapod` covers the size prefixes
 /// and `-leg` suffixes.
-pub fn is_enemy(name: &str) -> bool {
+fn is_enemy(name: &str) -> bool {
     if name == "captive-biter-spawner" {
         return false;
     }
@@ -529,7 +663,7 @@ pub fn is_enemy(name: &str) -> bool {
 /// network frame by frame, and every position they were ever caught in would
 /// otherwise pull the camera. Rails, signals and stations are not here, being
 /// stationary infrastructure rather than the thing moving over it.
-pub fn is_vehicle(name: &str) -> bool {
+fn is_vehicle(name: &str) -> bool {
     matches!(name, "car" | "tank" | "spidertron" | "locomotive" | "cargo-wagon" | "fluid-wagon" | "artillery-wagon")
         || name.starts_with("spidertron-leg-")
 }
@@ -542,7 +676,7 @@ pub fn is_vehicle(name: &str) -> bool {
 /// this set for the same reason it excludes tiles: it says nothing about how
 /// the factory grew, and counting it would track how much of the map has
 /// been revealed instead of where the buildings are.
-pub fn is_terrain_scatter(name: &str) -> bool {
+fn is_terrain_scatter(name: &str) -> bool {
     // `cliff-` rather than just `cliff`: every planet has its own cliff
     // prototype (`cliff-vulcanus`, `cliff-fulgora`, `cliff-gleba`), and
     // matching the bare name alone left all three rendering as structures.
@@ -605,7 +739,7 @@ const OFF_WORLD_FLORA: &[&str] = &[
 /// rather than from whichever ones happened to be noticed. A modded resource
 /// still will not be caught, which costs a wandering camera rather than
 /// anything incorrect.
-pub fn is_resource(name: &str) -> bool {
+fn is_resource(name: &str) -> bool {
     matches!(
         name,
         "iron-ore"
@@ -641,7 +775,7 @@ pub fn is_resource(name: &str) -> bool {
 /// listed renders unrotated by default, same as before this feature existed.
 const ALWAYS_ROTATE: &[&str] = BELTS;
 
-pub fn is_rotation_allowed(name: &str) -> bool {
+fn is_rotation_allowed(name: &str) -> bool {
     ALWAYS_ROTATE.contains(&name)
 }
 
@@ -653,7 +787,7 @@ pub fn is_rotation_allowed(name: &str) -> bool {
 /// picture and a splitter is drawn flat, so both are served fine by their icon.
 const BELTS: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
 
-pub fn is_belt(name: &str) -> bool {
+fn is_belt(name: &str) -> bool {
     BELTS.contains(&name)
 }
 
@@ -667,7 +801,7 @@ pub fn is_belt(name: &str) -> bool {
 const UNDERGROUNDS: &[(&str, i32)] =
     &[("underground-belt", 5), ("fast-underground-belt", 7), ("express-underground-belt", 9), ("turbo-underground-belt", 11)];
 
-pub fn underground_reach(name: &str) -> Option<i32> {
+fn underground_reach(name: &str) -> Option<i32> {
     UNDERGROUNDS.iter().find(|(tier, _)| *tier == name).map(|(_, reach)| *reach)
 }
 
@@ -678,18 +812,18 @@ const SPLITTERS: &[&str] = &["splitter", "fast-splitter", "express-splitter", "t
 /// Plain pipes, whose whole appearance comes from which sides join onto them.
 /// `pipe-to-ground` is deliberately absent: it has its own fixed pictures and
 /// does not change shape with its neighbours.
-pub fn is_pipe(name: &str) -> bool {
+fn is_pipe(name: &str) -> bool {
     name == "pipe"
 }
 
 /// Underground pipes, which draw one of four fixed pictures chosen by facing.
 /// Unlike an underground belt, the two ends of a run carry different
 /// directions of their own, so nothing has to be paired up to tell them apart.
-pub fn is_pipe_to_ground(name: &str) -> bool {
+fn is_pipe_to_ground(name: &str) -> bool {
     name == "pipe-to-ground"
 }
 
-pub fn is_splitter(name: &str) -> bool {
+fn is_splitter(name: &str) -> bool {
     SPLITTERS.contains(&name)
 }
 
@@ -1333,5 +1467,125 @@ mod tests {
         let curated = known_color("transport-belt").expect("belts are curated");
         assert_eq!(registry.entity_color(id).r, curated.r);
         assert_eq!(registry.tile_color(id).r, curated.r);
+    }
+
+    fn typed(pairs: &[(&str, &str)], reach: &[(&str, i32)]) -> TypeRegistry {
+        let mut registry = TypeRegistry::new();
+        registry.set_prototypes(save_timelapse::prototypes::Prototypes {
+            types: pairs.iter().map(|(n, t)| ((*n).to_string(), (*t).to_string())).collect(),
+            reach: reach.iter().map(|(n, r)| ((*n).to_string(), *r)).collect(),
+            ..Default::default()
+        });
+        registry
+    }
+
+    /// The point of the whole exercise: names no list here has ever heard of,
+    /// recognised for what they are because the game said so.
+    ///
+    /// Every one is a real Krastorio2 prototype. Under the name-matching this
+    /// replaced, all four were unrecognised: the belt drew as a flat coloured
+    /// square with no corners, the underground paired with nothing, the pipe
+    /// never joined onto its neighbours, and the ore counted as construction
+    /// and pulled the auto-follow camera out to the patch.
+    #[test]
+    fn a_modded_prototype_is_recognised_from_its_type() {
+        let mut registry = typed(
+            &[
+                ("kr-advanced-transport-belt", "transport-belt"),
+                ("kr-advanced-underground-belt", "underground-belt"),
+                ("kr-fluid-pipe", "pipe"),
+                ("imersite", "resource"),
+            ],
+            &[("kr-advanced-underground-belt", 30)],
+        );
+
+        let belt = registry.intern("kr-advanced-transport-belt");
+        assert!(registry.is_belt(belt), "a modded belt is a belt");
+        assert!(registry.is_rotation_allowed(belt), "and so turns with its chevrons");
+
+        let underground = registry.intern("kr-advanced-underground-belt");
+        assert_eq!(registry.underground_reach(underground), Some(30), "the game's reach, not a vanilla tier's");
+        assert!(!registry.is_belt(underground));
+
+        let pipe = registry.intern("kr-fluid-pipe");
+        assert!(registry.is_pipe(pipe));
+        let ore = registry.intern("imersite");
+        assert!(registry.is_resource(ore), "modded ore must not count as construction");
+    }
+
+    /// Types the vanilla names never had to distinguish, and one that would be
+    /// wrong to fold in: `heat-pipe` is its own artwork entirely, so joining
+    /// it onto its neighbours like a fluid pipe would draw something the game
+    /// does not have.
+    #[test]
+    fn related_types_are_told_apart() {
+        let mut registry = typed(
+            &[
+                ("lane-splitter", "lane-splitter"),
+                ("infinity-pipe", "infinity-pipe"),
+                ("heat-pipe", "heat-pipe"),
+                ("gun-turret", "ammo-turret"),
+                ("small-worm-turret", "turret"),
+            ],
+            &[],
+        );
+
+        let (lane, infinity, heat) =
+            (registry.intern("lane-splitter"), registry.intern("infinity-pipe"), registry.intern("heat-pipe"));
+        assert!(registry.is_splitter(lane));
+        assert!(registry.is_pipe(infinity));
+        assert!(!registry.is_pipe(heat), "a heat pipe is not a fluid pipe");
+
+        let (gun, worm) = (registry.intern("gun-turret"), registry.intern("small-worm-turret"));
+        assert!(!registry.is_enemy(gun), "the player's own defences are their own types");
+        assert!(registry.is_enemy(worm), "a worm is the bare turret type");
+    }
+
+    /// A captive spawner is `unit-spawner` like any nest and is built by the
+    /// player, so the type alone would call it an enemy and stop it counting
+    /// as construction (see `construction.rs`).
+    #[test]
+    fn a_captive_spawner_is_not_an_enemy_despite_its_type() {
+        let mut registry = typed(&[("captive-biter-spawner", "unit-spawner"), ("biter-spawner", "unit-spawner")], &[]);
+        let (captive, wild) = (registry.intern("captive-biter-spawner"), registry.intern("biter-spawner"));
+        assert!(!registry.is_enemy(captive));
+        assert!(registry.is_enemy(wild));
+    }
+
+    /// Every capture that exists today has no such file, so the name lists
+    /// have to keep answering for them exactly as they did before.
+    #[test]
+    fn without_the_game_talking_names_still_answer() {
+        let mut registry = TypeRegistry::new();
+        let ids: Vec<TypeId> = [
+            "transport-belt",
+            "fast-underground-belt",
+            "pipe",
+            "iron-ore",
+            "tree-01",
+            "biter-spawner",
+            "kr-advanced-transport-belt",
+        ]
+        .iter()
+        .map(|n| registry.intern(n))
+        .collect();
+        assert!(registry.is_belt(ids[0]));
+        assert_eq!(registry.underground_reach(ids[1]), Some(7));
+        assert!(registry.is_pipe(ids[2]));
+        assert!(registry.is_resource(ids[3]));
+        assert!(registry.is_terrain_scatter(ids[4]));
+        assert!(registry.is_enemy(ids[5]));
+        assert!(!registry.is_belt(ids[6]), "and know nothing of a mod, as before");
+    }
+
+    /// A file that describes some prototypes says nothing about the ones it
+    /// leaves out, and those must fall back rather than come back blank. A
+    /// modded capture still holds vanilla belts.
+    #[test]
+    fn a_name_the_file_omits_falls_back_to_its_own_answer() {
+        let mut registry = typed(&[("kr-advanced-transport-belt", "transport-belt")], &[]);
+        let (belt, underground) = (registry.intern("transport-belt"), registry.intern("underground-belt"));
+        assert!(registry.is_belt(belt), "unmentioned, so answered by name");
+        assert_eq!(registry.underground_reach(underground), Some(5));
     }
 }

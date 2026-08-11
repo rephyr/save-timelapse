@@ -759,8 +759,8 @@ function M.player_log_name(session_id)
   return M.session_dir(session_id) .. "players.jsonl"
 end
 
-function M.palette_name(session_id)
-  return M.session_dir(session_id) .. "palette.json"
+function M.prototypes_name(session_id)
+  return M.session_dir(session_id) .. "prototypes.json"
 end
 
 --- Which prototype types are enemies whatever else is true of them, and so
@@ -834,30 +834,56 @@ function M.color_bytes(color)
   return clamp_byte(r * scale), clamp_byte(g * scale), clamp_byte(b * scale)
 end
 
---- Every prototype's own map colour, as JSON, so the desktop side never has to
---- know what a prototype is called.
+--- The types that have an underground reach to report, so nothing else is
+--- asked for a property it does not have.
 ---
---- These are the exact colours Factorio paints its own map view with, which is
---- the palette a player already has in their head, and the only place they
---- exist is inside the running game: a mod ships as a zip in the mods folder,
---- not as anything the desktop tool can read. Without this, supporting a mod's
---- terrain means hand-transcribing its colours, once per mod, forever. Alien
---- Biomes alone adds a couple of hundred tiles.
+--- `max_underground_distance` is documented optional and so returns nil rather
+--- than raising for everything else (checked against the install's own
+--- runtime-api.json, the same source `EXCLUDED_TYPES` was checked against), but
+--- this file is written inside a `pcall` that turns any raise into no file at
+--- all. Reading two types' worth of properties instead of sixteen hundred is
+--- both cheaper and not a thing that can cost a capture its whole sidecar.
+local REACH_TYPES = {
+  ["underground-belt"] = true,
+  ["pipe-to-ground"] = true,
+}
+
+--- Everything the desktop side needs to know about this game's prototypes, as
+--- JSON, so it never has to recognise one by name.
 ---
---- Written once beside the baseline rather than per tick. Colours cannot change
---- during a playthrough: prototypes are fixed at load time.
+--- Two questions, one file, because both have the same answer source and the
+--- same lifetime. What colour is it: the exact colours Factorio paints its own
+--- map view with, which is the palette a player already has in their head. And
+--- what *is* it: a belt, a pipe, an ore patch, a tree. Neither exists anywhere
+--- but inside the running game, since a mod ships as a zip in the mods folder,
+--- not as anything the desktop tool can read.
 ---
---- Entities use `map_color` and fall back to `friendly_map_color`, with nests
+--- Without this, supporting a mod means transcribing its prototypes by hand,
+--- once per mod, forever: Alien Biomes alone adds a couple of hundred tiles,
+--- and Krastorio2 adds belt tiers, ore types and pipes that a viewer built
+--- around the vanilla names cannot see are belts, ore or pipes at all.
+---
+--- Written once beside the baseline rather than per tick, and refreshed once
+--- per load (see capture.lua's `prototypes_written`). None of it can change during
+--- a playthrough: prototypes are fixed at load time.
+---
+--- Entities take `map_color` and fall back to `friendly_map_color`, with nests
 --- and their kind taking `enemy_map_color`, which is the same split the game
---- makes when it draws them.
-function M.palette_json()
+--- makes when it draws them. The two are mutually exclusive per prototype:
+--- `map_color` is documented as what charting uses "if a friendly or enemy
+--- color isn't defined", and the prototypes that define one leave the other
+--- nil.
+function M.prototypes_json()
   local parts = {}
-  local function add(name, color)
+  local function add(text)
+    parts[#parts + 1] = text
+  end
+  local function add_color(name, color)
     if not color then
       return
     end
     local r, g, b = M.color_bytes(color)
-    parts[#parts + 1] = string.format('%q:[%d,%d,%d]', name, r, g, b)
+    add(string.format('%q:[%d,%d,%d]', name, r, g, b))
   end
 
   local tiles = {}
@@ -874,22 +900,44 @@ function M.palette_json()
     else
       color = proto.map_color or proto.friendly_map_color
     end
-    entities[#entities + 1] = { name = name, color = color }
+    entities[#entities + 1] = {
+      name = name,
+      color = color,
+      -- The prototype's own type, verbatim and unfiltered. Deciding here
+      -- which types are worth reporting would just move the curated list
+      -- from one side of the file to the other, and the desktop side is
+      -- where the answer is actually wanted.
+      kind = proto.type,
+      reach = REACH_TYPES[proto.type] and proto.max_underground_distance or nil,
+    }
   end
   table.sort(entities, function(a, b) return a.name < b.name end)
 
-  local out = { '{"tiles":{' }
-  local first = #parts
-  for _, t in ipairs(tiles) do
-    add(t.name, t.color)
+  -- Each section's entries are built into the shared `parts` buffer and then
+  -- joined out of it by range, so a section costs one concat rather than a
+  -- table of its own.
+  local out = {}
+  local function section(prefix, items, emit)
+    out[#out + 1] = prefix
+    local first = #parts
+    for _, item in ipairs(items) do
+      emit(item)
+    end
+    out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
   end
-  out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
-  out[#out + 1] = '},"entities":{'
-  first = #parts
-  for _, e in ipairs(entities) do
-    add(e.name, e.color)
-  end
-  out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
+
+  section('{"tiles":{', tiles, function(t) add_color(t.name, t.color) end)
+  section('},"entities":{', entities, function(e) add_color(e.name, e.color) end)
+  section('},"types":{', entities, function(e)
+    if e.kind then
+      add(string.format('%q:%q', e.name, e.kind))
+    end
+  end)
+  section('},"reach":{', entities, function(e)
+    if e.reach then
+      add(string.format('%q:%d', e.name, e.reach))
+    end
+  end)
   out[#out + 1] = '}}'
   return table.concat(out)
 end

@@ -7,8 +7,8 @@ pub mod frame;
 pub mod locate;
 pub mod milestone;
 pub mod names;
-pub mod palette;
 pub mod player_log;
+pub mod prototypes;
 pub mod replay;
 /// What the tool remembers between runs. Distinct from [`settings_dat`],
 /// which is Factorio's own `mod-settings.dat` format and nothing to do with

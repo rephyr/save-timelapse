@@ -12,7 +12,7 @@
 //! this graph is to show when the player was working, not to count distinct
 //! positions ever occupied.
 
-use crate::registry::{is_resource, is_terrain_scatter, TypeRegistry};
+use crate::registry::TypeRegistry;
 use crate::render_frame::FrameSequence;
 
 /// Entity positions are aligned to a tenth of a tile, the same fixed point
@@ -114,8 +114,7 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
         }
         current.clear();
         for run in &frame.entity_runs {
-            let name = registry.name(run.type_id);
-            if is_terrain_scatter(name) || is_resource(name) {
+            if registry.is_terrain_scatter(run.type_id) || registry.is_resource(run.type_id) {
                 continue;
             }
             current.extend(frame.entities[run.range()].iter().map(|e| pos_key(e.x, e.y)));

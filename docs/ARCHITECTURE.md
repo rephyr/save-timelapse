@@ -67,6 +67,7 @@ minutes of play, and why terrain left the frame format entirely.
 | The file formats | Frame format, Event format, Format stability |
 | Why captures survive version changes | Format stability and the extension contract |
 | What gets recorded and what does not | Entity filtering, What counts as the factory |
+| How a modded game describes itself | What the game says about itself |
 | How live capture reassembles history | Live capture and replay, Why replay is forgiving |
 | The hardest problem here | Reloading an earlier save |
 | Why the viewer is fast | Rendering, Loading, Only writing surfaces that changed |
@@ -382,18 +383,21 @@ catch Spidertron and does not, because Spidertron is `spider-vehicle`. Guessing
 would have excluded a player entity while leaving the enemies in.
 
 None of this helps a capture already on disk, where these entities are already
-recorded. `viewer/src/registry.rs` therefore names them too (`is_enemy`,
-`is_vehicle`), which cannot un-capture them but does stop them counting as
-construction for the auto-follow camera.
+recorded. `viewer/src/registry.rs` therefore recognises them too, from the
+game's own prototype types when the capture carries them and from its fallback
+name lists when it does not. That cannot un-capture them, but it does stop them
+counting as construction for the auto-follow camera.
 
 Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
 being enemies, because they are stationary and so the format represents them
 honestly. Watching the front line move outward as nests are cleared is a real
 part of how expansion looks, and the viewer colors both red so it reads at a
-glance (`viewer/src/registry.rs`'s `is_enemy`). Worms additionally could not
-be filtered safely even if wanted: they share Factorio's `turret` type with
-player-built turrets, so excluding them would mean matching by name rather
-than by what the entity actually is, risking a real player entity.
+glance. Worms additionally could not be filtered safely even if wanted: they
+share Factorio's `turret` type with player-built turrets, so excluding them
+would mean matching by name rather than by what the entity actually is,
+risking a real player entity. Note that this cuts the other way for the
+viewer, where the bare `turret` type is precisely what identifies a worm,
+because the player's own turrets are three separate types.
 
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
@@ -421,14 +425,18 @@ The mod side had the identical bug feeding the terrain margin, with trees in it
 too, so "32 tiles around the factory" was really 32 tiles around the explored
 map. That is most of where terrain capture's measured 5x came from.
 
-The Rust side filters by name (`is_terrain_scatter`, `is_resource`, `is_enemy`),
-which is a hand-maintained denylist and has needed a patch per planet. The mod
-side does not have to: it asks `entity.force`, which answers the question
-structurally, and it asks once per distinct prototype name rather than once per
-entity, since that loop runs on bases holding hundreds of thousands of them. The
-durable fix for the viewer is to carry force on the wire so it can stop guessing
-from names; the frame format's run flags have room for a bit that changes no
-layout, so an older reader would ignore it safely.
+The Rust side used to filter by name (`is_terrain_scatter`, `is_resource`,
+`is_enemy`), a hand-maintained denylist that needed a patch per planet and
+could not see a modded ore patch as ore at all. The mod side never had to: it
+asks the prototype what it is, which answers the question structurally, and it
+asks once per distinct prototype name rather than once per entity, since that
+loop runs on bases holding hundreds of thousands of them.
+
+The viewer now asks the same question the same way, by reading what the game
+said about its own prototypes (see What the game says about itself). The name
+lists survive only as the answer for captures recorded before the mod started
+saying, and are private to `registry.rs` so nothing outside it can go back to
+guessing.
 
 ### How much ground to capture
 
@@ -451,6 +459,81 @@ a margin of `(sqrt(k) - 1) / 2` per side, so k=4 yields exactly the half-width
 a 16:9 frame exposes. As a flat ceiling it inverted on any base larger than
 itself, leaving nothing to spend and falling back to the 32 tile floor, so the
 biggest factories got the smallest margins.
+
+## What the game says about itself
+
+A capture records prototype *names*, and a name means nothing on its own. The
+viewer has to know what colour `vegetation-turquoise-grass-2` is, and whether
+`kr-advanced-transport-belt` is a belt, and it cannot work either out. Both
+answers exist only inside the running game: a mod ships as a zip in the mods
+folder, so its prototypes are Lua the desktop side never executes.
+
+So the mod writes them down. One file, `prototypes.json`, beside everything
+else a capture produces:
+
+    {
+      "tiles":    { "grass-1": [55, 53, 11], ... },        map_color, as bytes
+      "entities": { "transport-belt": [204, 161, 71], ... },
+      "types":    { "kr-advanced-transport-belt": "transport-belt", ... },
+      "reach":    { "kr-advanced-underground-belt": 30, ... }
+    }
+
+Colours are the ones Factorio paints its own map view with, which is the
+palette a player already has in their head. Types are each entity prototype's
+own `type`, verbatim and unfiltered: deciding mod-side which types are
+interesting would only move the curated list from one side of the file to the
+other, and the viewer is where the answer is wanted. `reach` is
+`max_underground_distance`, asked only of the two types that have one.
+
+Before this, supporting a mod meant transcribing its prototypes into tables in
+`registry.rs`, once per mod, forever. Alien Biomes alone adds a couple of
+hundred tiles; Krastorio2 adds belt tiers, ores and pipes that a viewer built
+around Wube's names cannot see are belts, ore or pipes at all.
+
+**Absent is normal.** Every capture recorded before this file existed has none,
+so the reader folds every failure into "no file" and the viewer falls back on
+its built-in colours and name lists. Missing sections work the same way, which
+is what lets a file written by an older mod than the reader still be used for
+what it does say. Unusable *entries* are dropped one at a time rather than
+taking the file with them, which is not defensiveness for its own sake: mod
+0.7.0 wrote colours out of byte range, and deserializing straight into the
+struct meant the first bad number threw away all 364 good ones and rendered a
+whole modded playthrough from the built-in table.
+
+**Colours are 0..255 or 0..1, and the game will not tell you which.** Factorio
+accepts a `Color` written either way and distinguishes them by rule: if any
+component exceeds 1, the whole colour is in 0..255. Prototypes overwhelmingly
+use the second form, base's own tiles included (`grass-1` is `{55, 53, 11}`),
+and the runtime hands a prototype's colour back exactly as written rather than
+normalising it. `encode.color_bytes` applies the game's rule and clamps, since
+the rule is a convention the game does not enforce on a mod.
+
+**An entity's colour depends on whose it is, which a prototype cannot know.**
+`map_color` is documented as what charting uses "if a friendly or enemy color
+isn't defined", and the two are mutually exclusive per prototype: the ones
+defining `map_color` (rails, trees, cliffs) leave `friendly_map_color` and
+`enemy_map_color` nil, and the rest carry the pair. Preferring the enemy colour
+therefore paints a whole factory biter red, since force is a property of an
+entity and not of the prototype this file is keyed by. Enemies are picked out
+by type instead, which for a capture is exact: the only enemies that survive
+entity filtering are nests and worms.
+
+**Written once per load, not once per capture.** The baseline runs once per
+save and then never again, so a file written only there froze at whatever the
+playthrough started with. `capture.lua` refreshes it on the first flush after
+each load, which is as often as the answer can change (prototypes are fixed at
+load time). That is what lets a capture already in progress pick up a mod added
+since, or a fix to how this file is written, without a reset.
+
+The viewer resolves both halves at intern time, next to where it already
+resolves colour, so a name costs one lookup rather than one per entity per
+frame. Factorio's type vocabulary is fixed and small, so matching on it in
+`registry.rs` is not the thing the name lists had to be replaced for, but it
+does need care: a splitter can also be a `lane-splitter`, an `infinity-pipe` is
+a pipe while a `heat-pipe` is not, and worms are the bare `turret` type while
+the player's defences are `ammo-turret`, `electric-turret` and `fluid-turret`,
+which is what makes classifying enemies by type safe. Exactly one name is still
+worth knowing: `captive-biter-spawner` is a `unit-spawner` the player built.
 
 ## Ground is scanned, not captured
 
@@ -518,6 +601,8 @@ reassembles any moment by replaying that log over the baseline.
         frame_<tick>_<surface>.stfr   the baseline itself, one per surface
         events_<start_tick>.stev      append-only, one segment per timeline
         players.jsonl                 optional, sampled player positions
+        milestones.jsonl              optional, when each milestone was reached
+        prototypes.json               this game's colours and prototype types
 
 `<session>/baseline.json` is written last, so its existence means that
 playthrough's baseline finished. It is the handshake: replay reads it to
@@ -913,6 +998,24 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
+**One entity per position is a real limitation, not just an invariant.**
+Factorio lets two things occupy one position, and the pair that matters is a
+resource with something built on top of it. An `AddEntity` landing on an
+occupied key replaces what is there, so a belt or an odd-sized machine centred
+on an ore tile evicts that tile's ore; the later `RemoveEntity` then clears the
+position and the ore never returns. Only an exact key collision does it, so an
+even-sized building (positioned on a tile corner, never a centre) collides with
+nothing and an odd-sized one takes only the tile under its middle, which is why
+it reads as scattered gaps in a patch rather than a clean footprint.
+
+Both halves of the map are keyed this way for the same reason: `remove_at` is
+the only thing that can resolve a baseline-original entity, since a snapshot
+records no `unit_number`. Fixing this means letting a position hold more than
+one entity and teaching removal which one it meant, most cheaply by never
+letting an add evict a resource and never letting a positional remove take one,
+since a resource is never what a build event removes. Ore already has to be
+opted into (`save-timelapse-include-resources`), which is why this went unseen.
+
 ## What the tool remembers
 
 Four things, in plain JSON under the user's own config directory
@@ -1095,8 +1198,9 @@ drops the parsed form. Two things happen in that conversion.
 
 **Names are interned.** A real base has tens of distinct prototype names
 against hundreds of thousands of entities (or millions of tiles on a fully
-paved one), so `TypeRegistry` maps each name to a `u16` once and resolves its
-color at the same time. Drawing then never hashes a name: the pre-registry
+paved one), so `TypeRegistry` maps each name to a `u16` once and resolves both
+its color and what it *is* at the same time (see What the game says about
+itself). Drawing then never hashes a name: the pre-registry
 loop called `color_for` (FNV over the name) and `sprites.get(&e.n)` (SipHash
 over the name) for every entity on every rendered frame. `Frame`'s `n` field
 is `Arc<str>` rather than `String` for the same reason, one level earlier:

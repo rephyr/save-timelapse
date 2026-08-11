@@ -1593,7 +1593,7 @@ No captures found in {}.",
 /// existing at all.
 fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
     let mut copied = Vec::new();
-    for name in ["players.jsonl", "milestones.jsonl", "palette.json"] {
+    for name in ["players.jsonl", "milestones.jsonl", "prototypes.json"] {
         let source = session_dir.join(name);
         if source.exists() {
             std::fs::copy(&source, out.join(name))?;
