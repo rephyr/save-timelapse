@@ -9,7 +9,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use save_timelapse::export;
@@ -17,7 +17,7 @@ use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
 use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
-use save_timelapse::settings::{self, Settings};
+use save_timelapse::settings::Settings;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -65,9 +65,35 @@ fn prompt(question: &str) -> io::Result<String> {
     let mut line = String::new();
     let read = io::stdin().read_line(&mut line)?;
     if read == 0 {
-        return Err(io::Error::other("no more input"));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no more input"));
     }
     Ok(line.trim().to_string())
+}
+
+/// Whether an error means there is nobody left to ask.
+///
+/// Matters because a failed action now returns to the menu instead of ending
+/// the program. Without this, a closed stdin would fail the action, return to
+/// the menu, fail the menu's own prompt, and spin forever printing the same
+/// message. Every other kind of failure is something the user can react to, so
+/// only this one still ends the run.
+fn input_closed(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof
+}
+
+/// Reports a failed action and waits, then hands control back to the menu.
+///
+/// A double-clicked console gives no scrollback, so a message that is not
+/// paused on is a message nobody read. This is the only place a failure is
+/// printed now: individual flows return their error rather than announcing it
+/// and exiting, so "what went wrong" and "what happens next" stay in one place.
+fn show_problem(e: &io::Error) {
+    println!("\nThat didn't work.\n\n{e}\n");
+    print!("Press Enter to go back to the menu...");
+    io::stdout().flush().ok();
+    let mut discard = String::new();
+    io::stdin().read_line(&mut discard).ok();
+    println!();
 }
 
 /// Announces a step and leaves the line open, so whatever the step finds
@@ -80,7 +106,12 @@ fn prompt(question: &str) -> io::Result<String> {
 /// buffered, so without it the announcement would appear *after* the work it
 /// is announcing, which is worse than not printing it at all.
 fn step(what: &str) {
-    print!("{what}... ");
+    // Callers prefix a blank line to separate one stage of a flow from the
+    // last. That has to stay in front of the indent, or the indent lands on
+    // the line being left behind rather than the line being written.
+    let body = what.trim_start_matches('\n');
+    let breaks = &what[..what.len() - body.len()];
+    print!("{breaks}  {body}... ");
     io::stdout().flush().ok();
 }
 
@@ -88,21 +119,29 @@ fn step(what: &str) {
 /// Hiding it when there is nothing to open would renumber everything else
 /// depending on state, and a menu whose option 2 means different things on
 /// different days is worse than one line that sometimes reads "none yet".
+///
+/// Every line names a thing the user wants, not a thing the tool does, and
+/// none of them explains itself in brackets: an option that needs a sentence
+/// of justification beside it is one nobody can choose between at a glance.
+/// Quit is a numbered option rather than only a bare Enter, because "press
+/// Enter to quit" is an instruction somebody has to read and remember, and a
+/// menu that cannot be left the same way it is used is a trap.
 fn ask_mode(already_built: usize) -> io::Result<Mode> {
-    let opened = match already_built {
-        0 => "Open a timelapse I already built (none yet)".to_string(),
-        1 => "Open a timelapse I already built (1 available)".to_string(),
-        n => format!("Open a timelapse I already built ({n} available)"),
+    let ready = match already_built {
+        0 => String::new(),
+        1 => "         1 ready".to_string(),
+        n => format!("         {n} ready"),
     };
     loop {
         let input = prompt(&format!(
-            "What would you like to do?\n\
-             \x20 1) {opened}\n\
-             \x20 2) Update my timelapse from live capture (recommended if capture is on)\n\
-             \x20 3) Build a timelapse from existing save files\n\
-             \x20 4) Save a timelapse as a video file I can share\n\
-             \x20 5) Manage my captures (name them, see their size, delete ones you're done with)\n\
-             Enter 1, 2, 3, 4 or 5, or press Enter to quit:"
+            "  What would you like to do?\n\n\
+             \x20   1  Watch a timelapse{ready}\n\
+             \x20   2  Build one from what you recorded while playing\n\
+             \x20   3  Build one from your save files\n\
+             \x20   4  Save one as a video file\n\
+             \x20   5  Manage your recordings\n\
+             \x20   6  Quit\n\n\
+             \x20 Type a number:"
         ))?;
         match input.as_str() {
             "1" => return Ok(Mode::OpenExisting),
@@ -110,12 +149,11 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
             "3" => return Ok(Mode::FromSaves),
             "4" => return Ok(Mode::ExportVideo),
             "5" => return Ok(Mode::ManageCaptures),
-            // Managing captures returns here rather than exiting, so this
-            // menu needs its own way out. Blank rather than another number:
-            // Enter is what someone already presses to leave the management
-            // screen, and it should keep meaning "back" one level up.
-            "" => return Ok(Mode::Quit),
-            _ => println!("Please enter 1, 2, 3, 4 or 5.\n"),
+            // Bare Enter still leaves, both because it is what long-time users
+            // already press and because it is what leaves every screen below
+            // this one, so it should keep meaning "back" one level up.
+            "6" | "q" | "Q" | "" => return Ok(Mode::Quit),
+            _ => println!("\n  Please type a number from 1 to 6.\n"),
         }
     }
 }
@@ -141,28 +179,29 @@ fn locate_factorio_user_dir_interactive(settings: &mut Settings) -> io::Result<P
     // having just worked it out, and it is the only clue anyone gets that a
     // saved setting is in play at all.
     if let Some(dir) = settings.valid_factorio_dir() {
-        println!("remembered from last time\n  {}", dir.display());
+        println!("found");
         return Ok(dir.to_path_buf());
     }
     if let Some(dir) = factorio_user_dir() {
         if dir.join("mods").is_dir() {
-            println!("found at\n  {}", dir.display());
+            println!("found");
             settings.factorio_dir = Some(dir.clone());
             return Ok(dir);
         }
     }
-    println!("not found automatically.\n");
+    println!("not found\n");
     loop {
         let input = prompt(
-            "Please enter the path to it (the folder containing \"mods\" and \"saves\", \
-             usually %APPDATA%\\Factorio on Windows):",
+            "  Where is your Factorio data folder? It is the one with \"mods\" and\n  \
+             \"saves\" inside it, usually %APPDATA%\\Factorio.\n\n  \
+             Paste the path here:",
         )?;
         let path = PathBuf::from(&input);
         if path.join("mods").is_dir() {
             settings.factorio_dir = Some(path.clone());
             return Ok(path);
         }
-        println!("That doesn't look right: no \"mods\" folder inside {}.\n", path.display());
+        println!("\n  That folder has no \"mods\" inside it, so it is not the right one.\n");
     }
 }
 
@@ -172,26 +211,27 @@ fn locate_factorio_exe_interactive(settings: &mut Settings) -> io::Result<PathBu
     step("Finding your Factorio install");
 
     if let Some(exe) = settings.valid_factorio_exe() {
-        println!("remembered from last time\n  {}", exe.display());
+        println!("found");
         return Ok(exe.to_path_buf());
     }
     if let Some(exe) = locate_factorio() {
-        println!("found at\n  {}", exe.display());
+        println!("found");
         settings.factorio_exe = Some(exe.clone());
         return Ok(exe);
     }
-    println!("not found automatically.\n");
+    println!("not found\n");
     loop {
         let input = prompt(
-            "Please enter the full path to factorio.exe (usually inside a Steam \
-             library, under Factorio\\bin\\x64\\factorio.exe):",
+            "  Where is factorio.exe? In a Steam install it is usually under\n  \
+             Factorio\\bin\\x64\\factorio.exe.\n\n  \
+             Paste the path here:",
         )?;
         let path = PathBuf::from(&input);
         if path.is_file() {
             settings.factorio_exe = Some(path.clone());
             return Ok(path);
         }
-        println!("That file doesn't exist: {}\n", path.display());
+        println!("\n  There is no file there. Check the path and try again.\n");
     }
 }
 
@@ -239,16 +279,16 @@ fn parse_frame_seconds(input: &str) -> Option<u64> {
 fn ask_frame_seconds(default: u64) -> io::Result<u64> {
     loop {
         let input = prompt(&format!(
-            "How much game time should each frame represent? Fewer seconds means more \
-             frames, spaced closer together: smoother scrubbing and playback, at the cost of \
-             a larger export and slower load in the viewer. Enter seconds [default {default}]:"
+            "  How often should the timelapse take a picture?\n  \
+             A smaller number is smoother to watch but makes a bigger file.\n\n  \
+             Press Enter for every {default} seconds of game time, or type a number:"
         ))?;
         if input.trim().is_empty() {
             return Ok(default);
         }
         match parse_frame_seconds(&input) {
             Some(seconds) => return Ok(seconds),
-            None => println!("Please enter a whole number of seconds greater than 0.\n"),
+            None => println!("\n  Please type a whole number bigger than 0.\n"),
         }
     }
 }
@@ -256,9 +296,10 @@ fn ask_frame_seconds(default: u64) -> io::Result<u64> {
 fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
     loop {
         let input = prompt(&format!(
-            "Render every surface (so tab in the viewer can switch between worlds), or just \
-             one?\nSurfaces found: {}\nEnter a name, or press Enter for every surface:",
-            surfaces.join(", ")
+            "  Include everywhere you have been, or just one place?\n  \
+             You have been to: {}\n\n  \
+             Press Enter for all of them, or type one name:",
+            surfaces.iter().map(|s| pretty_place(s)).collect::<Vec<_>>().join(", ")
         ))?;
         if input.is_empty() {
             return Ok(None);
@@ -266,7 +307,7 @@ fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
         if let Some(found) = find_surface(&input, surfaces) {
             return Ok(Some(found.to_string()));
         }
-        println!("\"{input}\" doesn't match any surface listed above. Try again.\n");
+        println!("\n  There is no \"{input}\" in that list. Try again.\n");
     }
 }
 
@@ -306,19 +347,17 @@ fn parse_session_index(input: &str, count: usize) -> Option<usize> {
 /// prevent, so this always picks exactly one rather than offering "all"
 /// the way `ask_surface_choice` and the from-saves flow's selection do.
 fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
-    println!("\nFound {} captured playthrough(s):", sessions.len());
+    println!("\n  You have {} recordings:\n", sessions.len());
     let now = SystemTime::now();
     for (i, session) in sessions.iter().enumerate() {
-        let age = now.duration_since(session.last_modified).unwrap_or_default();
-        let _ = age;
-        println!("  {}) {}", i + 1, describe_session(session, now));
+        println!("  {}  {}\n", i + 1, describe_session(session, now));
     }
     loop {
-        let input = prompt("\nWhich playthrough do you want to update the timelapse for? Enter a number:")?;
+        let input = prompt("  Which one? Type a number:")?;
         if let Some(index) = parse_session_index(&input, sessions.len()) {
             return Ok(index);
         }
-        println!("Please enter a number between 1 and {}.\n", sessions.len());
+        println!("\n  Please type a number from 1 to {}.\n", sessions.len());
     }
 }
 
@@ -475,19 +514,20 @@ fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
 }
 
 fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
-    println!("\nTimelapses you have already built:");
+    println!("\n  Your timelapses:\n");
     for (i, t) in built.iter().enumerate() {
         let age = t.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
-        println!("  {}) {} ({} frames, {}, built {age})", i + 1, t.name, t.frames, describe_size(t.bytes));
+        println!("  {}  {}", i + 1, t.name);
+        println!("     {} frames, {}, built {age}\n", with_thousands(t.frames as u64), describe_size(t.bytes));
     }
     loop {
-        let input = prompt(&format!("\n{question} Enter a number, or press Enter to go back:"))?;
+        let input = prompt(&format!("  {question} Type a number, or press Enter to go back:"))?;
         if input.is_empty() {
             return Ok(None);
         }
         match input.parse::<usize>() {
             Ok(n) if n >= 1 && n <= built.len() => return Ok(Some(n - 1)),
-            _ => println!("Please enter a number between 1 and {}.", built.len()),
+            _ => println!("\n  Please type a number from 1 to {}.\n", built.len()),
         }
     }
 }
@@ -652,7 +692,7 @@ fn videos_root() -> PathBuf {
 fn run_export(settings: &mut Settings) -> io::Result<()> {
     let built = list_timelapses();
     if built.is_empty() {
-        println!("\nNothing built yet. Use option 2 or 3 first, then come back.\n");
+        println!("\n  You need a timelapse before you can save one as a video.\n  Try option 2 or 3 first.\n");
         return Ok(());
     }
 
@@ -732,16 +772,15 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // exists but names no finished baseline are the same "not started yet"
     // state from here, so a read_dir failure is folded into the empty case
     // rather than surfaced as a raw IO error.
-    step("Looking for captured playthroughs");
+    step("Looking for recordings");
     let sessions = replay::discover_sessions(&capture).unwrap_or_default();
     println!("{} found", sessions.len());
     if sessions.is_empty() {
-        return Err(io::Error::other(format!(
-            "No live capture found at {}.\n\n\
-             In Factorio, turn on the \"save-timelapse-live-capture\" setting (Settings > Mod \
-             Settings > Runtime > Save Timelapse), play for a bit, then run this again.",
-            capture.display()
-        )));
+        return Err(io::Error::other(
+            "You have no recordings yet.\n\n  \
+             In Factorio, open Settings > Mod Settings > Runtime and turn on \"Live capture\"\n  \
+             for Save Timelapse. Play for a while, then come back here.",
+        ));
     }
 
     // Different playthroughs are tagged separately precisely so they never
@@ -758,18 +797,13 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // The slowest silent step in the whole tool: a megabase baseline is tens
     // of megabytes and takes real time to read, with nothing on screen until
     // it finished.
-    step("\nReading the baseline snapshot");
+    step("\nReading your recording");
     let mut replay_state = replay::load_baseline(&chosen.baseline_path)?;
-    println!(
-        "tick {} ({} entities, {} tiles)",
-        replay_state.baseline.tick,
-        replay_state.world.entity_count(),
-        replay_state.world.tile_count()
-    );
+    println!("{} buildings", with_thousands(replay_state.world.entity_count() as u64));
 
-    step("Finding surfaces");
+    step("Finding places");
     let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
-    println!("{}\n", surfaces.join(", "));
+    println!("{}\n", describe_places(&surfaces));
 
     let chosen_surface = ask_surface_choice(&surfaces)?;
     let frame_seconds = ask_frame_seconds(settings.frame_seconds.unwrap_or(DEFAULT_FRAME_SECONDS))?;
@@ -791,7 +825,15 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // just this one before writing is still right: a shorter capture than
     // last time cannot leave stale, higher-numbered frames behind for the
     // viewer to mix in with current data.
-    let name = chosen.label().unwrap_or_else(|| format!("playthrough-{:08x}", chosen.session_id));
+    // Falls back to where the playthrough happened rather than to its session
+    // id. This name becomes a folder the user sees and later picks from a
+    // list, and "playthrough-cab96f9f" tells them nothing about which one it
+    // is. The id stays as the last resort, since two unnamed playthroughs on
+    // the same planets would otherwise collide on one folder.
+    let name = chosen.label().unwrap_or_else(|| match chosen.baseline.surfaces.as_slice() {
+        [] => format!("playthrough-{:08x}", chosen.session_id),
+        surfaces => format!("{} ({:08x})", describe_places(surfaces), chosen.session_id),
+    });
     let out = timelapses_root().join(as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
@@ -826,7 +868,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 
     let emitted = match &chosen_surface {
         None => {
-            println!("rendering every surface, one frame per {frame_seconds}s of game time\n");
+            println!("\n  Building your timelapse. On a big factory this takes a while.\n");
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
@@ -837,13 +879,13 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
                 }
                 written += 1;
                 if written.is_multiple_of(25) {
-                    print!("\r{written} frames");
+                    print!("\r  {written} frames");
                     io::stdout().flush().ok();
                 }
             })?
         }
         Some(name) => {
-            println!("rendering surface {name}, one frame per {frame_seconds}s of game time\n");
+            println!("\n  Building your timelapse of {}. On a big factory this takes a while.\n", pretty_place(name));
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
@@ -856,7 +898,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
                 }
                 written += 1;
                 if written.is_multiple_of(25) {
-                    print!("\r{written} frames");
+                    print!("\r  {written} frames");
                     io::stdout().flush().ok();
                 }
             })?
@@ -865,76 +907,46 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     if let Some(e) = error {
         return Err(e);
     }
-    println!("\r{emitted} frames written to {}\n", out.display());
+    println!(
+        "\r  Built {} frames covering {}.",
+        with_thousands(emitted as u64),
+        describe_span(replay_state.baseline.tick, replay_state.world.tick)
+    );
+    println!("  Saved in {}", out.display());
 
-    if replay_state.catch_ups_applied > 0 {
-        println!(
-            "{} catch-up baseline(s) applied for surface(s) added to tracking after capture started\n",
-            replay_state.catch_ups_applied
-        );
-    }
+    // What used to print here was six paragraphs, of which four reported that
+    // the replay had handled something correctly: catch-up baselines applied,
+    // events superseded by a reload, segments holding more than one attempt at
+    // the same stretch of play. Those are real and hard-won (see the reloading
+    // section in ARCHITECTURE.md), and they are also nothing the person who
+    // just wanted a timelapse can do anything about. Correct behaviour does
+    // not need announcing.
+    //
+    // What survives is only what changes what somebody should do next, and
+    // each one says what to do rather than what was counted.
+    let mut acted = false;
 
-    // Informational, deliberately not grouped with the warnings below: this
-    // is what a playthrough that was reloaded from an earlier save looks like
-    // when it replays correctly, so it reports rather than warns.
-    if replay_state.superseded_events > 0 {
-        println!(
-            "{} event(s) skipped from timeline(s) you reloaded away from; the timelapse follows \
-             what you actually played\n",
-            replay_state.superseded_events
-        );
-    }
-
-    // Its own line rather than folded into the message above, since this one
-    // names a different thing: not events dropped, but files that turned out
-    // to hold more than one attempt at the same stretch of play.
-    if replay_state.restarted_segments > 0 {
-        println!(
-            "{} segment(s) held more than one attempt at the same stretch of play, which is what \
-             reloading a save mid-capture looks like; only the last attempt at each was used\n",
-            replay_state.restarted_segments
-        );
-    }
-
-    // The one message here that names something the user can act on, and
-    // deliberately not phrased as corruption: a skipped extension record only
-    // means the mod that wrote this capture is newer than this build. The
-    // replay is correct as far as it goes, it just does not show whatever the
-    // newer records described, and updating the tool is what recovers them.
+    // Deliberately not phrased as corruption: a skipped extension record only
+    // means the mod that wrote this recording is newer than this build. The
+    // timelapse is correct as far as it goes.
     if replay_state.unknown_extensions > 0 {
-        println!(
-            "{} record(s) in this capture come from a newer version of the mod than this tool \
-             understands, and were skipped. The timelapse is complete apart from whatever they \
-             described. Updating Save Timelapse to match the mod will pick them up.\n",
-            replay_state.unknown_extensions
-        );
+        println!("\n  Part of this recording came from a newer version of the mod than this tool.");
+        println!("  Update Save Timelapse and build again to include it.");
+        acted = true;
     }
-
-    // Both counters are already computed by `replay::run`; surfacing them
-    // (and pausing so the message can't be missed the way a mid-run
-    // eprintln! can, especially in a double-clicked .exe with no persistent
-    // console) is the whole point, not the counting itself.
-    let mut warned = false;
     if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
-        println!(
-            "warning: {} segment(s) could not be read and {} batch(es) were out of tick order. \
-             This capture may be missing history, see the warnings above, and run \
-             /timelapse-reset-capture in-game before your next capture if this session's \
-             files were ever deleted by hand.",
-            replay_state.skipped_segments, replay_state.out_of_order_batches
-        );
-        warned = true;
+        println!("\n  Some of this recording could not be read, so parts of the history may be missing.");
+        acted = true;
     }
     let total = replay_state.applied_events + replay_state.no_op_events;
     if total >= 20 && replay_state.no_op_events * 2 > total {
-        println!(
-            "warning: {} of {total} events did nothing when replayed. This usually means \
-             the event log doesn't match this session's baseline.",
-            replay_state.no_op_events
-        );
-        warned = true;
+        println!("\n  Most of what was recorded did not match the starting snapshot, so this");
+        println!("  timelapse may be wrong. Starting a fresh recording in game usually fixes it.");
+        acted = true;
     }
-    if warned {
+    // Paused on only when something was actually said, and never for a clean
+    // build: a message nobody needs is not worth a keypress.
+    if acted {
         wait_for_enter();
     }
 
@@ -969,27 +981,31 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 /// takes it, so the common case stays one keystroke.
 fn ask_terrain_save(saves: &[PathBuf]) -> io::Result<&Path> {
     let now = SystemTime::now();
-    println!("\nWhich save should the ground come from?");
+    // The caveat lives here rather than beside the yes/no above, because this
+    // is the moment it can be acted on: somebody reading it while picking a
+    // save can still go and make a newer one.
+    println!("\n  Which save should the ground come from?");
+    println!("  Ground only exists where that save had already been, so pick a recent one.\n");
     for (i, save) in saves.iter().enumerate().take(TERRAIN_SAVE_CHOICES) {
         let age = save.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok());
         let when = age.map(describe_age).unwrap_or_else(|| "unknown".to_string());
         let name = save.file_name().unwrap_or_default().to_string_lossy();
-        println!("  {}) {name} ({when})", i + 1);
+        println!("  {:>2}  {name}  ({when})", i + 1);
     }
     if saves.len() > TERRAIN_SAVE_CHOICES {
-        println!("  ... and {} older, not shown", saves.len() - TERRAIN_SAVE_CHOICES);
+        println!("      and {} older ones", saves.len() - TERRAIN_SAVE_CHOICES);
     }
 
     let shown = saves.len().min(TERRAIN_SAVE_CHOICES);
     loop {
-        let input = prompt("\nEnter a number, or press Enter for the newest:")?;
+        let input = prompt("\n  Press Enter for the newest, or type a number:")?;
         if input.trim().is_empty() {
             return Ok(&saves[0]);
         }
         if let Some(index) = parse_session_index(&input, shown) {
             return Ok(&saves[index]);
         }
-        println!("Please enter a number between 1 and {shown}, or press Enter.");
+        println!("\n  Please type a number from 1 to {shown}, or press Enter.");
     }
 }
 
@@ -1017,11 +1033,8 @@ fn offer_terrain_for_capture(
 
     println!();
     let wanted = ask_yes_no(
-        "Add the natural ground (grass, water, trees) under this factory? It is read from a \
-         save rather than recorded while you play, so this runs Factorio once and takes about \
-         a minute.\n\
-         If you have built anything since your last save, save in game first: ground only \
-         exists where that save had already been",
+        "  Add the grass, water and trees under your factory?\n  \
+         It looks much better, and takes about a minute.",
         settings.capture_terrain.unwrap_or(false),
     )?;
     settings.capture_terrain = Some(wanted);
@@ -1288,61 +1301,89 @@ fn remember(settings: &Settings) {
     }
 }
 
-/// `None` when there is nothing to open the viewer on, which is the case for
-/// managing captures: it is housekeeping, not a build.
-fn run() -> io::Result<Option<PathBuf>> {
-    println!("save-timelapse\n");
+/// Opens the viewer on a finished timelapse without waiting for it.
+///
+/// `spawn`, not `status`: the viewer is a window somebody keeps open and comes
+/// back to, so blocking on it would leave this program frozen behind a window
+/// that has nothing more to do with it. Detaching is also what lets the menu
+/// come straight back, so a timelapse can be watched and another one started
+/// without running the tool again.
+fn open_viewer(path: &Path) -> io::Result<()> {
+    let viewer = viewer_path()?;
+    println!("\n  Opening the viewer.\n");
+    // The viewer narrates its own loading on stdout ("1 world(s) loaded", the
+    // sprite count, and so on), and it inherits this console, so all of that
+    // lands on top of the menu that has just come back. Discarding stdout and
+    // keeping stderr is what silences the narration without silencing a viewer
+    // that actually failed to open anything.
+    Command::new(&viewer).arg(path).stdout(Stdio::null()).spawn()?;
+    Ok(())
+}
 
-    // Said once, on the run that has nothing saved yet, so the questions
-    // below read as setup rather than as something that will happen forever.
+/// The menu. Returns only when the user asks to leave, or when there is
+/// nobody left to ask.
+///
+/// Every action returns here afterwards, including the ones that finish by
+/// opening the viewer and including the ones that fail. The old shape ended
+/// the program after a build, which meant that watching a timelapse and then
+/// making another one was two separate runs of the tool, and that any failure
+/// closed the window on the way out. Nothing here is a one-shot job from the
+/// user's point of view, so nothing here ends the program on its own.
+fn run() -> io::Result<()> {
+    // Said once, on the run that has nothing saved yet, so the questions that
+    // follow read as setup rather than as something that happens forever.
     // Checked before loading, since loading is what would create the file.
     let first_run = Settings::is_first_run();
     let mut settings = Settings::load();
+
+    println!("\n  Save Timelapse\n");
     if first_run {
-        println!("First run: the answers below are remembered, so you will not be asked again.");
-        if let Some(path) = settings::settings_path() {
-            println!("They live in {}, and deleting that file resets them.\n", path.display());
-        }
+        println!("  Your answers are remembered, so you are only asked once.\n");
     }
 
     loop {
         let built = list_timelapses();
-        match ask_mode(built.len())? {
+        let outcome = match ask_mode(built.len())? {
             // Straight to the viewer, building nothing. The whole point: a
             // timelapse that already exists should not have to be made again
             // to be looked at.
             Mode::OpenExisting => {
                 if built.is_empty() {
-                    println!("\nNothing built yet. Use option 2 or 3 first.\n");
+                    println!("\nYou haven't built one yet. Try option 2 or 3 first.\n");
                     continue;
                 }
-                match ask_timelapse_choice(&built, "Which would you like to open?")? {
-                    Some(index) => return Ok(Some(built[index].path.clone())),
+                match ask_timelapse_choice(&built, "Which one?")? {
+                    Some(index) => open_viewer(&built[index].path),
                     // Back to the menu rather than out of the program, the
                     // same as leaving the management screen.
-                    None => println!(),
+                    None => {
+                        println!();
+                        continue;
+                    }
                 }
             }
-            Mode::LiveCapture => return run_live_capture(&mut settings).map(Some),
-            Mode::FromSaves => return run_from_saves(&mut settings).map(Some),
-            // Loops back to the menu for the same reason managing captures
-            // does: the export has already run and opening the viewer on top
-            // of a finished video would be answering a question nobody asked.
-            Mode::ExportVideo => run_export(&mut settings)?,
-            // Loops back to the menu instead of returning, since managing
-            // captures is housekeeping done *before* building something:
-            // naming a playthrough and then being dropped out of the program
-            // means starting it again to actually use the name.
-            Mode::ManageCaptures => {
-                let capture = locate_factorio_user_dir_interactive(&mut settings)?.join("script-output").join("save-timelapse");
-                // Locating the folder may well have been the thing that
-                // needed asking, and it is worth keeping even though nothing
-                // was built.
+            Mode::LiveCapture => run_live_capture(&mut settings).and_then(|out| open_viewer(&out)),
+            Mode::FromSaves => run_from_saves(&mut settings).and_then(|out| open_viewer(&out)),
+            // No viewer afterwards: the export has already produced a video
+            // file, and opening a timelapse on top of it would be answering a
+            // question nobody asked.
+            Mode::ExportVideo => run_export(&mut settings),
+            Mode::ManageCaptures => locate_factorio_user_dir_interactive(&mut settings).and_then(|dir| {
+                // Locating the folder may well have been the thing that needed
+                // asking, and it is worth keeping even though nothing was
+                // built.
                 remember(&settings);
-                manage_captures(&capture)?;
-                println!();
-            }
-            Mode::Quit => return Ok(None),
+                manage_captures(&dir.join("script-output").join("save-timelapse"))
+            }),
+            Mode::Quit => return Ok(()),
+        };
+
+        match outcome {
+            Ok(()) => println!(),
+            // The one failure that cannot be recovered from by trying
+            // something else, because trying something else also needs input.
+            Err(e) if input_closed(&e) => return Err(e),
+            Err(e) => show_problem(&e),
         }
     }
 }
@@ -1360,24 +1401,101 @@ fn describe_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// One line describing a capture, for both the management screen and the
-/// picker that runs before a live-capture rebuild.
+/// A raw surface name as a player would say it. Factorio's own names are
+/// lowercase (`nauvis`, `platform-1`), which reads like a database key next to
+/// prose.
+fn pretty_place(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The places in a recording, named rather than listed exhaustively.
 ///
-/// Leads with the name when there is one. Without it a capture is identified
-/// only by a hex session id and a relative age, which is no help at all in
-/// telling two playthroughs apart, and naming them is most of the point of
-/// the management screen.
+/// A Space Age playthrough reaches five planets and any number of space
+/// platforms, and the full list ran to nine comma-separated names on a real
+/// capture here. Two names and a count says the same thing in a width somebody
+/// can actually scan.
+fn describe_places(surfaces: &[String]) -> String {
+    match surfaces {
+        [] => "nothing yet".to_string(),
+        [one] => pretty_place(one),
+        [one, two] => format!("{} and {}", pretty_place(one), pretty_place(two)),
+        [one, two, rest @ ..] => {
+            format!("{}, {} and {} more", pretty_place(one), pretty_place(two), rest.len())
+        }
+    }
+}
+
+/// Digits a person can read at a glance. `945480` is a serial number;
+/// `945,480` is a quantity.
+fn with_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How much play time a built timelapse covers, from the snapshot it starts
+/// at to the last thing replayed. Minutes are dropped once there are hours:
+/// at that scale they are noise, and a round number is easier to hold on to.
+fn describe_span(from_tick: u64, to_tick: u64) -> String {
+    let minutes = to_tick.saturating_sub(from_tick) / TICKS_PER_SECOND / 60;
+    match (minutes / 60, minutes) {
+        (0, 0) => "less than a minute of play".to_string(),
+        (0, 1) => "1 minute of play".to_string(),
+        (0, m) => format!("{m} minutes of play"),
+        (1, _) => "1 hour of play".to_string(),
+        (h, _) => format!("{h} hours of play"),
+    }
+}
+
+/// How far into a playthrough a tick is, in hours of play.
+fn describe_play_time(tick: u64) -> String {
+    let hours = tick / TICKS_PER_SECOND / 3600;
+    match hours {
+        0 => "under an hour in".to_string(),
+        1 => "1 hour in".to_string(),
+        n => format!("{n} hours in"),
+    }
+}
+
+/// One line describing a recording, for the picker before a rebuild.
+///
+/// Leads with the name when there is one, and with the places when there is
+/// not. It used to lead with a hex session id, which identifies a recording
+/// perfectly and tells the person choosing between two of them absolutely
+/// nothing.
+///
+/// Everything here answers "is this the playthrough I mean": where it happens,
+/// how big the factory got, and when it was last played. What it deliberately
+/// no longer shows is the baseline tick, the tile count and the size on disk,
+/// none of which help make this choice. Size returns in the management screen,
+/// where the question is what to delete and size is the whole point.
 fn describe_session(session: &replay::Session, now: SystemTime) -> String {
     let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
-    let name = session.label().unwrap_or_else(|| format!("unnamed ({:08x})", session.session_id));
-    format!(
-        "{name}  |  {}, baseline tick {} ({} entities, {} tiles)  |  surfaces: {}  |  {age}",
-        describe_size(session.size_on_disk()),
-        session.baseline.tick,
-        session.baseline.entities,
-        session.baseline.tiles,
-        session.baseline.surfaces.join(", "),
-    )
+    let places = describe_places(&session.baseline.surfaces);
+    let scale = format!(
+        "{} buildings, {}",
+        with_thousands(session.baseline.entities as u64),
+        describe_play_time(session.baseline.tick)
+    );
+    match session.label() {
+        Some(name) => format!("{name}  ({places})\n     {scale}, last played {age}"),
+        None => format!("{places}\n     {scale}, last played {age}"),
+    }
+}
+
+/// The same recording, plus what it costs on disk, for the management screen.
+fn describe_session_with_size(session: &replay::Session, now: SystemTime) -> String {
+    format!("{}, {}", describe_session(session, now), describe_size(session.size_on_disk()))
 }
 
 /// The capture management screen: name a playthrough so it can be told apart
@@ -1402,20 +1520,14 @@ No captures found in {}.",
 
         let now = SystemTime::now();
         let total: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
-        println!(
-            "
-{} capture(s), {} in total:
-",
-            sessions.len(),
-            describe_size(total)
-        );
+        println!("\n  {} recordings, {} in total:\n", sessions.len(), describe_size(total));
         for (i, session) in sessions.iter().enumerate() {
-            println!("  {}) {}", i + 1, describe_session(session, now));
+            println!("  {}  {}\n", i + 1, describe_session_with_size(session, now));
         }
 
         let action = prompt(
-            "
-Enter a number to name that capture, \"d <number>\" to delete one, or press Enter to go back:",
+            "  Type a number to rename one, or \"d\" and a number to delete one.\n\
+             \x20 Press Enter to go back:",
         )?;
         let action = action.trim().to_string();
         if action.is_empty() {
@@ -1519,21 +1631,13 @@ fn main() {
         wait_for_enter();
     }));
 
-    let outcome = std::panic::catch_unwind(|| {
-        run().and_then(|out| {
-            let Some(out) = out else { return Ok(()) };
-            let viewer = viewer_path()?;
-            println!("opening the viewer...");
-            Command::new(&viewer).arg(&out).spawn()?;
-            Ok(())
-        })
-    });
-
-    match outcome {
+    match std::panic::catch_unwind(run) {
         Ok(Ok(())) => {}
+        // Only reachable now when stdin closed, since every other failure is
+        // handled inside the menu loop and returns to it. Nothing to pause
+        // on: a closed stdin means the pause could not wait either.
         Ok(Err(e)) => {
             eprintln!("\n{e}");
-            wait_for_enter();
             std::process::exit(1);
         }
         // The panic hook above already printed the message and waited.
@@ -1766,10 +1870,12 @@ mod tests {
         assert_eq!(describe_size(3 * (1 << 30) / 2), "1.5 GiB");
     }
 
-    /// A capture with no name has to stay identifiable, or the management
-    /// screen lists rows nobody can tell apart.
+    /// A recording with no name has to stay identifiable, or the picker lists
+    /// rows nobody can tell apart. It used to be identified by its session id,
+    /// which is unique and completely uninformative; where the playthrough
+    /// happened is what somebody actually recognises.
     #[test]
-    fn an_unnamed_capture_is_described_by_its_session_id() {
+    fn an_unnamed_recording_is_described_by_where_it_happened() {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join("0000002a");
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -1778,13 +1884,49 @@ mod tests {
 
         let sessions = replay::discover_sessions(dir.path()).unwrap();
         let line = describe_session(&sessions[0], SystemTime::now());
-        assert!(line.contains("unnamed (0000002a)"), "got: {line}");
-        assert!(line.contains("nauvis") && line.contains("baseline tick 100"), "got: {line}");
+        assert!(line.starts_with("Nauvis"), "leads with the place: {line}");
+        assert!(line.contains("7 buildings"), "got: {line}");
+        // The things it deliberately stopped saying, none of which help
+        // anybody choose between two recordings.
+        assert!(!line.contains("0000002a"), "no session id: {line}");
+        assert!(!line.contains("tick"), "no raw tick: {line}");
 
         sessions[0].set_label("Vulcanus run").unwrap();
         let named = describe_session(&replay::discover_sessions(dir.path()).unwrap()[0], SystemTime::now());
-        assert!(named.starts_with("Vulcanus run"), "a named capture leads with its name: {named}");
-        assert!(!named.contains("unnamed"), "got: {named}");
+        assert!(named.starts_with("Vulcanus run"), "a named recording leads with its name: {named}");
+    }
+
+    /// A Space Age playthrough reaches five planets plus any number of space
+    /// platforms, and the full comma-separated list ran to nine names on a
+    /// real capture. Two and a count is what fits on a line.
+    #[test]
+    fn places_are_named_up_to_two_then_counted() {
+        let of = |names: &[&str]| describe_places(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(of(&[]), "nothing yet");
+        assert_eq!(of(&["nauvis"]), "Nauvis");
+        assert_eq!(of(&["nauvis", "vulcanus"]), "Nauvis and Vulcanus");
+        assert_eq!(of(&["nauvis", "vulcanus", "fulgora"]), "Nauvis, Vulcanus and 1 more");
+        assert_eq!(of(&["nauvis", "platform-1", "a", "b", "c"]), "Nauvis, Platform-1 and 3 more");
+    }
+
+    #[test]
+    fn counts_are_grouped_so_they_read_as_quantities() {
+        assert_eq!(with_thousands(0), "0");
+        assert_eq!(with_thousands(999), "999");
+        assert_eq!(with_thousands(1000), "1,000");
+        assert_eq!(with_thousands(945480), "945,480");
+    }
+
+    /// Minutes vanish once there are hours: at that scale they are noise, and
+    /// the singular cases are the ones that read wrong if left unhandled.
+    #[test]
+    fn a_built_span_is_rounded_to_something_sayable() {
+        let hour = TICKS_PER_SECOND * 3600;
+        assert_eq!(describe_span(0, 0), "less than a minute of play");
+        assert_eq!(describe_span(0, TICKS_PER_SECOND * 60), "1 minute of play");
+        assert_eq!(describe_span(0, TICKS_PER_SECOND * 60 * 19), "19 minutes of play");
+        assert_eq!(describe_span(0, hour), "1 hour of play");
+        assert_eq!(describe_span(hour, hour * 4), "3 hours of play");
     }
 
     #[test]
