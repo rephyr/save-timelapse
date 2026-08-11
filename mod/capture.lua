@@ -167,7 +167,7 @@ end
 --- back to 0 the same defensive way is_inhabited does: that only degrades
 --- to today's single shared bucket in the unlikely event nauvis or its
 --- map_gen_settings are unavailable, never a crash.
-local function compute_session_id()
+function M.compute_session_id()
   local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
   if ok and seed then
     return seed
@@ -211,7 +211,7 @@ local function ensure_capture_segment()
       segment_start_tick = game.tick,
       last_tick = game.tick,
       segment_initialized = false,
-      session_id = compute_session_id(),
+      session_id = M.compute_session_id(),
     }
     storage.timelapse_capture = state
   end

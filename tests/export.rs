@@ -81,6 +81,7 @@ fn config_for(root: &Path) -> ExportConfig {
         mod_source: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod"),
         include_resources: false,
         capture_terrain: false,
+        terrain_scan: false,
     }
 }
 

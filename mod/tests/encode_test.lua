@@ -317,6 +317,44 @@ do
   check("expand_bbox: right_bottom y is max_y plus the margin", area[2][2], 34)
 end
 
+-- scenery captured near the factory rather than across the whole surface
+
+do
+  local function set(list)
+    local s = {}
+    for _, t in pairs(list) do
+      if s[t] then
+        error("duplicate type " .. t)
+      end
+      s[t] = true
+    end
+    return s
+  end
+
+  local both_off = set(encode.context_types(false, false))
+  local both_on = set(encode.context_types(true, true))
+
+  check("context_types: nests are scenery whatever the settings say", both_off["unit-spawner"], true)
+  check("context_types: resources only when they are being recorded", both_off["resource"], nil)
+  check("context_types: resources when include-resources is on", both_on["resource"], true)
+  check("context_types: no flora when terrain capture is off", both_off["tree"], nil)
+  for _, t in pairs({ "tree", "cliff", "plant" }) do
+    check("context_types: " .. t .. " is scenery when terrain capture is on", both_on[t], true)
+  end
+
+  -- Worms share the "turret" type with player defences, so bounding this
+  -- type would bound real turrets to the factory box as well.
+  check("context_types: never bounds turrets, which would take player ones with them", both_on["turret"], nil)
+
+  -- The property the whole split rests on. A type named by both lists would
+  -- either be dropped from the unbounded pass and never picked up by the
+  -- bounded one, or captured twice.
+  local excluded = set(encode.EXCLUDED_TYPES)
+  for _, t in pairs(encode.context_types(true, true)) do
+    check("context_types: " .. t .. " is not also always-excluded", excluded[t], nil)
+  end
+end
+
 -- how far past the built area to capture ground
 
 do
@@ -359,10 +397,23 @@ do
       (100 + 2 * m) * (5000 + 2 * m) <= 4000000, true)
   end
 
-  -- Already over budget on its own, so there is nothing to spend on a
-  -- margin and it falls back to the floor rather than going negative.
-  check("terrain_margin: a base larger than the whole budget falls back to the floor",
-    encode.terrain_margin(box(5000, 5000), 32), 32)
+  -- The bug this guards against, and it was in the budget rather than the
+  -- margin: as a flat ceiling, any base bigger than the ceiling itself had
+  -- nothing left to spend, the affordable width came out negative, and it
+  -- fell back to the 32 tile floor. The largest factories got the smallest
+  -- margins, which is precisely backwards. A 5000x5000 base has a 25M tile
+  -- footprint and must still be given what its shape asks for.
+  check("terrain_margin: a base far larger than the flat budget still gets a real margin",
+    encode.terrain_margin(box(5000, 5000), 32), 2330)
+
+  -- The property rather than one number: the allowance has to grow with the
+  -- factory, or the same inversion comes back at whatever the next fixed
+  -- limit happens to be.
+  do
+    local small = encode.terrain_margin(box(3000, 3000), 32)
+    local large = encode.terrain_margin(box(6000, 6000), 32)
+    check("terrain_margin: a bigger base is given a bigger margin, not a smaller one", large > small, true)
+  end
 
   check("terrain_margin: always a whole number of tiles",
     encode.terrain_margin(box(1000, 1000), 32) % 1, 0)

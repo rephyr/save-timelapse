@@ -14,7 +14,9 @@ pub const MOD_NAME: &str = "save-timelapse";
 const TRIGGER_SETTING: &str = "save-timelapse-headless-scan";
 const RESOURCES_SETTING: &str = "save-timelapse-include-resources";
 const TERRAIN_SETTING: &str = "save-timelapse-capture-terrain";
+const TERRAIN_SCAN_SETTING: &str = "save-timelapse-terrain-scan";
 
+#[derive(Clone)]
 pub struct ExportConfig {
     pub factorio: PathBuf,
     pub user_mods: PathBuf,
@@ -25,6 +27,14 @@ pub struct ExportConfig {
     /// not just what the player built. Roughly 5x'd export size and time in
     /// testing, so this is a real opt-in rather than something to default on.
     pub capture_terrain: bool,
+    /// Scan this save for natural ground and nothing else.
+    ///
+    /// Mutually exclusive with the frame export rather than an addition to
+    /// it, because the two want different saves: frames come from every save
+    /// in the set, ground from one. Ground does not change over a
+    /// playthrough, so describing it once is enough, and doing it in its own
+    /// pass keeps it out of every frame and out of anybody's game.
+    pub terrain_scan: bool,
 }
 
 #[derive(Debug)]
@@ -141,7 +151,8 @@ fn stage_mods(staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
         &config.user_mods.join("mod-settings.dat"),
         &mods.join("mod-settings.dat"),
         &[
-            ("startup", TRIGGER_SETTING, true),
+            ("startup", TRIGGER_SETTING, !config.terrain_scan),
+            ("startup", TERRAIN_SCAN_SETTING, config.terrain_scan),
             ("startup", RESOURCES_SETTING, config.include_resources),
             ("startup", TERRAIN_SETTING, config.capture_terrain),
         ],
@@ -172,9 +183,14 @@ pub fn install_data_dir(exe: &Path) -> Option<PathBuf> {
 }
 
 /// Export one save. `staged` is a directory this call owns and may delete.
-pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<ExportOutcome> {
-    let started = Instant::now();
-
+/// Stage a private Factorio, run the save through it, and return the
+/// directory the mod wrote into.
+///
+/// Shared by the frame export and the ground scan, which differ only in which
+/// startup flag `stage_mods` sets: everything about locating the install,
+/// writing a config that reads real data but writes staged, and reporting a
+/// failed run is identical.
+fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
     let written_to = staged.join("script-output").join(MOD_NAME);
     std::fs::create_dir_all(&written_to)?;
 
@@ -208,6 +224,13 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
             String::from_utf8_lossy(&run.stderr).trim()
         )));
     }
+
+    Ok(written_to)
+}
+
+pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<ExportOutcome> {
+    let started = Instant::now();
+    let written_to = run_factorio(save, staged, config)?;
 
     let mut frames: Vec<PathBuf> = std::fs::read_dir(&written_to)?
         .filter_map(Result::ok)
@@ -254,4 +277,80 @@ pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Res
         });
 
     Ok(ExportOutcome { frames, seconds: started.elapsed().as_secs_f64(), players_log, milestones })
+}
+
+/// What one ground scan produced.
+#[derive(Debug)]
+pub struct TerrainScan {
+    /// The playthrough the scanned save actually belongs to, taken from the
+    /// folder the mod wrote into rather than from anything the caller
+    /// supplied. That is the whole verification: a save from a different game
+    /// lands under a different session and the caller can say so, instead of
+    /// quietly laying a stranger's landscape under somebody's factory.
+    pub session_id: u32,
+    pub files: Vec<PathBuf>,
+    pub seconds: f64,
+    /// The game tick the scanned save was at.
+    ///
+    /// Worth carrying because it is the one thing that can make a scan wrong
+    /// while succeeding: ground only exists in chunks the save had already
+    /// generated, so a save older than the end of a capture cannot describe
+    /// wherever the factory grew after it. The caller has the capture's own
+    /// tick and can compare.
+    pub tick: u64,
+}
+
+/// Read one save's natural ground, once, for a whole timelapse.
+///
+/// Ground is the only part of a capture that does not change, so it needs no
+/// history: entities need a record per placement and placed floor needs one,
+/// but grass is grass for the whole playthrough. Scanning it separately keeps
+/// it out of every frame of a from-saves export and out of the live baseline
+/// that freezes somebody's game, and lets the area be chosen knowing how far
+/// the factory eventually reached.
+///
+/// The trade is ground that has since been built over: water landfilled at
+/// hour three reads as landfill at hour ten and its water is never recorded,
+/// so replaying from the start shows a hole there until the landfill is laid.
+pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<TerrainScan> {
+    let started = Instant::now();
+    let scan = ExportConfig { terrain_scan: true, ..config.clone() };
+    let written_to = run_factorio(save, staged, &scan)?;
+
+    // One session folder per playthrough, and a scan only ever loads one
+    // save, so anything else here would mean a stale staging directory.
+    let mut found: Option<(u32, Vec<PathBuf>)> = None;
+    for entry in std::fs::read_dir(&written_to)?.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(session_id) = path.file_name().and_then(|n| n.to_str()).and_then(|n| u32::from_str_radix(n, 16).ok()) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&path)?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("terrain_") && n.ends_with(".stfr")))
+            .collect();
+        files.sort();
+        if !files.is_empty() {
+            found = Some((session_id, files));
+        }
+    }
+
+    let (session_id, files) = found.ok_or_else(|| {
+        io::Error::other(
+            "the scan produced no ground. Either nothing on this save is owned \
+             by the player force, or the mod did not run: the scan trigger must \
+             be a startup setting, since runtime-global values live inside the \
+             save and cannot be set from outside.",
+        )
+    })?;
+
+    // From the file the mod just wrote, not from anything guessed about the
+    // save: the header carries the tick the export ran at.
+    let tick = files.first().and_then(|p| crate::frame::read_header(p).ok()).map(|(tick, _)| tick).unwrap_or(0);
+
+    Ok(TerrainScan { session_id, files, seconds: started.elapsed().as_secs_f64(), tick })
 }

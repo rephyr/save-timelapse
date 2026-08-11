@@ -37,6 +37,14 @@ if settings.startup["save-timelapse-headless-scan"].value then
   headless_scan_pending = true
 end
 
+--- Set the same way, for the ground-only pass. Separate from the scan above
+--- rather than a mode of it because the two run against different saves: the
+--- frames come from every save in the set, the ground from one.
+local terrain_scan_pending = false
+if settings.startup["save-timelapse-terrain-scan"].value then
+  terrain_scan_pending = true
+end
+
 --- Trees and cliffs are excluded here, on top of `encode.EXCLUDED_TYPES`'s
 --- always-excluded set, when terrain capture is off: one setting
 --- controls all of it (them plus the natural-ground tile pass further
@@ -59,6 +67,50 @@ function M.excluded_types()
     -- surprising and the more expensive half on a planet that is mostly
     -- wilderness.
     list[#list + 1] = "plant"
+  end
+  return list
+end
+
+--- Scenery: entities the map generated rather than anybody placing, which
+--- therefore sit on every generated chunk regardless of where the factory
+--- is. Recorded, but only near the factory, exactly like the natural ground
+--- they stand on.
+---
+--- These used to come from the whole surface while the ground was capped to
+--- a margin around the base, which is the same reasoning applied to one of
+--- them and not the other. Measured on a real megabase capture, trees,
+--- resources and nests were **69% of every frame** and covered an area 2.3x
+--- larger than the ground beneath them, so most of them rendered on empty
+--- black. Worse, Factorio generates chunks ahead of the player, so a capture
+--- included forests and ore fields from chunks nobody had ever visited.
+---
+--- Worms are missing from this list and cannot join it: they share the
+--- "turret" type with player turrets (see `encode.EXCLUDED_TYPES`), so
+--- bounding by type would bound real defences too. They were 0.9% of that
+--- same capture alongside the nests, so the leak is small.
+---
+--- Disjoint from `M.excluded_types()` by construction: each entry is gated
+--- on the setting that would otherwise have excluded it outright, so no type
+--- is ever named by both. The list itself lives in `encode.lua`, which has
+--- no Factorio dependency and so can be unit tested; this only reads the
+--- settings for it.
+function M.context_types()
+  return encode.context_types(
+    settings.startup["save-timelapse-include-resources"].value,
+    settings.startup["save-timelapse-capture-terrain"].value
+  )
+end
+
+--- What the unbounded entity pass skips: everything never recorded at all,
+--- plus the scenery the bounded pass handles instead.
+---
+--- Not folded into `M.excluded_types()`, which `capture.lua` uses to decide
+--- what a live event may log: scenery is genuinely recorded, so an event
+--- touching it is not something to drop.
+local function unbounded_excludes()
+  local list = M.excluded_types()
+  for _, t in pairs(M.context_types()) do
+    list[#list + 1] = t
   end
   return list
 end
@@ -188,8 +240,12 @@ local function export_surface(surface, tick, session_id)
     order, groups, pending_count = {}, {}, 0
   end
 
+  -- Unbounded, because a factory reaches wherever somebody took it: a mining
+  -- outpost or a rail terminus thousands of tiles out is still theirs and
+  -- still belongs in the timelapse. Scenery is the opposite case and is
+  -- handled by the bounded pass below.
   for _, entity in pairs(surface.find_entities_filtered({
-    type = M.excluded_types(),
+    type = unbounded_excludes(),
     invert = true,
   })) do
     if entity.valid then
@@ -221,6 +277,41 @@ local function export_surface(surface, tick, session_id)
   end
 
   flush_entities()
+
+  -- One area for the scenery pass and the natural ground pass both, computed
+  -- once here from what somebody built. The two describing the same region is
+  -- the whole point: a tree drawn outside the ground it grows on is what this
+  -- fixes.
+  --
+  -- Taken from entities alone, unlike before, because it has to be final
+  -- before the scenery pass writes and placed floor is not read until the
+  -- tile section further down. Measured on a real megabase the paving sat
+  -- inside the entity box anyway (2873x2863 against 3070x3113), and
+  -- `encode.terrain_margin` adds far more slack than the difference, so
+  -- nothing is lost that the margin does not already cover.
+  local context_area = encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
+
+  if context_area then
+    for _, entity in pairs(surface.find_entities_filtered({
+      area = context_area,
+      type = M.context_types(),
+    })) do
+      if entity.valid then
+        local pos = entity.position
+        local group = group_for(entity.name, entity.tile_width, entity.tile_height)
+        local k = group.n + 1
+        group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
+        written = written + 1
+        pending_count = pending_count + 1
+
+        if pending_count >= FLUSH_EVERY then
+          flush_entities()
+        end
+      end
+    end
+
+    flush_entities()
+  end
 
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
@@ -258,10 +349,6 @@ local function export_surface(surface, tick, session_id)
     group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
     tiles_written = tiles_written + 1
     pending_count = pending_count + 1
-    -- Unconditional, unlike the entity loop above: this query asks only for
-    -- PLACED_FLOOR_TILES, so everything it returns was laid down by
-    -- somebody and there is no force to ask about.
-    encode.grow_bbox(bbox, pos.x, pos.y)
 
     if pending_count >= FLUSH_EVERY then
       flush_tiles()
@@ -270,53 +357,151 @@ local function export_surface(surface, tick, session_id)
 
   flush_tiles()
 
-  -- Natural terrain (grass, water, sand, ...) covers every generated tile,
-  -- not just where the player built, so it is capped to a margin around
-  -- the factory rather than the whole surface, since the whole surface
-  -- would otherwise dwarf everything else exported here. Off by default
-  -- (see settings.lua): it roughly 5x'd export size and time in testing,
-  -- so opting in is a real decision, not a free improvement. `nil` when
-  -- nothing was seen above (an untouched surface has no factory to show
-  -- context around) also skips it, same as the setting being off.
+  -- No natural ground here, deliberately, and this is the one place it would
+  -- obviously belong. Ground is the only part of a capture that does not
+  -- change: entities need a record per placement, tiles you lay down need
+  -- one, but grass is grass for the whole playthrough. Putting it in a frame
+  -- meant paying for it once per frame in a from-saves export, and paying for
+  -- it inside somebody's game during a live baseline, to describe something
+  -- that was the same every time.
   --
-  -- The margin is only worth what `bbox` is worth: it now surrounds what
-  -- somebody built, so it is a real edge around the factory. While trees
-  -- and nests still counted, this was a margin around the explored map,
-  -- which captured almost the whole surface and is most of where that 5x
-  -- came from.
-  --
-  -- That is also what makes widening it affordable. `encode.terrain_margin`
-  -- asks for enough ground to fill the frame a timelapse is watched in
-  -- rather than a fixed chunk, which against the old map-sized box would
-  -- have been unthinkable and against this one is bounded.
-  local terrain_area = settings.startup["save-timelapse-capture-terrain"].value
-    and encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
-  if terrain_area then
-    for _, tile in pairs(surface.find_tiles_filtered({
-      area = terrain_area,
-      name = encode.PLACED_FLOOR_TILES,
-      invert = true,
-    })) do
-      local pos = tile.position
-      local group = tile_group_for(tile.name)
-      local k = group.n + 1
-      group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
-      tiles_written = tiles_written + 1
-      pending_count = pending_count + 1
-
-      if pending_count >= FLUSH_EVERY then
-        flush_tiles()
-      end
-    end
-
-    flush_tiles()
-  end
+  -- `M.export_terrain` writes it once instead, from an unattended run against
+  -- a single save. See its comment for what that costs and what it gives up.
 
   -- Not itself folded into the checksum: nothing needs a checksum of the
   -- checksum, and the reader already knows the trailer's fixed size.
   M.safe_write_file(path, encode.u32le(checksum), true)
 
   return written, tiles_written
+end
+
+--- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
+--- with an empty entity section and nothing but tiles after it.
+---
+--- Placed floor is excluded because the frames already carry it, with the
+--- history of when each piece went down that this file cannot express.
+local function export_terrain_to(tick, session_id, surface, area)
+  local path = M.EXPORT_DIR .. encode.terrain_name(session_id, surface.name)
+  local dict = encode.new_dictionary()
+
+  local checksum = encode.checksum_init()
+  checksum = M.checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
+  checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
+
+  local order, groups, pending_count, written = {}, {}, 0, 0
+
+  local function flush()
+    if pending_count == 0 then
+      return
+    end
+    local parts = {}
+    for i = 1, #order do
+      local name = order[i]
+      local group = groups[name]
+      parts[i] = encode.frame_tile_run(dict, name, group.xs, group.ys, group.n)
+    end
+    checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
+    order, groups, pending_count = {}, {}, 0
+  end
+
+  for _, tile in pairs(surface.find_tiles_filtered({
+    area = area,
+    name = encode.PLACED_FLOOR_TILES,
+    invert = true,
+  })) do
+    local pos = tile.position
+    local group = groups[tile.name]
+    if not group then
+      group = { n = 0, xs = {}, ys = {} }
+      groups[tile.name] = group
+      order[#order + 1] = tile.name
+    end
+    local k = group.n + 1
+    group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
+    written = written + 1
+    pending_count = pending_count + 1
+
+    if pending_count >= FLUSH_EVERY then
+      flush()
+    end
+  end
+
+  flush()
+  M.safe_write_file(path, encode.u32le(checksum), true)
+  return written
+end
+
+--- The area a surface's ground should cover: a margin around everything the
+--- player force owns on it, or `nil` if they own nothing.
+---
+--- Asks for player-force entities directly rather than reusing
+--- `export_surface`'s scan, which is only affordable because this runs
+--- unattended: nothing here has a frame rate to protect, so bringing robots
+--- and characters across the API boundary costs time nobody is waiting on.
+--- They inflate the box by a rounding error and are not worth filtering.
+--- How much further the ground reaches than anything that stands on it.
+---
+--- Scenery is recorded into the frames while playing, from a box measured
+--- then; ground is scanned later, from a box measured then. Two boxes from
+--- two moments never agree exactly, and on a real capture the scenery
+--- overhung the ground by 33 tiles on every side. The viewer now clips
+--- scenery to whatever ground exists, so the edge is exact either way, but
+--- clipping throws away trees somebody paid to capture. Reaching further
+--- means there is usually nothing to throw away.
+---
+--- Affordable now in a way it never was before: ground used to be written
+--- into every frame, so widening it multiplied by the frame count. It is one
+--- file per surface now, so a wider margin costs once.
+local TERRAIN_SCAN_OVERSHOOT = 2.0
+
+local function terrain_area_for(surface)
+  local bbox = encode.new_bbox()
+  for _, entity in pairs(surface.find_entities_filtered({ force = "player" })) do
+    if entity.valid then
+      local pos = entity.position
+      encode.grow_bbox(bbox, pos.x, pos.y)
+    end
+  end
+  local margin = encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES) * TERRAIN_SCAN_OVERSHOOT
+  return encode.expand_bbox(bbox, math.floor(margin))
+end
+
+--- Write every inhabited surface's natural ground, one
+--- `terrain_<surface>.stfr` each, and nothing else.
+---
+--- Runs unattended, against one save, after the playthrough it describes.
+--- That ordering is the whole point and buys three things at once: no ground
+--- cost inside anybody's game, no ground repeated in every frame of a
+--- from-saves export, and an area chosen knowing how far the factory
+--- eventually reached rather than guessing from how far it had reached when
+--- recording started.
+---
+--- What it gives up is ground that has since been built over. The query asks
+--- for everything that is not placed floor, so water somebody landfilled at
+--- hour three reads as landfill at hour ten and its water is never recorded.
+--- Replayed from the beginning that lake is a hole until the tick the
+--- landfill was placed. A pass during the baseline would have caught it while
+--- it was still visible, which is the trade being made here.
+---
+--- Named `terrain_<surface>.stfr` because that is what the viewer already
+--- looks for, discovered straight from the directory and independent of the
+--- frame files, so nothing downstream needed changing to accept ground from
+--- a different producer.
+function M.export_terrain(tick, session_id)
+  local written, surfaces = 0, 0
+  for _, surface in pairs(game.surfaces) do
+    if M.is_inhabited(surface) then
+      local area = terrain_area_for(surface)
+      if area then
+        local count = export_terrain_to(tick, session_id, surface, area)
+        if count > 0 then
+          written = written + count
+          surfaces = surfaces + 1
+        end
+      end
+    end
+  end
+  return written, surfaces
 end
 
 --- A surface is worth exporting if it is nauvis or the player built on it.
@@ -567,10 +752,18 @@ commands.add_command("timelapse-export",
 --- the first tick since load; no-ops every other tick. Called unconditionally
 --- from control.lua's on_tick, alongside capture.lua's and snapshot.lua's
 --- own pending-work checks.
-function M.run_pending_tick_work(tick)
+function M.run_pending_tick_work(tick, session_id_fn)
   if headless_scan_pending then
     export_all(tick)
     headless_scan_pending = false
+  end
+  if terrain_scan_pending then
+    -- Asked for only now, and only if a scan is actually due: it reads
+    -- nauvis's map settings, which is not work to repeat on every tick of
+    -- every game just so this call site can read tidily.
+    local tiles, surfaces = M.export_terrain(tick, session_id_fn and session_id_fn() or nil)
+    log(string.format("[save-timelapse] terrain scan wrote %d tiles across %d surface(s)", tiles, surfaces))
+    terrain_scan_pending = false
   end
 end
 

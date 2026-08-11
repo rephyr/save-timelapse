@@ -38,7 +38,7 @@ pub use loading::{
 pub use marks::{busy_stretches, frames_for_ticks, next_mark, previous_mark, read_bookmarks, write_bookmarks, Mark};
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};
-pub use registry::{color_for, is_rotation_allowed, TypeId, TypeRegistry};
+pub use registry::{color_for, is_rotation_allowed, is_terrain_scatter, TypeId, TypeRegistry};
 pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, SequenceBuilder, LOD_CELL_TILES,
     LOD_MAX_TILE_PIXELS,

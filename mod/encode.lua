@@ -106,6 +106,37 @@ M.EXCLUDED_TYPES = {
   "asteroid-chunk",
 }
 
+--- Scenery types, given the two settings that decide which of them are
+--- recorded at all. Entities the map generated rather than anybody placing,
+--- so they sit on every generated chunk regardless of where the factory is.
+---
+--- The point of naming them is that they are captured *near the factory*
+--- rather than across the whole surface, exactly like the natural ground
+--- they stand on. See `export.lua`'s bounded pass.
+---
+--- Disjoint from `EXCLUDED_TYPES` and from the conditional part of
+--- `export.excluded_types()` by construction: each entry below is gated on
+--- the same setting that would otherwise have excluded it outright, so a
+--- type is either never recorded or recorded near the base, never both.
+---
+--- Worms are absent and cannot be added: they share the "turret" type with
+--- player turrets (see `EXCLUDED_TYPES`), so bounding by type here would
+--- bound real defences too.
+function M.context_types(include_resources, capture_terrain)
+  local list = { "unit-spawner" }
+  if include_resources then
+    list[#list + 1] = "resource"
+  end
+  if capture_terrain then
+    list[#list + 1] = "tree"
+    list[#list + 1] = "cliff"
+    -- Gleba's flora is type "plant", not "tree", the same split
+    -- `export.excluded_types()` has to make.
+    list[#list + 1] = "plant"
+  end
+  return list
+end
+
 -- Natural terrain (grass, water, sand, dirt, ...) vastly outnumbers placed
 -- floor types, so this is an include list rather than an exclude list, the
 -- opposite of EXCLUDED_TYPES above. Verified against base/prototypes/tile/tiles.lua.
@@ -194,14 +225,30 @@ local TERRAIN_VIEW_FIT = 0.92
 --- a 4800 tile margin, which is 140M tiles of ground, most of it nowhere
 --- near anything.
 ---
---- 4M is a 2000x2000 region. A 1000 tile wide base (a real megabase
---- footprint) gets its full 16:9 framing covered without this ever
---- engaging, and past that the camera is zoomed far enough out that ground
---- detail stops reading anyway. It matters more than the raw number
---- suggests because terrain is rewritten into *every* frame of a from-saves
---- export, unlike entities it cannot be skipped as unchanged, so its cost
---- is multiplied by the frame count.
+--- 4M is a 2000x2000 region, which covers an ordinary base's full 16:9
+--- framing without ever engaging.
+---
+--- A floor rather than the whole budget, because as a fixed ceiling it
+--- inverted on anything larger than itself: a real 3070x3113 megabase has a
+--- 9.6M tile footprint, so a 4M *total* left nothing for a margin, the
+--- affordable width came out negative, and the base fell back to the 32 tile
+--- floor. The bigger the factory, the less ground it got, which is exactly
+--- backwards.
 local TERRAIN_MAX_TILES = 4000000
+
+--- ...so past that size the budget scales with the factory instead: a base
+--- may always spend four times its own footprint.
+---
+--- Four specifically, because that is what a square base needs. Solving the
+--- area cap for a square gives a margin of `(sqrt(k) - 1) / 2` per side, so
+--- k=4 yields exactly half the base's width, which is what a 16:9 frame
+--- exposes around a square factory (see `M.terrain_margin`). Anything less
+--- caps a normally shaped base below what it can actually see, and the whole
+--- point of the aspect calculation is to fill the frame.
+---
+--- Elongated bases stay bounded regardless, since the cap is on area: the
+--- 100x5000 corridor below still gets 306 rather than the 4,781 it asks for.
+local TERRAIN_BUDGET_MULTIPLE = 4
 
 --- How far past `bbox` to capture natural ground, in tiles, never less than
 --- `base_margin`.
@@ -244,12 +291,14 @@ function M.terrain_margin(bbox, base_margin)
     math.max(w, h) * (slack - 1) / 2
   )
 
-  -- Largest margin keeping (w + 2m)(h + 2m) within the budget, i.e. the
-  -- positive root of 4m^2 + 2m(w + h) + wh - max = 0. Goes negative once
-  -- the base alone is over budget, which the outer max floors back to
-  -- `base_margin`: a base that size pays for its own ground either way, and
-  -- a chunk of edge around it is a rounding error next to that.
-  local affordable = (math.sqrt((w - h) * (w - h) + 4 * TERRAIN_MAX_TILES) - (w + h)) / 4
+  -- At least the flat budget, and at least a multiple of what the factory
+  -- itself occupies, so the allowance grows with the base rather than being
+  -- swallowed by it.
+  local budget = math.max(TERRAIN_MAX_TILES, TERRAIN_BUDGET_MULTIPLE * w * h)
+
+  -- Largest margin keeping (w + 2m)(h + 2m) within that budget, i.e. the
+  -- positive root of 4m^2 + 2m(w + h) + wh - budget = 0.
+  local affordable = (math.sqrt((w - h) * (w - h) + 4 * budget) - (w + h)) / 4
 
   return math.floor(math.max(base_margin, math.min(wanted, affordable)))
 end
@@ -717,6 +766,19 @@ end
 --- output to collide with.
 function M.frame_name(session_id, tick, surface)
   local name = string.format("frame_%d_%s.stfr", tick, surface)
+  if not session_id then
+    return name
+  end
+  return M.session_dir(session_id) .. name
+end
+
+--- Ground is one file per surface for a whole capture, not one per tick, so
+--- unlike `M.frame_name` there is no tick in it. Session tagged for the same
+--- reason everything else is: the shared script-output folder holds every
+--- playthrough that ever recorded, and the desktop tool uses the folder it
+--- lands in to tell whether the save it scanned was really the right one.
+function M.terrain_name(session_id, surface)
+  local name = string.format("terrain_%s.stfr", surface)
   if not session_id then
     return name
   end
