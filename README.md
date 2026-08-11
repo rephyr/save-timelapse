@@ -167,8 +167,6 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 - **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded. A belt whose direction changes because the game connected it up for you, rather than because you rotated it yourself, is not, so it keeps the facing it had when it was first placed. It shows up as an occasional corner drawn as a straight belt. Recording a fresh baseline corrects everything built so far.
 
-- **Ore built over does not come back when you remove what you built.** An ore deposit is an entity like any other, and the replay holds one entity per position, so something placed exactly on an ore tile takes that tile's place instead of covering it. Mining the building later leaves a gap in the patch rather than uncovering the ore. Only an exact overlap counts, so it reads as scattered missing tiles across a patch you have built across, not as a clean rectangle.
-
 - **Ground you covered before it was read is not recovered either.** Natural ground is scanned once, from a single save, after the fact, which is what keeps it out of your game entirely. A lake you landfilled at hour three is already landfill when that scan happens, so its water was never recorded anywhere: replayed from the beginning the lake is a hole until the tick the landfill goes down, and removing that landfill uncovers nothing. With terrain capture switched off there is deliberately no ground in the timelapse to uncover at all.
 
 ---

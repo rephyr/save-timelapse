@@ -634,11 +634,18 @@ check("color_bytes: clamped below", color({ r = -5, g = 5, b = 400 }), "0,5,255"
 -- naming it. Reach is asked of underground belts and pipes and nothing else.
 
 do
-  local tile = function(c) return { map_color = c } end
+  -- `mineable_properties` is never nil on a real tile prototype, so the
+  -- stubs carry it too rather than letting the reader be defensive about a
+  -- shape the game does not produce.
+  local tile = function(c, minable)
+    return { map_color = c, mineable_properties = { minable = minable or false } }
+  end
   prototypes = {
     tile = {
       ["grass-1"] = tile({ r = 55, g = 53, b = 11 }),
       ["water"] = tile({ r = 51, g = 83, b = 95 }),
+      -- Minable, so it is floor somebody laid, and no list here names it.
+      ["cerys-refined-concrete"] = tile({ r = 100, g = 100, b = 100 }, true),
     },
     entity = {
       ["transport-belt"] = {
@@ -676,13 +683,17 @@ do
   check(
     "prototypes_json: colours, types and reach, each sorted",
     encode.prototypes_json(),
-    '{"tiles":{"grass-1":[55,53,11],"water":[51,83,95]},'
+    '{"tiles":{"cerys-refined-concrete":[100,100,100],"grass-1":[55,53,11],"water":[51,83,95]},'
       .. '"entities":{"biter-spawner":[255,25,25],"kr-advanced-underground-belt":[0,93,147],'
       .. '"radar":[0,93,147],"small-worm-turret":[255,25,25],"transport-belt":[204,161,71]},'
       .. '"types":{"biter-spawner":"unit-spawner","colourless":"container",'
       .. '"kr-advanced-underground-belt":"underground-belt","radar":"radar",'
       .. '"small-worm-turret":"turret","transport-belt":"transport-belt"},'
-      .. '"reach":{"kr-advanced-underground-belt":30}}'
+      .. '"reach":{"kr-advanced-underground-belt":30},'
+      -- Named so the desktop side splits a baseline's tiles the way this
+      -- capture recorded them, rather than from a list of its own that would
+      -- disagree the moment a mod adds a floor.
+      .. '"floor":["cerys-refined-concrete"]}'
   )
   prototypes = nil
 end

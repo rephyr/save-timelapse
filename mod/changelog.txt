@@ -10,6 +10,7 @@ Date: 2026-08-11
   Optimizations:
     - Floors are drawn in one pass however many kinds of paving a base has. Concrete, refined concrete and hazard concrete each used to interrupt the batch, which on a heavily paved base was a real cost for something that is only ever a backdrop
   Bugfixes:
+    - Ore comes back when you mine up what you built on it. Anything placed on an ore tile took that tile's place rather than covering it, so building across a patch ate it a tile at a time and removing the building later left a gap where the ore had been
     - Space platforms grow instead of appearing whole. A platform's own foundation was not counted as floor you lay, so the tiles you place to expand one were never recorded as built and the whole platform showed up finished from the first frame. Aquilo's foundation had the same problem, and so did every floor added by a mod
     - Rotating a belt is recorded. A belt rotated after it was placed kept its original direction forever, so its corner drew as a straight belt. Belts the game connects up for you as you drag are still not covered; a fresh baseline corrects everything placed so far
     - The viewer's readouts no longer cover the factory. Entity counts, zoom, frame rate and the draw-call profile moved behind F3, where anybody who wants them can still find them

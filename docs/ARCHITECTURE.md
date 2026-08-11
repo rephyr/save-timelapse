@@ -519,12 +519,24 @@ entity and not of the prototype this file is keyed by. Enemies are picked out
 by type instead, which for a capture is exact: the only enemies that survive
 entity filtering are nests and worms.
 
-**Written once per load, not once per capture.** The baseline runs once per
-save and then never again, so a file written only there froze at whatever the
-playthrough started with. `capture.lua` refreshes it on the first flush after
-each load, which is as often as the answer can change (prototypes are fixed at
-load time). That is what lets a capture already in progress pick up a mod added
-since, or a fix to how this file is written, without a reset.
+**Written when the loaded mods change, not once per capture.** The baseline
+runs once per save and then never again, so a file written only there froze at
+whatever the playthrough started with, and a capture already in progress could
+never pick up a mod added since or a fix to how the file is written.
+
+The condition is `script.active_mods`, stamped into `storage` alongside the
+rest of the capture's state. Prototypes are fixed at load time, so the same
+mods at the same versions describe the same game, and this mod's own version
+being in that stamp is what makes a capture heal itself when a build that wrote
+the file wrongly is replaced.
+
+Stamped in `storage` rather than held in a module local, which is what it was
+first, and which was wrong in a way worth recording: Factorio re-runs the
+control stage on every load, so a local reading "already done this session"
+silently meant "once per load". Rebuilding a couple of hundred kilobytes of
+JSON out of every loaded prototype, in one tick, on the tick that is already
+flushing events and sampling players, is not something to repeat on that
+schedule. It showed up as the mod's time usage climbing tenfold.
 
 **Which tiles are floor is asked the same way**, though it is asked in the mod
 rather than written down for the viewer, since it decides what a capture
@@ -1017,23 +1029,26 @@ at x=327.0. Keying on half tiles merged them and silently dropped five of that
 frame's 240 entities. One decimal is exactly the precision positions are
 stored at on the wire (see "Frame format" above).
 
-**One entity per position is a real limitation, not just an invariant.**
-Factorio lets two things occupy one position, and the pair that matters is a
-resource with something built on top of it. An `AddEntity` landing on an
-occupied key replaces what is there, so a belt or an odd-sized machine centred
-on an ore tile evicts that tile's ore; the later `RemoveEntity` then clears the
-position and the ore never returns. Only an exact key collision does it, so an
-even-sized building (positioned on a tile corner, never a centre) collides with
-nothing and an odd-sized one takes only the tile under its middle, which is why
-it reads as scattered gaps in a patch rather than a clean footprint.
+**A position holds two entities, not one.** Factorio lets two things occupy
+one position, and the pair that happens is a resource with something built on
+top of it. Keying by position alone meant an `AddEntity` evicted the ore and
+the `RemoveEntity` that eventually followed cleared the position, so building
+across a patch ate it a tile at a time and mining the building back off never
+returned it. `Surface::under` holds what a position had before something
+covered it, and removal promotes it back.
 
-Both halves of the map are keyed this way for the same reason: `remove_at` is
-the only thing that can resolve a baseline-original entity, since a snapshot
-records no `unit_number`. Fixing this means letting a position hold more than
-one entity and teaching removal which one it meant, most cheaply by never
-letting an add evict a resource and never letting a positional remove take one,
-since a resource is never what a build event removes. Ore already has to be
-opted into (`save-timelapse-include-resources`), which is why this went unseen.
+A second layer rather than a list per position, because the depth this needs
+is two: a `Vec` per position would allocate once per entity on a map holding
+hundreds of thousands of them, to express something that almost never happens.
+A third arrival displaces whatever the second was hiding, which is the old
+behaviour one level down. Nothing in it knows what a resource is, and it does
+not need to: covering and uncovering is the behaviour whatever the two things
+are.
+
+Only an exact key collision covers anything, so an even-sized building sits on
+a tile corner and covers nothing, while an odd-sized one covers the single tile
+under its middle. That is why the old bug read as scattered gaps in a patch
+rather than as a clean footprint.
 
 ## What the tool remembers
 

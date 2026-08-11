@@ -17,7 +17,7 @@
 //! Absent is normal, not an error: every capture recorded before this existed
 //! has no such file, and the viewer keeps its own built-in names for those.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// One prototype's colour, as bytes. The mod reduces Factorio's colours to
@@ -39,11 +39,16 @@ pub struct Prototypes {
     /// How far an underground belt or pipe reaches, in tiles. Only the two
     /// types that have one appear here.
     pub reach: HashMap<String, i32>,
+    /// Which tiles this capture treated as placed floor rather than as ground
+    /// the map generated, which is the split `world.rs` has to reproduce when
+    /// it loads a baseline. Empty for a capture that did not say, which falls
+    /// back to the built-in list there.
+    pub floor: HashSet<String>,
 }
 
 impl Prototypes {
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty() && self.entities.is_empty() && self.types.is_empty()
+        self.tiles.is_empty() && self.entities.is_empty() && self.types.is_empty() && self.floor.is_empty()
     }
 
     pub fn kind(&self, name: &str) -> Option<&str> {
@@ -65,6 +70,7 @@ pub fn read(dir: &Path) -> Option<Prototypes> {
         entities: section(&root, "entities", rgb),
         types: section(&root, "types", |value| Some(value.as_str()?.to_string())),
         reach: section(&root, "reach", |value| i32::try_from(value.as_i64()?).ok()),
+        floor: names(&root, "floor"),
     };
     (!prototypes.is_empty()).then_some(prototypes)
 }
@@ -86,6 +92,15 @@ fn section<T>(root: &serde_json::Value, key: &str, parse: fn(&serde_json::Value)
         return HashMap::new();
     };
     map.iter().filter_map(|(name, value)| Some((name.clone(), parse(value)?))).collect()
+}
+
+/// One `[name, name, ...]` section. Unlike `section` above this says nothing
+/// per name, only which names are in the set, so it reads as a list.
+fn names(root: &serde_json::Value, key: &str) -> HashSet<String> {
+    let Some(list) = root.get(key).and_then(|v| v.as_array()) else {
+        return HashSet::new();
+    };
+    list.iter().filter_map(|v| Some(v.as_str()?.to_string())).collect()
 }
 
 fn rgb(value: &serde_json::Value) -> Option<Rgb> {

@@ -374,6 +374,12 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
 
     let mut world = World::new();
+    // Before any baseline, since the floor/terrain split happens as tiles
+    // arrive. Absent for every capture older than the file, which falls back
+    // to the built-in list (see `world::is_placed_floor`).
+    if let Some(prototypes) = crate::prototypes::read(dir) {
+        world.set_floor(prototypes.floor);
+    }
     let mut loaded = 0;
     for path in &paths {
         let bytes = match std::fs::read(path) {

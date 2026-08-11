@@ -145,3 +145,58 @@ the few hundred bytes packing would save.
 
 **`PlayerTrack` lookups are a linear scan.** Sample counts are tiny next to
 entity counts, so a binary search would be complexity spent where no time is.
+
+### Live capture's per-event cost
+
+Unlike every other number in this file, this one comes from the game rather
+than from a harness, because nothing outside Factorio can produce it: read off
+`F4 > show-time-usage` during real play on a 69 mod save. The mod sits near
+0.02 ms per tick idle and reaches about 0.2 ms while building hard, roughly 1%
+of a 16.67 ms tick. Re-check it the same way; there is no command to give.
+
+What follows is known, costs a little, and is left alone on purpose. Each item
+says what it would buy and why that is not worth buying.
+
+**Every field read off a `LuaEntity` crosses the Lua/C++ boundary once.** That
+is what the per-event cost mostly is, so the only reductions worth making are
+in how many properties are read at all. Two were made: a removal reads only
+what a removal record holds (`log_entity`), and `game.tick` is read once per
+event rather than three times. The rest below were considered and declined.
+
+**`entity.surface.name` is two crossings and materialises a `LuaSurface`.**
+`entity.surface_index` would be one crossing returning an integer, with a
+memoized index to name table behind it. Declined on correctness, not on
+effort: the game's own documentation for `LuaSurface.index` states that
+"indexes of deleted surfaces can be reused", and Space Age creates and
+destroys space platforms routinely, so a cached table would eventually file a
+new platform's events under a dead platform's name. Keeping it correct means
+subscribing to `on_surface_deleted` to invalidate, which registers a permanent
+handler to save a property read. A silently mis-attributed surface is not
+discovered until somebody builds the timelapse hours later, which is the wrong
+trade for 1% of a tick.
+
+**`is_surface_excluded` writes to `storage` on every event.**
+`excluded_surfaces()` does `storage.x = storage.x or {}` unconditionally, so
+the read path performs a write. Cheap (an ordinary Lua table store) and
+removing it means the read path grows its own nil check while the write path
+keeps creating the table. Left as is because the lazy init is why no caller has
+to nil check, and that is worth more than the store.
+
+**Each record allocates.** Varints are built through `string.char` and joined
+with `table.concat`, so every event produces short-lived strings and the
+collection that follows is charged to the mod. Short strings are interned in
+Lua 5.2, so the repeated one-byte pieces mostly cost a hash lookup rather than
+garbage, and the alternative is a hand-rolled buffer scheme whose complexity is
+not repayable at this volume.
+
+**Broader placed-floor detection logs tile events that used to be skipped.**
+Working the floor list out from the loaded prototypes (see ARCHITECTURE's
+"What the game says about itself") means a space platform's foundation and
+every modded floor now record as built. That is the point, and it is genuinely
+more work while paving or growing a platform. It is proportional to what the
+player is doing rather than a standing cost.
+
+**The flush tick does synchronous file I/O.** Amortised over 200 pending
+events or ten seconds, whichever comes first, so it is a spike rather than an
+average. Worth watching for a perceptible hitch, since a single long tick is
+what a player feels; a raised average is not.

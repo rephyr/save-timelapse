@@ -16,7 +16,7 @@
 //! unavoidable smear into a non-problem instead of something the mod would
 //! have to freeze the game to prevent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::event::Event;
@@ -54,14 +54,31 @@ pub struct WorldEntity {
     pub id: Option<u64>,
 }
 
-/// Whether `name` is one of the placed-floor prototypes the mod tracks
-/// incrementally (concrete, landfill, and the like), mirroring
-/// `mod/encode.lua`'s `PLACED_FLOOR_TILES` list exactly. Anything else that
-/// shows up in a baseline's tiles is natural terrain (grass, water, sand,
+/// Whether `name` is floor somebody laid rather than ground the map
+/// generated: what the capture itself said, or the built-in list below when it
+/// said nothing.
+///
+/// A free function rather than a method on `World`, so it borrows the one
+/// field and can be called while `load_baseline` holds a surface.
+fn is_floor(floor: &HashSet<String>, name: &str) -> bool {
+    if floor.is_empty() {
+        return is_placed_floor(name);
+    }
+    floor.contains(name)
+}
+
+/// Placed floor the mod tracks incrementally (concrete, landfill, and the
+/// like), for a capture that did not say which tiles it treated that way.
+/// Anything else in a baseline's tiles is natural terrain (grass, water, sand,
 /// ...), captured once by `save-timelapse-capture-terrain` and never again:
 /// Factorio has no event for terrain changing (nobody "builds" grass), so
-/// unlike placed floor it needs no ongoing tracking, just a one-time split
-/// at baseline load time. See `Surface::terrain`.
+/// unlike placed floor it needs no ongoing tracking, just a one-time split at
+/// baseline load time. See `Surface::terrain`.
+///
+/// These are Wube's names, which is the whole reason a capture now says for
+/// itself: the mod works its own list out from the loaded prototypes, so a
+/// platform's foundation and every modded floor are floor there and would be
+/// mistaken for permanent ground here (see `World::set_floor`).
 fn is_placed_floor(name: &str) -> bool {
     matches!(
         name,
@@ -109,6 +126,25 @@ pub struct Surface {
     slots: Vec<Option<WorldEntity>>,
     free: Vec<usize>,
     by_pos: HashMap<PosKey, usize>,
+    /// What a position held before something was built on top of it.
+    ///
+    /// Factorio lets two things occupy one position, and the pair that
+    /// actually happens is a resource with a machine or a belt on it. Keying
+    /// entities by position alone meant the later add evicted the ore, and the
+    /// remove that eventually followed cleared the position, so building
+    /// across a patch ate it a tile at a time and mining the building back off
+    /// never returned it.
+    ///
+    /// A second layer rather than a list per position, because the depth this
+    /// needs is two and a `Vec` per position would allocate once per entity on
+    /// a map that holds hundreds of thousands of them. Empty unless something
+    /// genuinely overlaps, which is rare enough that a real capture pays
+    /// nothing for it.
+    ///
+    /// Deliberately not "the resource layer": nothing here knows what a
+    /// resource is, and it does not need to. Covering something and then
+    /// uncovering it is the behaviour, whatever the two things are.
+    under: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
     /// Placed floor: seeded from the baseline, then kept current by
     /// `AddTile`/`RemoveTile` events for as long as replay runs.
@@ -140,8 +176,10 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Counted from the slab rather than from `by_pos`, which holds only what
+    /// is on top of each position and so undercounts anything covered.
     pub fn entity_count(&self) -> usize {
-        self.by_pos.len()
+        self.slots.len() - self.free.len()
     }
 
     /// See the field's own comment. Only ever compared against a previously
@@ -174,8 +212,6 @@ impl Surface {
     fn insert(&mut self, entity: WorldEntity) {
         let key = pos_key(entity.x, entity.y);
 
-        // Idempotent: an add for a position already occupied updates it in
-        // place rather than creating a second entity on the same tile.
         if let Some(&slot) = self.by_pos.get(&key) {
             // An add landing on exactly what is already there changed
             // nothing, so it must not bump `revision`. Checked rather than
@@ -186,17 +222,14 @@ impl Surface {
             if self.slots[slot] == Some(entity) {
                 return;
             }
-            if let Some(existing) = self.slots[slot].take() {
-                if let Some(id) = existing.id {
-                    self.by_id.remove(&id);
-                }
+            // Something different landing on an occupied position covers what
+            // was there rather than replacing it. Only one thing can be
+            // covered: a third arrival displaces whatever the second one was
+            // hiding, which is the old behaviour applied one level down and is
+            // as deep as the game gives any reason to go.
+            if let Some(buried) = self.under.insert(key, slot) {
+                self.free_slot(buried);
             }
-            if let Some(id) = entity.id {
-                self.by_id.insert(id, slot);
-            }
-            self.slots[slot] = Some(entity);
-            self.revision += 1;
-            return;
         }
 
         let slot = match self.free.pop() {
@@ -216,9 +249,37 @@ impl Surface {
         self.revision += 1;
     }
 
+    /// Return a slot to the free list, forgetting the entity in it. Does not
+    /// touch either position index, so the caller has to have dealt with those
+    /// already, and does not bump `revision`, since every caller is part of a
+    /// larger change that bumps it once.
+    fn free_slot(&mut self, slot: usize) {
+        if let Some(entity) = self.slots[slot].take() {
+            if let Some(id) = entity.id {
+                self.by_id.remove(&id);
+            }
+        }
+        self.free.push(slot);
+    }
+
     fn remove_slot(&mut self, slot: usize) {
         let Some(entity) = self.slots[slot].take() else { return };
-        self.by_pos.remove(&pos_key(entity.x, entity.y));
+        let key = pos_key(entity.x, entity.y);
+
+        // Uncovering, when this was the thing on top: what it was covering
+        // takes the position back. This is the whole point of the second
+        // layer, and it is why removal cannot just clear the key.
+        if self.by_pos.get(&key) == Some(&slot) {
+            match self.under.remove(&key) {
+                Some(buried) => self.by_pos.insert(key, buried),
+                None => self.by_pos.remove(&key),
+            };
+        } else if self.under.get(&key) == Some(&slot) {
+            // Removed by id from underneath whatever is standing on it, which
+            // leaves the covering entity exactly where it was.
+            self.under.remove(&key);
+        }
+
         if let Some(id) = entity.id {
             self.by_id.remove(&id);
         }
@@ -255,12 +316,33 @@ pub struct World {
     /// The surface events fall back to when they name none: logs written
     /// before events carried a surface, and removals keyed by id.
     default_surface: Option<String>,
+    /// Which tiles this capture called placed floor, when it said. See
+    /// `set_floor`; empty means fall back to `is_placed_floor`.
+    floor: HashSet<String>,
     pub tick: u64,
 }
 
 impl World {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Adopt the capture's own idea of which tiles are placed floor, from the
+    /// `prototypes.json` written beside it.
+    ///
+    /// Must be set before any baseline is loaded, since the split happens once
+    /// as tiles arrive and a later answer would apply to nothing.
+    ///
+    /// The mod works this out from the loaded prototypes rather than from a
+    /// list, so it is the only side that can be right about a modded floor or
+    /// a platform's foundation. Reproducing that here by keeping a copy of the
+    /// list in step was fine while the mod's was also stated and is not now:
+    /// the two would disagree, and whichever lost would file floor somebody
+    /// laid as ground that can never change, so removing it would leave it on
+    /// screen forever.
+    pub fn set_floor(&mut self, floor: HashSet<String>) {
+        debug_assert!(self.surfaces.is_empty(), "floor must be set before loading a baseline");
+        self.floor = floor;
     }
 
     pub fn names(&self) -> &NameTable {
@@ -312,7 +394,7 @@ impl World {
         for tile in &frame.tiles {
             let name = self.names.intern(&tile.n);
             let key = (tile.x, tile.y);
-            if is_placed_floor(&tile.n) {
+            if is_floor(&self.floor, &tile.n) {
                 surface.tiles.insert(key, name);
             } else {
                 surface.terrain.insert(key, name);
@@ -616,21 +698,65 @@ mod tests {
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
-    /// The baseline is written over many ticks while events are logged, so an
-    /// add for something already captured is expected, not a bug.
+    /// Building on an ore patch and mining the building back off. Factorio
+    /// lets both share a tile, and keying entities by position alone meant the
+    /// belt evicted the ore and the removal then cleared the tile, so building
+    /// across a patch ate it a tile at a time and nothing brought it back.
     #[test]
-    fn adding_over_an_existing_position_replaces_rather_than_duplicating() {
+    fn building_on_something_covers_it_and_removing_uncovers_it() {
         let mut world = World::new();
-        world.load_baseline(&baseline(vec![entity("pipe", 1.5, 2.5)], Vec::new()));
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
 
         world.apply(Some("nauvis"), &add("transport-belt", 1.5, 2.5, Some(9)));
-        assert_eq!(world.entity_count(), 1, "still one entity on that tile");
+        assert_eq!(world.entity_count(), 2, "the ore is still there, under the belt");
 
         let frame = world.to_frame("nauvis", 200);
-        assert_eq!(frame.entities[0].n, Arc::from("transport-belt"), "the later add wins");
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert!(names.contains(&"transport-belt") && names.contains(&"iron-ore"), "got {names:?}");
 
-        // ...and it is now reachable by the id the add carried.
+        // Reachable by the id the add carried, and taking it away gives the
+        // tile back to the ore rather than emptying it.
         assert!(world.apply(None, &remove_by_id(9, 1.5, 2.5)));
+        assert_eq!(world.entity_count(), 1);
+        let frame = world.to_frame("nauvis", 300);
+        assert_eq!(frame.entities[0].n, Arc::from("iron-ore"), "the ore is back");
+
+        // And the uncovered ore is reachable by position again, which is the
+        // only way a baseline entity can be reached at all.
+        assert!(world.apply(Some("nauvis"), &remove_at(1.5, 2.5)));
+        assert_eq!(world.entity_count(), 0);
+    }
+
+    /// A re-add of the same thing must not bury a copy of it. The baseline
+    /// smear produces these by design, and burying one would leave a
+    /// duplicate behind forever once the visible one was removed. The
+    /// baseline is written over many ticks while events are logged, so an add
+    /// for something already captured is expected, not a bug.
+    #[test]
+    fn re_adding_the_same_entity_covers_nothing() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("transport-belt", 1.5, 2.5)], Vec::new()));
+
+        world.apply(Some("nauvis"), &add("transport-belt", 1.5, 2.5, None));
+        assert_eq!(world.entity_count(), 1);
+        assert!(world.apply(Some("nauvis"), &remove_at(1.5, 2.5)));
+        assert_eq!(world.entity_count(), 0, "nothing left buried under it");
+    }
+
+    /// Only one thing can be covered. A third arrival displaces whatever the
+    /// second was hiding rather than growing a stack, which is the old
+    /// behaviour applied one level down.
+    #[test]
+    fn covering_is_two_deep_and_does_not_leak() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+
+        world.apply(Some("nauvis"), &add("transport-belt", 1.5, 2.5, Some(1)));
+        world.apply(Some("nauvis"), &add("pipe", 1.5, 2.5, Some(2)));
+        assert_eq!(world.entity_count(), 2, "the ore fell out, the belt did not");
+
+        assert!(world.apply(None, &remove_by_id(2, 1.5, 2.5)));
+        assert!(world.apply(None, &remove_by_id(1, 1.5, 2.5)));
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -785,6 +911,38 @@ mod tests {
         for name in ["grass-1", "water", "sand-1", "deepwater", "dirt-3", "snow-flat", "ice-smooth", "ammoniacal-ocean"] {
             assert!(!is_placed_floor(name), "{name} should be natural terrain");
         }
+    }
+
+    /// What the capture says outranks the list above, which is the point: the
+    /// mod works its own answer out from the loaded prototypes, so it is the
+    /// only side that can know a platform's foundation or a modded floor is
+    /// something somebody laid rather than ground that was always there.
+    ///
+    /// Getting it wrong is not cosmetic. Terrain is seeded once and never
+    /// touched again, so floor filed as terrain can never be removed: mining
+    /// it up would leave it on screen for the rest of the timelapse.
+    #[test]
+    fn the_captures_own_floor_list_decides_the_split() {
+        let tiles = vec![
+            crate::frame::Tile { n: Arc::from("space-platform-foundation"), x: 0, y: 0 },
+            crate::frame::Tile { n: Arc::from("vegetation-green-grass-1"), x: 1, y: 0 },
+        ];
+
+        let mut told = World::new();
+        told.set_floor(["space-platform-foundation".to_string()].into_iter().collect());
+        told.load_baseline(&baseline(Vec::new(), tiles.clone()));
+        let surface = told.surface("nauvis").expect("a surface");
+        assert_eq!(surface.floor_tile_count(), 1, "the platform's own foundation is floor somebody laid");
+        assert_eq!(surface.terrain_tile_count(), 1, "and the modded grass is not");
+
+        // A capture that said nothing gets the built-in list, which knows
+        // neither name, so both read as ground. That is the old behaviour and
+        // has to stay it: every capture recorded so far is this one.
+        let mut silent = World::new();
+        silent.load_baseline(&baseline(Vec::new(), tiles));
+        let surface = silent.surface("nauvis").expect("a surface");
+        assert_eq!(surface.floor_tile_count(), 0);
+        assert_eq!(surface.terrain_tile_count(), 2);
     }
 
     /// A baseline mixes both kinds of tile; loading must sort each into the

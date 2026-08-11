@@ -172,8 +172,6 @@ M.KNOWN_PLACED_FLOOR_TILES = {
   "frozen-refined-hazard-concrete-left", "frozen-refined-hazard-concrete-right",
 }
 
-local placed_floor_tiles = nil
-
 --- Every tile in this game that counts as placed floor, asked of the game
 --- rather than listed.
 ---
@@ -198,14 +196,12 @@ local placed_floor_tiles = nil
 --- are handed to `find_tiles_filtered`, and a name no loaded mod defines is not
 --- a tile the game will accept being asked about.
 ---
---- Memoized in a module local, so it is computed once per load and reset by the
---- next one. Prototypes are fixed at load time, so that is as often as the
---- answer can change.
+--- Recomputed per call rather than memoized. It is a few hundred iterations
+--- next to a `find_tiles_filtered` over a whole surface, and the one hot path
+--- that asks per tile (`capture.lua`'s `is_placed_floor`) builds its own set
+--- once anyway. A module-level cache would buy nothing and would be one more
+--- piece of state that has to be reasoned about across a load.
 function M.placed_floor_tiles()
-  if placed_floor_tiles then
-    return placed_floor_tiles
-  end
-
   local known = {}
   for _, name in ipairs(M.KNOWN_PLACED_FLOOR_TILES) do
     known[name] = true
@@ -225,8 +221,6 @@ function M.placed_floor_tiles()
   -- Sorted so the list does not depend on `pairs` order, which Lua does not
   -- promise and which would otherwise vary between two runs of one save.
   table.sort(found)
-
-  placed_floor_tiles = found
   return found
 end
 
@@ -928,9 +922,10 @@ local REACH_TYPES = {
 --- and Krastorio2 adds belt tiers, ore types and pipes that a viewer built
 --- around the vanilla names cannot see are belts, ore or pipes at all.
 ---
---- Written once beside the baseline rather than per tick, and refreshed once
---- per load (see capture.lua's `prototypes_written`). None of it can change during
---- a playthrough: prototypes are fixed at load time.
+--- Written once beside the baseline rather than per tick, and rewritten only
+--- when the loaded mods change (see capture.lua's `loaded_mods`). Nothing here
+--- can change during a playthrough: prototypes are fixed at load time, so
+--- rebuilding this on any other occasion is pure cost.
 ---
 --- Entities take `map_color` and fall back to `friendly_map_color`, with nests
 --- and their kind taking `enemy_map_color`, which is the same split the game
@@ -1003,7 +998,24 @@ function M.prototypes_json()
       add(string.format('%q:%d', e.name, e.reach))
     end
   end)
-  out[#out + 1] = '}}'
+
+  -- Which tiles this capture treats as placed floor, so the desktop side
+  -- splits a baseline's tiles the same way this mod recorded them. It kept its
+  -- own copy of the old list for that (`world.rs`'s `is_placed_floor`), which
+  -- was fine while both were the same stated names and is not once this side
+  -- works the answer out per game: the two would disagree about a platform's
+  -- foundation, and the half that lost would treat floor somebody laid as
+  -- ground that can never change.
+  --
+  -- An array rather than an object, because unlike every section above this
+  -- says nothing per name, only which names are in the set.
+  out[#out + 1] = '},"floor":['
+  local first = #parts
+  for _, name in ipairs(M.placed_floor_tiles()) do
+    add(string.format('%q', name))
+  end
+  out[#out + 1] = table.concat(parts, ",", first + 1, #parts)
+  out[#out + 1] = ']}'
   return table.concat(out)
 end
 

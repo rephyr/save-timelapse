@@ -11,7 +11,19 @@ local milestones = require("milestones")
 local M = {}
 
 local CAPTURE_FLUSH_EVERY = 200
-M.CAPTURE_FLUSH_TICKS = 240 -- ~4 real seconds, bounds data loss even when idle
+--- How often the idle timer flushes, in ticks. Ten real seconds.
+---
+--- This is the *floor* on how often a flush happens, not the rate: a busy
+--- factory flushes on volume long before the timer comes round, at every
+--- CAPTURE_FLUSH_EVERY pending events. All this bounds is how much a crash can
+--- lose while nothing much is being built, and how coarse the two samplers
+--- that ride on it are, which is player positions and milestone polling.
+---
+--- Four seconds before. Raised because the tick a flush lands on does real
+--- work (a file write, a player sample, a milestone poll) and doing it half as
+--- often is half the interruption for a bound nobody is watching: ten seconds
+--- of idle events is a handful of records.
+M.CAPTURE_FLUSH_TICKS = 600
 
 --- How long to hold off the actual (synchronous, freezing) baseline export
 --- after printing the warning about it. A single tick is one rendered
@@ -71,23 +83,28 @@ local capture_last_written_tick = nil
 --- "this save has been running a while".
 local capture_dictionaries_synced = false
 
---- Whether this session has already rewritten the prototype description.
+--- What was loaded, as one string, so the prototype description is rewritten
+--- when the answer could have changed and never otherwise.
 ---
---- Once per load, and a module local for exactly the reason the flag above is
---- one: a load is the only moment the answer can have changed, since
---- prototypes are fixed at load time and nothing can add a mod to a running
---- game.
+--- `script.active_mods` is exactly what decides that answer: prototypes are
+--- fixed at load time, so two loads carrying the same mods at the same
+--- versions describe the same game. This mod is in there too, which is what
+--- makes a capture heal itself when a version that wrote the file wrongly is
+--- replaced by one that does not.
 ---
---- Once per *load* rather than once per capture because a baseline runs once
---- per save and then never again (`perform_baseline`), so a file written only
---- there was frozen at whatever the playthrough started with. A playthrough
---- that added a mod later, or that was recorded by a version of this mod that
---- wrote its colours wrongly, could never pick either up: the one file
---- describing this game's prototypes was the one file a running capture had no
---- way to correct. It is small (a couple of hundred kilobytes on a heavily
---- modded game) and written on a flush tick that is already writing, so the
---- refresh costs a capture nothing it would notice.
-local prototypes_written = false
+--- Memoized, since it cannot change during a session either.
+local loaded_mods_stamp = nil
+local function loaded_mods()
+  if not loaded_mods_stamp then
+    local parts = {}
+    for name, version in pairs(script.active_mods) do
+      parts[#parts + 1] = name .. " " .. version
+    end
+    table.sort(parts)
+    loaded_mods_stamp = table.concat(parts, ",")
+  end
+  return loaded_mods_stamp
+end
 
 local excluded_type_set = nil
 --- Same filter as snapshot export, so a captured event never logs something
@@ -379,10 +396,11 @@ local function perform_baseline(tick)
   if not capture.baseline_tick then
     total, tiles, count =
       export.export_all_to(tick, baseline_manifest_path(capture.session_id), capture.session_id, M.is_surface_excluded)
-    -- export_all_to describes the prototypes itself, so the next flush has
-    -- nothing left to refresh. Only the first-ever baseline: a catch-up goes
-    -- through export_surfaces_to below, which writes no description of its own.
-    prototypes_written = true
+    -- export_all_to describes the prototypes itself, so record what it was
+    -- describing and the next flush has nothing left to do. Only the
+    -- first-ever baseline: a catch-up goes through export_surfaces_to below,
+    -- which writes no description of its own.
+    capture.prototypes_stamp = loaded_mods()
     capture.baseline_tick = tick
     for _, name in ipairs(names) do
       baselined_surfaces()[name] = tick
@@ -488,15 +506,19 @@ local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
     ensure_capture_segment()
     capture_checked_rollover = true
   end
-  storage.timelapse_capture.last_tick = game.tick
+
+  -- Read once. `game.tick` is a property read across the Lua/C++ boundary
+  -- like any other, and this asked for the same answer three times per event.
+  local tick = game.tick
+  storage.timelapse_capture.last_tick = tick
 
   -- Emitted once per distinct tick that has at least one event, rather than
   -- on every record: many events (a blueprint landing hundreds of entities)
   -- usually share a tick.
-  if capture_last_written_tick ~= game.tick then
+  if capture_last_written_tick ~= tick then
     capture_pending_count = capture_pending_count + 1
-    capture_pending[capture_pending_count] = encode.event_set_tick(game.tick)
-    capture_last_written_tick = game.tick
+    capture_pending[capture_pending_count] = encode.event_set_tick(tick)
+    capture_last_written_tick = tick
   end
 
   capture_pending_count = capture_pending_count + 1
@@ -507,12 +529,30 @@ local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
   end
 end
 
+--- Every field read here crosses the Lua/C++ boundary, once per property, and
+--- on a busy tick those crossings are most of what live capture costs. So a
+--- removal reads only what a removal record holds.
+---
+--- `encode_capture_event` sends one as surface, position and id, and nothing
+--- else: direction and footprint belong to the definition an add already
+--- carried. Reading them anyway spent three crossings per removal, and
+--- deconstructing an area is precisely a burst of removals.
+---
+--- Written as two calls rather than one with conditionals, so what each kind
+--- of record actually needs is visible at the call site instead of being
+--- assembled out of `and`/`or` pairs.
 local function log_entity(op, entity)
   if not entity.valid or is_excluded_type(entity.type) then
     return
   end
   local pos = entity.position
-  log_event(op, "e", op == "+" and entity.name or nil, pos.x, pos.y,
+
+  if op ~= "+" then
+    log_event(op, "e", nil, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
+    return
+  end
+
+  log_event(op, "e", entity.name, pos.x, pos.y,
     entity.direction, entity.unit_number, entity.tile_width, entity.tile_height,
     entity.surface.name)
 end
@@ -667,9 +707,17 @@ function M.periodic_flush(tick)
   flush_capture()
   export.sample_connected_players(tick, storage.timelapse_capture.session_id)
   milestones.poll(tick, storage.timelapse_capture.session_id)
-  if not prototypes_written then
+  -- Rewritten only when the loaded mods differ from what the file was written
+  -- for, and the answer to that lives in `storage` rather than in a module
+  -- local. A local meant "already done this session", which assumed a session
+  -- was long: it is reset by every load, and the cost of being wrong about
+  -- that is not small, since this rebuilds a couple of hundred kilobytes of
+  -- JSON out of every loaded prototype in a single tick. Kept in the save, it
+  -- is written once per change of mods and then never again.
+  local stamp = loaded_mods()
+  if storage.timelapse_capture.prototypes_stamp ~= stamp then
     export.write_prototypes(storage.timelapse_capture.session_id)
-    prototypes_written = true
+    storage.timelapse_capture.prototypes_stamp = stamp
   end
 end
 
