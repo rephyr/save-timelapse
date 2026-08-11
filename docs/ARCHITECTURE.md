@@ -70,16 +70,23 @@ minutes of play, and why terrain left the frame format entirely.
 | How live capture reassembles history | Live capture and replay, Why replay is forgiving |
 | The hardest problem here | Reloading an earlier save |
 | Why the viewer is fast | Rendering, Loading, Only writing surfaces that changed |
+| What is on screen and why | Viewer chrome |
 | How a video gets made | Exporting a video |
 
 ## Components
 
     mod/     Lua mod loaded by Factorio. Exports entity data in a custom binary format.
     src/     Rust CLI. Drives Factorio, collects exports, renders output.
+    viewer/  Rust macroquad app. Pans, zooms, scrubs and exports the result.
 
-The two never communicate directly. Factorio's Lua sandbox cannot read files,
-open sockets, or spawn processes, so the mod's only output channel is writing
-into `script-output`. The CLI reads that directory after the process exits.
+The mod and the CLI never communicate directly. Factorio's Lua sandbox cannot
+read files, open sockets, or spawn processes, so the mod's only output channel
+is writing into `script-output`. The CLI reads that directory after the process
+exits.
+
+The viewer is a separate binary rather than a mode of the CLI, because it is
+the thing a user keeps open and comes back to. The CLI builds a timelapse and
+launches it; closing the window does not end a job.
 
 ## Pipeline
 
@@ -1124,12 +1131,134 @@ vertex count, so vertex capacity above 65,536 corrupts geometry, and macroquad
 allocates one GPU buffer of this size per draw call it has ever used.
 
 `DrawCallCounter` models the batching rule above so the viewer can report its
-real draw-call count in the HUD. macroquad's own `telemetry::drawcalls` is not
-usable for this: `track_drawcall` allocates a 128x128 render texture per call.
+real draw-call count in the diagnostics overlay behind `F3` (see Viewer
+chrome). macroquad's own `telemetry::drawcalls` is not usable for this:
+`track_drawcall` allocates a 128x128 render texture per call.
 
 Culling happens in world space, before the world-to-screen transform, so a
 culled item costs two comparisons rather than a transform plus a screen-bounds
 test.
+
+## Viewer chrome
+
+Everything drawn on top of the world lives in `viewer/src/chrome.rs`. One rule
+decides what is allowed there: **an element earns its place by answering where
+am I, when am I, or what can I do.** Anything that answers *how is the renderer
+doing* goes behind `F3`.
+
+**What that replaced.** The viewer used to open on three lines of text across
+the top of the picture. Transcribed from `assets/overview.gif`, the recording
+used as the README's hero image:
+
+    /1]  frame 12/65  |  860647 entities  |  3247824 tiles  |  +14746942 terrain
+    tiles  |  zoom 0.01x  |  follow off  |  18 fps  |  53.2 ms
+    calls  |  1302536 chunk cells drawn  |  125 runs  |  LOD on (18855413 items
+    collapsed)
+    pan, scroll to zoom  |  left/right step, space play, home/end jump  |  -/=
+    speed (2x)  |  s toggles sprites, l toggles LOD  |  h build heatmap (off)  |
+    f auto-follows the growing base (off)  |  drag the bar below to scrub
+
+The truncated starts are not a transcription error. The readout ran off the
+left edge of its own window, which is the clearest possible statement of the
+problem: none of it was for the person watching their factory grow, and there
+was so much of it that it did not fit.
+
+It was also overwhelming and *incomplete at the same time*. It never mentioned
+`m` (milestones), `c` (busy stretches) or `b` (bookmark), so three shipped
+features were undiscoverable for their entire life while two renderer A/B
+toggles were advertised.
+
+Nothing was deleted. Both readout lines moved verbatim behind `F3`, and `s`
+(sprites off) and `l` (LOD off) went with them, because they are A/B tests for
+texture binding and per-item CPU cost rather than features. Pressing either by
+accident makes the factory render wrongly with no visible reason why, so they
+only answer while the diagnostics they exist to serve are on screen.
+
+### Geometry is computed once and read twice
+
+`Chrome::layout` positions every chip and button once per frame. `draw` and
+`hit` both read those rects and neither recomputes anything, which is what
+keeps a control from drifting away from the region that activates it.
+
+Layout runs *before* input is polled, not after. Laying out afterwards would
+test this frame's click against last frame's rects, which is invisible except
+on the single frame a window is resized, and is exactly the kind of bug that
+never gets reproduced.
+
+### The font
+
+macroquad bundles exactly one face, ProggyClean, a bitmap font that works and
+looks it. Anything else has to be loaded, so `font_candidates` walks a chain:
+`ui-font.ttf` beside the executable, then the platform's own UI font (Segoe UI,
+or DejaVu and Liberation on Linux), then `None`, which leaves macroquad's
+built-in one.
+
+No font is committed to the repository. The system face is already on every
+machine and carries no redistribution obligation, and a release that wants one
+exact face can ship `ui-font.ttf` beside the binary without this code changing.
+
+### Why the active surface is a fill and not a brighter label
+
+Chrome is painted straight onto the rendered world, and that world is dark
+grass in one place and a white space platform in the next. Brightness is
+therefore not a reliable signal: the gap between full white and a dimmed label
+disappears over bright terrain. A filled pill paints its own ground, so it
+reads identically on both. Brightness is left to carry the hover state, where
+being wrong for one frame costs nothing.
+
+The same problem sets the weight of the *inactive* chips. They are the only dim
+thing painted onto the factory with no fill behind them, and at the 55% used
+elsewhere in the chrome they started disappearing over a screen full of machine
+icons, so they sit at 72%: as bright as they can be while still losing clearly
+to the active chip beside them.
+
+Chips keep their natural order rather than floating the active one to the
+front, because reordering on every switch would rearrange the row under the
+cursor. Surfaces that do not fit collapse into a `+N more` chip, which matters
+more than it sounds: beyond the five planets a player can have arbitrarily many
+space platforms under names they chose. The one exception to natural order is
+an active surface that did not fit, which is swapped in for the last visible
+chip, since a switcher that cannot show where you are has failed at its only
+job.
+
+### Why the transport sits beside the scrub bar, not above it
+
+The bar is 60% of the window and centered (`Timeline::for_screen`), so the
+gutters either side are already dead space and cost nothing to use. The column
+*above* the bar is not free: the activity graph stands on it, the playhead
+label clears the graph, and the hover tooltip clears the label, all derived
+from each other so they move together. A control row centered over the bar
+would have to clear all three.
+
+On a narrow window the left cluster degrades in tiers rather than overflowing:
+speed pill first, then the step buttons, leaving play alone. Everything dropped
+still has a keyboard equivalent, and the `?` panel still lists it.
+
+### Two ordering constraints in the draw loop
+
+**Surface switches take effect one frame later.** A click on a chip arrives
+while `worlds[current]` is still mutably borrowed by the loop body, so it is
+recorded in `pending_surface` and applied at the top of the next iteration.
+That is 16ms and invisible.
+
+**A press on chrome is latched, not tested continuously.** `on_chrome` is set
+when the button goes down and read for the rest of the drag, so a drag that
+starts on a control and wanders off it does not turn into a camera pan halfway
+through.
+
+### The controls panel shows itself once
+
+`first_run` writes a `seen-controls` marker beside the tool's own
+`settings.json`, and the `?` panel opens by itself the first time the viewer is
+ever run. Everything else about this UI is on request, but a `?` in the corner
+only helps somebody who already suspects there is something to find.
+
+The marker is a sibling file rather than a field in `Settings`, which is
+documented as holding only answers a user would otherwise retype. Deleting it
+is also an obvious way to get the panel back, which a JSON field would not be.
+A failed write leaves the panel appearing again next launch, which is the right
+way round: a panel that reappears is a nuisance, and one that never appears
+leaves a first-time viewer with nothing to go on.
 
 ## Loading
 
