@@ -166,14 +166,14 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.3:** Terrain optimization, entity rotation, capture recovery, in-game control panel, surface selection
 - **v0.4:** Timeline timestamps, activity graph, heatmap, milestones, capture management
 - **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
+- **v0.6:** Video export, improved camera framing, moving entities excluded, ground scanned from a save, better scenery cutoff
 
-### v0.6
+### v0.7
 
-- [x] Image sequence or .avi video export
-- [x] Improved camera framing
-- [x] Exclude moving entities from capture
-- [x] Ground is read from a save afterwards instead of recorded while you play.
-- [x] Improved tree/cliff/water cutoff in the render
+- [x] Clean viewer interface: surface switcher, clickable playback controls, keyboard panel
+- [ ] Rotated sprites for the entities whose icons carry a direction
+- [ ] Clear recovery when a build fails or is interrupted partway
+- [ ] Refreshed screenshots and demo recordings
 
 ### v1.0
 
