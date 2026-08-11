@@ -646,12 +646,8 @@ pub fn is_belt(name: &str) -> bool {
 /// facing the same way on the same line belong together only if they are close
 /// enough to actually connect, and a factory routinely has several separate
 /// crossings in a row along one line.
-const UNDERGROUNDS: &[(&str, i32)] = &[
-    ("underground-belt", 5),
-    ("fast-underground-belt", 7),
-    ("express-underground-belt", 9),
-    ("turbo-underground-belt", 11),
-];
+const UNDERGROUNDS: &[(&str, i32)] =
+    &[("underground-belt", 5), ("fast-underground-belt", 7), ("express-underground-belt", 9), ("turbo-underground-belt", 11)];
 
 pub fn underground_reach(name: &str) -> Option<i32> {
     UNDERGROUNDS.iter().find(|(tier, _)| *tier == name).map(|(_, reach)| *reach)

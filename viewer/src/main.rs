@@ -14,16 +14,14 @@ use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
     activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
-    entity_sheet_path,
-    entity_footprint_size, entity_rotation_radians, format_game_time, sheet_row, growing_bounds_per_frame, icon_path,
-    icon_source_rect, is_belt, is_pipe, is_pipe_to_ground, is_rotation_allowed, is_splitter, pipe_piece_path, pipe_to_ground_paths, splitter_offsets, splitter_patch_path, splitter_source_rect,
-    splitter_structure_paths,
-    underground_reach, underground_source_rect,
-    underground_structure_path, is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click, DrawCallCounter, FrameSequence,
-    GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity, RenderFrame, RenderTile, Run,
-    Timeline,
-    TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES, SHEET_ROWS, SPRITE_TILE_PIXELS,
+    entity_footprint_size, entity_rotation_radians, entity_sheet_path, format_game_time, growing_bounds_per_frame, icon_path,
+    icon_source_rect, is_belt, is_pipe, is_pipe_to_ground, is_rotation_allowed, is_splitter, is_terrain_scatter, pipe_piece_path,
+    pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path, splitter_source_rect,
+    splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_reach, underground_source_rect,
+    underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
+    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity,
+    RenderFrame, RenderTile, Run, Timeline, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES,
+    SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -642,11 +640,7 @@ fn entity_source(sprite: &Sprite, entity: &RenderEntity, rotation_allowed: bool)
             let mirrored = end == UndergroundEnd::Exit;
             let along_x = entity.d == 4 || entity.d == 12;
             let source = underground_source_rect(width, height, end.sheet_row(), (entity.d / 4) as usize);
-            return EntityArt {
-                flip_x: mirrored && along_x,
-                flip_y: mirrored && !along_x,
-                ..EntityArt::sized(0, source)
-            };
+            return EntityArt { flip_x: mirrored && along_x, flip_y: mirrored && !along_x, ..EntityArt::sized(0, source) };
         }
         Some(SheetKind::UndergroundStructure) => {}
         None => {}
@@ -793,12 +787,8 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
                 }
                 if textures.len() == 4 {
                     let icon_rect = Rect::new(0.0, 0.0, textures[0].width(), textures[0].height());
-                    sprites[id] = Some(Sprite {
-                        textures,
-                        icon_rect,
-                        sheet: Some(SheetKind::PipeToGround),
-                        splitter_offsets: Vec::new(),
-                    });
+                    sprites[id] =
+                        Some(Sprite { textures, icon_rect, sheet: Some(SheetKind::PipeToGround), splitter_offsets: Vec::new() });
                     continue;
                 }
             }
@@ -816,8 +806,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
             }
             if textures.len() == PIECES.len() {
                 let icon_rect = Rect::new(0.0, 0.0, textures[0].width(), textures[0].height());
-                sprites[id] =
-                    Some(Sprite { textures, icon_rect, sheet: Some(SheetKind::Pipe), splitter_offsets: Vec::new() });
+                sprites[id] = Some(Sprite { textures, icon_rect, sheet: Some(SheetKind::Pipe), splitter_offsets: Vec::new() });
                 continue;
             }
         }
@@ -1543,27 +1532,9 @@ fn draw_world(
         // macroquad sees a long stretch of quads sharing one texture
         // instead of a texture change per item.
         if let Some(terrain) = terrain {
-            draw_tile_layer(
-                &terrain.tiles,
-                &terrain.tile_runs,
-                camera,
-                screen_center,
-                view_min,
-                view_max,
-                registry,
-                counter,
-            );
+            draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
         }
-        draw_tile_layer(
-            &frame.tiles,
-            &frame.tile_runs,
-            camera,
-            screen_center,
-            view_min,
-            view_max,
-            registry,
-            counter,
-        );
+        draw_tile_layer(&frame.tiles, &frame.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
 
         paint_heat(camera);
 
@@ -2051,13 +2022,7 @@ fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -
 /// Below the bar rather than above it: the activity graph, playhead label and
 /// hover tooltip already stack upward, and markers want to be near the track
 /// they annotate rather than on the far side of a graph.
-fn draw_milestone_markers(
-    ui: &Ui,
-    timeline: &Timeline,
-    sequence: &FrameSequence,
-    milestones: &[Milestone],
-    mouse: Vec2,
-) -> bool {
+fn draw_milestone_markers(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, milestones: &[Milestone], mouse: Vec2) -> bool {
     // A sequence is never empty (see `FrameSequence`), so only the milestone
     // list needs guarding.
     if milestones.is_empty() {
@@ -2202,14 +2167,7 @@ fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, m
 /// Where the player(s) were as of `tick`, on whichever world/surface is
 /// active, looked up fresh each draw rather than cached on the frame,
 /// since it's a cheap scan over a tiny sample count (see PlayerTrack).
-fn draw_player_markers(
-    ui: &Ui,
-    player_track: &PlayerTrack,
-    world_name: &str,
-    tick: u64,
-    camera: &Camera,
-    screen_center: Vec2,
-) {
+fn draw_player_markers(ui: &Ui, player_track: &PlayerTrack, world_name: &str, tick: u64, camera: &Camera, screen_center: Vec2) {
     for (name, x, y) in player_track.positions_at(world_name, tick) {
         let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
         let color = color_for(name, 0.7, 0.95);

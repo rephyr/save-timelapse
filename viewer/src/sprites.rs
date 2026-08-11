@@ -117,9 +117,7 @@ pub fn splitter_patch_path(data_dir: &Path, name: &str, facing: usize) -> Option
     };
     ["base", "space-age"]
         .iter()
-        .map(|group| {
-            data_dir.join(group).join("graphics/entity").join(name).join(format!("{name}-{side}-top_patch.png"))
-        })
+        .map(|group| data_dir.join(group).join("graphics/entity").join(name).join(format!("{name}-{side}-top_patch.png")))
         .find(|candidate| candidate.exists())
 }
 

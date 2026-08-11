@@ -372,10 +372,8 @@ impl RenderFrame {
         // This runs first because belt corners depend on it: the far end of a
         // crossing feeds the belt in front of it and can therefore bend it,
         // which cannot be known until the ends have been told apart.
-        let underground_kinds: Vec<Option<(TypeId, i32)>> = entity_ids
-            .iter()
-            .map(|&id| crate::registry::underground_reach(registry.name(id)).map(|reach| (id, reach)))
-            .collect();
+        let underground_kinds: Vec<Option<(TypeId, i32)>> =
+            entity_ids.iter().map(|&id| crate::registry::underground_reach(registry.name(id)).map(|reach| (id, reach))).collect();
         crate::belts::infer_underground_ends(&mut entities, &underground_kinds);
 
         let carriers: Vec<Option<crate::belts::Carrier>> = entity_ids

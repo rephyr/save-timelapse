@@ -239,8 +239,7 @@ pub struct Chrome {
 
 impl Chrome {
     pub fn layout(ui: &Ui, timeline: &Timeline, state: &ChromeState) -> Chrome {
-        let mut chrome =
-            Chrome { chips: Vec::new(), more: None, expanded: Vec::new(), buttons: Vec::new() };
+        let mut chrome = Chrome { chips: Vec::new(), more: None, expanded: Vec::new(), buttons: Vec::new() };
         chrome.layout_chips(ui, state);
         chrome.layout_transport(ui, timeline, state);
         chrome
@@ -263,8 +262,7 @@ impl Chrome {
         // Half the window, so a long surface name can never crowd the clock.
         let budget = screen_width() * 0.5;
 
-        let total: f32 =
-            state.surfaces.iter().map(|s| width_of(s) + CHIP_GAP).sum::<f32>() - CHIP_GAP;
+        let total: f32 = state.surfaces.iter().map(|s| width_of(s) + CHIP_GAP).sum::<f32>() - CHIP_GAP;
         let more_width = ui.width("+00 more", CHIP_TEXT) + CHIP_PAD_X * 2.0;
         let available = if total <= budget { budget } else { budget - more_width - CHIP_GAP };
 
@@ -307,12 +305,8 @@ impl Chrome {
     /// stacked under it at the same chip height so the two read as one
     /// control rather than as a list that appeared from somewhere else.
     fn layout_expanded(&mut self, ui: &Ui, state: &ChromeState, shown: &[usize]) {
-        let hidden: Vec<usize> =
-            (0..state.surfaces.len()).filter(|i| !shown.contains(i)).collect();
-        let width = hidden
-            .iter()
-            .map(|&i| ui.width(&state.surfaces[i], CHIP_TEXT) + CHIP_PAD_X * 2.0)
-            .fold(0.0f32, f32::max);
+        let hidden: Vec<usize> = (0..state.surfaces.len()).filter(|i| !shown.contains(i)).collect();
+        let width = hidden.iter().map(|&i| ui.width(&state.surfaces[i], CHIP_TEXT) + CHIP_PAD_X * 2.0).fold(0.0f32, f32::max);
         let mut y = MARGIN + CHIP_HEIGHT + CHIP_GAP;
         for index in hidden {
             let rect = Rect::new(MARGIN, y, width, CHIP_HEIGHT);
@@ -362,39 +356,26 @@ impl Chrome {
         let mut x = timeline.left - GUTTER_PAD - cluster;
 
         if with_steps {
-            self.buttons.push(Button {
-                click: Click::StepBack,
-                rect: Rect::new(x, y - BUTTON / 2.0, BUTTON, BUTTON),
-            });
+            self.buttons.push(Button { click: Click::StepBack, rect: Rect::new(x, y - BUTTON / 2.0, BUTTON, BUTTON) });
             x += BUTTON + BUTTON_GAP;
         }
-        self.buttons.push(Button {
-            click: Click::PlayPause,
-            rect: Rect::new(x, y - PLAY_BUTTON / 2.0, PLAY_BUTTON, PLAY_BUTTON),
-        });
+        self.buttons
+            .push(Button { click: Click::PlayPause, rect: Rect::new(x, y - PLAY_BUTTON / 2.0, PLAY_BUTTON, PLAY_BUTTON) });
         x += PLAY_BUTTON + BUTTON_GAP;
         if with_steps {
-            self.buttons.push(Button {
-                click: Click::StepForward,
-                rect: Rect::new(x, y - BUTTON / 2.0, BUTTON, BUTTON),
-            });
+            self.buttons.push(Button { click: Click::StepForward, rect: Rect::new(x, y - BUTTON / 2.0, BUTTON, BUTTON) });
             x += BUTTON + BUTTON_GAP;
         }
         if with_speed {
-            self.buttons.push(Button {
-                click: Click::Speed,
-                rect: Rect::new(x, y - CHIP_HEIGHT / 2.0, speed_width, CHIP_HEIGHT),
-            });
+            self.buttons
+                .push(Button { click: Click::Speed, rect: Rect::new(x, y - CHIP_HEIGHT / 2.0, speed_width, CHIP_HEIGHT) });
         }
 
         // Right gutter. Two controls only, so it fits anywhere the window is
         // wide enough to have a bar at all.
         let right_edge = screen_width() - MARGIN;
         let right_start = (timeline.left + timeline.width + GUTTER_PAD).min(right_edge - BUTTON * 2.0 - BUTTON_GAP);
-        self.buttons.push(Button {
-            click: Click::Fit,
-            rect: Rect::new(right_start, y - BUTTON / 2.0, BUTTON, BUTTON),
-        });
+        self.buttons.push(Button { click: Click::Fit, rect: Rect::new(right_start, y - BUTTON / 2.0, BUTTON, BUTTON) });
         self.buttons.push(Button {
             click: Click::Help,
             rect: Rect::new(right_start + BUTTON + BUTTON_GAP, y - BUTTON / 2.0, BUTTON, BUTTON),
@@ -453,9 +434,7 @@ impl Chrome {
                 Click::StepForward => draw_step(button.rect, ink, true),
                 Click::PlayPause if state.playing => draw_pause(button.rect, ink),
                 Click::PlayPause => draw_play(button.rect, ink),
-                Click::Speed => {
-                    ui.text_centered(&format!("{}x", state.play_speed), button.rect, CHIP_TEXT, ink)
-                }
+                Click::Speed => ui.text_centered(&format!("{}x", state.play_speed), button.rect, CHIP_TEXT, ink),
                 Click::Fit => draw_fit(button.rect, ink),
                 Click::Help => ui.text_centered("?", button.rect, 22.0, ink),
                 _ => {}
@@ -475,13 +454,7 @@ impl Chrome {
 
         let buildings = format!("{} buildings", with_thousands(state.buildings));
         let count_width = ui.width(&buildings, COUNT_TEXT);
-        ui.text_legible(
-            &buildings,
-            right - count_width,
-            MARGIN + CLOCK_TEXT + COUNT_TEXT + 7.0,
-            COUNT_TEXT,
-            INK_DIM,
-        );
+        ui.text_legible(&buildings, right - count_width, MARGIN + CLOCK_TEXT + COUNT_TEXT + 7.0, COUNT_TEXT, INK_DIM);
     }
 }
 
@@ -530,12 +503,7 @@ fn draw_play(rect: Rect, color: Color) {
     // bounding box reads as sitting left of centre, which is why every media
     // player offsets it.
     let x = c.x - size * 0.45 + size * 0.15;
-    draw_triangle(
-        Vec2::new(x, c.y - size),
-        Vec2::new(x, c.y + size),
-        Vec2::new(x + size * 1.6, c.y),
-        color,
-    );
+    draw_triangle(Vec2::new(x, c.y - size), Vec2::new(x, c.y + size), Vec2::new(x + size * 1.6, c.y), color);
 }
 
 fn draw_pause(rect: Rect, color: Color) {
@@ -555,12 +523,7 @@ fn draw_step(rect: Rect, color: Color, forward: bool) {
     let dir = if forward { 1.0 } else { -1.0 };
     let tip = c.x + dir * size * 0.55;
     let base = c.x - dir * size * 0.75;
-    draw_triangle(
-        Vec2::new(base, c.y - size),
-        Vec2::new(base, c.y + size),
-        Vec2::new(tip, c.y),
-        color,
-    );
+    draw_triangle(Vec2::new(base, c.y - size), Vec2::new(base, c.y + size), Vec2::new(tip, c.y), color);
     draw_rectangle(tip + if forward { 0.0 } else { -bar }, c.y - size, bar, size * 2.0, color);
 }
 
@@ -713,20 +676,14 @@ pub fn draw_key_panel(ui: &Ui) {
         rows = rows.max(bindings.len());
     }
 
-    let body: f32 = column_widths.iter().map(|(_, w)| w).sum::<f32>()
-        + PANEL_COLUMN_GAP * (KEY_GROUPS.len() as f32 - 1.0);
+    let body: f32 = column_widths.iter().map(|(_, w)| w).sum::<f32>() + PANEL_COLUMN_GAP * (KEY_GROUPS.len() as f32 - 1.0);
     let title = "Controls";
     let width = body.max(ui.width(title, 24.0)) + PANEL_PAD * 2.0;
     let height = PANEL_PAD * 2.0 + 24.0 + 18.0 + PANEL_HEADING + 10.0 + rows as f32 * PANEL_ROW;
 
     draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.0, 0.0, 0.55));
 
-    let panel = Rect::new(
-        (screen_width() - width) / 2.0,
-        (screen_height() - height) / 2.0,
-        width,
-        height,
-    );
+    let panel = Rect::new((screen_width() - width) / 2.0, (screen_height() - height) / 2.0, width, height);
     draw_pill(panel, 14.0, Color::new(0.07, 0.08, 0.10, 0.97), Some(EDGE));
 
     ui.text(title, panel.x + PANEL_PAD, panel.y + PANEL_PAD + 20.0, 24.0, INK);
@@ -746,13 +703,7 @@ pub fn draw_key_panel(ui: &Ui) {
 
     let dismiss = "press ? or esc to close";
     let width = ui.width(dismiss, COUNT_TEXT);
-    ui.text(
-        dismiss,
-        panel.x + panel.w - PANEL_PAD - width,
-        panel.y + PANEL_PAD + 20.0,
-        COUNT_TEXT,
-        INK_DIM,
-    );
+    ui.text(dismiss, panel.x + panel.w - PANEL_PAD - width, panel.y + PANEL_PAD + 20.0, COUNT_TEXT, INK_DIM);
 }
 
 #[cfg(test)]

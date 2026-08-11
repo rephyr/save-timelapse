@@ -306,7 +306,8 @@ mod tests {
     /// module looks at.
     fn frame_of(registry: &mut TypeRegistry, name: &str, positions: &[(f32, f32)]) -> RenderFrame {
         let type_id = registry.intern(name);
-        let entities: Vec<RenderEntity> = positions.iter().map(|&(x, y)| RenderEntity { x, y, w: 1, h: 1, d: 0, shape: 0 }).collect();
+        let entities: Vec<RenderEntity> =
+            positions.iter().map(|&(x, y)| RenderEntity { x, y, w: 1, h: 1, d: 0, shape: 0 }).collect();
         RenderFrame {
             tick: 0,
             count: entities.len(),

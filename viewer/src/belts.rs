@@ -623,10 +623,7 @@ mod tests {
     #[test]
     fn separate_crossings_on_one_line_pair_up_individually() {
         let found = ends(vec![belt(0, 0, EAST), belt(3, 0, EAST), belt(6, 0, EAST), belt(9, 0, EAST)], 5);
-        assert_eq!(
-            found,
-            vec![UndergroundEnd::Entrance, UndergroundEnd::Exit, UndergroundEnd::Entrance, UndergroundEnd::Exit]
-        );
+        assert_eq!(found, vec![UndergroundEnd::Entrance, UndergroundEnd::Exit, UndergroundEnd::Entrance, UndergroundEnd::Exit]);
     }
 
     /// Further apart than the tier can reach is not a pair, so neither is an

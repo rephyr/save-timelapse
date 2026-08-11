@@ -1482,11 +1482,8 @@ fn describe_play_time(tick: u64) -> String {
 fn describe_session(session: &replay::Session, now: SystemTime) -> String {
     let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
     let places = describe_places(&session.baseline.surfaces);
-    let scale = format!(
-        "{} buildings, {}",
-        with_thousands(session.baseline.entities as u64),
-        describe_play_time(session.baseline.tick)
-    );
+    let scale =
+        format!("{} buildings, {}", with_thousands(session.baseline.entities as u64), describe_play_time(session.baseline.tick));
     match session.label() {
         Some(name) => format!("{name}  ({places})\n     {scale}, last played {age}"),
         None => format!("{places}\n     {scale}, last played {age}"),
