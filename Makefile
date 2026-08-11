@@ -1,11 +1,34 @@
 # Convenience targets wrapping the workflows in README.md. Recipes use
 # Unix-style commands (cp, mkdir -p), matching the shell the README's own
 # "Developing without Factorio" section already assumes, so this needs a
-# POSIX shell on PATH to run `make` from -- Git Bash's sh.exe covers it on
+# POSIX shell on PATH to run `make` from. Git Bash's sh.exe covers it on
 # Windows.
 #
 # Override any variable on the command line, e.g.:
 #   make viewer FRAMES=frames_multi
+
+# Started from PowerShell or cmd on Windows, GNU Make falls back to cmd.exe,
+# which cannot run any recipe here. The failure is unrecognisable as a shell
+# problem: `sed` is simply missing, and `for f in ...; do` parses as cmd's own
+# FOR statement, so the first symptom is
+#
+#     process_begin: CreateProcess(NULL, sed -n ...) failed.
+#     f was unexpected at this time.
+#     make: *** [Makefile:135: check-mod-files] Error 255
+#
+# naming a target that has nothing to do with the cause. This turns that into
+# one line saying what to do, before any recipe runs.
+#
+# Detected rather than assumed from $(OS): `echo $$0` comes back as the literal
+# `$0` under cmd, because it does not expand shell variables, and as a shell
+# path under any POSIX shell. Setting SHELL to sh.exe outright would be the
+# nicer fix and is not reliable, since it lives under "Program Files" and
+# GNU Make does not handle a SHELL path containing spaces.
+ifeq ($(OS),Windows_NT)
+ifeq ($(shell echo $$0),$$0)
+$(error This Makefile needs a POSIX shell. Run it from Git Bash rather than PowerShell or cmd, e.g. `bash -c "make $(MAKECMDGOALS)"`)
+endif
+endif
 
 MOD_INSTALL ?= $(APPDATA)/Factorio/mods/save-timelapse
 FRAMES      ?= frames
