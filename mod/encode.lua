@@ -106,6 +106,37 @@ M.EXCLUDED_TYPES = {
   "asteroid-chunk",
 }
 
+--- Scenery types, given the two settings that decide which of them are
+--- recorded at all. Entities the map generated rather than anybody placing,
+--- so they sit on every generated chunk regardless of where the factory is.
+---
+--- The point of naming them is that they are captured *near the factory*
+--- rather than across the whole surface, exactly like the natural ground
+--- they stand on. See `export.lua`'s bounded pass.
+---
+--- Disjoint from `EXCLUDED_TYPES` and from the conditional part of
+--- `export.excluded_types()` by construction: each entry below is gated on
+--- the same setting that would otherwise have excluded it outright, so a
+--- type is either never recorded or recorded near the base, never both.
+---
+--- Worms are absent and cannot be added: they share the "turret" type with
+--- player turrets (see `EXCLUDED_TYPES`), so bounding by type here would
+--- bound real defences too.
+function M.context_types(include_resources, capture_terrain)
+  local list = { "unit-spawner" }
+  if include_resources then
+    list[#list + 1] = "resource"
+  end
+  if capture_terrain then
+    list[#list + 1] = "tree"
+    list[#list + 1] = "cliff"
+    -- Gleba's flora is type "plant", not "tree", the same split
+    -- `export.excluded_types()` has to make.
+    list[#list + 1] = "plant"
+  end
+  return list
+end
+
 -- Natural terrain (grass, water, sand, dirt, ...) vastly outnumbers placed
 -- floor types, so this is an include list rather than an exclude list, the
 -- opposite of EXCLUDED_TYPES above. Verified against base/prototypes/tile/tiles.lua.

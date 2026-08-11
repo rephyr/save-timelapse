@@ -63,6 +63,50 @@ function M.excluded_types()
   return list
 end
 
+--- Scenery: entities the map generated rather than anybody placing, which
+--- therefore sit on every generated chunk regardless of where the factory
+--- is. Recorded, but only near the factory, exactly like the natural ground
+--- they stand on.
+---
+--- These used to come from the whole surface while the ground was capped to
+--- a margin around the base, which is the same reasoning applied to one of
+--- them and not the other. Measured on a real megabase capture, trees,
+--- resources and nests were **69% of every frame** and covered an area 2.3x
+--- larger than the ground beneath them, so most of them rendered on empty
+--- black. Worse, Factorio generates chunks ahead of the player, so a capture
+--- included forests and ore fields from chunks nobody had ever visited.
+---
+--- Worms are missing from this list and cannot join it: they share the
+--- "turret" type with player turrets (see `encode.EXCLUDED_TYPES`), so
+--- bounding by type would bound real defences too. They were 0.9% of that
+--- same capture alongside the nests, so the leak is small.
+---
+--- Disjoint from `M.excluded_types()` by construction: each entry is gated
+--- on the setting that would otherwise have excluded it outright, so no type
+--- is ever named by both. The list itself lives in `encode.lua`, which has
+--- no Factorio dependency and so can be unit tested; this only reads the
+--- settings for it.
+function M.context_types()
+  return encode.context_types(
+    settings.startup["save-timelapse-include-resources"].value,
+    settings.startup["save-timelapse-capture-terrain"].value
+  )
+end
+
+--- What the unbounded entity pass skips: everything never recorded at all,
+--- plus the scenery the bounded pass handles instead.
+---
+--- Not folded into `M.excluded_types()`, which `capture.lua` uses to decide
+--- what a live event may log: scenery is genuinely recorded, so an event
+--- touching it is not something to drop.
+local function unbounded_excludes()
+  local list = M.excluded_types()
+  for _, t in pairs(M.context_types()) do
+    list[#list + 1] = t
+  end
+  return list
+end
+
 --- Whether a capture write has already failed this session (disk full,
 --- permissions, a program locking the file, the kind of thing a
 --- long-running live capture is exactly the workload to eventually hit).
@@ -188,8 +232,12 @@ local function export_surface(surface, tick, session_id)
     order, groups, pending_count = {}, {}, 0
   end
 
+  -- Unbounded, because a factory reaches wherever somebody took it: a mining
+  -- outpost or a rail terminus thousands of tiles out is still theirs and
+  -- still belongs in the timelapse. Scenery is the opposite case and is
+  -- handled by the bounded pass below.
   for _, entity in pairs(surface.find_entities_filtered({
-    type = M.excluded_types(),
+    type = unbounded_excludes(),
     invert = true,
   })) do
     if entity.valid then
@@ -221,6 +269,41 @@ local function export_surface(surface, tick, session_id)
   end
 
   flush_entities()
+
+  -- One area for the scenery pass and the natural ground pass both, computed
+  -- once here from what somebody built. The two describing the same region is
+  -- the whole point: a tree drawn outside the ground it grows on is what this
+  -- fixes.
+  --
+  -- Taken from entities alone, unlike before, because it has to be final
+  -- before the scenery pass writes and placed floor is not read until the
+  -- tile section further down. Measured on a real megabase the paving sat
+  -- inside the entity box anyway (2873x2863 against 3070x3113), and
+  -- `encode.terrain_margin` adds far more slack than the difference, so
+  -- nothing is lost that the margin does not already cover.
+  local context_area = encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
+
+  if context_area then
+    for _, entity in pairs(surface.find_entities_filtered({
+      area = context_area,
+      type = M.context_types(),
+    })) do
+      if entity.valid then
+        local pos = entity.position
+        local group = group_for(entity.name, entity.tile_width, entity.tile_height)
+        local k = group.n + 1
+        group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
+        written = written + 1
+        pending_count = pending_count + 1
+
+        if pending_count >= FLUSH_EVERY then
+          flush_entities()
+        end
+      end
+    end
+
+    flush_entities()
+  end
 
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
@@ -258,10 +341,6 @@ local function export_surface(surface, tick, session_id)
     group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
     tiles_written = tiles_written + 1
     pending_count = pending_count + 1
-    -- Unconditional, unlike the entity loop above: this query asks only for
-    -- PLACED_FLOOR_TILES, so everything it returns was laid down by
-    -- somebody and there is no force to ask about.
-    encode.grow_bbox(bbox, pos.x, pos.y)
 
     if pending_count >= FLUSH_EVERY then
       flush_tiles()
@@ -289,8 +368,10 @@ local function export_surface(surface, tick, session_id)
   -- asks for enough ground to fill the frame a timelapse is watched in
   -- rather than a fixed chunk, which against the old map-sized box would
   -- have been unthinkable and against this one is bounded.
-  local terrain_area = settings.startup["save-timelapse-capture-terrain"].value
-    and encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
+  --
+  -- The very same `context_area` the scenery pass used, not a second box
+  -- computed the same way: the trees have to land on the ground.
+  local terrain_area = settings.startup["save-timelapse-capture-terrain"].value and context_area
   if terrain_area then
     for _, tile in pairs(surface.find_tiles_filtered({
       area = terrain_area,

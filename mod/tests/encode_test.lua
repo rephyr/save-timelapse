@@ -317,6 +317,44 @@ do
   check("expand_bbox: right_bottom y is max_y plus the margin", area[2][2], 34)
 end
 
+-- scenery captured near the factory rather than across the whole surface
+
+do
+  local function set(list)
+    local s = {}
+    for _, t in pairs(list) do
+      if s[t] then
+        error("duplicate type " .. t)
+      end
+      s[t] = true
+    end
+    return s
+  end
+
+  local both_off = set(encode.context_types(false, false))
+  local both_on = set(encode.context_types(true, true))
+
+  check("context_types: nests are scenery whatever the settings say", both_off["unit-spawner"], true)
+  check("context_types: resources only when they are being recorded", both_off["resource"], nil)
+  check("context_types: resources when include-resources is on", both_on["resource"], true)
+  check("context_types: no flora when terrain capture is off", both_off["tree"], nil)
+  for _, t in pairs({ "tree", "cliff", "plant" }) do
+    check("context_types: " .. t .. " is scenery when terrain capture is on", both_on[t], true)
+  end
+
+  -- Worms share the "turret" type with player defences, so bounding this
+  -- type would bound real turrets to the factory box as well.
+  check("context_types: never bounds turrets, which would take player ones with them", both_on["turret"], nil)
+
+  -- The property the whole split rests on. A type named by both lists would
+  -- either be dropped from the unbounded pass and never picked up by the
+  -- bounded one, or captured twice.
+  local excluded = set(encode.EXCLUDED_TYPES)
+  for _, t in pairs(encode.context_types(true, true)) do
+    check("context_types: " .. t .. " is not also always-excluded", excluded[t], nil)
+  end
+end
+
 -- how far past the built area to capture ground
 
 do
