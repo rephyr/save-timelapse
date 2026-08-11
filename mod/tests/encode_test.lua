@@ -556,6 +556,81 @@ check("PLACED_FLOOR_TILES: contains concrete", floor["concrete"], true)
 check("PLACED_FLOOR_TILES: contains landfill", floor["landfill"], true)
 check("PLACED_FLOOR_TILES: contains stone-path", floor["stone-path"], true)
 
+-- color_bytes
+--
+-- Factorio writes a Color as 0..1 floats or as 0..255 values and tells them
+-- apart by whether anything is above 1, so this has to as well. Assuming
+-- floats put an already-byte-ranged prototype colour out of byte range (61
+-- became 15555), which the reader could not parse at all: on an Alien Biomes
+-- save 357 of 364 tiles were unreadable, and a single one of them was enough
+-- to make the desktop side discard the whole file and colour the playthrough
+-- from its built-in table.
+
+local function color(c)
+  return string.format("%d,%d,%d", encode.color_bytes(c))
+end
+
+check("color_bytes: 0..1 floats scale up", color({ r = 0.2, g = 0.4, b = 1 }), "51,102,255")
+check("color_bytes: 0..255 values pass through", color({ r = 55, g = 53, b = 11 }), "55,53,11")
+check("color_bytes: one component above 1 means the whole colour is 0..255", color({ r = 218, g = 1, b = 0 }), "218,1,0")
+check("color_bytes: black is black whichever form it is in", color({ r = 0, g = 0, b = 0 }), "0,0,0")
+check("color_bytes: white as floats", color({ r = 1, g = 1, b = 1 }), "255,255,255")
+check("color_bytes: a missing component is zero", color({ r = 0.5 }), "128,0,0")
+-- The range rule is a convention, not something the game enforces on a mod.
+check("color_bytes: clamped above", color({ r = 300, g = 260, b = 4 }), "255,255,4")
+check("color_bytes: clamped below", color({ r = -5, g = 5, b = 400 }), "0,5,255")
+
+-- palette_json
+--
+-- Reads the `prototypes` global the game provides, which the test stands in
+-- for. Nests and worms take the enemy colour and everything else does not:
+-- `enemy_map_color` is set on most prototypes whatever side they are on, so
+-- preferring it painted an entire factory, belts and walls and radars alike,
+-- in biter red.
+
+do
+  local tile = function(c) return { map_color = c } end
+  prototypes = {
+    tile = {
+      ["grass-1"] = tile({ r = 55, g = 53, b = 11 }),
+      ["water"] = tile({ r = 51, g = 83, b = 95 }),
+    },
+    entity = {
+      ["transport-belt"] = {
+        type = "transport-belt",
+        map_color = { r = 204, g = 161, b = 71 },
+        enemy_map_color = { r = 255, g = 25, b = 25 },
+      },
+      ["radar"] = {
+        type = "radar",
+        friendly_map_color = { r = 0, g = 93, b = 147 },
+        enemy_map_color = { r = 255, g = 25, b = 25 },
+      },
+      ["biter-spawner"] = {
+        type = "unit-spawner",
+        friendly_map_color = { r = 0, g = 93, b = 147 },
+        enemy_map_color = { r = 255, g = 25, b = 25 },
+      },
+      ["small-worm-turret"] = {
+        type = "turret",
+        enemy_map_color = { r = 255, g = 25, b = 25 },
+      },
+      -- Nothing to say about itself, so it says nothing and the viewer
+      -- falls back for it, exactly as for a name this file never mentions.
+      ["colourless"] = { type = "container" },
+    },
+  }
+
+  check(
+    "palette_json: tiles and entities, sorted, in bytes",
+    encode.palette_json(),
+    '{"tiles":{"grass-1":[55,53,11],"water":[51,83,95]},'
+      .. '"entities":{"biter-spawner":[255,25,25],"radar":[0,93,147],'
+      .. '"small-worm-turret":[255,25,25],"transport-belt":[204,161,71]}}'
+  )
+  prototypes = nil
+end
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

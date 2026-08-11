@@ -763,6 +763,77 @@ function M.palette_name(session_id)
   return M.session_dir(session_id) .. "palette.json"
 end
 
+--- Which prototype types are enemies whatever else is true of them, and so
+--- take `enemy_map_color` rather than the friendly one.
+---
+--- Force is a property of an entity, not of a prototype, and this file is
+--- keyed by prototype name, so it has to pick one colour per name without
+--- ever being told which side anything was on. Type is the closest the game
+--- comes to answering that, and for a capture it answers it exactly: the only
+--- enemies that survive `EXCLUDED_TYPES` are nests and worms.
+---
+--- `turret` is the plain type worms use. It cannot catch a player's defences,
+--- which are `ammo-turret`, `electric-turret` and `fluid-turret`, three types
+--- of their own (see the note on EXCLUDED_TYPES above, which makes the same
+--- split for the same reason).
+---
+--- The mobile ones are listed even though nothing captures them, because this
+--- file describes the game's prototypes rather than one capture's contents,
+--- and a wriggler that is somehow in an old recording should still be red.
+local ENEMY_TYPES = {
+  ["unit"] = true,
+  ["unit-spawner"] = true,
+  ["turret"] = true,
+  ["spider-unit"] = true,
+  ["spider-leg"] = true,
+  ["segmented-unit"] = true,
+  ["segment"] = true,
+}
+
+--- Rounds to a whole byte and holds it there. Unlike `clamp_u8`, which guards
+--- a footprint that is a positive integer already, this takes an arbitrary
+--- float off a prototype and has both ends to defend.
+local function clamp_byte(v)
+  v = math.floor(v + 0.5)
+  if v < 0 then
+    return 0
+  end
+  if v > 255 then
+    return 255
+  end
+  return v
+end
+
+--- One prototype colour as three bytes, which is the only form the reader
+--- accepts.
+---
+--- Factorio writes a Color either as 0..1 floats or as 0..255 values, and the
+--- rule for telling them apart is the game's own: any component above 1 means
+--- the whole colour is in 0..255. Prototypes overwhelmingly use the second
+--- form, base's own tiles included (`grass-1` is {55, 53, 11}), and the
+--- runtime hands a prototype's colour back exactly as it was written rather
+--- than normalising it first.
+---
+--- Assuming floats here did not produce a wrong colour, it produced no colours
+--- at all: an already-byte-ranged 61 scaled by 255 wrote 15555, too large for
+--- the byte the reader expects, and one such number made the entire file
+--- unreadable. A modded playthrough then fell back to the desktop side's
+--- built-in table for every tile it had, which is the exact thing this file
+--- exists to stop. Alien Biomes was where it showed: 357 of 364 tiles.
+---
+--- Clamped as well as rounded, because the range rule is a convention the game
+--- does not enforce on a mod: nothing stops a prototype carrying a component
+--- outside either range, and a colour that is merely wrong must never cost the
+--- other few hundred their colours.
+function M.color_bytes(color)
+  local r, g, b = color.r or 0, color.g or 0, color.b or 0
+  local scale = 255
+  if r > 1 or g > 1 or b > 1 then
+    scale = 1
+  end
+  return clamp_byte(r * scale), clamp_byte(g * scale), clamp_byte(b * scale)
+end
+
 --- Every prototype's own map colour, as JSON, so the desktop side never has to
 --- know what a prototype is called.
 ---
@@ -776,7 +847,7 @@ end
 --- Written once beside the baseline rather than per tick. Colours cannot change
 --- during a playthrough: prototypes are fixed at load time.
 ---
---- Entities use `friendly_map_color` and fall back to `map_color`, with nests
+--- Entities use `map_color` and fall back to `friendly_map_color`, with nests
 --- and their kind taking `enemy_map_color`, which is the same split the game
 --- makes when it draws them.
 function M.palette_json()
@@ -785,15 +856,8 @@ function M.palette_json()
     if not color then
       return
     end
-    -- Factorio gives these as 0..1 floats. Rounded to bytes here so the file
-    -- stays short and the reader has nothing to interpret.
-    parts[#parts + 1] = string.format(
-      '%q:[%d,%d,%d]',
-      name,
-      math.floor((color.r or 0) * 255 + 0.5),
-      math.floor((color.g or 0) * 255 + 0.5),
-      math.floor((color.b or 0) * 255 + 0.5)
-    )
+    local r, g, b = M.color_bytes(color)
+    parts[#parts + 1] = string.format('%q:[%d,%d,%d]', name, r, g, b)
   end
 
   local tiles = {}
@@ -804,9 +868,13 @@ function M.palette_json()
 
   local entities = {}
   for name, proto in pairs(prototypes.entity) do
-    local enemy = proto.enemy_map_color
-    local friendly = proto.friendly_map_color or proto.map_color
-    entities[#entities + 1] = { name = name, color = enemy or friendly }
+    local color
+    if ENEMY_TYPES[proto.type] then
+      color = proto.enemy_map_color or proto.map_color
+    else
+      color = proto.map_color or proto.friendly_map_color
+    end
+    entities[#entities + 1] = { name = name, color = color }
   end
   table.sort(entities, function(a, b) return a.name < b.name end)
 

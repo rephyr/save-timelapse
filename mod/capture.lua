@@ -71,6 +71,24 @@ local capture_last_written_tick = nil
 --- "this save has been running a while".
 local capture_dictionaries_synced = false
 
+--- Whether this session has already rewritten the prototype colours.
+---
+--- Once per load, and a module local for exactly the reason the flag above is
+--- one: a load is the only moment the answer can have changed, since
+--- prototypes are fixed at load time and nothing can add a mod to a running
+--- game.
+---
+--- Once per *load* rather than once per capture because a baseline runs once
+--- per save and then never again (`perform_baseline`), so a palette written
+--- only there was frozen at whatever the playthrough started with. A
+--- playthrough that added a mod later, or that was recorded by a version of
+--- this mod that wrote its colours wrongly, could never pick either up: the
+--- one file describing the game's colours was the one file a running capture
+--- had no way to correct. It is small (a hundred kilobytes on a heavily
+--- modded game) and written on a flush tick that is already writing, so the
+--- refresh costs a capture nothing it would notice.
+local palette_written = false
+
 local excluded_type_set = nil
 --- Same filter as snapshot export, so a captured event never logs something
 --- a snapshot wouldn't have shown (biter deaths, tree fires, and so on).
@@ -361,6 +379,10 @@ local function perform_baseline(tick)
   if not capture.baseline_tick then
     total, tiles, count =
       export.export_all_to(tick, baseline_manifest_path(capture.session_id), capture.session_id, M.is_surface_excluded)
+    -- export_all_to writes the palette itself, so the next flush has nothing
+    -- left to refresh. Only the first-ever baseline: a catch-up goes through
+    -- export_surfaces_to below, which writes no palette of its own.
+    palette_written = true
     capture.baseline_tick = tick
     for _, name in ipairs(names) do
       baselined_surfaces()[name] = tick
@@ -645,6 +667,10 @@ function M.periodic_flush(tick)
   flush_capture()
   export.sample_connected_players(tick, storage.timelapse_capture.session_id)
   milestones.poll(tick, storage.timelapse_capture.session_id)
+  if not palette_written then
+    export.write_palette(storage.timelapse_capture.session_id)
+    palette_written = true
+  end
 end
 
 --- Run when the save-timelapse-live-capture setting is turned on: baselines
