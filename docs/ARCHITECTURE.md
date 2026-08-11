@@ -34,6 +34,18 @@ different things and converge on the same on-disk shape.
 | Reloads are resolved when reading | The mod *cannot* detect a reloaded save. Every value durable enough to survive a load lives in the save and rewinds with it |
 | Nothing under your Factorio install is touched | Exports run against a staged tree the CLI owns and deletes |
 
+**The rule that decides ties.** Time spent inside Factorio and time spent in
+the desktop tool are not worth the same. A player feels a stutter, a frozen
+tick, a baseline that locks the game for thirty seconds. Nobody minds an
+external tool taking a minute longer while they do something else. So whenever
+work can be moved out of the game, move it, even when that costs more total
+work overall: scanning ground from a save afterwards reads an entire surface
+again, which is strictly more work than capturing it during the baseline, and
+is still the right trade because none of it happens while somebody is playing.
+This is also why the mod logs changes rather than re-snapshotting, why the
+baseline is a single freeze rather than a background cost smeared across
+minutes of play, and why terrain left the frame format entirely.
+
 **Three rules worth knowing before reading any section:**
 
 1. **This format records that something was built or destroyed, never that it
@@ -426,9 +438,61 @@ needs 1.4 of it.
 
 Shape-driven also means a long thin base asks for enormous amounts (a 100x5000
 corridor wants 4,800 tiles, which is 140M tiles of ground), so the result is
-capped to a 4M tile budget. That ceiling matters more than it looks: terrain is
-rewritten into **every** frame of a from-saves export, since unlike entities it
-cannot be skipped as unchanged, so its cost is multiplied by the frame count.
+bounded by an area budget: at least 4M tiles, and at least four times the
+factory's own footprint. Four, because solving the area cap for a square gives
+a margin of `(sqrt(k) - 1) / 2` per side, so k=4 yields exactly the half-width
+a 16:9 frame exposes. As a flat ceiling it inverted on any base larger than
+itself, leaving nothing to spend and falling back to the 32 tile floor, so the
+biggest factories got the smallest margins.
+
+## Ground is scanned, not captured
+
+Natural ground is the one part of a capture that does not change. Entities need
+a record per placement and placed floor needs one, but grass is grass for the
+whole playthrough. So it is not recorded during play at all: a separate
+unattended pass reads it from **one** save, afterwards, and writes one
+`terrain_<surface>.stfr` per surface.
+
+That ordering buys three things at once:
+
+- **Nothing during play.** Ground was the expensive half of the baseline, the
+  freeze a player actually feels. It is now entirely outside the game.
+- **Nothing per frame.** A from-saves export wrote the same ground into every
+  frame, since unlike entities it cannot be skipped as unchanged, so its cost
+  was multiplied by the frame count.
+- **The right area.** Running afterwards means the box can be drawn knowing how
+  far the factory eventually reached, instead of guessing from how far it had
+  reached when recording started.
+
+That last point is what makes this a fix rather than a rearrangement. Ground
+captured at baseline time covers wherever the factory stood *then*, and a
+factory grows, so a capture enabled on a starter base and played for hours
+showed buildings standing on nothing everywhere beyond that first small box.
+The alternative was topping ground up as the base grew, which needs the covered
+area tracked in `storage`, a threshold to batch on, ring geometry so each
+top-up writes only what is new, and a stall every time one fires. Scanning
+once, later, needs none of it.
+
+**What it gives up is ground that has since been built over.** The query asks
+for everything that is not placed floor, so water landfilled at hour three
+reads as landfill at hour ten and its water is never recorded. Replayed from
+the beginning, that lake is a hole until the tick the landfill was laid. A pass
+during the baseline would have caught it while it was still visible. A hybrid
+would fix it: a cheap baseline pass for the area built on then, plus a scan for
+everything the factory expanded into later.
+
+The scan writes into the session folder named for the map seed, which is the
+whole verification: a save from a different playthrough lands under a different
+session, so the desktop tool refuses it rather than laying an unrelated
+landscape under somebody's factory. The from-saves flow skips that check, since
+there the saves *are* the playthrough.
+
+`terrain_<surface>.stfr` was already what the viewer looked for, discovered
+straight from the directory and independent of the frame files, so nothing
+downstream changed to accept ground from a different producer. Captures made
+before this still carry ground in their baseline, and `replay::write_all_terrain`
+still projects it; a scan simply overwrites the result, which is the right
+precedence.
 
 ## Write batching
 

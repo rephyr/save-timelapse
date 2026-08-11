@@ -15,9 +15,9 @@ use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
     activity_heights, analyze_activity, color_for, downsample, entity_cull_half_extents, entity_footprint_size,
     entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path, icon_source_rect, is_rotation_allowed,
-    recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, AviWriter, Camera, CameraTransition, DrawCallCounter,
-    FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run,
-    Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
+    is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles, use_chunk_lod, AviWriter, Camera, CameraTransition,
+    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame,
+    RenderTile, Run, Timeline, TypeRegistry, HEAT_CELL_TILES, LOD_CELL_TILES,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -1111,6 +1111,28 @@ fn draw_world(
     let pixels_per_tile = camera.pixels_per_tile();
     let (view_min, view_max) = view_bounds(camera, screen_center);
 
+    // Scenery is culled against the ground as well as against the screen, so
+    // trees and cliffs stop exactly where the grass does.
+    //
+    // They cannot be made to agree at capture time. Scenery is recorded into
+    // the frames, from a box measured while playing; ground is scanned later
+    // from one save, from a box measured then, and is additionally cut short
+    // wherever Factorio had not generated chunks yet. Two boxes, two moments,
+    // one of them clipped by something neither side controls. Measured on a
+    // real capture the scenery overhung the ground by 33 tiles on every side,
+    // which reads as a forest floating on empty black.
+    //
+    // Intersecting here is the only thing that makes the edge exact, because
+    // this is the first point where both extents are known. Costs one extra
+    // pair of comparisons on scenery runs and nothing at all on the rest.
+    let scenery_bounds = terrain.and_then(|t| t.tile_bounds).map(|(tmin, tmax)| {
+        (Vec2::new(view_min.x.max(tmin.x), view_min.y.max(tmin.y)), Vec2::new(view_max.x.min(tmax.x), view_max.y.min(tmax.y)))
+    });
+    let bounds_for = |type_id| match scenery_bounds {
+        Some(b) if is_terrain_scatter(registry.name(type_id)) => b,
+        _ => (view_min, view_max),
+    };
+
     if use_lod {
         // Below LOD_MAX_TILE_PIXELS a full-detail tile or entity is
         // already sub-pixel, so nothing is lost by collapsing a whole
@@ -1142,13 +1164,14 @@ fn draw_world(
         let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
         for run in &frame.entity_lod_runs {
             let color = registry.entity_color(run.type_id);
+            let (min, max) = bounds_for(run.type_id);
             let mut drawn = 0;
             for cell in &frame.entity_lod[run.range()] {
                 let origin = cell.world_origin();
-                if origin.x + (LOD_CELL_TILES as f32) < view_min.x
-                    || origin.x > view_max.x
-                    || origin.y + (LOD_CELL_TILES as f32) < view_min.y
-                    || origin.y > view_max.y
+                if origin.x + (LOD_CELL_TILES as f32) < min.x
+                    || origin.x > max.x
+                    || origin.y + (LOD_CELL_TILES as f32) < min.y
+                    || origin.y > max.y
                 {
                     continue;
                 }
@@ -1200,14 +1223,15 @@ fn draw_world(
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
             let color = registry.entity_color(run.type_id);
             let rotation_allowed = is_rotation_allowed(registry.name(run.type_id));
+            let (min, max) = bounds_for(run.type_id);
             let mut drawn = 0;
             for entity in &frame.entities[run.range()] {
                 let (w, h) = (entity.w as u32, entity.h as u32);
                 let half = entity_cull_half_extents(w, h, entity.d, rotation_allowed);
-                if entity.x + half.x < view_min.x
-                    || entity.x - half.x > view_max.x
-                    || entity.y + half.y < view_min.y
-                    || entity.y - half.y > view_max.y
+                if entity.x + half.x < min.x
+                    || entity.x - half.x > max.x
+                    || entity.y + half.y < min.y
+                    || entity.y - half.y > max.y
                 {
                     continue;
                 }

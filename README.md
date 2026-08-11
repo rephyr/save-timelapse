@@ -61,7 +61,7 @@ You only need the companion tool.
 
 The tool automatically finds your Factorio installation and saves folder and remembers your settings for future runs.
 
-It asks whether to include natural terrain, meaning the grass, water, trees and cliffs around your factory. It looks considerably better with it, but it makes the export larger and slower, so it is a choice you make each run.
+It asks whether to include the natural ground, meaning the grass, water and trees around your factory. It looks considerably better with it. The ground is read in one extra pass over your most recent save rather than recorded into every frame, so it costs one more Factorio run and very little size.
 
 ### Record while you play
 
@@ -82,7 +82,7 @@ From the panel you can:
 
 > **The initial snapshot pauses the game.** It reads your entire factory in one go, which on a very large base takes a few tens of seconds. The mod tells you how many entities it is about to read and gives you a moment before it starts. This happens once, and everything afterwards is incremental, so it has no ongoing effect on your game. Surfaces you exclude in the panel are skipped entirely, so you never pay for a base you did not want recorded.
 
-> **Want terrain in a live capture?** Enable `save-timelapse-capture-terrain` before the initial snapshot is taken. It is a **startup** setting, so Factorio restarts when you change it. Terrain cannot be added to a capture afterwards, and switching it on later means resetting the capture and losing what you have recorded so far.
+> **Want ground in a live capture?** You are asked once the timelapse is built, not before you start recording. Ground never changes during a playthrough, so it is read afterwards from one of your saves rather than recorded while you play. It costs nothing during the game, and it can be added to a capture you already have.
 
 ---
 

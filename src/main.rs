@@ -793,7 +793,15 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // Terrain is fixed the instant the baseline loads (see
     // `World::terrain_frame`), so it is written once here rather than once
     // per emitted frame like `replay::run`'s per-tick callback below does.
-    // No-op per surface with terrain capture off.
+    //
+    // Only ever finds anything for a capture recorded before ground moved out
+    // of the baseline and into its own scan: a mod from this version onward
+    // puts no ground in a frame, so the world has none and this writes
+    // nothing. Kept, and kept first, precisely for those older captures.
+    // `offer_terrain_for_capture` runs after the replay and copies over
+    // whatever lands here, which is the right precedence: a scan covers the
+    // factory's final extent, while a baseline only ever covered how far it
+    // had reached on the day it was taken.
     match &chosen_surface {
         None => replay::write_all_terrain(&replay_state.world, replay_state.baseline.tick, &out)?,
         Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
@@ -924,7 +932,157 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         wait_for_enter();
     }
 
+    offer_terrain_for_capture(settings, &user_dir, &out, chosen.session_id, replay_state.world.tick)?;
+
     Ok(out)
+}
+
+/// Offer to read the ground for a live capture, from a save of the same
+/// playthrough.
+///
+/// Live capture records what changes, and ground never does, so it is not
+/// recorded at all: it is read afterwards from any single save. That keeps
+/// the most expensive part of an export out of the game entirely, at the cost
+/// of the one thing this flow otherwise never needs, which is Factorio
+/// itself. So it is asked rather than assumed, at the moment the cost is
+/// actually incurred.
+///
+/// The newest save is offered first because it has the most map generated and
+/// the furthest-reaching factory, so its ground covers every earlier frame.
+/// Whether it is really the same playthrough is checked by the scan, not
+/// guessed from the filename.
+fn offer_terrain_for_capture(
+    settings: &mut Settings,
+    user_dir: &Path,
+    out: &Path,
+    session_id: u32,
+    capture_tick: u64,
+) -> io::Result<()> {
+    let mut saves: Vec<PathBuf> = std::fs::read_dir(user_dir.join("saves"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("zip"))
+        .collect();
+    if saves.is_empty() {
+        return Ok(());
+    }
+    saves.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH));
+
+    let newest = saves.last().expect("checked non-empty above").clone();
+    let label = newest.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+    println!();
+    let wanted = ask_yes_no(
+        &format!(
+            "Add the natural ground (grass, water, trees) under this factory? It is read from \
+             a save rather than recorded while you play, so this runs Factorio once against \
+             \"{label}\" and takes about a minute.\n\
+             If you have built anything since that save, save in game first and answer again: \
+             ground only exists where the save had already been"
+        ),
+        settings.capture_terrain.unwrap_or(false),
+    )?;
+    settings.capture_terrain = Some(wanted);
+    remember(settings);
+    if !wanted {
+        return Ok(());
+    }
+
+    let factorio = locate_factorio_exe_interactive(settings)?;
+    let config = export::ExportConfig {
+        factorio,
+        user_mods: user_dir.join("mods"),
+        mod_source: mod_source_dir()?,
+        include_resources: false,
+        capture_terrain: true,
+        terrain_scan: true,
+    };
+    add_terrain(&newest, out, &config, Some(session_id), Some(capture_tick));
+    Ok(())
+}
+
+/// Scan one save for natural ground and put it beside the frames.
+///
+/// Ground does not change over a playthrough, so one save describes it for
+/// the whole timelapse. That is why this is a separate pass rather than part
+/// of the export: doing it per frame would repeat the same answer, and doing
+/// it during live capture would charge somebody's game for it.
+///
+/// `expect_session` is the playthrough the caller believes this save belongs
+/// to. The mod writes into a folder named for the map seed, so a save from a
+/// different game lands somewhere else and gets refused here rather than
+/// laying an unrelated landscape under the factory. `None` skips the check,
+/// which is right for the from-saves flow: the saves *are* the playthrough,
+/// so there is nothing to disagree with.
+///
+/// Best effort throughout. A timelapse with no ground is a working timelapse,
+/// so nothing here fails a build that has already succeeded.
+fn add_terrain(
+    save: &Path,
+    out: &Path,
+    config: &export::ExportConfig,
+    expect_session: Option<u32>,
+    capture_tick: Option<u64>,
+) -> bool {
+    let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    step(&format!("Reading the ground from {label}"));
+
+    let staged = std::env::temp_dir().join(format!("save-timelapse-terrain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+
+    let result = export::scan_terrain(save, &staged, config);
+    let copied = match result {
+        Ok(scan) => match expect_session {
+            Some(want) if want != scan.session_id => {
+                eprintln!(
+                    "warning: {label} is from a different playthrough ({:08x}, not {want:08x}), \
+                     so its ground would not match this timelapse. Skipped.",
+                    scan.session_id
+                );
+                0
+            }
+            _ => {
+                let mut copied = 0usize;
+                for file in &scan.files {
+                    let Some(name) = file.file_name() else { continue };
+                    match std::fs::copy(file, out.join(name)) {
+                        Ok(_) => copied += 1,
+                        Err(e) => eprintln!("warning: could not copy {}: {e}", name.to_string_lossy()),
+                    }
+                }
+                println!("{copied} surface(s) of ground in {:.1}s", scan.seconds);
+
+                // The one failure this cannot prevent and can always see. A
+                // scan knows only what its save knew, and Factorio generates
+                // chunks as somebody goes, so ground simply does not exist for
+                // anywhere they had not reached yet. Play on past the last
+                // save and the factory grows into territory the save has never
+                // heard of, leaving buildings on nothing with no error
+                // anywhere. Both ticks are right here, so say so.
+                if let Some(end) = capture_tick {
+                    if scan.tick + TICKS_PER_SECOND * 60 < end {
+                        let minutes = (end - scan.tick) / (TICKS_PER_SECOND * 60);
+                        println!(
+                            "\nnote: that save is {minutes} minute(s) of game time behind the end of \
+                             your capture. Anything you built after saving has no ground under it, \
+                             because Factorio had not generated that part of the map yet. Save in \
+                             game and build this timelapse again to fill it in."
+                        );
+                    }
+                }
+                copied
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: could not read the ground: {e}");
+            0
+        }
+    };
+
+    let _ = std::fs::remove_dir_all(&staged);
+    copied > 0
 }
 
 fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
@@ -997,8 +1155,14 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     std::fs::create_dir_all(&out)?;
 
     let workspace = std::env::temp_dir().join(format!("save-timelapse-{}", std::process::id()));
-    let config =
-        export::ExportConfig { factorio, user_mods, mod_source: mod_source_dir()?, include_resources: false, capture_terrain };
+    let config = export::ExportConfig {
+        factorio,
+        user_mods,
+        mod_source: mod_source_dir()?,
+        include_resources: false,
+        capture_terrain,
+        terrain_scan: false,
+    };
 
     let mut done = 0usize;
     let mut milestone_states: Vec<milestone::State> = Vec::new();
@@ -1037,6 +1201,16 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     if done == 0 {
         return Err(io::Error::other("none of the selected saves exported successfully"));
+    }
+
+    // The last save chosen, because ground is scanned once for the whole
+    // timelapse and the latest save is the one whose map has been generated
+    // furthest out and whose factory reached furthest, so its box covers
+    // every earlier frame too.
+    if capture_terrain {
+        if let Some(last) = chosen.last() {
+            add_terrain(last, &out, &config, None, None);
+        }
     }
 
     // Milestones are the one output that cannot be derived from a single

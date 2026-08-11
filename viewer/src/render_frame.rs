@@ -131,6 +131,12 @@ pub struct RenderFrame {
     pub tile_lod_runs: Vec<Run>,
     pub entity_lod: Vec<LodCell>,
     pub entity_lod_runs: Vec<Run>,
+    /// Corner-to-corner extent of this frame's tiles, or `None` if it has
+    /// none. Computed here, once, because the only consumer needs it on a
+    /// terrain layer that can hold millions of tiles and asks for it on every
+    /// rendered frame: see `draw_world`, which culls scenery against the
+    /// ground so trees stop where the grass does.
+    pub tile_bounds: Option<(Vec2, Vec2)>,
 }
 
 /// Below this many items, `group_by_type`/`build_chunk_lod` just run
@@ -324,6 +330,9 @@ impl RenderFrame {
             tile_lod_runs: Vec::new(),
             entity_lod: Vec::new(),
             entity_lod_runs: Vec::new(),
+            // Only ever read off a terrain layer, and this buffer is the
+            // per-tick one, so it never has ground to bound.
+            tile_bounds: None,
         }
     }
 
@@ -359,6 +368,17 @@ impl RenderFrame {
         let (entities, entity_runs) = group_by_type(&entity_ids, &entities, type_count);
         let (tiles, tile_runs) = group_by_type(&tile_ids, &tiles, type_count);
 
+        // Corner to corner, so a tile at (x, y) contributes the whole square
+        // it occupies rather than just its own corner: tiles are corner
+        // anchored, unlike entities.
+        let tile_bounds = tiles.iter().fold(None, |acc: Option<(Vec2, Vec2)>, t| {
+            let (lo, hi) = (Vec2::new(t.x as f32, t.y as f32), Vec2::new(t.x as f32 + 1.0, t.y as f32 + 1.0));
+            Some(match acc {
+                None => (lo, hi),
+                Some((min, max)) => (min.min(lo), max.max(hi)),
+            })
+        });
+
         RenderFrame {
             tick: frame.tick,
             count: frame.count,
@@ -370,6 +390,7 @@ impl RenderFrame {
             tile_lod_runs,
             entity_lod,
             entity_lod_runs,
+            tile_bounds,
         }
     }
 }

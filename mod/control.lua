@@ -105,7 +105,7 @@ end
 --- priority, though nothing today can actually make more than one of these
 --- pending on the same tick.
 local function on_tick(event)
-  export.run_pending_tick_work(event.tick)
+  export.run_pending_tick_work(event.tick, capture.compute_session_id)
   capture.run_pending_tick_work(event.tick)
   snapshot.run_pending_tick_work(event.tick)
 end

@@ -20,6 +20,23 @@ data:extend({
     order = "a",
   },
   {
+    -- Natural ground, exported by itself in an unattended run rather than
+    -- during play.
+    --
+    -- Ground is the one thing in a capture that is essentially static, so it
+    -- does not need a history: one pass over a save, afterwards, describes it
+    -- for the whole timelapse. Doing it here rather than in the baseline
+    -- keeps the most expensive part of an export out of somebody's game
+    -- entirely, and means the area can be chosen knowing how far the factory
+    -- eventually reached instead of guessing from how far it had reached when
+    -- recording started.
+    type = "bool-setting",
+    name = "save-timelapse-terrain-scan",
+    setting_type = "startup",
+    default_value = false,
+    order = "a2",
+  },
+  {
     -- Every ore tile is a separate entity, so resources typically outnumber
     -- built entities while saying nothing about how the factory grew.
     type = "bool-setting",

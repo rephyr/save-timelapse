@@ -772,6 +772,19 @@ function M.frame_name(session_id, tick, surface)
   return M.session_dir(session_id) .. name
 end
 
+--- Ground is one file per surface for a whole capture, not one per tick, so
+--- unlike `M.frame_name` there is no tick in it. Session tagged for the same
+--- reason everything else is: the shared script-output folder holds every
+--- playthrough that ever recorded, and the desktop tool uses the folder it
+--- lands in to tell whether the save it scanned was really the right one.
+function M.terrain_name(session_id, surface)
+  local name = string.format("terrain_%s.stfr", surface)
+  if not session_id then
+    return name
+  end
+  return M.session_dir(session_id) .. name
+end
+
 -- Milestones
 --
 -- Notable moments worth marking on the timeline: the first of each science
