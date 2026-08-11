@@ -16,7 +16,7 @@ use viewer::{
     activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
     entity_sheet_path,
     entity_footprint_size, entity_rotation_radians, format_game_time, sheet_row, growing_bounds_per_frame, icon_path,
-    icon_source_rect, is_belt, is_pipe, is_rotation_allowed, is_splitter, pipe_piece_path, splitter_offsets, splitter_patch_path, splitter_source_rect,
+    icon_source_rect, is_belt, is_pipe, is_pipe_to_ground, is_rotation_allowed, is_splitter, pipe_piece_path, pipe_to_ground_paths, splitter_offsets, splitter_patch_path, splitter_source_rect,
     splitter_structure_paths,
     underground_reach, underground_source_rect,
     underground_structure_path, is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles,
@@ -531,6 +531,8 @@ enum SheetKind {
     /// Sixteen files, one per combination of the four sides something joins
     /// onto, indexed by the connection mask.
     Pipe,
+    /// Four files, one per facing.
+    PipeToGround,
 }
 
 /// Where in `sprite` to read the picture for one entity, and how far to rotate
@@ -600,6 +602,12 @@ fn entity_source(sprite: &Sprite, entity: &RenderEntity, rotation_allowed: bool)
         // One file per facing, so the facing picks the texture rather than a
         // region inside one. Frame zero of the animation: a timelapse frame is
         // a still, and the other 31 only move the belt surface.
+        Some(SheetKind::PipeToGround) if entity.d.is_multiple_of(4) => {
+            let facing = (entity.d / 4) as usize;
+            let texture = &sprite.textures[facing];
+            return EntityArt::sized(facing, Rect::new(0.0, 0.0, texture.width(), texture.height()));
+        }
+        Some(SheetKind::PipeToGround) => {}
         // The mask indexes straight into the textures, which were loaded in
         // the same order (see `pipes::PIECES`).
         Some(SheetKind::Pipe) => {
@@ -769,6 +777,27 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
                         textures: facings.into_iter().map(|f| f.texture).collect(),
                         icon_rect,
                         sheet: Some(SheetKind::Splitter),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if is_pipe_to_ground(name) {
+            if let Some(paths) = pipe_to_ground_paths(data_dir) {
+                let mut textures = Vec::with_capacity(4);
+                for path in &paths {
+                    let Some(path) = path.to_str() else { break };
+                    let Ok(texture) = load_texture(path).await else { break };
+                    textures.push(texture);
+                }
+                if textures.len() == 4 {
+                    let icon_rect = Rect::new(0.0, 0.0, textures[0].width(), textures[0].height());
+                    sprites[id] = Some(Sprite {
+                        textures,
+                        icon_rect,
+                        sheet: Some(SheetKind::PipeToGround),
+                        splitter_offsets: Vec::new(),
                     });
                     continue;
                 }

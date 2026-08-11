@@ -1,4 +1,21 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.7.0
+Date: 2026-08-11
+  Features:
+    - Belts, underground belts, splitters and pipes are drawn with Factorio's own artwork instead of their inventory icons. Belt corners actually curve, an underground belt's two ends face opposite ways, splitters look like splitters from either side, and a run of pipe joins up with corners, tees and crossings
+    - A new viewer interface. Your factory fills the window: a planet switcher in one corner, the time in the other, and playback controls you can click rather than keys you had to know. Everything else is one keypress away and nothing else is in the way
+    - Press ? in the viewer for every control it has. Three of them, jumping between milestones, jumping between busy stretches, and bookmarking a moment, had never been listed anywhere
+    - The tool no longer closes on you. Building a timelapse, watching one, or hitting an error all return to the menu, so making a second one no longer means starting the program again
+  Optimizations:
+    - Floors are drawn in one pass however many kinds of paving a base has. Concrete, refined concrete and hazard concrete each used to interrupt the batch, which on a heavily paved base was a real cost for something that is only ever a backdrop
+  Bugfixes:
+    - Rotating a belt is recorded. A belt rotated after it was placed kept its original direction forever, so its corner drew as a straight belt. Belts the game connects up for you as you drag are still not covered; a fresh baseline corrects everything placed so far
+    - The viewer's readouts no longer cover the factory. Entity counts, zoom, frame rate and the draw-call profile moved behind F3, where anybody who wants them can still find them
+  Changes:
+    - Floors are drawn as flat colour rather than a stretched item icon. A floor only needs to show that there is a base under the machines, and the icons did not look like the real thing anyway
+    - The companion tool speaks plainly. Recordings are listed by where they happened and how big the factory got, rather than by a hex id and a raw tick count, and a finished build reports one line instead of six paragraphs of internal detail
+
+---------------------------------------------------------------------------------------------------
 Version: 0.6.0
 Date: 2026-08-11
   Features:

@@ -119,7 +119,10 @@ The replay is designed to be explored rather than simply watched.
 | `B` | Add or clear bookmark |
 | `F` | Toggle camera auto-follow |
 | `H` | Toggle construction heatmap |
-| `S` | Toggle entity icons |
+| `?` | Show every control |
+| `F3` | Renderer diagnostics |
+
+Playback, the planet switcher and reframing are also clickable, so the viewer can be driven without knowing any of these.
 
 ![Camera automatically following a growing Factorio base](assets/camera-follow.gif)
 
@@ -173,8 +176,9 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 ### v0.7
 
 - [x] Clean viewer interface: surface switcher, clickable playback controls, keyboard panel
-- [ ] Rotated sprites for the entities whose icons carry a direction
-- [ ] Clear recovery when a build fails or is interrupted partway
+- [x] Belts, underground belts, splitters and pipes drawn with Factorio's own artwork
+- [x] Belt rotations recorded, so corners stop drawing as straight belts
+- [x] The companion tool stays open and speaks plainly, and failures return to the menu
 - [ ] Refreshed screenshots and demo recordings
 
 ### v1.0
