@@ -189,7 +189,6 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - [x] Belt rotations recorded, so corners stop drawing as straight belts
 - [x] The companion tool stays open and speaks plainly, and failures return to the menu
 - [x] Modded games recorded as themselves: colours, belts, pipes and ores taken from the game's own prototypes
-- [ ] Refreshed screenshots and demo recordings
 
 ### v1.0
 
@@ -214,7 +213,6 @@ Documentation:
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Performance](docs/PERFORMANCE.md)
-- [Testing](docs/TESTING.md)
 - [Test fixtures](tests/fixtures/README.md)
 
 The exporter can also be developed and tested without owning Factorio.
