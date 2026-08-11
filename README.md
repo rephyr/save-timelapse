@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml/badge.svg)](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml)
 
-**Watch your Factorio factory grow without sacrificing performance.**
+**The factory must grow. Unlike your files.**
 
 Save Timelapse is an interactive Factorio timelapse tool built for large factories and long-running saves. Its live capture records your factory as you play using an initial snapshot followed by incremental changes, avoiding repeated full-world exports.
 
