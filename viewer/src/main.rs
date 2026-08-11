@@ -13,12 +13,17 @@ use save_timelapse::export::install_data_dir;
 use save_timelapse::locate::locate_factorio;
 use save_timelapse::milestone::{Kind, Milestone};
 use viewer::{
-    activity_heights, analyze_activity, color_for, downsample, draw_key_panel, entity_cull_half_extents,
-    entity_footprint_size, entity_rotation_radians, format_game_time, growing_bounds_per_frame, icon_path,
-    icon_source_rect, is_rotation_allowed, is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles,
-    use_chunk_lod, AviWriter, Camera, CameraTransition, Chrome, ChromeState, Click, DrawCallCounter, FrameSequence,
-    GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderFrame, RenderTile, Run, Timeline,
-    TypeRegistry, Ui, HEAT_CELL_TILES, LOD_CELL_TILES,
+    activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
+    entity_sheet_path,
+    entity_footprint_size, entity_rotation_radians, format_game_time, sheet_row, growing_bounds_per_frame, icon_path,
+    icon_source_rect, is_belt, is_pipe, is_rotation_allowed, is_splitter, pipe_piece_path, splitter_offsets, splitter_patch_path, splitter_source_rect,
+    splitter_structure_paths,
+    underground_reach, underground_source_rect,
+    underground_structure_path, is_terrain_scatter, recent_heat, synthetic_frame, synthetic_tiles,
+    use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click, DrawCallCounter, FrameSequence,
+    GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity, RenderFrame, RenderTile, Run,
+    Timeline,
+    TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -492,8 +497,228 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
 /// texture stretched into an entity's box renders every copy squashed
 /// together. `icon_rect` crops to just the first (primary) one.
 struct Sprite {
-    texture: Texture2D,
+    /// Usually one. A splitter has four, one per facing, because that is how
+    /// Factorio ships them: `splitter-north.png` and its three siblings rather
+    /// than one sheet with the facings inside it.
+    textures: Vec<Texture2D>,
     icon_rect: Rect,
+    /// Which of Factorio's own in-world sheets these are, if any. `None` means
+    /// an ordinary inventory icon, drawn the way it always was.
+    sheet: Option<SheetKind>,
+    /// Per-facing offset from the entity's centre, in tiles. Only a splitter
+    /// has these, because only a splitter is assembled from pieces whose own
+    /// shifts move where the middle ends up.
+    splitter_offsets: Vec<Vec2>,
+}
+
+impl Sprite {
+    fn primary(&self) -> &Texture2D {
+        &self.textures[0]
+    }
+}
+
+/// The two sheet layouts worth reading, both of which hold several pictures of
+/// one entity and need the right one picked per entity rather than per type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SheetKind {
+    /// 20 rows of square frames: four facings, eight corners, eight end caps.
+    Belt,
+    /// Four facings across by four variants down: exit, entrance, and the two
+    /// side-loading forms this does not use.
+    UndergroundStructure,
+    /// One file per facing, each 32 frames as eight columns of four rows.
+    Splitter,
+    /// Sixteen files, one per combination of the four sides something joins
+    /// onto, indexed by the connection mask.
+    Pipe,
+}
+
+/// Where in `sprite` to read the picture for one entity, and how far to rotate
+/// what comes out.
+///
+/// A belt drawn from the in-world sheet is never rotated: every facing and
+/// every corner is a separate frame that Factorio drew the right way up, so
+/// rotating one would undo that. Everything else keeps the old behaviour, an
+/// inventory icon turned to face the way the entity does.
+/// How to draw one entity from its sprite: which part of the texture, how far
+/// to turn it, whether to mirror it, and how much of a tile it covers.
+struct EntityArt {
+    /// Index into `Sprite::textures`. Always 0 except for a splitter, whose
+    /// facings are four separate files.
+    texture: usize,
+    source: Rect,
+    rotation: f32,
+    flip_x: bool,
+    flip_y: bool,
+    /// How many tiles the chosen frame covers, when that is not simply the
+    /// entity's footprint.
+    ///
+    /// Factorio's frames are deliberately bigger than the thing inside them,
+    /// to leave room for overhang and shadow: a belt's artwork fills 68 pixels
+    /// of a 128 pixel frame, and a splitter's spills past its own 2x1
+    /// footprint on purpose. Fitting the frame to the footprint therefore
+    /// draws everything at roughly half size, which on belts shows up as gaps
+    /// between segments. `None` keeps the old behaviour for inventory icons,
+    /// which really are footprint sized.
+    tiles: Option<Vec2>,
+    /// Where the frame sits relative to the entity's centre, in tiles.
+    ///
+    /// Factorio's sprites carry a `shift`, and a splitter's is about a fifth
+    /// of a tile sideways. Ignoring it draws every splitter that far off
+    /// centre, which is small enough to read as a rendering fault rather than
+    /// as a field nobody applied.
+    offset: Vec2,
+}
+
+impl EntityArt {
+    fn plain(source: Rect, rotation: f32) -> EntityArt {
+        EntityArt { texture: 0, source, rotation, flip_x: false, flip_y: false, tiles: None, offset: Vec2::ZERO }
+    }
+
+    /// A frame drawn at its own size, worked out from its pixels.
+    fn sized(texture: usize, source: Rect) -> EntityArt {
+        EntityArt {
+            texture,
+            source,
+            rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
+            tiles: Some(Vec2::new(source.w, source.h) / SPRITE_TILE_PIXELS),
+            offset: Vec2::ZERO,
+        }
+    }
+}
+
+fn entity_source(sprite: &Sprite, entity: &RenderEntity, rotation_allowed: bool) -> EntityArt {
+    let (width, height) = (sprite.primary().width(), sprite.primary().height());
+    match sprite.sheet {
+        Some(SheetKind::Belt) => {
+            if let Some(row) = sheet_row(entity.d, BeltShape::from_byte(entity.shape)) {
+                return EntityArt::sized(0, belt_source_rect(width, height, SHEET_ROWS, row));
+            }
+        }
+        // One file per facing, so the facing picks the texture rather than a
+        // region inside one. Frame zero of the animation: a timelapse frame is
+        // a still, and the other 31 only move the belt surface.
+        // The mask indexes straight into the textures, which were loaded in
+        // the same order (see `pipes::PIECES`).
+        Some(SheetKind::Pipe) => {
+            let piece = (entity.shape & 0b1111) as usize;
+            let texture = &sprite.textures[piece];
+            return EntityArt::sized(piece, Rect::new(0.0, 0.0, texture.width(), texture.height()));
+        }
+        // Already assembled and already frame zero, so the whole texture is
+        // the picture. The offset is the composite's own, which is not either
+        // piece's shift once two differently placed halves are joined.
+        Some(SheetKind::Splitter) if entity.d.is_multiple_of(4) => {
+            let facing = (entity.d / 4) as usize;
+            let texture = &sprite.textures[facing];
+            let source = Rect::new(0.0, 0.0, texture.width(), texture.height());
+            return EntityArt { offset: sprite.splitter_offsets[facing], ..EntityArt::sized(facing, source) };
+        }
+        Some(SheetKind::Splitter) => {}
+        // Columns run north, east, south, west, which is Factorio's own order
+        // for a four-facing sheet, so the raw 16-way byte divides straight
+        // down to a column.
+        //
+        // The exit is drawn as the entrance mirrored along the direction items
+        // travel. Factorio's own two structures are very nearly the same
+        // picture (measured: they differ only across a 67x69 patch of a 192px
+        // cell, the striping on the top face), so taking them at face value
+        // leaves a crossing looking like the same object twice. Mirroring is
+        // also what the pair really does: the entrance's mouth opens backwards
+        // towards the belt feeding it, and the exit's opens forwards towards
+        // the belt it feeds.
+        Some(SheetKind::UndergroundStructure) if entity.d.is_multiple_of(4) => {
+            let end = UndergroundEnd::from_byte(entity.shape);
+            let mirrored = end == UndergroundEnd::Exit;
+            let along_x = entity.d == 4 || entity.d == 12;
+            let source = underground_source_rect(width, height, end.sheet_row(), (entity.d / 4) as usize);
+            return EntityArt {
+                flip_x: mirrored && along_x,
+                flip_y: mirrored && !along_x,
+                ..EntityArt::sized(0, source)
+            };
+        }
+        Some(SheetKind::UndergroundStructure) => {}
+        None => {}
+    }
+    let rotation = entity_rotation_radians(entity.w as u32, entity.h as u32, entity.d, rotation_allowed);
+    EntityArt::plain(sprite.icon_rect, rotation)
+}
+
+/// One splitter facing, assembled into a single picture.
+///
+/// Facing east or west, Factorio draws a splitter in two pieces that overlap
+/// only in the sense of sitting next to each other, and drawing just one of
+/// them shows half a splitter. They are joined here, once at load, rather than
+/// as a second quad per entity at draw time: the whole renderer is built
+/// around one quad per entity in a per-type batch, and a second texture would
+/// break the batch for every splitter in the factory.
+///
+/// The composite's own offset comes back too, since joining two differently
+/// shifted pieces moves the middle.
+struct SplitterFacing {
+    texture: Texture2D,
+    /// Offset from the entity's centre, in tiles.
+    offset: Vec2,
+}
+
+/// Combines a splitter's structure with its top patch, if it has one.
+///
+/// Both are frame zero of their own animation grid. Everything is worked out
+/// in sheet pixels and converted to tiles at the end, because that is the
+/// space Factorio's shifts are quoted in.
+fn assemble_splitter(structure: &Image, patch: Option<&Image>, facing: usize) -> SplitterFacing {
+    let frame = |image: &Image| {
+        let rect = splitter_source_rect(image.width() as f32, image.height() as f32);
+        (rect.w, rect.h)
+    };
+    let (structure_offset, patch_offset) = splitter_offsets(facing);
+    let (sw, sh) = frame(structure);
+
+    // Each piece's extent around the entity centre, then the union of them.
+    let mut min = Vec2::new(structure_offset.0 - sw / 2.0, structure_offset.1 - sh / 2.0);
+    let mut max = Vec2::new(structure_offset.0 + sw / 2.0, structure_offset.1 + sh / 2.0);
+    if let Some(patch) = patch {
+        let (pw, ph) = frame(patch);
+        min = min.min(Vec2::new(patch_offset.0 - pw / 2.0, patch_offset.1 - ph / 2.0));
+        max = max.max(Vec2::new(patch_offset.0 + pw / 2.0, patch_offset.1 + ph / 2.0));
+    }
+
+    let size = max - min;
+    let mut canvas = Image::gen_image_color(size.x as u16, size.y as u16, Color::new(0.0, 0.0, 0.0, 0.0));
+    // Patch first: it is the far half, so the near half draws over it where
+    // they meet, which is the order Factorio layers them in.
+    if let Some(patch) = patch {
+        let (pw, ph) = frame(patch);
+        let at = Vec2::new(patch_offset.0 - pw / 2.0, patch_offset.1 - ph / 2.0) - min;
+        blit(&mut canvas, patch, at);
+    }
+    let at = Vec2::new(structure_offset.0 - sw / 2.0, structure_offset.1 - sh / 2.0) - min;
+    blit(&mut canvas, structure, at);
+
+    let texture = Texture2D::from_image(&canvas);
+    texture.set_filter(FilterMode::Linear);
+    SplitterFacing { texture, offset: (min + max) / 2.0 / SPRITE_TILE_PIXELS }
+}
+
+/// Copies frame zero of `source` onto `canvas` at `at`, keeping whatever is
+/// already there wherever the source is transparent.
+fn blit(canvas: &mut Image, source: &Image, at: Vec2) {
+    let rect = splitter_source_rect(source.width() as f32, source.height() as f32);
+    for y in 0..rect.h as u32 {
+        for x in 0..rect.w as u32 {
+            let pixel = source.get_pixel(x, y);
+            if pixel.a <= 0.0 {
+                continue;
+            }
+            let (tx, ty) = (at.x as u32 + x, at.y as u32 + y);
+            if tx < canvas.width() as u32 && ty < canvas.height() as u32 {
+                canvas.set_pixel(tx, ty, pixel);
+            }
+        }
+    }
 }
 
 /// Sprites indexed by `TypeId`, so drawing never hashes a name.
@@ -516,10 +741,86 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
         progress.detail = name.clone();
         redraw_progress(&progress, &mut last, false).await;
 
-        if let Some(path) = icon_path(data_dir, name).and_then(|p| p.to_str().map(str::to_owned)) {
-            if let Ok(texture) = load_texture(&path).await {
-                let icon_rect = icon_source_rect(texture.width(), texture.height());
-                sprites[id] = Some(Sprite { texture, icon_rect });
+        // Belts come from Factorio's own in-world sheet, which is the only
+        // place corner artwork exists at all: an inventory icon is a straight
+        // belt, so a corner drawn from one is a straight belt at an angle no
+        // matter how it is turned. Anything else, and any belt whose sheet is
+        // missing, falls back to the icon exactly as before.
+        // Splitters are assembled rather than loaded: each facing is one or
+        // two files that have to be joined before they are a whole splitter.
+        if is_splitter(name) {
+            if let Some(paths) = splitter_structure_paths(data_dir, name) {
+                let mut facings = Vec::with_capacity(4);
+                for (facing, path) in paths.iter().enumerate() {
+                    let Some(path) = path.to_str() else { break };
+                    let Ok(structure) = load_image(path).await else { break };
+                    let mut patch = None;
+                    if let Some(found) = splitter_patch_path(data_dir, name, facing) {
+                        if let Some(found) = found.to_str() {
+                            patch = load_image(found).await.ok();
+                        }
+                    }
+                    facings.push(assemble_splitter(&structure, patch.as_ref(), facing));
+                }
+                if facings.len() == 4 {
+                    let icon_rect = Rect::new(0.0, 0.0, facings[0].texture.width(), facings[0].texture.height());
+                    sprites[id] = Some(Sprite {
+                        splitter_offsets: facings.iter().map(|f| f.offset).collect(),
+                        textures: facings.into_iter().map(|f| f.texture).collect(),
+                        icon_rect,
+                        sheet: Some(SheetKind::Splitter),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // A pipe needs all sixteen of its pictures, since which one it draws
+        // depends on its neighbours and changes frame to frame.
+        if is_pipe(name) {
+            let mut textures = Vec::with_capacity(PIECES.len());
+            for piece in PIECES {
+                let Some(path) = pipe_piece_path(data_dir, piece) else { break };
+                let Some(path) = path.to_str().map(str::to_owned) else { break };
+                let Ok(texture) = load_texture(&path).await else { break };
+                textures.push(texture);
+            }
+            if textures.len() == PIECES.len() {
+                let icon_rect = Rect::new(0.0, 0.0, textures[0].width(), textures[0].height());
+                sprites[id] =
+                    Some(Sprite { textures, icon_rect, sheet: Some(SheetKind::Pipe), splitter_offsets: Vec::new() });
+                continue;
+            }
+        }
+
+        let found = if is_belt(name) {
+            entity_sheet_path(data_dir, name).map(|path| (vec![path], SheetKind::Belt))
+        } else if underground_reach(name).is_some() {
+            underground_structure_path(data_dir, name).map(|path| (vec![path], SheetKind::UndergroundStructure))
+        } else {
+            None
+        };
+        let sheet = found.as_ref().map(|(_, kind)| *kind);
+        let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(data_dir, name).map(|p| vec![p]));
+
+        // All or nothing: a splitter missing one of its four facings would
+        // otherwise index past the end of the list at draw time. Falling back
+        // to the icon for the whole type is the same thing that happens when
+        // no artwork is found at all.
+        if let Some(paths) = paths {
+            let mut textures = Vec::with_capacity(paths.len());
+            for path in &paths {
+                match path.to_str().map(str::to_owned) {
+                    Some(path) => match load_texture(&path).await {
+                        Ok(texture) => textures.push(texture),
+                        Err(_) => break,
+                    },
+                    None => break,
+                }
+            }
+            if textures.len() == paths.len() {
+                let icon_rect = icon_source_rect(textures[0].width(), textures[0].height());
+                sprites[id] = Some(Sprite { textures, icon_rect, sheet, splitter_offsets: Vec::new() });
             }
         }
     }
@@ -531,39 +832,40 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
 
 // Drawing
 
-fn draw_entity(center: Vec2, size: Vec2, rotation: f32, color: Color, sprite: Option<&Sprite>) {
+fn draw_entity(center: Vec2, size: Vec2, color: Color, sprite: Option<&Sprite>, art: &EntityArt) {
+    // Centred, so a frame that covers more than its footprint spreads evenly
+    // around the tile it sits on rather than off one corner. `size` already
+    // accounts for `art.tiles`; see the call site, which is where the zoom is.
     let top_left = center - size / 2.0;
     match sprite {
         Some(sprite) => draw_texture_ex(
-            &sprite.texture,
+            &sprite.textures[art.texture],
             top_left.x,
             top_left.y,
             WHITE,
-            DrawTextureParams { dest_size: Some(size), source: Some(sprite.icon_rect), rotation, ..Default::default() },
+            DrawTextureParams {
+                dest_size: Some(size),
+                source: Some(art.source),
+                rotation: art.rotation,
+                flip_x: art.flip_x,
+                flip_y: art.flip_y,
+                ..Default::default()
+            },
         ),
         None => draw_rectangle_ex(
             center.x,
             center.y,
             size.x,
             size.y,
-            DrawRectangleParams { rotation, offset: Vec2::splat(0.5), color },
+            DrawRectangleParams { rotation: art.rotation, offset: Vec2::splat(0.5), color },
         ),
     }
 }
 
 /// Tiles are corner positioned, unlike entities, so `screen` here is the
 /// tile's top-left corner rather than its center.
-fn draw_tile(screen: Vec2, size: f32, color: Color, sprite: Option<&Sprite>) {
-    match sprite {
-        Some(sprite) => draw_texture_ex(
-            &sprite.texture,
-            screen.x,
-            screen.y,
-            WHITE,
-            DrawTextureParams { dest_size: Some(Vec2::splat(size)), source: Some(sprite.icon_rect), ..Default::default() },
-        ),
-        None => draw_rectangle(screen.x, screen.y, size, size, color),
-    }
+fn draw_tile(screen: Vec2, size: f32, color: Color) {
+    draw_rectangle(screen.x, screen.y, size, size, color);
 }
 
 /// One level-of-detail cell: always a flat rect, never a sprite. A chunk
@@ -608,13 +910,10 @@ fn draw_tile_layer(
     view_min: Vec2,
     view_max: Vec2,
     registry: &TypeRegistry,
-    sprites: &[Option<Sprite>],
-    use_sprites: bool,
     counter: &mut DrawCallCounter,
 ) {
     let tile_size = camera.pixels_per_tile().max(1.0);
     for run in tile_runs {
-        let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
         let color = registry.tile_color(run.type_id);
         let mut drawn = 0;
         for tile in &tiles[run.range()] {
@@ -624,10 +923,12 @@ fn draw_tile_layer(
                 continue;
             }
             let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
-            draw_tile(screen, tile_size, color, sprite);
+            draw_tile(screen, tile_size, color);
             drawn += 1;
         }
-        counter.quads(sprite.map(|_| run.type_id), drawn);
+        // `None`, always: every tile is an untextured rect now, so the whole
+        // floor is one batch however many kinds of paving it holds.
+        counter.quads(None, drawn);
     }
 }
 
@@ -1221,8 +1522,6 @@ fn draw_world(
                 view_min,
                 view_max,
                 registry,
-                sprites,
-                use_sprites,
                 counter,
             );
         }
@@ -1234,8 +1533,6 @@ fn draw_world(
             view_min,
             view_max,
             registry,
-            sprites,
-            use_sprites,
             counter,
         );
 
@@ -1258,9 +1555,17 @@ fn draw_world(
                     continue;
                 }
                 let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                let size = entity_footprint_size(pixels_per_tile, w, h);
-                let rotation = entity_rotation_radians(w, h, entity.d, rotation_allowed);
-                draw_entity(screen, size, rotation, color, sprite);
+                let art = match sprite {
+                    Some(sprite) => entity_source(sprite, entity, rotation_allowed),
+                    None => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
+                };
+                // A frame that knows its own size in tiles is drawn at that
+                // size; everything else still fills its footprint.
+                let size = match art.tiles {
+                    Some(tiles) => tiles * pixels_per_tile,
+                    None => entity_footprint_size(pixels_per_tile, w, h),
+                };
+                draw_entity(screen + art.offset * pixels_per_tile, size, color, sprite, &art);
                 drawn += 1;
             }
             counter.quads(sprite.map(|_| run.type_id), drawn);

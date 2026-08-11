@@ -554,6 +554,25 @@ M.CAPTURE_HANDLERS = {
   [defines.events.on_built_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.on_robot_built_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.script_raised_built] = function(e) log_entity("+", e.entity) end,
+  -- Rotating raises neither a build nor a removal, so without this the
+  -- capture never hears about it and the entity keeps whatever facing it had
+  -- when it was first placed, for the rest of the playthrough. That showed up
+  -- as belt corners drawing as straight belts: the corner was real in game and
+  -- the replay still had the pre-rotation direction.
+  --
+  -- Logged as an add, which is what an add already means here: `World::insert`
+  -- updates an occupied position in place rather than making a second entity
+  -- on the tile, and skips even the revision bump when nothing actually
+  -- changed. So this costs one event per manual rotation and nothing at all
+  -- when a rotation turns out to be a no-op.
+  --
+  -- Known limitation: this covers rotating by hand and nothing else. A belt
+  -- whose direction the game changes for you, by connecting it up as you drag
+  -- a line past it, raises no event this listens for, so it keeps its original
+  -- facing and its corner still draws as a straight belt. Rarer than manual
+  -- rotation and left for another time; a fresh baseline corrects every belt
+  -- placed so far, since a baseline reads the world as it actually is.
+  [defines.events.on_player_rotated_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.on_player_mined_entity] = function(e) log_entity("-", e.entity) end,
   [defines.events.on_robot_mined_entity] = function(e) log_entity("-", e.entity) end,
   [defines.events.on_entity_died] = function(e) log_entity("-", e.entity) end,

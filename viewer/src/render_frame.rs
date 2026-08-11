@@ -52,6 +52,14 @@ pub struct RenderEntity {
     /// degree steps), used to rotate square-footprint entities on screen.
     /// See `entity_rotation_radians` in `camera.rs`.
     pub d: u8,
+    /// Which way a belt bends, as a `BeltShape` byte. Worked out from the
+    /// neighbours after a frame is read (see `belts::infer_shapes`), never
+    /// stored in a capture, so it is correct on captures recorded long before
+    /// this field existed.
+    ///
+    /// Free: the two `f32`s force four byte alignment, so the three bytes
+    /// above already sat in a four byte slot with one spare.
+    pub shape: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -340,7 +348,7 @@ impl RenderFrame {
     /// defeat the point, since the `frame::Frame` is the expensive one.
     pub fn from_frame(frame: Frame, registry: &mut TypeRegistry) -> RenderFrame {
         let entity_ids: Vec<TypeId> = frame.entities.iter().map(|e| registry.intern(&e.n)).collect();
-        let entities: Vec<RenderEntity> = frame
+        let mut entities: Vec<RenderEntity> = frame
             .entities
             .iter()
             .map(|e| RenderEntity {
@@ -349,8 +357,49 @@ impl RenderFrame {
                 w: e.w.clamp(1, u8::MAX as u32) as u8,
                 h: e.h.clamp(1, u8::MAX as u32) as u8,
                 d: e.d,
+                shape: 0,
             })
             .collect();
+
+        // Before grouping, while entities are still in scan order and their
+        // ids line up one to one. A belt's shape depends on its neighbours,
+        // not on itself, so this is the only place in the pipeline that has
+        // every belt in one list at once.
+        // Underground belts share the same `shape` byte, meaning which end of
+        // a crossing this is rather than which way a corner bends. The two
+        // never touch the same entity, since nothing is both.
+        //
+        // This runs first because belt corners depend on it: the far end of a
+        // crossing feeds the belt in front of it and can therefore bend it,
+        // which cannot be known until the ends have been told apart.
+        let underground_kinds: Vec<Option<(TypeId, i32)>> = entity_ids
+            .iter()
+            .map(|&id| crate::registry::underground_reach(registry.name(id)).map(|reach| (id, reach)))
+            .collect();
+        crate::belts::infer_underground_ends(&mut entities, &underground_kinds);
+
+        let carriers: Vec<Option<crate::belts::Carrier>> = entity_ids
+            .iter()
+            .map(|&id| {
+                let name = registry.name(id);
+                if crate::registry::is_belt(name) {
+                    Some(crate::belts::Carrier::Belt)
+                } else if crate::registry::is_splitter(name) {
+                    Some(crate::belts::Carrier::Splitter)
+                } else if crate::registry::underground_reach(name).is_some() {
+                    Some(crate::belts::Carrier::Underground)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        crate::belts::infer_shapes(&mut entities, &carriers);
+
+        // Pipes reuse the same `shape` byte again, holding a four bit mask of
+        // which sides join onto them. Nothing is both a pipe and a belt, so
+        // the three meanings never collide on one entity.
+        let pipe_flags: Vec<bool> = entity_ids.iter().map(|&id| crate::registry::is_pipe(registry.name(id))).collect();
+        crate::pipes::infer_connections(&mut entities, &pipe_flags);
 
         let tile_ids: Vec<TypeId> = frame.tiles.iter().map(|t| registry.intern(&t.n)).collect();
         let tiles: Vec<RenderTile> = frame.tiles.iter().map(|t| RenderTile { x: t.x, y: t.y }).collect();

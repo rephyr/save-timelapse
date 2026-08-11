@@ -153,7 +153,9 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **Live capture starts when enabled.** Earlier factory history requires existing save files.
 - **Save-based milestones depend on save frequency.** Live capture records milestone timing precisely, while existing saves can only identify the first save that shows an event.
 - **Bot construction is less visible in the heatmap.** Automated construction is spread across multiple frames, while manual building can create many entities in a single frame.
-- **Entity rotation is limited.** Belts render with their correct direction, while most other entities remain unrotated because their icons are not designed to rotate convincingly.
+- **Entity rotation is limited.** Belts, underground belts, splitters and pipes are drawn from Factorio's own in-world sprites, so they show their real direction, corners and connections. Most other entities remain unrotated because their inventory icons are not designed to rotate convincingly.
+
+- **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded. A belt whose direction changes because the game connected it up for you, rather than because you rotated it yourself, is not, so it keeps the facing it had when it was first placed. It shows up as an occasional corner drawn as a straight belt. Recording a fresh baseline corrects everything built so far.
 
 ---
 

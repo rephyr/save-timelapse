@@ -420,7 +420,7 @@ mod bench {
             for (t, &type_id) in types.iter().enumerate() {
                 let start = entities.len() as u32;
                 for i in (t..n).step_by(types.len()) {
-                    entities.push(RenderEntity { x: (i % 2000) as f32 + 0.5, y: (i / 2000) as f32 + 0.5, w: 1, h: 1, d: 0 });
+                    entities.push(RenderEntity { x: (i % 2000) as f32 + 0.5, y: (i / 2000) as f32 + 0.5, w: 1, h: 1, d: 0, shape: 0 });
                 }
                 runs.push(Run { type_id, start, end: entities.len() as u32 });
             }

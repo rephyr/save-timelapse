@@ -621,10 +621,62 @@ pub fn is_resource(name: &str) -> bool {
 /// while this only needs to grow one confirmed-good entry at a time. Add to
 /// it once an entity's rotated icon is checked and looks right; anything not
 /// listed renders unrotated by default, same as before this feature existed.
-const ALWAYS_ROTATE: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
+const ALWAYS_ROTATE: &[&str] = BELTS;
 
 pub fn is_rotation_allowed(name: &str) -> bool {
     ALWAYS_ROTATE.contains(&name)
+}
+
+/// The four transport belt tiers, which are the entities drawn from Factorio's
+/// own in-world sheet rather than from a rotated inventory icon.
+///
+/// Only these four. Underground belts and splitters move items too, but they
+/// have no curved form to get wrong: an underground entrance is one fixed
+/// picture and a splitter is drawn flat, so both are served fine by their icon.
+const BELTS: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
+
+pub fn is_belt(name: &str) -> bool {
+    BELTS.contains(&name)
+}
+
+/// Underground belt tiers and how far each one reaches, in tiles, taken from
+/// `max_distance` in the game's own prototypes.
+///
+/// The reach is what pairs an entrance with its exit. Two underground belts
+/// facing the same way on the same line belong together only if they are close
+/// enough to actually connect, and a factory routinely has several separate
+/// crossings in a row along one line.
+const UNDERGROUNDS: &[(&str, i32)] = &[
+    ("underground-belt", 5),
+    ("fast-underground-belt", 7),
+    ("express-underground-belt", 9),
+    ("turbo-underground-belt", 11),
+];
+
+pub fn underground_reach(name: &str) -> Option<i32> {
+    UNDERGROUNDS.iter().find(|(tier, _)| *tier == name).map(|(_, reach)| *reach)
+}
+
+/// Splitter tiers, which draw from four separate per-facing files rather than
+/// from one sheet.
+const SPLITTERS: &[&str] = &["splitter", "fast-splitter", "express-splitter", "turbo-splitter"];
+
+/// Plain pipes, whose whole appearance comes from which sides join onto them.
+/// `pipe-to-ground` is deliberately absent: it has its own fixed pictures and
+/// does not change shape with its neighbours.
+pub fn is_pipe(name: &str) -> bool {
+    name == "pipe"
+}
+
+/// Underground pipes, which draw one of four fixed pictures chosen by facing.
+/// Unlike an underground belt, the two ends of a run carry different
+/// directions of their own, so nothing has to be paired up to tell them apart.
+pub fn is_pipe_to_ground(name: &str) -> bool {
+    name == "pipe-to-ground"
+}
+
+pub fn is_splitter(name: &str) -> bool {
+    SPLITTERS.contains(&name)
 }
 
 /// Every prototype that is rail track, and therefore should look like rail
