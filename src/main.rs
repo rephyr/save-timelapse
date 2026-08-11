@@ -39,6 +39,12 @@ const DEFAULT_EXPORT_SIZE: (u32, u32) = (1920, 1080);
 /// this, so it only sets how fast the finished file plays back.
 const DEFAULT_EXPORT_FPS: u32 = 30;
 
+/// How many saves to list when asking which one the ground comes from.
+/// A saves folder holds every autosave, which on a long playthrough is far
+/// more than anybody wants to read; the ones worth choosing between are
+/// always the most recent few.
+const TERRAIN_SAVE_CHOICES: usize = 15;
+
 enum Mode {
     OpenExisting,
     LiveCapture,
@@ -951,6 +957,42 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 /// the furthest-reaching factory, so its ground covers every earlier frame.
 /// Whether it is really the same playthrough is checked by the scan, not
 /// guessed from the filename.
+/// Which save to read the ground from.
+///
+/// Offered rather than assumed, because the newest save is only usually the
+/// right one. Somebody who has since started a different game, or who keeps a
+/// "before I wrecked it" save around, needs to be able to say so. Picking
+/// wrong is caught either way, since the scan reports which playthrough the
+/// save actually belongs to, but being asked beats being refused.
+///
+/// `saves` must be newest first, which is also the default: pressing Enter
+/// takes it, so the common case stays one keystroke.
+fn ask_terrain_save(saves: &[PathBuf]) -> io::Result<&Path> {
+    let now = SystemTime::now();
+    println!("\nWhich save should the ground come from?");
+    for (i, save) in saves.iter().enumerate().take(TERRAIN_SAVE_CHOICES) {
+        let age = save.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok());
+        let when = age.map(describe_age).unwrap_or_else(|| "unknown".to_string());
+        let name = save.file_name().unwrap_or_default().to_string_lossy();
+        println!("  {}) {name} ({when})", i + 1);
+    }
+    if saves.len() > TERRAIN_SAVE_CHOICES {
+        println!("  ... and {} older, not shown", saves.len() - TERRAIN_SAVE_CHOICES);
+    }
+
+    let shown = saves.len().min(TERRAIN_SAVE_CHOICES);
+    loop {
+        let input = prompt("\nEnter a number, or press Enter for the newest:")?;
+        if input.trim().is_empty() {
+            return Ok(&saves[0]);
+        }
+        if let Some(index) = parse_session_index(&input, shown) {
+            return Ok(&saves[index]);
+        }
+        println!("Please enter a number between 1 and {shown}, or press Enter.");
+    }
+}
+
 fn offer_terrain_for_capture(
     settings: &mut Settings,
     user_dir: &Path,
@@ -968,20 +1010,18 @@ fn offer_terrain_for_capture(
     if saves.is_empty() {
         return Ok(());
     }
-    saves.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH));
-
-    let newest = saves.last().expect("checked non-empty above").clone();
-    let label = newest.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    // Newest first, because that is both the default and the one most likely
+    // to be wanted: ground only exists where a save had already been, so a
+    // later save can only ever cover more of the factory.
+    saves.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)));
 
     println!();
     let wanted = ask_yes_no(
-        &format!(
-            "Add the natural ground (grass, water, trees) under this factory? It is read from \
-             a save rather than recorded while you play, so this runs Factorio once against \
-             \"{label}\" and takes about a minute.\n\
-             If you have built anything since that save, save in game first and answer again: \
-             ground only exists where the save had already been"
-        ),
+        "Add the natural ground (grass, water, trees) under this factory? It is read from a \
+         save rather than recorded while you play, so this runs Factorio once and takes about \
+         a minute.\n\
+         If you have built anything since your last save, save in game first: ground only \
+         exists where that save had already been",
         settings.capture_terrain.unwrap_or(false),
     )?;
     settings.capture_terrain = Some(wanted);
@@ -989,6 +1029,8 @@ fn offer_terrain_for_capture(
     if !wanted {
         return Ok(());
     }
+
+    let chosen = ask_terrain_save(&saves)?;
 
     let factorio = locate_factorio_exe_interactive(settings)?;
     let config = export::ExportConfig {
@@ -999,7 +1041,7 @@ fn offer_terrain_for_capture(
         capture_terrain: true,
         terrain_scan: true,
     };
-    add_terrain(&newest, out, &config, Some(session_id), Some(capture_tick));
+    add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
     Ok(())
 }
 
