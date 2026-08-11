@@ -261,14 +261,38 @@ fn chunk_lod_counts(ids: &[TypeId], chunk_coords: &[(i32, i32)]) -> ChunkCounts 
     counts
 }
 
+/// Which single type stands for a cell, once counted.
+///
+/// The most common one, except that a resource never speaks for a cell that
+/// holds anything else. Ore is ground a factory is built over, and by count it
+/// wins easily: a 4x4 cell on a patch is sixteen ore against the two or three
+/// entities of an outpost, so plain majority erases the outpost and shows the
+/// patch it stands in. That is the failure `LOD_CELL_TILES` was already
+/// shrunk to reduce, in its sharpest form, and it is the same rule the
+/// full-detail draw order states (see `draw_world`): built things go over ore,
+/// never under it.
+///
+/// A cell of nothing but ore still reads as ore, which is why this falls back
+/// rather than filtering.
+fn dominant_type(counts: &[(TypeId, u32)], registry: &TypeRegistry) -> TypeId {
+    let most_common = |resource: bool| {
+        counts
+            .iter()
+            .filter(|&&(kind, _)| registry.is_resource(kind) == resource)
+            .max_by_key(|&&(_, count)| count)
+            .map(|&(kind, _)| kind)
+    };
+    most_common(false).or_else(|| most_common(true)).unwrap_or(0)
+}
+
 /// The other half of `build_chunk_lod`: picks the dominant type per chunk
 /// from already-finished counts, then groups the resulting cells into
 /// per-type runs the same way entities/tiles are.
-fn finalize_chunk_lod(counts: ChunkCounts, type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
+fn finalize_chunk_lod(counts: ChunkCounts, type_count: usize, registry: &TypeRegistry) -> (Vec<LodCell>, Vec<Run>) {
     let mut cell_ids = Vec::with_capacity(counts.len());
     let mut cells = Vec::with_capacity(counts.len());
     for ((cx, cy), type_counts) in counts {
-        let dominant = type_counts.into_iter().max_by_key(|&(_, count)| count).map(|(t, _)| t).unwrap_or(0);
+        let dominant = dominant_type(&type_counts, registry);
         cell_ids.push(dominant);
         cells.push(LodCell { cx, cy });
     }
@@ -290,10 +314,15 @@ fn finalize_chunk_lod(counts: ChunkCounts, type_count: usize) -> (Vec<LodCell>, 
 /// which thread happened to see which tiles. That merge is bounded by
 /// however many distinct chunks exist times the worker count, not by item
 /// count, so it stays cheap even done single-threaded.
-fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usize) -> (Vec<LodCell>, Vec<Run>) {
+fn build_chunk_lod(
+    ids: &[TypeId],
+    chunk_coords: &[(i32, i32)],
+    type_count: usize,
+    registry: &TypeRegistry,
+) -> (Vec<LodCell>, Vec<Run>) {
     let workers = worker_count();
     if ids.len() < PARALLEL_THRESHOLD || workers <= 1 {
-        return finalize_chunk_lod(chunk_lod_counts(ids, chunk_coords), type_count);
+        return finalize_chunk_lod(chunk_lod_counts(ids, chunk_coords), type_count, registry);
     }
 
     let chunk_size = ids.len().div_ceil(workers);
@@ -319,7 +348,7 @@ fn build_chunk_lod(ids: &[TypeId], chunk_coords: &[(i32, i32)], type_count: usiz
         }
     }
 
-    finalize_chunk_lod(merged, type_count)
+    finalize_chunk_lod(merged, type_count, registry)
 }
 
 impl RenderFrame {
@@ -406,10 +435,10 @@ impl RenderFrame {
         // Computed from the pre-grouped ids/positions, so this doesn't need
         // the full-detail grouping to have happened first.
         let entity_chunks: Vec<(i32, i32)> = entities.iter().map(|e| chunk_of(e.x.floor() as i32, e.y.floor() as i32)).collect();
-        let (entity_lod, entity_lod_runs) = build_chunk_lod(&entity_ids, &entity_chunks, type_count);
+        let (entity_lod, entity_lod_runs) = build_chunk_lod(&entity_ids, &entity_chunks, type_count, registry);
 
         let tile_chunks: Vec<(i32, i32)> = tiles.iter().map(|t| chunk_of(t.x, t.y)).collect();
-        let (tile_lod, tile_lod_runs) = build_chunk_lod(&tile_ids, &tile_chunks, type_count);
+        let (tile_lod, tile_lod_runs) = build_chunk_lod(&tile_ids, &tile_chunks, type_count, registry);
 
         let (entities, entity_runs) = group_by_type(&entity_ids, &entities, type_count);
         let (tiles, tile_runs) = group_by_type(&tile_ids, &tiles, type_count);
@@ -898,6 +927,32 @@ mod tests {
     /// `HashMap`, whose order isn't guaranteed stable between the
     /// sequential and parallel paths' separately-constructed maps even for
     /// identical input.
+    /// A mining outpost stands in an ore patch, so by count the ore wins a
+    /// cell easily and plain majority erased the outpost, showing the patch it
+    /// was built in. What was built speaks for the cell instead, matching the
+    /// order the full-detail path draws them in.
+    #[test]
+    fn ore_never_speaks_for_a_cell_that_holds_something_built() {
+        let mut registry = TypeRegistry::new();
+        let ore = registry.intern("iron-ore");
+        let drill = registry.intern("electric-mining-drill");
+
+        // Fifteen tiles of ore against a single drill, in one cell.
+        let mut ids = vec![ore; 15];
+        ids.push(drill);
+        let coords = vec![(0, 0); ids.len()];
+
+        let (cells, runs) = build_chunk_lod(&ids, &coords, registry.len(), &registry);
+        assert_eq!(cells.len(), 1, "one cell");
+        assert_eq!(runs[0].type_id, drill, "the drill speaks for it, outnumbered fifteen to one");
+
+        // ...but a cell with nothing built in it is still ore, which is why
+        // this prefers rather than filters.
+        let bare = vec![ore; 4];
+        let (_, runs) = build_chunk_lod(&bare, &[(0, 0); 4], registry.len(), &registry);
+        assert_eq!(runs[0].type_id, ore);
+    }
+
     #[test]
     fn build_chunk_lod_parallel_path_matches_sequential_at_scale() {
         let type_count = 4;
@@ -905,8 +960,14 @@ mod tests {
         let ids: Vec<TypeId> = (0..n).map(|i| (i % type_count) as TypeId).collect();
         let chunk_coords: Vec<(i32, i32)> = (0..n).map(|i| ((i % 3) as i32, 0)).collect();
 
-        let (parallel_cells, parallel_runs) = build_chunk_lod(&ids, &chunk_coords, type_count);
-        let (sequential_cells, sequential_runs) = finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count);
+        let mut registry = TypeRegistry::new();
+        for i in 0..type_count {
+            registry.intern(&format!("type-{i}"));
+        }
+
+        let (parallel_cells, parallel_runs) = build_chunk_lod(&ids, &chunk_coords, type_count, &registry);
+        let (sequential_cells, sequential_runs) =
+            finalize_chunk_lod(chunk_lod_counts(&ids, &chunk_coords), type_count, &registry);
 
         let content = |cells: &[LodCell], runs: &[Run]| {
             let mut pairs: Vec<(TypeId, i32, i32)> =

@@ -1538,7 +1538,24 @@ fn draw_world(
 
         paint_heat(camera);
 
-        for run in &frame.entity_runs {
+        // Ore before anything standing on it, for the same reason floor goes
+        // down before buildings: a resource is ground a factory is built over,
+        // not a thing that competes with it for the tile.
+        //
+        // Stated here because nothing else states it. Runs arrive in type
+        // order (`spans::materialize` rebuilds them from type-sorted spans),
+        // and type order is intern order, which is just whichever name a
+        // capture happened to mention first. So a resource interned before a
+        // belt drew underneath it and one interned after drew over it, and
+        // with both now genuinely present on the tile (see `world.rs`'s
+        // `Surface::under`, which stopped a build from evicting the ore) that
+        // arbitrary order became visible as ore flickering over the factory.
+        //
+        // Two filtered passes rather than a sorted copy: the run count is in
+        // the tens, and this draw loop allocates nothing per frame today.
+        let ore = frame.entity_runs.iter().filter(|run| registry.is_resource(run.type_id));
+        let built = frame.entity_runs.iter().filter(|run| !registry.is_resource(run.type_id));
+        for run in ore.chain(built) {
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
             let color = registry.entity_color(run.type_id);
             let rotation_allowed = registry.is_rotation_allowed(run.type_id);
