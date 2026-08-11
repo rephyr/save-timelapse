@@ -397,10 +397,23 @@ do
       (100 + 2 * m) * (5000 + 2 * m) <= 4000000, true)
   end
 
-  -- Already over budget on its own, so there is nothing to spend on a
-  -- margin and it falls back to the floor rather than going negative.
-  check("terrain_margin: a base larger than the whole budget falls back to the floor",
-    encode.terrain_margin(box(5000, 5000), 32), 32)
+  -- The bug this guards against, and it was in the budget rather than the
+  -- margin: as a flat ceiling, any base bigger than the ceiling itself had
+  -- nothing left to spend, the affordable width came out negative, and it
+  -- fell back to the 32 tile floor. The largest factories got the smallest
+  -- margins, which is precisely backwards. A 5000x5000 base has a 25M tile
+  -- footprint and must still be given what its shape asks for.
+  check("terrain_margin: a base far larger than the flat budget still gets a real margin",
+    encode.terrain_margin(box(5000, 5000), 32), 2330)
+
+  -- The property rather than one number: the allowance has to grow with the
+  -- factory, or the same inversion comes back at whatever the next fixed
+  -- limit happens to be.
+  do
+    local small = encode.terrain_margin(box(3000, 3000), 32)
+    local large = encode.terrain_margin(box(6000, 6000), 32)
+    check("terrain_margin: a bigger base is given a bigger margin, not a smaller one", large > small, true)
+  end
 
   check("terrain_margin: always a whole number of tiles",
     encode.terrain_margin(box(1000, 1000), 32) % 1, 0)

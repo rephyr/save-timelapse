@@ -225,14 +225,30 @@ local TERRAIN_VIEW_FIT = 0.92
 --- a 4800 tile margin, which is 140M tiles of ground, most of it nowhere
 --- near anything.
 ---
---- 4M is a 2000x2000 region. A 1000 tile wide base (a real megabase
---- footprint) gets its full 16:9 framing covered without this ever
---- engaging, and past that the camera is zoomed far enough out that ground
---- detail stops reading anyway. It matters more than the raw number
---- suggests because terrain is rewritten into *every* frame of a from-saves
---- export, unlike entities it cannot be skipped as unchanged, so its cost
---- is multiplied by the frame count.
+--- 4M is a 2000x2000 region, which covers an ordinary base's full 16:9
+--- framing without ever engaging.
+---
+--- A floor rather than the whole budget, because as a fixed ceiling it
+--- inverted on anything larger than itself: a real 3070x3113 megabase has a
+--- 9.6M tile footprint, so a 4M *total* left nothing for a margin, the
+--- affordable width came out negative, and the base fell back to the 32 tile
+--- floor. The bigger the factory, the less ground it got, which is exactly
+--- backwards.
 local TERRAIN_MAX_TILES = 4000000
+
+--- ...so past that size the budget scales with the factory instead: a base
+--- may always spend four times its own footprint.
+---
+--- Four specifically, because that is what a square base needs. Solving the
+--- area cap for a square gives a margin of `(sqrt(k) - 1) / 2` per side, so
+--- k=4 yields exactly half the base's width, which is what a 16:9 frame
+--- exposes around a square factory (see `M.terrain_margin`). Anything less
+--- caps a normally shaped base below what it can actually see, and the whole
+--- point of the aspect calculation is to fill the frame.
+---
+--- Elongated bases stay bounded regardless, since the cap is on area: the
+--- 100x5000 corridor below still gets 306 rather than the 4,781 it asks for.
+local TERRAIN_BUDGET_MULTIPLE = 4
 
 --- How far past `bbox` to capture natural ground, in tiles, never less than
 --- `base_margin`.
@@ -275,12 +291,14 @@ function M.terrain_margin(bbox, base_margin)
     math.max(w, h) * (slack - 1) / 2
   )
 
-  -- Largest margin keeping (w + 2m)(h + 2m) within the budget, i.e. the
-  -- positive root of 4m^2 + 2m(w + h) + wh - max = 0. Goes negative once
-  -- the base alone is over budget, which the outer max floors back to
-  -- `base_margin`: a base that size pays for its own ground either way, and
-  -- a chunk of edge around it is a rounding error next to that.
-  local affordable = (math.sqrt((w - h) * (w - h) + 4 * TERRAIN_MAX_TILES) - (w + h)) / 4
+  -- At least the flat budget, and at least a multiple of what the factory
+  -- itself occupies, so the allowance grows with the base rather than being
+  -- swallowed by it.
+  local budget = math.max(TERRAIN_MAX_TILES, TERRAIN_BUDGET_MULTIPLE * w * h)
+
+  -- Largest margin keeping (w + 2m)(h + 2m) within that budget, i.e. the
+  -- positive root of 4m^2 + 2m(w + h) + wh - budget = 0.
+  local affordable = (math.sqrt((w - h) * (w - h) + 4 * budget) - (w + h)) / 4
 
   return math.floor(math.max(base_margin, math.min(wanted, affordable)))
 end
