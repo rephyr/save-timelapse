@@ -12,6 +12,13 @@ Already have a factory? Save Timelapse can also reconstruct a timelapse from you
 
 ![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
 
+
+Zoomed in, it draws with Factorio's own artwork, so belts weave and turn, splitters and underground belts read the right way round, and pipe runs join up. 
+
+Reworked ui and belt rotations from v0.7.0:
+
+![The Save Timelapse viewer, showing a factory drawn with Factorio's own belt, splitter and pipe artwork](assets/sprites.PNG)
+
 > ⚠️ **Alpha.** The core pipeline works, but the project is still under active development. Expect bugs and changes between releases.
 
 ---
@@ -100,8 +107,6 @@ The replay is designed to be explored rather than simply watched.
 - 🌍 Switch between planets and space platforms
 - 👤 Track player position, in timelapses recorded with live capture
 
-![Scrubbing through a Factorio factory construction timeline](assets/scrubbing.gif)
-
 ### Viewer controls
 
 | Key | Action |
@@ -123,10 +128,6 @@ The replay is designed to be explored rather than simply watched.
 | `F3` | Renderer diagnostics |
 
 Playback, the planet switcher and reframing are also clickable, so the viewer can be driven without knowing any of these.
-
-![Camera automatically following a growing Factorio base](assets/camera-follow.gif)
-
-![Factorio entities drawn as icons when zoomed in](assets/sprites.PNG)
 
 ---
 
