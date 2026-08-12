@@ -5,12 +5,9 @@ use std::collections::HashMap;
 
 use save_timelapse::player_log::PlayerSample;
 
-/// Where every tracked player was, looked up as of whatever tick is
-/// currently displayed. Built once at load time from
-/// `player_log::read_jsonl`'s flat sample list; a plain linear scan per
-/// lookup is plenty since sample counts are tiny (at most one per ~10
-/// seconds of real play per player) next to entity/tile counts, so there's
-/// no reason to reach for a binary search or an incremental cursor here.
+/// Where every tracked player was, as of whatever tick is displayed. Built once
+/// at load; a linear scan per lookup is plenty, sample counts being tiny next
+/// to entity counts.
 pub struct PlayerTrack {
     /// Sorted by tick, ascending, once at construction rather than on every
     /// lookup.
@@ -23,12 +20,10 @@ impl PlayerTrack {
         PlayerTrack { samples }
     }
 
-    /// Each tracked player's latest known position at or before `tick`,
-    /// filtered to whichever surface they were last seen on, the same
-    /// nearest-preceding "step function" semantics `World` already uses to
-    /// reconstruct entity state from events. A player not yet sampled by
-    /// `tick`, or last seen on a different surface, isn't returned: they
-    /// either aren't there yet or are currently elsewhere.
+    /// Each player's latest known position at or before `tick`, filtered to
+    /// the surface they were last seen on: the same nearest-preceding
+    /// semantics `World` uses for entity state. A player not yet sampled, or
+    /// last seen elsewhere, is not returned.
     pub fn positions_at(&self, surface: &str, tick: u64) -> Vec<(&str, f32, f32)> {
         let mut latest: HashMap<&str, &PlayerSample> = HashMap::new();
         for sample in &self.samples {

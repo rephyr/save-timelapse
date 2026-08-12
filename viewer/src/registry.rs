@@ -4,24 +4,22 @@ use std::collections::HashMap;
 
 use macroquad::color::Color;
 
-/// Dense index into [`TypeRegistry`]. A real base has tens of distinct
-/// prototype names against hundreds of thousands of entities, so the name is
-/// worth storing once and referring to by number everywhere else.
+/// Dense index into [`TypeRegistry`]: a base has tens of distinct names
+/// against hundreds of thousands of entities.
 pub type TypeId = u16;
 
-/// Interns entity/tile prototype names, and resolves each one's color once.
-///
-/// The pre-registry renderer called `color_for` (an FNV hash over the name)
-/// and `sprites.get(&e.n)` (a SipHash over the name) for every entity on
-/// every rendered frame. Both are pure functions of the name, and there are
-/// only ~58 distinct names in the real fixtures, so both collapse into an
-/// array index once names are interned.
+/// Interns prototype names and resolves each one's colour and kind once, so
+/// drawing never hashes a name.
 #[derive(Default)]
 pub struct TypeRegistry {
     names: Vec<String>,
     ids: HashMap<String, TypeId>,
     entity_colors: Vec<Color>,
     tile_colors: Vec<Color>,
+    kinds: Vec<Kind>,
+    /// What the running game said its own prototypes are, when the capture
+    /// shipped with an answer. Consulted before every built-in table below.
+    prototypes: Option<save_timelapse::prototypes::Prototypes>,
 }
 
 impl TypeRegistry {
@@ -29,23 +27,36 @@ impl TypeRegistry {
         Self::default()
     }
 
-    /// Both color variants are precomputed rather than one per registered
-    /// kind: a name is realistically either an entity or a tile type, but
-    /// nothing in the format guarantees it, and two `Color`s per *type* is
-    /// negligible next to one hash per *entity per frame*.
+    /// Must be set before anything is interned: a name is resolved once, at
+    /// intern time, so a description arriving later would apply to nothing.
+    pub fn set_prototypes(&mut self, prototypes: save_timelapse::prototypes::Prototypes) {
+        debug_assert!(self.names.is_empty(), "prototypes must be set before interning");
+        self.prototypes = Some(prototypes);
+    }
+
+    /// Both variants precomputed: nothing guarantees a name is only one, and
+    /// two `Color`s per type is nothing next to a hash per entity per frame.
     pub fn intern(&mut self, name: &str) -> TypeId {
         if let Some(&id) = self.ids.get(name) {
             return id;
         }
         let id = TypeId::try_from(self.names.len()).expect("more than u16::MAX distinct type names");
         self.names.push(name.to_string());
+        let from_game = self.prototypes.as_ref();
+        let rgb = |c: &[u8; 3]| Color::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0);
+        let game_entity = from_game.and_then(|p| p.entities.get(name)).map(rgb);
+        let game_tile = from_game.and_then(|p| p.tiles.get(name)).map(rgb);
         let color = known_color(name);
-        // Entities fall back to a shade of the map view's friendly blue;
-        // tiles keep the full-hue hash. A name is one or the other in
-        // practice, and an unrecognised *floor* has no reason to be blue: the
-        // blue is what the game uses for structures specifically.
-        self.entity_colors.push(color.unwrap_or_else(|| friendly_shade(name)));
-        self.tile_colors.push(color.unwrap_or_else(|| color_for(name, 0.35, 0.5)));
+        // Entities take a shade of the map view's friendly blue, tiles the
+        // full-hue hash: an unrecognised floor has no reason to be blue.
+        self.entity_colors.push(game_entity.or(color).unwrap_or_else(|| friendly_shade(name)));
+        self.tile_colors.push(game_tile.or(color).unwrap_or_else(|| color_for(name, 0.35, 0.5)));
+        // Resolved here for the same reason the colours are: once per name
+        // beats once per entity per frame.
+        self.kinds.push(match from_game.and_then(|p| p.kind(name)) {
+            Some(kind) => Kind::from_prototype_type(kind, name, from_game.and_then(|p| p.reach.get(name)).copied()),
+            None => Kind::from_name(name),
+        });
         self.ids.insert(name.to_string(), id);
         id
     }
@@ -73,19 +84,126 @@ impl TypeRegistry {
     pub fn tile_color(&self, id: TypeId) -> Color {
         self.tile_colors[id as usize]
     }
+
+    pub fn is_belt(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].belt
+    }
+
+    pub fn is_splitter(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].splitter
+    }
+
+    pub fn is_pipe(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].pipe
+    }
+
+    pub fn is_pipe_to_ground(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].pipe_to_ground
+    }
+
+    pub fn is_resource(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].resource
+    }
+
+    pub fn is_terrain_scatter(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].scatter
+    }
+
+    pub fn is_vehicle(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].vehicle
+    }
+
+    pub fn is_enemy(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].enemy
+    }
+
+    pub fn is_rotation_allowed(&self, id: TypeId) -> bool {
+        self.kinds[id as usize].rotates
+    }
+
+    /// Whether somebody placed this rather than the map generating it. One
+    /// definition for the two questions that need it: what the auto-follow
+    /// camera aims at, and what the on-screen count counts. A capture keeps
+    /// trees, ore and nests for context, and on a wooded map they outnumber
+    /// the factory ten to one.
+    pub fn is_built(&self, id: TypeId) -> bool {
+        let kind = &self.kinds[id as usize];
+        !kind.scatter && !kind.resource && !kind.enemy && !kind.vehicle
+    }
+
+    /// How far an underground belt of this type reaches, or `None` if it is
+    /// not one. The reach is what pairs an entrance with its exit.
+    pub fn underground_reach(&self, id: TypeId) -> Option<i32> {
+        self.kinds[id as usize].reach
+    }
 }
 
-/// A curated color for terrain and terrain-scatter names, approximating how
-/// they actually look in Factorio, checked before falling back to
-/// `color_for`'s hash. Best-effort and pattern-matched against the real
-/// names a live capture actually produced (see the terrain-capture work in
-/// mod/control.lua), not an exhaustive prototype list. Factorio and Space
-/// Age have dozens of terrain names across four planets, and hashing is a
-/// perfectly good fallback for whatever this doesn't recognize. Without
-/// this, ordinary factory infrastructure (concrete, a hazard floor) got the
-/// same rainbow-hash treatment as everything else, which is exactly backward
-/// for the handful of names a player sees constantly and has strong
-/// expectations for the color of.
+/// What one prototype name is, as far as drawing cares. The name lists it
+/// replaced survive as `from_name`, for captures the mod never described.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct Kind {
+    belt: bool,
+    splitter: bool,
+    pipe: bool,
+    pipe_to_ground: bool,
+    resource: bool,
+    scatter: bool,
+    vehicle: bool,
+    enemy: bool,
+    rotates: bool,
+    reach: Option<i32>,
+}
+
+impl Kind {
+    /// From the game's own prototype type.
+    ///
+    /// A splitter can also be a `lane-splitter` and an `infinity-pipe` is a
+    /// pipe, while a `heat-pipe` is not. Worms are the bare `turret` type and
+    /// the player's defences are not, which is what makes typing enemies safe.
+    fn from_prototype_type(kind: &str, name: &str, reach: Option<i32>) -> Self {
+        let belt = kind == "transport-belt";
+        Self {
+            belt,
+            splitter: matches!(kind, "splitter" | "lane-splitter"),
+            pipe: matches!(kind, "pipe" | "infinity-pipe"),
+            pipe_to_ground: kind == "pipe-to-ground",
+            resource: kind == "resource",
+            scatter: matches!(kind, "tree" | "plant" | "cliff"),
+            vehicle: matches!(
+                kind,
+                "car" | "spider-vehicle" | "spider-leg" | "locomotive" | "cargo-wagon" | "fluid-wagon" | "artillery-wagon"
+            ),
+            // The one prototype whose type lies about its side: a captive
+            // biter spawner is `unit-spawner` and player built.
+            enemy: matches!(kind, "unit" | "unit-spawner" | "turret" | "spider-unit" | "segmented-unit" | "segment")
+                && name != "captive-biter-spawner",
+            // Belts only: chevrons are a flat top-down icon that rotates
+            // honestly, where an oblique render just spins its camera angle.
+            rotates: belt,
+            reach: (kind == "underground-belt").then_some(reach).flatten(),
+        }
+    }
+
+    /// From the name alone, for a capture whose mod never described its
+    /// prototypes. Defers to the free functions so the two cannot drift.
+    fn from_name(name: &str) -> Self {
+        Self {
+            belt: is_belt(name),
+            splitter: is_splitter(name),
+            pipe: is_pipe(name),
+            pipe_to_ground: is_pipe_to_ground(name),
+            resource: is_resource(name),
+            scatter: is_terrain_scatter(name),
+            vehicle: is_vehicle(name),
+            enemy: is_enemy(name),
+            rotates: is_rotation_allowed(name),
+            reach: underground_reach(name),
+        }
+    }
+}
+
+/// A curated colour for terrain and scatter names, checked before the hash.
+/// Best-effort: hashing is a fine fallback for anything unrecognised.
 fn known_color(name: &str) -> Option<Color> {
     let rgb = |r: u8, g: u8, b: u8| Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
 
@@ -112,14 +230,8 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(8, 8, 8));
     }
 
-    // Player-built structures, following Factorio's own map view.
-    //
-    // The game paints the chart from each prototype's chart colour (see
-    // `core/prototypes/utility-constants.lua`): rails grey, the belt family
-    // yellow, a handful of types with their own colour, and everything else
-    // one friendly blue. That palette is already in a player's head from
-    // looking at the map screen, so matching it makes a timelapse read the
-    // way the game does instead of like a hash function's opinion.
+    // Player-built structures, following the game's own chart colours: rails
+    // grey, belts yellow, everything else one friendly blue.
     if RAIL_TRACK.contains(&name) {
         // The game lightens elevated rail and ramps so a raised line is
         // distinguishable from the ground it crosses, which is worth keeping.
@@ -174,24 +286,10 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(7, 68, 104));
     }
 
-    // Space Age planets.
-    //
-    // Taken from each tile prototype's own `map_color`, the value Factorio
-    // draws that tile with in map view, rather than picked by eye. That is
-    // the palette a player already has in their head from looking at the
-    // in-game map, and it means a timelapse of Vulcanus looks like Vulcanus
-    // rather than like a hash function's opinion of one. Read out of
-    // `data/space-age/prototypes/tile/tiles-<planet>.lua`.
-    //
-    // Grouped by prefix rather than listed tile by tile, matching how the
-    // Nauvis terrain above is handled: there are around 75 of these across
-    // the three planets and most of a family shares one colour anyway, so
-    // naming each individually would be a table to maintain for no visible
-    // gain.
+    // Space Age planets, from each tile prototype's own `map_color`. Grouped
+    // by prefix, most of a family sharing one colour.
 
-    // Vulcanus: near-black rock and ash, with lava the only bright thing on
-    // the planet. The contrast is the point, and it is what makes a lava flow
-    // read at a glance against a base built on the rock beside it.
+    // Vulcanus: near-black rock and ash, lava the only bright thing on it.
     if name == "lava-hot" {
         return Some(rgb(255, 138, 57));
     }
@@ -199,9 +297,8 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(150, 49, 30));
     }
     if name.starts_with("volcanic") {
-        // The "hot" and "warm" variants are the ground immediately around
-        // lava and are tinted towards it in game, so they keep that warmth
-        // rather than flattening into the general grey.
+        // "hot" and "warm" are the ground around lava and are tinted towards
+        // it in game.
         if name.contains("hot") || name.contains("warm") {
             return Some(rgb(33, 13, 10));
         }
@@ -284,13 +381,8 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(52, 55, 48));
     }
 
-    // Aquilo: pale snow at the top of the range, mid blue ice below it, and
-    // near-black ammoniacal ocean at the bottom. The whole planet is one cold
-    // ramp, so what matters is keeping those three bands apart.
-    //
-    // The ocean values here are the *uncommented* ones. The file also carries
-    // an earlier `{5, 15, 25}` commented out directly above the live
-    // `{15, 13, 25}`, which is an easy thing to read off by mistake.
+    // Aquilo: pale snow, mid blue ice, near-black ammoniacal ocean. Keeping
+    // the three bands apart is what matters.
     if name.starts_with("ammoniacal-ocean") {
         return Some(rgb(16, 14, 27));
     }
@@ -304,9 +396,7 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(100, 135, 177));
     }
     // Snow and dust share one palette, graded by how much ground shows
-    // through: flat is fresh cover, patchy is nearly bare. The game builds
-    // these by interpolating between two colours, so these are the computed
-    // ends and midpoints rather than literals in the file.
+    // through. The game interpolates these, so these are the computed ends.
     if name.starts_with("snow-") || name.starts_with("dust-") {
         if name.ends_with("patchy") {
             return Some(rgb(156, 166, 181));
@@ -320,17 +410,9 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(190, 194, 197));
     }
 
-    // Resource deposits: colored to match Factorio's own map-view resource
-    // palette (the little colored blobs shown in chart/map mode), since
-    // that's the mental model a player already has for "what color is
-    // iron" from staring at the map screen, not the ore chunk's in-world
-    // sprite.
-    //
-    // Space Age's are here too now, taken from their prototypes' own
-    // `map_color` rather than picked by eye. Leaving them out was survivable
-    // while unrecognised names got a random hue, but once structures became
-    // blue it meant Vulcanus's calcite and Fulgora's scrap rendered as
-    // buildings, which is exactly the opposite of what a resource patch is.
+    // Resource deposits, matching the game's map-view resource palette rather
+    // than the in-world ore sprite. Without Space Age's, calcite and scrap
+    // rendered as buildings once structures went blue.
     if name == "iron-ore" {
         return Some(rgb(140, 165, 200));
     }
@@ -373,9 +455,8 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(196, 160, 40));
     }
     if name == "concrete" || name == "refined-concrete" {
-        // Dark enough that entities sitting on it (colored via the bright
-        // hash palette below) stay readable against it. A mid grey was
-        // too close in brightness to blend into rather than contrast with.
+        // Dark enough that entities drawn from the bright hash palette stay
+        // readable against it.
         return Some(rgb(58, 58, 60));
     }
     if name == "stone-path" {
@@ -385,24 +466,19 @@ fn known_color(name: &str) -> Option<Color> {
         return Some(rgb(107, 84, 60));
     }
 
-    // Enemies, red so clearing a nest reads at a glance against a base
-    // that is otherwise a rainbow of hashed hues. Worms are the lighter
-    // shade purely so a nest and the worms around it stay distinguishable
-    // when they sit in one cluster, which is how they usually generate.
+    // Enemies, red so clearing a nest reads at a glance. Worms take the
+    // lighter shade so a nest and the worms around it stay distinguishable.
     if is_enemy(name) {
-        // Checked before the nest shade below, so a name that is somehow
-        // both lands on one deterministically rather than by branch order
-        // being read the other way round later.
+        // Before the nest shade, so a name that is somehow both lands
+        // deterministically.
         if name.ends_with("-worm-turret") {
             return Some(rgb(220, 74, 60));
         }
         return Some(rgb(168, 34, 30));
     }
 
-    // Terrain scatter: cliffs read as bare rock; live trees green, with
-    // "dead"/"dry" variants (including desert trees) a dead-wood brown
-    // rather than green, since that's the biggest visual distinction
-    // between tree variants, not the specific species.
+    // Terrain scatter: cliffs read as bare rock, live trees green, and
+    // "dead"/"dry" variants dead-wood brown.
     if is_terrain_scatter(name) {
         // Each planet's cliffs are its own rock, so they take that planet's
         // stone rather than one shared grey that would look imported.
@@ -421,9 +497,7 @@ fn known_color(name: &str) -> Option<Color> {
         if name.starts_with("dead-") || name.starts_with("dry-") {
             return Some(rgb(107, 92, 66));
         }
-        // Vulcanus lichen is ash-grey scrub on black rock, not forest. Nauvis
-        // green here would dot a volcanic planet with something that reads as
-        // a different world's vegetation.
+        // Vulcanus lichen is ash-grey scrub on black rock, not forest.
         if name.starts_with("ashland-lichen") {
             return Some(rgb(74, 78, 62));
         }
@@ -433,106 +507,34 @@ fn known_color(name: &str) -> Option<Color> {
     None
 }
 
-/// Whether `name` is an enemy structure: a nest or a worm turret.
+/// Whether `name` is an enemy structure, for captures with no
+/// `prototypes.json`.
 ///
-/// Matched by name because that is all the wire format carries. The mod
-/// knows each entity's prototype *type* while capturing (`unit-spawner`,
-/// `turret`) but never writes it, since a type is worth nothing to the
-/// renderer for the thousands of ordinary entities that make up a base, and
-/// this is the one place it would have helped.
+/// Substring rather than a list, so a modded nest is caught for free, and not
+/// a suffix because Space Age ships `gleba-spawner-small`.
+/// `captive-biter-spawner` is the exception: player-crafted despite the name.
 ///
-/// Substring matching rather than an exact list of the vanilla worms and
-/// nests: modded enemies conventionally follow the same `spawner` naming, and
-/// getting a modded nest colored as an enemy for free is worth more than the
-/// precision of a list that would silently miss it. Substring rather than
-/// suffix specifically because Space Age ships `gleba-spawner-small`, so even
-/// within vanilla the word is not always last.
-///
-/// The exception is why this needs to be a function at all.
-/// `captive-biter-spawner` contains `spawner` but is a Space Age
-/// *assembling-machine*, a factory building the player crafts and places to
-/// make biter eggs, so painting it enemy red would mislabel part of the
-/// player's own base as something to be cleared. Checked against the real
-/// prototype in `space-age/prototypes/entity/entities.lua`.
-///
-/// The other names carrying `spawner` (`biter-spawner-corpse`,
-/// `captive-spawner-explosion-1`, `guts-entrails-particle-spawner`) need no
-/// exception: every one is a corpse, explosion, or particle source, all of
-/// which `EXCLUDED_TYPES` already keeps out of a capture entirely, so they
-/// never reach a color lookup.
-///
-/// Individual biters and spitters are deliberately absent, and not because
-/// of color: they are excluded from capture entirely (`mod/encode.lua`'s
-/// `EXCLUDED_TYPES`), since the event log records construction and
-/// destruction but never movement, so a captured biter would sit frozen
-/// wherever it was first logged while the real one walked away.
-///
-/// Space Age's own mobile enemies, Gleba's pentapods and Vulcanus's
-/// demolishers, *should* be absent for that same reason and are not in any
-/// capture recorded so far: `EXCLUDED_TYPES` kept out Factorio's `unit` type,
-/// and Space Age gave its new enemies types of their own (`spider-unit`,
-/// `spider-leg`, `segmented-unit`, `segment`), so every one of them landed in
-/// captures as though somebody had built it. Found by reading a real Gleba
-/// capture, which holds `small-stomper-pentapod`, `small-strafer-pentapod`
-/// and both of their `-leg` prototypes.
-///
-/// `mod/encode.lua` excludes those types now, which fixes it at the source
-/// and helps no capture already on disk. Naming them here is what those
-/// captures get: it stops them counting as construction, which matters
-/// because they roam. On that same capture they held the auto-follow box
-/// open across the whole explored map, so the factory rendered as a smudge
-/// in the middle of untouched jungle.
-///
-/// Matching is by substring, which is safe here in the way
-/// `is_terrain_scatter`'s exact lists are not: no player-craftable entity
-/// carries either word. Pentapod eggs are an *item*, and items are not
-/// entities. `demolisher` covers the head and its `-segment` bodies at all
-/// three sizes together, the same way `pentapod` covers the size prefixes
-/// and `-leg` suffixes.
-pub fn is_enemy(name: &str) -> bool {
+/// Pentapods and demolishers are here for captures recorded before
+/// `EXCLUDED_TYPES` covered Space Age's enemy types.
+fn is_enemy(name: &str) -> bool {
     if name == "captive-biter-spawner" {
         return false;
     }
     name.contains("spawner") || name.ends_with("-worm-turret") || name.contains("pentapod") || name.contains("demolisher")
 }
 
-/// Whether `name` is something that drives, walks or rolls: a car, a tank, a
-/// Spidertron, or a train.
-///
-/// Excluded from capture now (`mod/encode.lua`'s `EXCLUDED_TYPES`) under the
-/// same rule as robots and biters, and named here for the captures written
-/// before that, where they are already recorded. Not folded into `is_enemy`
-/// despite both feeding the same two callers: a locomotive is not an enemy,
-/// and colouring one enemy red on an existing capture would be a worse lie
-/// than leaving it the shade it already has.
-///
-/// Trains are the ones that actually matter. A from-saves export catches
-/// them somewhere different in every save, so they blink around the rail
-/// network frame by frame, and every position they were ever caught in would
-/// otherwise pull the camera. Rails, signals and stations are not here, being
-/// stationary infrastructure rather than the thing moving over it.
-pub fn is_vehicle(name: &str) -> bool {
+/// Whether `name` drives, walks or rolls. Excluded from capture now, named
+/// here for captures written before that.
+fn is_vehicle(name: &str) -> bool {
     matches!(name, "car" | "tank" | "spidertron" | "locomotive" | "cargo-wagon" | "fluid-wagon" | "artillery-wagon")
         || name.starts_with("spidertron-leg-")
 }
 
-/// Whether `name` is a tree or cliff prototype: decorative terrain scatter
-/// captured only when the terrain-capture setting is on (see
-/// `mod/control.lua`'s `excluded_types`), naturally scattered across a wide
-/// area independent of anything the player built. Shared with
-/// `construction.rs`'s auto-follow bounds, which needs to exclude exactly
-/// this set for the same reason it excludes tiles: it says nothing about how
-/// the factory grew, and counting it would track how much of the map has
-/// been revealed instead of where the buildings are.
-pub fn is_terrain_scatter(name: &str) -> bool {
-    // `cliff-` rather than just `cliff`: every planet has its own cliff
-    // prototype (`cliff-vulcanus`, `cliff-fulgora`, `cliff-gleba`), and
-    // matching the bare name alone left all three rendering as structures.
-    //
-    // A prefix here rather than the exact list used for rails and flora,
-    // because unlike those there is nothing a `cliff-` entity could be except
-    // a cliff, and a new planet should not need this file edited to stop its
-    // cliffs looking like buildings.
+/// Whether `name` is a tree or cliff. Shared with `construction.rs`'s
+/// auto-follow bounds, which must exclude scatter the map generated.
+fn is_terrain_scatter(name: &str) -> bool {
+    // `cliff-` rather than `cliff`: every planet has its own, and nothing
+    // else can be one, so a new planet needs no edit here.
     name == "cliff"
         || name.starts_with("cliff-")
         || name.starts_with("dead-")
@@ -541,20 +543,9 @@ pub fn is_terrain_scatter(name: &str) -> bool {
         || OFF_WORLD_FLORA.contains(&name)
 }
 
-/// Every flora prototype outside Nauvis, named exactly.
-///
-/// Nauvis names happen to share `tree`, `dead-` and `dry-` prefixes, so it
-/// got away with prefix matching. Nothing on the other planets follows that
-/// convention: Gleba's are called `jellystem`, `boompuff`, `stingfrond` and
-/// so on, and Vulcanus has `ashland-lichen-tree`. Without them listed, a
-/// Gleba forest counted as construction and dragged the auto-follow camera
-/// out over untouched wilderness, and every one of them rendered as a
-/// structure rather than as scenery.
-///
-/// Exact names rather than a pattern, for the reason `RAIL_TRACK` is:
-/// `rocket-turret` contains "rock", and `cryogenic-plant` and
-/// `electromagnetic-plant` are crafting machines despite the name. Taken from
-/// the prototypes of type `tree` and `plant` in the game's own data.
+/// Every flora prototype outside Nauvis, named exactly. Only Nauvis shares
+/// `tree`, `dead-` and `dry-` prefixes, and `cryogenic-plant` and
+/// `electromagnetic-plant` are crafting machines.
 const OFF_WORLD_FLORA: &[&str] = &[
     // Vulcanus
     "ashland-lichen-tree",
@@ -574,20 +565,10 @@ const OFF_WORLD_FLORA: &[&str] = &[
     "yumako-tree",
 ];
 
-/// Whether `name` is a resource deposit: ore, oil, and the like, captured
-/// only when the include-resources setting is on. Like terrain scatter,
-/// shared with `construction.rs`'s auto-follow bounds: a resource sits
-/// wherever the map generated it, entirely independent of anything the
-/// player built, so counting it can pull the tracked area out toward a
-/// distant oil field or ore patch instead of hugging the actual buildings.
-///
-/// Named exactly, not pattern-matched: unlike tree/cliff names, resource
-/// names share no common prefix. This is the vanilla set plus every Space
-/// Age one, taken from the prototypes of type `resource` in the game's data
-/// rather than from whichever ones happened to be noticed. A modded resource
-/// still will not be caught, which costs a wandering camera rather than
-/// anything incorrect.
-pub fn is_resource(name: &str) -> bool {
+/// Whether `name` is a resource deposit. Shared with `construction.rs`'s
+/// auto-follow bounds, since a resource sits where the map generated it.
+/// Named exactly, resource names sharing no prefix.
+fn is_resource(name: &str) -> bool {
     matches!(
         name,
         "iron-ore"
@@ -607,41 +588,54 @@ pub fn is_resource(name: &str) -> bool {
     )
 }
 
-/// Entity types confirmed safe to rotate: a flat, top-down icon (visibly
-/// directional, like a belt's chevrons) rather than a stylized oblique-angle
-/// render (a fixed 3D camera perspective, like a chest, lab, or drill's).
-/// Rotating a flat icon conveys the entity's real facing; rotating an
-/// oblique one just spins that fixed camera angle around and looks wrong
-/// regardless of the angle used, confirmed by directly inspecting the icon
-/// files for both kinds.
-///
-/// An allowlist rather than a denylist deliberately: most Factorio entity
-/// icons are the oblique, don't-rotate kind (confirmed against everything
-/// checked so far), so a denylist would need to name nearly everything,
-/// while this only needs to grow one confirmed-good entry at a time. Add to
-/// it once an entity's rotated icon is checked and looks right; anything not
-/// listed renders unrotated by default, same as before this feature existed.
-const ALWAYS_ROTATE: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
+/// Entity names safe to rotate: a flat top-down icon rather than an oblique
+/// render, which just spins its fixed camera angle.
+const ALWAYS_ROTATE: &[&str] = BELTS;
 
-pub fn is_rotation_allowed(name: &str) -> bool {
+fn is_rotation_allowed(name: &str) -> bool {
     ALWAYS_ROTATE.contains(&name)
 }
 
-/// Every prototype that is rail track, and therefore should look like rail
-/// track rather than like twelve unrelated things.
-///
-/// Factorio 2.0 split what used to be two rail prototypes into a family:
-/// straight, two curve halves, half-diagonal, the elevated version of each,
-/// ramps and supports, plus `legacy-` variants kept for saves made before the
-/// split. Hashing each name separately gave every one its own hue, so a
-/// single rail line rendered as a rainbow and a pre-2.0 save's track was a
-/// different colour again from track laid after it.
-///
-/// Named explicitly rather than matched on "rail" as a substring, which would
-/// wrongly swallow `rail-signal`, `rail-chain-signal`, `gate-over-rail` and
-/// `railgun-turret`. Those are genuinely different things and keep their own
-/// colours. Taken from the game's own `entity-name` locale entries rather
-/// than from memory.
+/// The four belt tiers, drawn from the in-world sheet rather than an icon.
+/// Only these have a curved form to get wrong.
+const BELTS: &[&str] = &["transport-belt", "fast-transport-belt", "express-transport-belt", "turbo-transport-belt"];
+
+fn is_belt(name: &str) -> bool {
+    BELTS.contains(&name)
+}
+
+/// Underground belt tiers and their reach in tiles, from `max_distance` in the
+/// game's prototypes. The reach is what pairs an entrance with its exit.
+const UNDERGROUNDS: &[(&str, i32)] =
+    &[("underground-belt", 5), ("fast-underground-belt", 7), ("express-underground-belt", 9), ("turbo-underground-belt", 11)];
+
+fn underground_reach(name: &str) -> Option<i32> {
+    UNDERGROUNDS.iter().find(|(tier, _)| *tier == name).map(|(_, reach)| *reach)
+}
+
+/// Splitter tiers, which draw from four separate per-facing files rather than
+/// from one sheet.
+const SPLITTERS: &[&str] = &["splitter", "fast-splitter", "express-splitter", "turbo-splitter"];
+
+/// Plain pipes, whose appearance comes from which sides join onto them.
+/// `pipe-to-ground` is absent: it has fixed pictures and does not change.
+fn is_pipe(name: &str) -> bool {
+    name == "pipe"
+}
+
+/// Underground pipes, drawing one of four fixed pictures chosen by facing.
+/// Unlike belts, the two ends carry different directions, so nothing pairs.
+fn is_pipe_to_ground(name: &str) -> bool {
+    name == "pipe-to-ground"
+}
+
+fn is_splitter(name: &str) -> bool {
+    SPLITTERS.contains(&name)
+}
+
+/// Every prototype that is rail track. 2.0 split two into a family, and
+/// hashing each made one line render as a rainbow. Named explicitly rather
+/// than matched on "rail", which would swallow `rail-signal` and `gate-over-rail`.
 const RAIL_TRACK: &[&str] = &[
     "straight-rail",
     "curved-rail-a",
@@ -657,23 +651,14 @@ const RAIL_TRACK: &[&str] = &[
     "rail-support",
 ];
 
-/// The name a prototype is coloured by, which is its own unless it belongs to
-/// a family the eye reads as one thing.
-///
-/// Deliberately the only grouping so far. A curated list of "these look alike"
-/// is exactly the maintenance burden `color_for` was designed to avoid, so
-/// this earns its place only where the alternative is visibly wrong, and rail
-/// is that case: track is a continuous line, and a line changing colour along
-/// its length reads as a different structure rather than as the same one.
+/// The name a prototype is coloured by: its own, unless it belongs to a
+/// family the eye reads as one thing. Rail is the only case so far.
 fn color_group(name: &str) -> &str {
     if RAIL_TRACK.contains(&name) {
         return "rail";
     }
-    // Aquilo freezes placed floor into a `frozen-` twin of the same tile,
-    // deep-copied from it in the game's own data. It is the same path the
-    // player laid, so it must not change colour because the weather did, and
-    // a path crossing from a warm surface to a cold one must not appear to
-    // change material halfway.
+    // Aquilo's `frozen-` twin is the same path the player laid, so it must
+    // not change colour because the weather did.
     if let Some(base) = name.strip_prefix("frozen-") {
         return base;
     }
@@ -697,21 +682,10 @@ pub fn color_for(name: &str, saturation: f32, value: f32) -> Color {
     Color::new(r, g, b, 1.0)
 }
 
-/// A shade of Factorio's map-view friendly blue, for any structure without a
-/// colour of its own.
-///
-/// The game paints all of these with exactly one blue
-/// (`default_friendly_color`), which is why a Factorio map reads as a blue
-/// city. Copying that literally would make a furnace, an assembler and a
-/// chest indistinguishable here, and telling machines apart is most of what
-/// this renderer is for.
-///
-/// So the hash picks a shade *within* the blue rather than anywhere on the
-/// wheel: the hue stays in a narrow band around the game's own 200 degrees,
-/// and lightness and saturation carry the rest of the variation. Everything
-/// still reads as blue at a glance, while two neighbouring machine types stay
-/// visibly different up close, which is the compromise the plain hash got
-/// backwards and a single flat blue would get backwards the other way.
+/// A shade of the map view's friendly blue, for a structure with no colour of
+/// its own. The game paints them all one blue, which would make a furnace and
+/// a chest indistinguishable, so the hash varies lightness and saturation
+/// within a narrow hue band instead.
 fn friendly_shade(name: &str) -> Color {
     let hash = name_hash(color_group(name));
     let hue = (188 + hash % 26) as f32 / 360.0;
@@ -742,9 +716,8 @@ mod tests {
     use super::*;
 
     impl TypeRegistry {
-        /// A registry holding exactly one name, so a test can ask what colour
-        /// that name actually resolves to through the real path rather than
-        /// reimplementing the fallback chain.
+        /// A registry holding one name, so a test can ask what it resolves to
+        /// through the real path.
         fn new_with(name: &str) -> TypeRegistry {
             let mut registry = TypeRegistry::new();
             registry.intern(name);
@@ -752,10 +725,8 @@ mod tests {
         }
     }
 
-    /// A rail line is one continuous structure and has to read as one. Before
-    /// this, 2.0's split into straight, curved, half-diagonal and elevated
-    /// variants gave each its own hue, and a save from before the split
-    /// coloured differently again from track laid after it.
+    /// A rail line is one structure and has to read as one: 2.0's split gave
+    /// each variant its own hue.
     #[test]
     fn every_kind_of_rail_track_shares_one_color() {
         let reference = color_for("straight-rail", 0.6, 0.9);
@@ -774,14 +745,8 @@ mod tests {
         }
     }
 
-    /// Every Space Age tile a capture can contain resolves to a curated
-    /// colour rather than falling through to the hash.
-    ///
-    /// The names are the real prototype names, read out of the game's own
-    /// tile definitions. A tile falling through here would not look broken,
-    /// it would just look like an arbitrary hue in the middle of a planet
-    /// whose palette is otherwise deliberate, which is exactly the kind of
-    /// thing nobody notices until they see a screenshot of it.
+    /// Every Space Age tile a capture can contain resolves to a curated colour
+    /// rather than the hash.
     #[test]
     fn every_space_age_tile_family_has_a_curated_color() {
         for name in [
@@ -833,9 +798,8 @@ mod tests {
         }
     }
 
-    /// Aquilo is one cold ramp from pale snow down to near-black ocean, and
-    /// the three bands staying apart is the only thing that makes its terrain
-    /// readable at a glance.
+    /// Aquilo is one cold ramp, and the three bands staying apart is what
+    /// makes its terrain readable.
     #[test]
     fn aquilo_reads_as_snow_then_ice_then_ocean() {
         let brightness = |c: Color| c.r + c.g + c.b;
@@ -859,10 +823,8 @@ mod tests {
         }
     }
 
-    /// Lava has to stay obviously brighter than the rock it sits in, which is
-    /// the whole reason Vulcanus reads at a glance. Asserted rather than
-    /// eyeballed, because a later tweak to the greys could quietly close the
-    /// gap.
+    /// Lava has to stay obviously brighter than the rock it sits in, which a
+    /// later tweak to the greys could quietly close.
     #[test]
     fn lava_is_far_brighter_than_volcanic_rock() {
         let brightness = |c: Color| c.r + c.g + c.b;
@@ -919,12 +881,9 @@ mod tests {
         assert!(apart > 0.08, "two machine types should be tellable apart, got {apart}");
     }
 
-    /// Flora on the other planets is scenery, exactly like a Nauvis forest.
-    ///
-    /// This matters well beyond colour. `construction.rs` and `activity.rs`
-    /// both skip terrain scatter, so while these went unrecognised a Gleba
-    /// forest counted as construction and dragged the auto-follow camera out
-    /// over untouched wilderness.
+    /// Flora on the other planets is scenery like a Nauvis forest.
+    /// `construction.rs` and `activity.rs` both skip scatter, so while these
+    /// went unrecognised a Gleba forest dragged the auto-follow camera.
     #[test]
     fn flora_on_every_planet_counts_as_scenery() {
         for name in [
@@ -943,13 +902,9 @@ mod tests {
         }
     }
 
-    /// Every resource is a deposit, on every planet.
-    ///
-    /// Two separate failures were possible here and both bit. A resource
-    /// missing from `is_resource` counts as construction and drags the
-    /// auto-follow camera toward it; one missing from `known_color` renders
-    /// as a structure, which since structures went blue meant Vulcanus's
-    /// calcite and Fulgora's scrap looked like buildings.
+    /// Every resource is a deposit, on every planet. Missing from
+    /// `is_resource` it drags the camera; missing from `known_color` it
+    /// renders as a building.
     #[test]
     fn every_resource_on_every_planet_is_a_deposit() {
         for name in [
@@ -1010,11 +965,8 @@ mod tests {
         assert_ne!(color_for("transport-belt", 0.6, 0.9), color_for("stone-furnace", 0.6, 0.9));
     }
 
-    /// Every one of these is a real name a live capture actually produced
-    /// (see the terrain-capture work in mod/control.lua); pinning that
-    /// they resolve to a curated color, not the hash fallback, is what
-    /// guards against a substring check silently stopping matching one of
-    /// them after some future edit.
+    /// Real names a live capture produced. Pinning that they resolve to a
+    /// curated colour guards against a substring check silently stopping.
     #[test]
     fn known_color_recognizes_real_captured_terrain_names() {
         for name in [
@@ -1043,9 +995,8 @@ mod tests {
         }
     }
 
-    /// Distinct colors, not just "present": pinning that iron and copper in
-    /// particular don't end up looking alike guards against the kind of
-    /// mistake that's easy to make copy-pasting six similar `if` blocks.
+    /// Distinct colours, not just present: iron and copper looking alike is
+    /// the easy mistake when copy-pasting six similar `if` blocks.
     #[test]
     fn known_color_recognizes_resource_deposits_distinctly() {
         let iron = known_color("iron-ore").unwrap();
@@ -1097,11 +1048,9 @@ mod tests {
         }
     }
 
-    /// A machine with no colour of its own in the game's chart palette has
-    /// none here either, and picks up a shade of the friendly blue instead.
-    ///
-    /// Belts and rails deliberately no longer qualify: the game gives those
-    /// their own chart colours, so this build does too.
+    /// A machine with no chart colour of its own picks up a shade of the
+    /// friendly blue. Belts and rails no longer qualify, the game giving those
+    /// their own.
     #[test]
     fn known_color_falls_back_to_none_for_ordinary_factory_entities() {
         for name in ["assembling-machine-1", "electric-furnace", "iron-chest"] {
@@ -1128,11 +1077,9 @@ mod tests {
         }
     }
 
-    /// Every one of these was found in a real Gleba capture, having slipped
-    /// past `EXCLUDED_TYPES`'s `unit` filter because Space Age gave its new
-    /// enemies their own prototype types. They roam, so counting them as
-    /// construction held the auto-follow box open across the whole explored
-    /// map.
+    /// All found in a real Gleba capture, having slipped past the `unit`
+    /// filter because Space Age gave its enemies their own types. They roam,
+    /// so counting them held the auto-follow box open.
     #[test]
     fn glebas_pentapods_are_enemies_despite_not_being_units() {
         for name in [
@@ -1147,9 +1094,8 @@ mod tests {
         }
     }
 
-    /// Vulcanus's demolishers, the other half of the same miss: a
-    /// `segmented-unit` head trailing `segment` bodies, neither of them the
-    /// `unit` type that was being filtered.
+    /// Demolishers, the other half of the same miss: a `segmented-unit` head
+    /// trailing `segment` bodies.
     #[test]
     fn vulcanus_demolishers_are_enemies() {
         for name in ["small-demolisher", "medium-demolisher", "big-demolisher", "small-demolisher-segment"] {
@@ -1164,9 +1110,8 @@ mod tests {
         }
     }
 
-    /// The infrastructure a train runs on is stationary and stays. Getting
-    /// this wrong would erase the rail network, which is one of the things
-    /// most worth watching a base grow.
+    /// The track a train runs on is stationary and stays. Getting this wrong
+    /// would erase the rail network.
     #[test]
     fn rails_and_stations_are_not_vehicles() {
         for name in [
@@ -1182,9 +1127,8 @@ mod tests {
         }
     }
 
-    /// The trap this exists for: a Space Age assembling-machine the player
-    /// crafts and places, which matches the `-spawner` suffix but is part of
-    /// their own base, not something to clear.
+    /// The trap this exists for: a player-crafted assembling machine that
+    /// matches the `-spawner` suffix.
     #[test]
     fn the_player_built_captive_biter_spawner_is_not_an_enemy() {
         assert!(!is_enemy("captive-biter-spawner"));
@@ -1238,13 +1182,9 @@ mod tests {
         assert_eq!(registry.name(belt), "transport-belt");
     }
 
-    /// The registry has to agree with the functions it caches, or interning
-    /// would silently recolor every entity in the viewer.
-    ///
-    /// The two lists deliberately disagree with each other for an
-    /// uncurated name: as an entity it is a structure and gets a blue shade,
-    /// as a tile it is floor and keeps the full-hue hash. Asserting both is
-    /// what stops one of them quietly being wired to the other.
+    /// The registry has to agree with the functions it caches. The two lists
+    /// deliberately disagree for an uncurated name, as an entity gets a blue
+    /// shade and as a tile keeps the hash, so both are asserted.
     #[test]
     fn registry_colors_match_the_functions_behind_them() {
         let name = "assembling-machine-1";
@@ -1267,5 +1207,116 @@ mod tests {
         let curated = known_color("transport-belt").expect("belts are curated");
         assert_eq!(registry.entity_color(id).r, curated.r);
         assert_eq!(registry.tile_color(id).r, curated.r);
+    }
+
+    fn typed(pairs: &[(&str, &str)], reach: &[(&str, i32)]) -> TypeRegistry {
+        let mut registry = TypeRegistry::new();
+        registry.set_prototypes(save_timelapse::prototypes::Prototypes {
+            types: pairs.iter().map(|(n, t)| ((*n).to_string(), (*t).to_string())).collect(),
+            reach: reach.iter().map(|(n, r)| ((*n).to_string(), *r)).collect(),
+            ..Default::default()
+        });
+        registry
+    }
+
+    /// Names no list here has heard of, recognised because the game said so.
+    /// All four are real Krastorio2 prototypes, and all four were
+    /// unrecognised under the name matching this replaced.
+    #[test]
+    fn a_modded_prototype_is_recognised_from_its_type() {
+        let mut registry = typed(
+            &[
+                ("kr-advanced-transport-belt", "transport-belt"),
+                ("kr-advanced-underground-belt", "underground-belt"),
+                ("kr-fluid-pipe", "pipe"),
+                ("imersite", "resource"),
+            ],
+            &[("kr-advanced-underground-belt", 30)],
+        );
+
+        let belt = registry.intern("kr-advanced-transport-belt");
+        assert!(registry.is_belt(belt), "a modded belt is a belt");
+        assert!(registry.is_rotation_allowed(belt), "and so turns with its chevrons");
+
+        let underground = registry.intern("kr-advanced-underground-belt");
+        assert_eq!(registry.underground_reach(underground), Some(30), "the game's reach, not a vanilla tier's");
+        assert!(!registry.is_belt(underground));
+
+        let pipe = registry.intern("kr-fluid-pipe");
+        assert!(registry.is_pipe(pipe));
+        let ore = registry.intern("imersite");
+        assert!(registry.is_resource(ore), "modded ore must not count as construction");
+    }
+
+    /// Types the vanilla names never had to tell apart, and one that must not
+    /// be folded in: `heat-pipe` is its own artwork entirely.
+    #[test]
+    fn related_types_are_told_apart() {
+        let mut registry = typed(
+            &[
+                ("lane-splitter", "lane-splitter"),
+                ("infinity-pipe", "infinity-pipe"),
+                ("heat-pipe", "heat-pipe"),
+                ("gun-turret", "ammo-turret"),
+                ("small-worm-turret", "turret"),
+            ],
+            &[],
+        );
+
+        let (lane, infinity, heat) =
+            (registry.intern("lane-splitter"), registry.intern("infinity-pipe"), registry.intern("heat-pipe"));
+        assert!(registry.is_splitter(lane));
+        assert!(registry.is_pipe(infinity));
+        assert!(!registry.is_pipe(heat), "a heat pipe is not a fluid pipe");
+
+        let (gun, worm) = (registry.intern("gun-turret"), registry.intern("small-worm-turret"));
+        assert!(!registry.is_enemy(gun), "the player's own defences are their own types");
+        assert!(registry.is_enemy(worm), "a worm is the bare turret type");
+    }
+
+    /// A captive spawner is `unit-spawner` and player built, so type alone
+    /// would stop it counting as construction.
+    #[test]
+    fn a_captive_spawner_is_not_an_enemy_despite_its_type() {
+        let mut registry = typed(&[("captive-biter-spawner", "unit-spawner"), ("biter-spawner", "unit-spawner")], &[]);
+        let (captive, wild) = (registry.intern("captive-biter-spawner"), registry.intern("biter-spawner"));
+        assert!(!registry.is_enemy(captive));
+        assert!(registry.is_enemy(wild));
+    }
+
+    /// Every capture that exists today has no such file, so the name lists
+    /// have to keep answering for them exactly as they did before.
+    #[test]
+    fn without_the_game_talking_names_still_answer() {
+        let mut registry = TypeRegistry::new();
+        let ids: Vec<TypeId> = [
+            "transport-belt",
+            "fast-underground-belt",
+            "pipe",
+            "iron-ore",
+            "tree-01",
+            "biter-spawner",
+            "kr-advanced-transport-belt",
+        ]
+        .iter()
+        .map(|n| registry.intern(n))
+        .collect();
+        assert!(registry.is_belt(ids[0]));
+        assert_eq!(registry.underground_reach(ids[1]), Some(7));
+        assert!(registry.is_pipe(ids[2]));
+        assert!(registry.is_resource(ids[3]));
+        assert!(registry.is_terrain_scatter(ids[4]));
+        assert!(registry.is_enemy(ids[5]));
+        assert!(!registry.is_belt(ids[6]), "and know nothing of a mod, as before");
+    }
+
+    /// Names the file leaves out must fall back rather than come back blank:
+    /// a modded capture still holds vanilla belts.
+    #[test]
+    fn a_name_the_file_omits_falls_back_to_its_own_answer() {
+        let mut registry = typed(&[("kr-advanced-transport-belt", "transport-belt")], &[]);
+        let (belt, underground) = (registry.intern("transport-belt"), registry.intern("underground-belt"));
+        assert!(registry.is_belt(belt), "unmentioned, so answered by name");
+        assert_eq!(registry.underground_reach(underground), Some(5));
     }
 }

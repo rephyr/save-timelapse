@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml/badge.svg)](https://github.com/rephyr/save-timelapse/actions/workflows/ci.yml)
 
-**Watch your Factorio factory grow without sacrificing performance.**
+**The factory must grow. Unlike your files.**
 
 Save Timelapse is an interactive Factorio timelapse tool built for large factories and long-running saves. Its live capture records your factory as you play using an initial snapshot followed by incremental changes, avoiding repeated full-world exports.
 
@@ -11,6 +11,13 @@ The result is an interactive replay you can pan, zoom, scrub, and explore. It is
 Already have a factory? Save Timelapse can also reconstruct a timelapse from your existing Factorio save files, even if you never had the mod installed while playing.
 
 ![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
+
+
+Zoomed in, it draws with Factorio's own artwork, so belts weave and turn, splitters and underground belts read the right way round, and pipe runs join up. 
+
+Reworked ui and belt rotations from v0.7.0:
+
+![The Save Timelapse viewer, showing a factory drawn with Factorio's own belt, splitter and pipe artwork](assets/sprites.PNG)
 
 > ⚠️ **Alpha.** The core pipeline works, but the project is still under active development. Expect bugs and changes between releases.
 
@@ -44,6 +51,12 @@ The result is a viewer that can handle captures containing hundreds of thousands
 Save Timelapse does not require you to have been recording beforehand.
 
 If you have autosaves or milestone saves from an existing factory, the companion tool can use those saves to reconstruct its history. It runs Factorio in an isolated environment, exports the selected saves, and builds them into the same replay format used by live capture.
+
+### 🧩 Works with the mods you play
+
+Save Timelapse does not carry a list of the things it knows how to draw. It records what your game says its own prototypes are, so a modded playthrough replays as itself: terrain and buildings take the colours Factorio paints its own map view with, and a modded belt is still a belt, a modded ore patch is still ore, and a modded underground belt still pairs up over its real distance.
+
+That means an Alien Biomes world keeps its own terrain, a Krastorio2 belt curves at corners, and an ore field from a mod nobody has ever heard of does not pull the camera off your factory. There is nothing to configure, and a mod added partway through a playthrough is picked up the next time you load the save.
 
 ---
 
@@ -100,8 +113,6 @@ The replay is designed to be explored rather than simply watched.
 - 🌍 Switch between planets and space platforms
 - 👤 Track player position, in timelapses recorded with live capture
 
-![Scrubbing through a Factorio factory construction timeline](assets/scrubbing.gif)
-
 ### Viewer controls
 
 | Key | Action |
@@ -119,11 +130,10 @@ The replay is designed to be explored rather than simply watched.
 | `B` | Add or clear bookmark |
 | `F` | Toggle camera auto-follow |
 | `H` | Toggle construction heatmap |
-| `S` | Toggle entity icons |
+| `?` | Show every control |
+| `F3` | Renderer diagnostics |
 
-![Camera automatically following a growing Factorio base](assets/camera-follow.gif)
-
-![Factorio entities drawn as icons when zoomed in](assets/sprites.PNG)
+Playback, the planet switcher and reframing are also clickable, so the viewer can be driven without knowing any of these.
 
 ---
 
@@ -153,7 +163,11 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **Live capture starts when enabled.** Earlier factory history requires existing save files.
 - **Save-based milestones depend on save frequency.** Live capture records milestone timing precisely, while existing saves can only identify the first save that shows an event.
 - **Bot construction is less visible in the heatmap.** Automated construction is spread across multiple frames, while manual building can create many entities in a single frame.
-- **Entity rotation is limited.** Belts render with their correct direction, while most other entities remain unrotated because their icons are not designed to rotate convincingly.
+- **Entity rotation is limited.** Belts, underground belts, splitters and pipes are drawn from Factorio's own in-world sprites, so they show their real direction, corners and connections. Most other entities remain unrotated because their inventory icons are not designed to rotate convincingly.
+
+- **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded. A belt whose direction changes because the game connected it up for you, rather than because you rotated it yourself, is not, so it keeps the facing it had when it was first placed. It shows up as an occasional corner drawn as a straight belt. Recording a fresh baseline corrects everything built so far.
+
+- **Ground you covered before it was read is not recovered either.** Natural ground is scanned once, from a single save, after the fact, which is what keeps it out of your game entirely. A lake you landfilled at hour three is already landfill when that scan happens, so its water was never recorded anywhere: replayed from the beginning the lake is a hole until the tick the landfill goes down, and removing that landfill uncovers nothing. With terrain capture switched off there is deliberately no ground in the timelapse to uncover at all.
 
 ---
 
@@ -166,23 +180,22 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.3:** Terrain optimization, entity rotation, capture recovery, in-game control panel, surface selection
 - **v0.4:** Timeline timestamps, activity graph, heatmap, milestones, capture management
 - **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
+- **v0.6:** Video export, improved camera framing, moving entities excluded, ground scanned from a save, better scenery cutoff
 
-### v0.6
+### v0.7
 
-- [x] Image sequence or .avi video export
-- [x] Improved camera framing
-- [x] Exclude moving entities from capture
-- [x] Ground is read from a save afterwards instead of recorded while you play.
-- [x] Improved tree/cliff/water cutoff in the render
+- [x] Clean viewer interface: surface switcher, clickable playback controls, keyboard panel
+- [x] Belts, underground belts, splitters and pipes drawn with Factorio's own artwork
+- [x] Belt rotations recorded, so corners stop drawing as straight belts
+- [x] The companion tool stays open and speaks plainly, and failures return to the menu
+- [x] Modded games recorded as themselves: colours, belts, pipes and ores taken from the game's own prototypes
 
 ### v1.0
 
-- [ ] Broader modded-game support
 - [ ] Smarter camera auto-follow
 - [ ] Camera keyframes and cinematic controls
 - [ ] MP4 export
 - [ ] Single-binary distribution
-- [ ] Stable capture format with migration
 
 ---
 
@@ -198,7 +211,6 @@ Documentation:
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Performance](docs/PERFORMANCE.md)
-- [Testing](docs/TESTING.md)
 - [Test fixtures](tests/fixtures/README.md)
 
 The exporter can also be developed and tested without owning Factorio.

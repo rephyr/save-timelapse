@@ -7,11 +7,9 @@ use crate::render_frame::RenderFrame;
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 
-/// How much smaller than a bare edge-to-edge fit `fit_frames`'s initial,
-/// static whole-sequence view zooms. Leaves visible breathing room around
-/// the base instead of touching the window edges. Auto-follow uses its own,
-/// tighter margin (see `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`); this one is
-/// only for the one-time opening view.
+/// How much smaller than edge to edge the initial whole-sequence view zooms,
+/// leaving breathing room around the base. Auto-follow uses its own tighter
+/// margin (`AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
 const FIT_MARGIN: f32 = 0.75;
 
 #[derive(Clone, Copy)]
@@ -33,22 +31,18 @@ impl Camera {
         self.offset + (screen - screen_center) / self.pixels_per_tile()
     }
 
-    /// Center on the bounding box of every entity and tile across every
-    /// frame given (plus `terrain`'s own tiles, if a terrain layer is
-    /// loaded), and pick a zoom that fits it on screen. Fitting the whole
-    /// sequence rather than just the current frame means scrubbing through a
-    /// growing base doesn't jump-recenter every step. Terrain is folded in
-    /// too so the opening view shows the factory sitting on real ground
-    /// rather than framing just the built area and cropping the terrain
-    /// captured around it. Real bases are almost never near world origin, so
-    /// an empty/degenerate input falls back to a sane default rather than
-    /// opening on empty space.
+    /// Center on the bounding box of every entity and tile across every frame,
+    /// plus `terrain`'s tiles, and pick a zoom that fits.
     ///
-    /// The whole-run fit, over a sequence rather than a slice of frames,
-    /// since frames are no longer all resident at once (see `FrameSequence`).
-    /// Every frame is materialized once into a shared scratch buffer as this
-    /// walks, which is why it takes corners as it goes rather than collecting
-    /// them: the frames do not outlive the walk.
+    /// The whole sequence rather than the current frame, so scrubbing through
+    /// a growing base does not jump-recenter every step. Terrain is folded in
+    /// so the opening view shows the factory on real ground. An empty or
+    /// degenerate input falls back to a default rather than opening on empty
+    /// space, real bases almost never being near the origin.
+    ///
+    /// Takes a sequence rather than a slice, frames no longer all being
+    /// resident: each is materialized into a shared scratch buffer as this
+    /// walks, so corners are taken as it goes rather than collected.
     pub fn fit_sequence(
         frames: &crate::render_frame::FrameSequence,
         terrain: Option<&RenderFrame>,
@@ -117,16 +111,12 @@ impl Camera {
         Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
     }
 
-    /// Center on an arbitrary world-space box and pick a zoom that fits it on
-    /// screen. `min_size_tiles` floors how tight this can zoom in either
-    /// axis: framing a single small placement without a floor would zoom in
-    /// far enough to fill the screen with one tile, which reads as broken
-    /// rather than "focused." `margin` is how much smaller than a bare
-    /// edge-to-edge fit to zoom (1.0 = box edges touch the window border,
-    /// smaller = more breathing room), a caller's choice rather than a
-    /// fixed constant, since a one-time static view and a continuously
-    /// re-fitting auto-follow camera want different amounts of it (see
-    /// `fit_frames` and `AUTO_FOLLOW_FIT_MARGIN` in `main.rs`).
+    /// Center on a world-space box and pick a zoom that fits.
+    ///
+    /// `min_size_tiles` floors how tight this zooms: framing one small
+    /// placement without it fills the screen with a single tile. `margin` is
+    /// how much smaller than edge to edge to zoom, a caller's choice because a
+    /// static view and a re-fitting auto-follow want different amounts.
     pub fn fit_bounds(
         center: Vec2,
         size: Vec2,
@@ -141,14 +131,11 @@ impl Camera {
     }
 }
 
-/// A camera move from wherever it currently is to a new target, over a
-/// fixed real-time duration, the same model TLBE (the most-downloaded
-/// Factorio timelapse mod) uses for its own camera transitions: plain
-/// linear interpolation of both position and zoom against elapsed time,
-/// not an easing curve. A fixed duration is what makes a transition read as
-/// deliberate and gradual regardless of how far it's travelling, rather
-/// than an exponential approach that (without extra clamping of its own)
-/// moves fastest the instant a distant target first appears.
+/// A camera move from wherever it is to a new target over a fixed real-time
+/// duration, the model TLBE uses: linear interpolation of position and zoom
+/// against elapsed time, not an easing curve. A fixed duration reads as
+/// deliberate regardless of distance, where an exponential approach moves
+/// fastest the instant a distant target appears.
 #[derive(Clone, Copy)]
 pub struct CameraTransition {
     start: Camera,
@@ -158,11 +145,9 @@ pub struct CameraTransition {
 }
 
 impl CameraTransition {
-    /// Starts from `start` (the camera's live position, not the previous
-    /// target) so retargeting mid-transition (the point of interest
-    /// moving again before the camera arrived) glides on from wherever
-    /// the camera actually is, with no discontinuity, rather than jumping
-    /// back to resume an old transition's endpoint.
+    /// Starts from `start`, the camera's live position rather than the
+    /// previous target, so retargeting mid-transition glides on from where the
+    /// camera actually is instead of jumping back.
     pub fn new(start: Camera, end: Camera, duration_secs: f32) -> Self {
         CameraTransition { start, end, elapsed_secs: 0.0, duration_secs }
     }
@@ -185,46 +170,34 @@ impl CameraTransition {
     }
 }
 
-/// The on-screen size of an entity's footprint, in pixels. Most entities are
-/// 1x1, but assemblers, furnaces and the like span several tiles, so sizing
-/// every entity to a fixed 1-tile square (the pre-footprint behavior) is why
-/// multi-tile buildings used to render undersized and visually disconnected
-/// from whatever was actually touching them.
+/// The on-screen size of an entity's footprint, in pixels. Most are 1x1, but
+/// assemblers and furnaces span several tiles, and sizing everything to one
+/// tile is what left multi-tile buildings undersized and disconnected from
+/// whatever touched them.
 pub fn entity_footprint_size(pixels_per_tile: f32, w: u32, h: u32) -> Vec2 {
     Vec2::new((w as f32 * pixels_per_tile).max(1.0), (h as f32 * pixels_per_tile).max(1.0))
 }
 
-/// Whether an entity's footprint is safe to rotate at all. `is_rotation_allowed`
-/// is the curated `registry::is_rotation_allowed` allowlist result: only
-/// entities confirmed to have a flat, top-down icon go through (this also
-/// covers terrain scatter for free, since trees/cliffs are never added to
-/// that allowlist). Separately, a non-square footprint's `w`/`h` already
-/// reflect Factorio's own post-rotation swap (see `entity_rotation_radians`),
-/// so rotating the already-swapped quad again would double count it. A
-/// square footprint has no such swap (it's a no-op regardless of
-/// direction), so it's the only footprint shape safe to rotate.
+/// Whether an entity's footprint is safe to rotate.
+///
+/// `is_rotation_allowed` is the curated allowlist, which also covers terrain
+/// scatter for free. Separately, a non-square footprint's `w`/`h` already
+/// reflect Factorio's post-rotation swap, so rotating the quad again would
+/// double count it. A square has no such swap, so it is the only shape safe to
+/// rotate.
 fn is_rotatable_square(w: u32, h: u32, is_rotation_allowed: bool) -> bool {
     is_rotation_allowed && w == h
 }
 
-/// An entity's on-screen rotation, in radians, from Factorio's raw 16-way
-/// `direction` byte (0 = north, clockwise in 22.5 degree steps). Zero for
-/// anything not safe to rotate: Factorio's own `tile_width`/`tile_height`
-/// (our `w`/`h`) are read straight off the live, already-rotated entity,
-/// so for a rotated rectangular entity they already reflect the
-/// post-rotation footprint swap. Rotating the drawn quad again on top of
-/// that would misalign it from the entity's real world-space footprint,
-/// and there is no native, unrotated size captured anywhere to undo the
-/// swap correctly. See `is_rotatable_square`.
+/// An entity's on-screen rotation in radians, from Factorio's 16-way
+/// `direction` byte. Zero for anything not safe to rotate: `w`/`h` are read
+/// off the already-rotated entity, so rotating the quad again would misalign
+/// it from the real footprint, and no unrotated size is captured anywhere to
+/// undo the swap. See `is_rotatable_square`.
 ///
-/// The `- 4.0`: confirmed against a real capture that a belt set to face
-/// east (`d = 4`) rendered facing south instead, for every direction, not
-/// just that one. This project's icons are the generic square inventory
-/// icons (not Factorio's real in-world sprites, see `sprites.rs`), and the
-/// belt icon's own native, unrotated artwork already depicts it facing
-/// east, not north as first assumed. Solving the reported symptom directly
-/// (observed south at `d = 4`, wanted east) gives a fixed reference-angle
-/// correction of one quarter turn, not a sign flip.
+/// The `- 4.0` is a quarter turn of reference-angle correction: these are the
+/// square inventory icons rather than in-world sprites, and the belt icon's
+/// unrotated artwork already depicts it facing east.
 pub fn entity_rotation_radians(w: u32, h: u32, d: u8, is_rotation_allowed: bool) -> f32 {
     if !is_rotatable_square(w, h, is_rotation_allowed) {
         return 0.0;
@@ -232,15 +205,11 @@ pub fn entity_rotation_radians(w: u32, h: u32, d: u8, is_rotation_allowed: bool)
     (d as f32 - 4.0) * (std::f32::consts::PI / 8.0)
 }
 
-/// Half-extents to use for view-frustum culling, in world-space tiles.
-/// Plain `w/2, h/2` for everything except a rotatable square at a
-/// non-cardinal direction (`d` not a multiple of 4): a rotated square's
-/// on-screen bounding box grows by up to sqrt(2) on each axis, maximal
-/// exactly at a 45 degree diagonal rather than at a cardinal angle, so
-/// culling against the unrotated box there would occasionally clip an
-/// entity a few pixels early at the view's edge. Gated on `!d.is_multiple_of(4)`
-/// (a plain integer check, no trig) so the common case, a cardinally
-/// placed square building, pays nothing extra.
+/// Half-extents for view culling, in world tiles. Plain `w/2, h/2` except for
+/// a rotatable square at a non-cardinal direction, whose on-screen box grows by
+/// up to sqrt(2) per axis, maximal at 45 degrees, so culling against the
+/// unrotated box would clip it early at the view's edge. Gated on a plain
+/// integer check, so a cardinally placed square pays nothing.
 pub fn entity_cull_half_extents(w: u32, h: u32, d: u8, is_rotation_allowed: bool) -> Vec2 {
     let half = Vec2::new(w as f32, h as f32) / 2.0;
     if is_rotatable_square(w, h, is_rotation_allowed) && !d.is_multiple_of(4) {
@@ -299,21 +268,18 @@ impl Timeline {
     /// stops following the cursor and parks instead.
     pub const TOOLTIP_MARGIN: f32 = 8.0;
 
-    /// Left edge for a hover tooltip of `width` that would ideally be
-    /// centered on `center_x`, pushed back inside the window when centering
-    /// would hang it off an edge.
+    /// Left edge for a hover tooltip of `width` ideally centered on
+    /// `center_x`, pushed back inside the window when centering would hang it
+    /// off an edge.
     ///
-    /// Needed because the tooltip tracks the cursor across the whole bar
-    /// while the bar itself reaches to within 20% of each window edge (see
-    /// `for_screen`). A label wide enough to be worth reading is therefore
-    /// wider than the gap beside the bar's ends, so it would be clipped
-    /// exactly at the first and last frame, which are two of the positions
-    /// someone is most likely to go looking at.
+    /// The tooltip tracks the cursor across the whole bar while the bar
+    /// reaches to within 20% of each window edge, so a label worth reading is
+    /// wider than the gap beside the bar's ends and would clip at the first
+    /// and last frame.
     ///
-    /// Clamping rather than flipping the tooltip to the other side of the
-    /// cursor: flipping keeps the pointer relationship exact but makes the
-    /// box jump sideways mid-drag, and a scrub bar is dragged along its
-    /// whole length, so that jump would happen constantly.
+    /// Clamped rather than flipped to the other side of the cursor: flipping
+    /// keeps the pointer relationship exact but makes the box jump sideways
+    /// mid-drag, and a scrub bar is dragged along its whole length.
     pub fn tooltip_left(center_x: f32, width: f32, screen_width: f32) -> f32 {
         let margin = Self::TOOLTIP_MARGIN;
         // A tooltip too wide for the window has no in-bounds placement at

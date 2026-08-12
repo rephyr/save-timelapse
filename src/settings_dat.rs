@@ -1,8 +1,8 @@
 //! Decode and encode Factorio's `mod-settings.dat`.
 //!
-//! The exporter needs to set one startup flag without disturbing anything else,
-//! so the file's real structure is decoded rather than pattern matched. Writing
-//! a minimal replacement would discard every other mod's configuration.
+//! The exporter sets one startup flag without disturbing anything else, so the
+//! real structure is decoded rather than pattern matched: writing a minimal
+//! replacement would discard every other mod's configuration.
 //!
 //! See docs/ARCHITECTURE.md for the wire format.
 

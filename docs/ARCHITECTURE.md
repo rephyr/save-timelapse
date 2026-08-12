@@ -1,60 +1,44 @@
 # Architecture
 
-This document is long because it records *why* rather than *what*, including
-the approaches that were tried and rejected. Read this summary first and dip
-into the section you need; nothing below depends on being read in order.
-
 ## In short
 
-**The constraint everything follows from.** Factorio's Lua sandbox cannot read
-files, open sockets, or spawn processes. A mod's only output channel is
-writing into `script-output`, and it can never read back what it wrote. So the
-mod and the desktop tool never communicate: the mod appends bytes, the tool
-reads the directory afterwards. Almost every design decision here is a
-consequence of that, and the recurring shape is **the mod states what it saw,
-and every hard question is answered on the Rust side, where the evidence
-actually exists.**
+Factorio's Lua sandbox cannot read files, open sockets, or spawn processes. A
+mod's only output is writing into `script-output`, and it can never read back
+what it wrote, so the mod and the desktop tool never communicate: the mod
+appends bytes, the tool reads the directory afterwards. The mod states what it
+saw, and every question that needs more than one moment's evidence is answered
+on the Rust side.
 
-**Two ways in, one way out.**
+Two ways in, one way out:
 
     existing saves ──> CLI drives headless Factorio, mod exports each save ──┐
                                                                              ├──> frames ──> viewer ──> video
     live play ──────> mod snapshots once, then logs only what changes ──────┘
 
-A save file has no history of its own, so those two paths know completely
-different things and converge on the same on-disk shape.
-
-**Five decisions that shape everything else:**
+A save file carries no history of its own, so the two paths know different
+things and converge on the same on-disk shape.
 
 | Decision | Because |
 |---|---|
-| Custom binary formats, not JSON | The mod writes during real gameplay on bases of ~900k entities. Text formatting per entity *was* the cost. Runs plus delta varints plus a name dictionary took one megabase surface from 200 MB to 38 MB |
-| Unknown records are skipped, not fatal | Factorio auto-updates mods from the portal; the desktop tool does not update itself. "Mod newer than tool" is the normal state of anyone who installed once and kept playing |
-| Log changes, don't re-snapshot | At ~50 bytes per entity, snapshotting a megabase every ten seconds writes gigabytes an hour, all of it repeating what the log already says |
-| Reloads are resolved when reading | The mod *cannot* detect a reloaded save. Every value durable enough to survive a load lives in the save and rewinds with it |
+| Custom binary formats, not JSON | The mod writes during play on bases of ~900k entities. Runs, delta varints and a name dictionary took one megabase surface from 200 MB to 38 MB |
+| Unknown records are skipped, not fatal | Factorio auto-updates mods; the desktop tool does not update itself, so "mod newer than tool" is the normal state |
+| Log changes, don't re-snapshot | At ~50 bytes per entity, snapshotting a megabase every ten seconds writes gigabytes an hour |
+| Reloads are resolved when reading | The mod cannot detect a reloaded save: every value durable enough to survive a load rewinds with it |
 | Nothing under your Factorio install is touched | Exports run against a staged tree the CLI owns and deletes |
 
-**The rule that decides ties.** Time spent inside Factorio and time spent in
-the desktop tool are not worth the same. A player feels a stutter, a frozen
-tick, a baseline that locks the game for thirty seconds. Nobody minds an
-external tool taking a minute longer while they do something else. So whenever
-work can be moved out of the game, move it, even when that costs more total
-work overall: scanning ground from a save afterwards reads an entire surface
-again, which is strictly more work than capturing it during the baseline, and
-is still the right trade because none of it happens while somebody is playing.
-This is also why the mod logs changes rather than re-snapshotting, why the
-baseline is a single freeze rather than a background cost smeared across
-minutes of play, and why terrain left the frame format entirely.
+Time inside Factorio and time in the desktop tool are not worth the same. A
+player feels a stutter; nobody minds an external tool taking a minute longer.
+So work moves out of the game wherever it can, even when that costs more work
+overall: scanning ground from a save afterwards reads a whole surface again,
+which is strictly more than capturing it during the baseline.
 
-**Three rules worth knowing before reading any section:**
+Three rules the sections below assume:
 
-1. **This format records that something was built or destroyed, never that it
-   moved.** That one sentence explains the whole entity filter: robots,
-   biters, pentapods, trains and cars are excluded because the format would
-   pin them wherever they were captured while the real one carried on.
+1. **The format records that something was built or destroyed, never that it
+   moved.** That is the whole entity filter: robots, biters, pentapods, trains
+   and cars would be pinned wherever they were captured.
 2. **Being worth drawing and being worth aiming at are different questions.**
-   Nests are kept and drawn; they do not move the camera. Conflating the two
-   was a long-lived bug.
+   Nests are kept and drawn; they do not move the camera.
 3. **Core format layout is frozen at version 3.** Anything new is an extension
    record with a length prefix, so an older reader skips exactly what it does
    not understand.
@@ -67,19 +51,27 @@ minutes of play, and why terrain left the frame format entirely.
 | The file formats | Frame format, Event format, Format stability |
 | Why captures survive version changes | Format stability and the extension contract |
 | What gets recorded and what does not | Entity filtering, What counts as the factory |
-| How live capture reassembles history | Live capture and replay, Why replay is forgiving |
-| The hardest problem here | Reloading an earlier save |
+| How a modded game describes itself | What the game says about itself |
+| How live capture reassembles history | Live capture and replay, Replay tolerates events it cannot apply |
+| What happens when a player reloads | Reloading an earlier save |
 | Why the viewer is fast | Rendering, Loading, Only writing surfaces that changed |
+| What is on screen and why | Viewer chrome |
 | How a video gets made | Exporting a video |
 
 ## Components
 
     mod/     Lua mod loaded by Factorio. Exports entity data in a custom binary format.
     src/     Rust CLI. Drives Factorio, collects exports, renders output.
+    viewer/  Rust macroquad app. Pans, zooms, scrubs and exports the result.
 
-The two never communicate directly. Factorio's Lua sandbox cannot read files,
-open sockets, or spawn processes, so the mod's only output channel is writing
-into `script-output`. The CLI reads that directory after the process exits.
+The mod and the CLI never communicate directly. Factorio's Lua sandbox cannot
+read files, open sockets, or spawn processes, so the mod's only output channel
+is writing into `script-output`. The CLI reads that directory after the process
+exits.
+
+The viewer is a separate binary rather than a mode of the CLI, because it is
+the thing a user keeps open and comes back to. The CLI builds a timelapse and
+launches it; closing the window does not end a job.
 
 ## Pipeline
 
@@ -157,11 +149,9 @@ from `factorio.exe version`.
 ## Frame format
 
 Every per-surface export (`frame_<tick>_<surface>.stfr`) is a small custom
-binary format, not JSON. The mod exports during real gameplay (the baseline
-snapshot alone has been measured at tens of seconds of frozen play on a
-~375k-entity base), so this is the one file whose write cost genuinely
-mattered: JSON text formatting and punctuation for every single entity was
-the actual CPU and I/O cost of a big export, not something incidental to it.
+binary format, not JSON. The mod writes it during real gameplay (a baseline
+snapshot alone measures tens of seconds of frozen play on a ~375k entity base),
+and JSON text formatting for every entity is most of that cost.
 
 Wire format, all integers little endian:
 
@@ -190,34 +180,26 @@ encoding their positions is what took a real megabase surface export from
 200 MB to 38 MB. Version 1 predates runs entirely, writing one fixed width
 record per entity or tile, and is still read by a separate function.
 
-The version byte lets a reader tell "this is a format I don't understand"
-apart from a generic parse failure. This project has already changed this
-format more than once, each time with no way for an older build to say
-anything clearer than a confusing parse error about a newer file. The
-checksum catches a narrower, different problem the tag structure alone
-can't: silent bit-level corruption that still happens to decode as
-plausible looking records. `mod/control.lua` accumulates it incrementally
-(`checksummed_write`, next to every `helpers.write_file` call for a given
-frame) as the file is written, since a file can be tens or hundreds of
-megabytes and is never held in memory whole on that side; the Rust reader,
-which does hold the whole file in memory, just hashes the payload in one
-pass and compares. Both formats' hash functions (`encode.checksum_update`
-in Lua, `frame::checksum` in Rust) implement the same djb2 variant using
-only multiply/add/mod, with no bitwise primitive, since Factorio's Lua 5.2
-has neither `string.pack` nor a `bit32` library, the same constraint
-`u32le`/`i32le` above already work around by hand. A test in each language
-asserts both agree on the same known input.
+The version byte separates "this is a format I don't understand" from a
+generic parse failure. The checksum catches what the tag structure cannot:
+bit-level corruption that still decodes as plausible records.
 
-A file from before this version byte existed has neither it nor the
-trailer and will not parse under the current reader, consistent with this
-project's precedent of clean breaks over carrying old formats forward at
-this alpha stage (see "Live capture and replay" below, which made the same
-call for session tagging).
+`mod/control.lua` accumulates the checksum incrementally (`checksummed_write`,
+beside every `helpers.write_file` call for a frame), a file running to hundreds
+of megabytes and never being held whole on that side; the Rust reader hashes
+the payload in one pass. Both implementations (`encode.checksum_update` in Lua,
+`frame::checksum` in Rust) use a djb2 variant built from multiply, add and mod
+alone, Factorio's Lua 5.2 having neither `string.pack` nor `bit32`, the same
+constraint `u32le`/`i32le` work around by hand. A test in each language asserts
+they agree on one known input.
+
+A file older than the version byte has neither it nor the trailer and does not
+parse under the current reader.
 
 ## Format stability and the extension contract
 
-Version 3 of both formats is where that precedent ends. From it onward the
-core layout does not change; anything added is an extension record, and both
+Version 3 of both formats is the last clean break. From it onward the core
+layout does not change; anything added is an extension record, and both
 formats use the same rule: **a tag of 128 or above carries a varint byte
 length, then that many bytes.** A reader that does not recognise the tag skips
 exactly that many bytes and carries on, so a capture written by a newer mod
@@ -230,75 +212,48 @@ natural home for a future per-entity column (quality, say, or health), since a
 top level record would have to restate a dictionary and a coordinate list to
 re-associate itself with the entities it describes.
 
-Extension payloads are never interleaved with the data they annotate. This is
-the rule that makes the whole thing work, and `RUN_FLAG_DIRECTIONS` is the
-counter-example that shows why: it *is* interleaved, so a reader that did not
-know the column was there could not find where the run ended. A trailing,
-length prefixed block has no such problem. Anything added later has to keep to
-that shape.
+Extension payloads are never interleaved with the data they annotate.
+`RUN_FLAG_DIRECTIONS` is, which is why an unknown column of that shape is
+unskippable: a reader cannot find where the run ends. A trailing, length
+prefixed block can always be stepped over, and anything added later has to keep
+to that shape.
 
-A length that runs past the end of the file is still an error. Not
-understanding a record is fine; a record that does not fit means damage.
+A length running past the end of the file is an error. Not understanding a
+record is fine; one that does not fit means damage.
 
-### Why this matters more than it looks
-
-Factorio updates mods from the portal on its own. The desktop tool does not
-update itself. **The mod being newer than the tool is therefore the normal
-state of anyone who installed once and kept playing**, not an edge case.
-
-Before extension records that combination had only two possible outcomes, both
-bad. If the new mod bumped the version, the old tool refused the whole capture.
-If it added a tag without bumping, the event reader's unknown-tag arm returned
-`None`, which an iterator reports as end of stream, so the replay silently
-stopped partway through with nothing to say about why. Skipping replaces both
-with a capture that loads and a count of what was stepped over, which
-`Replay::unknown_extensions` carries up to a message telling the user their
-tool is behind their mod.
+`Replay::unknown_extensions` counts what was stepped over, which the CLI turns
+into a message saying the tool is behind the mod.
 
 ### What holds it in place
 
 `tests/format_compatibility.rs` opens one real frame in all three released
 encodings (v1 through v0.3, v2 in v0.4, v3 from v0.5) and asserts they agree.
-Those fixtures are committed bytes, not generated at test time, so the check
-is against what older builds actually wrote rather than against this build's
-idea of what they wrote. A failure there is not a test to adjust; it means
+The fixtures are committed bytes rather than generated at test time, so the
+check is against what older builds actually wrote. A failure there means
 somebody's existing capture stopped loading.
 
-`DefineName` writes a prototype name the first time it is used and gives it
-the next sequential id; every later reference is just the two byte id, which
-is what lets a base with hundreds of thousands of entities but only a few
-dozen distinct prototype names avoid repeating `"transport-belt"` per entity.
-One dictionary is shared by the entity and tile sections of a file, since a
-name only needs defining once.
+`DefineName` writes a prototype name the first time it is used and gives it the
+next sequential id; every later reference is the two byte id. One dictionary is
+shared by the entity and tile sections, a name only needing defining once.
 
-There is deliberately no entity or tile count anywhere in this format. Both
-counts would be free to compute upfront for the single tick synchronous
-export path (`find_entities_filtered` already returns a full array), but the
-periodic incremental exporter (`snapshot_step` in control.lua) spreads one
-export across many ticks specifically so no single tick has to do the whole
-thing, with real play still running in between: an entity a batch has not
-reached yet can be mined by the player before its turn comes, so a count
-taken upfront could still be wrong by the time writing finishes, and scanning
-the whole list once just to learn it would reintroduce the very stall the
-incremental exporter exists to avoid. `EndEntities` sidesteps needing a count
-at all: each section is a plain forward stream, and the tile section simply
-runs until the checksum trailer (the reader knows that trailer is always
-exactly 4 bytes, so it stops the tile loop there rather than at true EOF).
+There is no entity or tile count anywhere in the format. The incremental
+exporter spreads one export across many ticks with play continuing in between,
+so a count taken upfront can be wrong by the time writing finishes, and
+scanning for one would reintroduce the stall that exporter avoids.
+`EndEntities` removes the need: each section is a forward stream, and the tile
+section runs until the 4 byte checksum trailer.
 
-Entity coordinates are stored as position times ten, rounded to the nearest
-integer (the same fixed point scale `world.rs::pos_key` keys positions by on
-the Rust side, and exactly the precision entities are aligned to). Tile
-coordinates are already integers, stored as is: a tile named at `(x, y)`
-occupies world space `[x, x+1) x [y, y+1)`, corner rather than center
-anchored like entities. `d`, `w` and `h` are always present now rather than
-omitted at their default (0 direction, 1x1 footprint): once a record is this
-compact, a variable width encoding to skip a default value costs more
-complexity than the bytes it would save.
+Entity coordinates are position times ten, rounded, the same fixed point scale
+`world.rs::pos_key` uses. Tile coordinates are already integers: a tile named
+at `(x, y)` occupies `[x, x+1) x [y, y+1)`, corner anchored where entities are
+centre anchored. `d`, `w` and `h` are always present, a variable width encoding
+to skip a default costing more complexity than the bytes it saves.
 
-`tiles` covers placed floor (concrete, stone path, hazard/refined concrete
-variants, landfill), a short, stable include list, the opposite of entity
-filtering's exclude list, since natural terrain vastly outnumbers placed
-floor types.
+`tiles` covers placed floor (concrete, stone path, hazard and refined concrete
+variants, landfill, a platform's foundation), an include list rather than
+entity filtering's exclude list, since natural terrain vastly outnumbers placed
+floor types. The list is asked of the game rather than stated: a tile counts if
+an item places it or it can be mined (see What the game says about itself).
 
 A surface is exported when it is nauvis or contains at least one entity owned
 by the player force. A manifest listing exported surfaces accompanies each
@@ -347,46 +302,33 @@ worse than leaving it out.
   stations stay, being the stationary infrastructure that shows the network
   growing, exactly as roboports stay while the robots do not.
 
-The last two were missed for a long time and are worth dwelling on, because
-neither was a judgement call that went the wrong way. They are the same rule
-failing to reach things nobody re-checked it against.
+`unit` is one prototype type rather than "enemies", which is why Space Age's
+own mobile enemies need naming separately. Trains are the worst case of the
+rule: a from-saves export catches them somewhere different in every save, so
+they blink around the network frame by frame, while a live capture shows one
+parked where it was placed for the rest of the playthrough.
 
-`unit` is not "enemies", it is one prototype type, and Space Age gave its new
-enemies types of their own. The list was written when `unit` covered every
-mobile enemy in the game and was never revisited when that stopped being
-true. It surfaced only by reading a real Gleba capture, which held
-`small-stomper-pentapod`, `small-strafer-pentapod` and both of their `-leg`
-prototypes; since they roam, the auto-follow camera stretched to wherever they
-had wandered and the factory rendered as a smudge in untouched jungle.
-Demolishers are the same miss on another planet, found by looking rather than
-by waiting for a second bug report.
+Types here are read out of the game's own
+`space-age/prototypes/entity/enemies.lua` and `base/prototypes/entity/` rather
+than inferred from names: `spider-unit` sounds like it would catch Spidertron
+and does not, Spidertron being `spider-vehicle`.
 
-Vehicles were never excluded at all, which is harder to explain away: the rule
-names movement, and a train is the most mobile thing in the game. Trains are
-also the worst case, because they never stop. A from-saves export catches them
-somewhere different in every save, so they blink around the rail network frame
-by frame; a live capture logs one add where a locomotive was placed and then
-shows it parked there for the rest of the playthrough.
-
-Prototype types here were read out of the game's own
-`space-age/prototypes/entity/enemies.lua` and `base/prototypes/entity/`,
-not inferred from names. That matters once: `spider-unit` sounds like it would
-catch Spidertron and does not, because Spidertron is `spider-vehicle`. Guessing
-would have excluded a player entity while leaving the enemies in.
-
-None of this helps a capture already on disk, where these entities are already
-recorded. `viewer/src/registry.rs` therefore names them too (`is_enemy`,
-`is_vehicle`), which cannot un-capture them but does stop them counting as
+A capture already on disk still holds these entities, so
+`viewer/src/registry.rs` recognises them too, from the game's own prototype
+types when the capture carries them and from its fallback name lists when it
+does not. That cannot un-capture them, but it stops them counting as
 construction for the auto-follow camera.
 
 Nests (`unit-spawner`) and worm turrets are deliberately **kept**, despite
 being enemies, because they are stationary and so the format represents them
 honestly. Watching the front line move outward as nests are cleared is a real
 part of how expansion looks, and the viewer colors both red so it reads at a
-glance (`viewer/src/registry.rs`'s `is_enemy`). Worms additionally could not
-be filtered safely even if wanted: they share Factorio's `turret` type with
-player-built turrets, so excluding them would mean matching by name rather
-than by what the entity actually is, risking a real player entity.
+glance. Worms additionally could not be filtered safely even if wanted: they
+share Factorio's `turret` type with player-built turrets, so excluding them
+would mean matching by name rather than by what the entity actually is,
+risking a real player entity. Note that this cuts the other way for the
+viewer, where the bare `turret` type is precisely what identifies a worm,
+because the player's own turrets are three separate types.
 
 Resource entities are excluded unless `save-timelapse-include-resources` is set.
 Every ore tile is a separate entity and they typically outnumber built entities
@@ -394,34 +336,24 @@ while carrying no information about factory growth.
 
 ## What counts as the factory
 
-Being worth drawing and being worth *aiming at* are separate questions, and
-conflating them was a long-lived bug. Two things point themselves at the base:
-the auto-follow camera (`viewer/src/construction.rs`) and the terrain margin
-(`mod/export.lua`). Both need "where the buildings are", and both were being
-handed "where anything the capture kept is", which is not the same set.
+Being worth drawing and being worth *aiming at* are separate questions. Two
+things point themselves at the base: the auto-follow camera
+(`viewer/src/construction.rs`) and the terrain margin (`mod/export.lua`). Both
+need "where the buildings are" rather than "where anything the capture kept
+is".
 
-Trees, cliffs and resource deposits had each already been excluded from the
-camera's box, one at a time, as each was noticed dragging it toward untouched
-wilderness. Enemy nests and worms are the same problem and were missed longest,
-because unlike the others they are not scenery: they are kept on purpose, drawn
-red, and clearing them is worth watching. They are still generated rather than
-built, though, and they cover every generated chunk in every direction, so
-counting them made the box span the explored map. Since the camera centers on
-the box's **midpoint**, it centered on the middle of the revealed map rather
-than on anything anybody built.
+Trees, cliffs, resource deposits, nests and worms are all excluded from that
+box. Every one of them sits wherever the map generated it, and nests cover
+every generated chunk in every direction, so counting them makes the box span
+the explored map; since the camera centres on the box's midpoint, it then
+centres on the middle of the revealed map. The same exclusion feeds the mod's
+terrain margin, so "32 tiles around the factory" means the factory.
 
-The mod side had the identical bug feeding the terrain margin, with trees in it
-too, so "32 tiles around the factory" was really 32 tiles around the explored
-map. That is most of where terrain capture's measured 5x came from.
-
-The Rust side filters by name (`is_terrain_scatter`, `is_resource`, `is_enemy`),
-which is a hand-maintained denylist and has needed a patch per planet. The mod
-side does not have to: it asks `entity.force`, which answers the question
-structurally, and it asks once per distinct prototype name rather than once per
-entity, since that loop runs on bases holding hundreds of thousands of them. The
-durable fix for the viewer is to carry force on the wire so it can stop guessing
-from names; the frame format's run flags have room for a bit that changes no
-layout, so an older reader would ignore it safely.
+Both sides ask the prototype what it is rather than matching names: the mod
+directly, once per distinct name rather than once per entity, and the viewer by
+reading what the game said about its own prototypes (see What the game says
+about itself). The name lists survive only for captures recorded before the mod
+started saying, and are private to `registry.rs`.
 
 ### How much ground to capture
 
@@ -445,6 +377,95 @@ a 16:9 frame exposes. As a flat ceiling it inverted on any base larger than
 itself, leaving nothing to spend and falling back to the 32 tile floor, so the
 biggest factories got the smallest margins.
 
+## What the game says about itself
+
+A capture records prototype *names*, and a name means nothing on its own. The
+viewer has to know what colour `vegetation-turquoise-grass-2` is, and whether
+`kr-advanced-transport-belt` is a belt, and it cannot work either out. Both
+answers exist only inside the running game: a mod ships as a zip in the mods
+folder, so its prototypes are Lua the desktop side never executes.
+
+So the mod writes them down. One file, `prototypes.json`, beside everything
+else a capture produces:
+
+    {
+      "tiles":    { "grass-1": [55, 53, 11], ... },        map_color, as bytes
+      "entities": { "transport-belt": [204, 161, 71], ... },
+      "types":    { "kr-advanced-transport-belt": "transport-belt", ... },
+      "reach":    { "kr-advanced-underground-belt": 30, ... }
+    }
+
+Colours are the ones Factorio paints its own map view with, which is the
+palette a player already has in their head. Types are each entity prototype's
+own `type`, verbatim and unfiltered: deciding mod-side which types are
+interesting would only move the curated list from one side of the file to the
+other, and the viewer is where the answer is wanted. `reach` is
+`max_underground_distance`, asked only of the two types that have one.
+
+Without it, supporting a mod means transcribing its prototypes into tables in
+`registry.rs`, once per mod: Alien Biomes alone adds a couple of hundred tiles,
+and Krastorio2 adds belt tiers, ores and pipes a viewer built around Wube's
+names cannot see are belts, ore or pipes.
+
+**Absent is normal.** Every capture older than the file has none, so the reader
+folds every failure into "no file" and the viewer falls back on its built-in
+colours and name lists. A missing section works the same way, which is what
+lets a file from an older mod be used for what it does say. Unusable entries
+are dropped one at a time rather than taking the file with them: one colour out
+of range would otherwise discard all 364 good ones.
+
+**Colours are 0..255 or 0..1, and the game does not say which.** Factorio
+accepts either and distinguishes them by rule: if any component exceeds 1, the
+whole colour is in 0..255. Prototypes mostly use the second form, base's own
+tiles included (`grass-1` is `{55, 53, 11}`), and the runtime returns them as
+written. `encode.color_bytes` applies that rule and clamps, the rule being a
+convention the game does not enforce on a mod.
+
+**An entity's colour depends on whose it is, which a prototype cannot know.**
+`map_color` is what charting uses "if a friendly or enemy color isn't defined",
+and the two are mutually exclusive per prototype: the ones defining `map_color`
+(rails, trees, cliffs) leave the pair nil, and the rest carry it. Force belongs
+to an entity rather than to the prototype this file is keyed by, so enemies are
+picked out by type, which for a capture is exact: the only ones surviving
+entity filtering are nests and worms.
+
+**Rewritten when the loaded mods change**, not once per capture: a baseline
+runs once per save and never again, so a file written only there cannot pick up
+a mod added since. The condition is `script.active_mods`, stamped into
+`storage` alongside the rest of the capture's state, prototypes being fixed at
+load time. This mod's own version is in that stamp, which is what makes a
+capture heal itself when a build that wrote the file wrongly is replaced.
+
+`storage` rather than a module local, because Factorio re-runs the control
+stage on every load: a local reading "already done this session" means once per
+load, and this rebuilds a couple of hundred kilobytes of JSON in one tick, on
+the tick already flushing events and sampling players.
+
+**Which tiles are floor is asked the same way**, in the mod rather than written
+down for the viewer, since it decides what a capture records rather than how it
+draws. `encode.placed_floor_tiles` unions two properties, neither covering it
+alone on a real 69 mod game: `items_to_place_this` finds 18 tiles,
+`mineable_properties.minable` finds 41, and together they miss only the eleven
+coloured refined concretes, which no item places and which report as not
+minable. Those eleven are stated, along with the rest of the old list, as a
+floor guaranteeing a capture cannot lose paving it used to record.
+
+`space-platform-foundation` is why this matters and is not modded at all:
+missing from the stated list, the tiles a player lays to grow a platform were
+recorded as natural ground by the scan rather than as built, so a platform
+appeared fully formed from its first frame. Aquilo's `foundation` had the same
+problem.
+
+The viewer resolves both halves at intern time, next to where it already
+resolves colour, so a name costs one lookup rather than one per entity per
+frame. Factorio's type vocabulary is fixed and small, so matching on it in
+`registry.rs` is not the thing the name lists had to be replaced for, but it
+does need care: a splitter can also be a `lane-splitter`, an `infinity-pipe` is
+a pipe while a `heat-pipe` is not, and worms are the bare `turret` type while
+the player's defences are `ammo-turret`, `electric-turret` and `fluid-turret`,
+which is what makes classifying enemies by type safe. Exactly one name is still
+worth knowing: `captive-biter-spawner` is a `unit-spawner` the player built.
+
 ## Ground is scanned, not captured
 
 Natural ground is the one part of a capture that does not change. Entities need
@@ -464,35 +485,27 @@ That ordering buys three things at once:
   far the factory eventually reached, instead of guessing from how far it had
   reached when recording started.
 
-That last point is what makes this a fix rather than a rearrangement. Ground
-captured at baseline time covers wherever the factory stood *then*, and a
-factory grows, so a capture enabled on a starter base and played for hours
-showed buildings standing on nothing everywhere beyond that first small box.
-The alternative was topping ground up as the base grew, which needs the covered
-area tracked in `storage`, a threshold to batch on, ring geometry so each
-top-up writes only what is new, and a stall every time one fires. Scanning
-once, later, needs none of it.
+Ground captured at baseline time covers wherever the factory stood then, so a
+capture enabled on a starter base and played for hours leaves buildings
+standing on nothing beyond that first box. Topping it up as the base grows
+would need the covered area tracked in `storage`, a threshold to batch on, ring
+geometry so each top-up writes only what is new, and a stall when one fires.
 
-**What it gives up is ground that has since been built over.** The query asks
-for everything that is not placed floor, so water landfilled at hour three
-reads as landfill at hour ten and its water is never recorded. Replayed from
-the beginning, that lake is a hole until the tick the landfill was laid. A pass
-during the baseline would have caught it while it was still visible. A hybrid
-would fix it: a cheap baseline pass for the area built on then, plus a scan for
-everything the factory expanded into later.
+**What it gives up is ground since built over.** The query asks for everything
+that is not placed floor, so water landfilled at hour three reads as landfill
+at hour ten and its water is never recorded: replayed from the beginning, that
+lake is a hole until the tick the landfill was laid.
 
-The scan writes into the session folder named for the map seed, which is the
-whole verification: a save from a different playthrough lands under a different
-session, so the desktop tool refuses it rather than laying an unrelated
-landscape under somebody's factory. The from-saves flow skips that check, since
-there the saves *are* the playthrough.
+The scan writes into the session folder named for the map seed, which is what
+verifies it: a save from a different playthrough lands under a different
+session and is refused rather than laying an unrelated landscape under
+somebody's factory. The from-saves flow skips that check, the saves there being
+the playthrough.
 
-`terrain_<surface>.stfr` was already what the viewer looked for, discovered
-straight from the directory and independent of the frame files, so nothing
-downstream changed to accept ground from a different producer. Captures made
-before this still carry ground in their baseline, and `replay::write_all_terrain`
-still projects it; a scan simply overwrites the result, which is the right
-precedence.
+`terrain_<surface>.stfr` is what the viewer already looked for, discovered from
+the directory independently of the frame files. Captures made before this carry
+ground in their baseline and `replay::write_all_terrain` still projects it; a
+scan overwrites that result.
 
 ## Write batching
 
@@ -511,140 +524,112 @@ reassembles any moment by replaying that log over the baseline.
         frame_<tick>_<surface>.stfr   the baseline itself, one per surface
         events_<start_tick>.stev      append-only, one segment per timeline
         players.jsonl                 optional, sampled player positions
+        milestones.jsonl              optional, when each milestone was reached
+        prototypes.json               this game's colours and prototype types
 
 `<session>/baseline.json` is written last, so its existence means that
 playthrough's baseline finished. It is the handshake: replay reads it to
 learn which frame files to seed from.
 
 `<session>` (an 8 digit hex folder name) identifies which playthrough these
-files belong to: `script-output/save-timelapse/` is shared by every save
-that ever turns capture on, and `game.tick` restarts from 0 for each one, so
-a bare tick cannot tell two playthroughs' files apart, and unlike a bare
-filename, two playthroughs no longer share one directory to get confused in
-to begin with, since each gets its own. `control.lua`'s `compute_session_id`
-uses the map's terrain seed (`map_gen_settings.seed`), deterministic across
-save/reload of one playthrough and different across different ones with
-overwhelming probability, needing no new in-game UI to collect (unlike a
-save name, which mods have no API access to at all). The Rust side's
+files belong to. `script-output/save-timelapse/` is shared by every save that
+ever turns capture on and `game.tick` restarts from 0 for each, so a bare tick
+cannot tell two playthroughs' files apart. `control.lua`'s
+`compute_session_id` hashes the map's terrain seed (`map_gen_settings.seed`),
+which is stable across save and reload of one playthrough, differs across
+playthroughs, and needs no new in-game UI to collect. A save name would, mods
+having no API access to it.
+
 `replay::discover_sessions` lists every session folder with a finished
-baseline; `save-timelapse.exe` auto-picks the only one when there's just
-one, and otherwise asks which playthrough to build the timelapse from — the
-same reasoning as picking which save files belong to one playthrough in the
-from-saves flow, just applied to live capture instead.
+baseline. `save-timelapse.exe` auto-picks the only one when there is just one
+and otherwise asks which playthrough to build from.
 
-A save whose capture state predates this folder-per-session scheme has no
-session id yet (`nil` in `storage.timelapse_capture`) and keeps writing the
-old, untagged `baseline.json`/`events_<tick>.stev`/`frame_<tick>_<surface>.stfr`
-names flat in the shared top-level folder until `/timelapse-reset-capture`
-clears its state; the Rust side simply never descends into anything but a
-session subfolder, so a leftover flat file sits inert rather than colliding
-with (or crashing) a properly tagged session's replay.
+A capture whose state predates the folder-per-session scheme has no session id
+(`nil` in `storage.timelapse_capture`) and keeps writing the old untagged names
+flat in the shared top-level folder until `/timelapse-reset-capture` clears its
+state. The Rust side descends only into session subfolders, so a leftover flat
+file sits inert.
 
-The baseline is taken once per save, not periodically, and **synchronously**
-in a single tick — the game visibly freezes for its duration (measured on a
-~375k entity base: tens of seconds). That trade is deliberate: a repeating
-snapshot would need to avoid a stall on every run, but a baseline runs at most
-once per save, so a one-time freeze beats a background cost smeared across
-the next several minutes of play that a save or quit could interrupt and
-force to restart. Factorio can only save or quit between ticks, never
-mid-tick, so the export cannot itself be caught half-written by normal
-play — only a killed process could, and that just retries on next load (see
-below).
+The baseline is taken once per save, not periodically, and **synchronously** in
+a single tick: the game freezes for its duration, tens of seconds on a ~375k
+entity base. A repeating snapshot would have to avoid a stall on every run,
+where a one-time freeze can simply take one. Factorio saves and quits only
+between ticks, so the export cannot be caught half written by normal play; a
+killed process retries on next load.
 
-`baseline_tick` lives in `storage`, so it travels inside the save file — a
-save that has been baselined knows it. It is recorded only on *completion*,
-so a game saved and reloaded midway simply starts over rather than leaving a
-truncated baseline that replay would trust.
+`baseline_tick` lives in `storage`, so it travels inside the save file and a
+baselined save knows it. It is recorded only on completion, so a game saved and
+reloaded midway starts over rather than leaving a truncated baseline that
+replay would trust.
 
-Because nothing renders while a tick's Lua is still running, there is no way
-to show a live progress bar for a freeze that happens entirely inside one
-tick. `request_baseline`/`perform_baseline` split the work across two moments
-purely so a warning can actually be read: `request_baseline` prints an entity
-count (`LuaSurface::count_entities_filtered`, cheap since it never builds the
-array `export_surface` needs) and schedules `perform_baseline` for
-`BASELINE_WARNING_DELAY_TICKS` later (about two real seconds), not just the
-next tick, since one tick is only one rendered frame, often too brief to
-actually read the message before the freeze hits. Printing and freezing in
-the same tick would put the warning and the "finished" message on screen at
-the same moment, after the freeze already ended.
+Nothing renders while a tick's Lua is still running, so a freeze inside one
+tick cannot show progress. `request_baseline`/`perform_baseline` split across
+two moments so the warning can be read: `request_baseline` prints an entity
+count (`LuaSurface::count_entities_filtered`, cheap because it never builds the
+array `export_surface` needs) and schedules `perform_baseline`
+`BASELINE_WARNING_DELAY_TICKS` later, about two seconds, one tick being one
+rendered frame and too brief to read.
 
-That same persistence used to be a trap if the *output* was deleted rather
-than the save, since `storage` survives independently of `script-output` and
-the mod has no way to notice the mismatch on its own. Checked against
-Factorio's own `runtime-api.json`: `LuaHelpers` exposes `write_file` and
-`remove_path` and nothing else, no read and no directory listing, so a mod
-genuinely cannot ask "is the file I wrote still there." `remove_path` can
-still delete a path it already knows it wrote, though, which is what
-`M.reset_capture` (the `/timelapse-reset-capture` command and the panel's
-reset button) now does: it deletes this playthrough's own session folder
-outright (via `encode.session_dir`, since every playthrough already gets
-one) before clearing `storage.timelapse_capture`, so the next baseline starts
-from a genuinely empty folder rather than assuming the player already
-cleared it by hand.
+Deleting `script-output` while keeping the save leaves `storage` claiming a
+baseline that no longer exists, and the mod cannot check: `LuaHelpers` exposes
+`write_file` and `remove_path` and nothing else, no read and no directory
+listing. It can delete a path it knows it wrote, which is what `M.reset_capture`
+(the `/timelapse-reset-capture` command and the panel's reset button) does,
+removing this playthrough's session folder via `encode.session_dir` before
+clearing `storage.timelapse_capture`.
 
 ### Per-surface exclusion and catch-up baselines
 
 The in-game panel (`mod/gui.lua`, opened via a toolbar shortcut or
-Control+Shift+T) lets a player exclude individual surfaces from recording,
-including planets not yet visited (listed from `game.planets`, which covers
-every planet prototype regardless of whether its surface has been created
-yet, alongside whatever else already exists in `game.surfaces`).
-`storage.timelapse_excluded_surfaces` is an opt-out set: presence as a key
-means excluded, so a surface absent from it is recorded, which is what lets
-a brand new planet or platform keep recording automatically the moment it's
-created, with no special-casing. `log_event` checks this before anything
-else, and `request_baseline`/`perform_baseline` skip an excluded surface
-too, so exclusion also means "don't pay this surface's baseline cost," not
-just "stop logging its future changes."
+Control+Shift+T) excludes individual surfaces from recording, including planets
+not yet visited: `game.planets` covers every planet prototype whether or not
+its surface exists, alongside whatever is already in `game.surfaces`.
 
-Un-excluding a surface that already had something built on it needs a
-baseline of its own, taken at that moment, or the timelapse for it would
-start from empty and silently miss everything built before inclusion.
-`storage.timelapse_capture.baselined_surfaces` tracks which surfaces have
-ever gotten one and at what tick; `request_baseline`/`perform_baseline` were
-generalized to mean "baseline whatever currently-included surfaces aren't in
-this table yet," which serves the first-ever baseline, a reset, and a later
-catch-up identically. A catch-up (triggered by `M.on_surface_included` when
-a panel checkbox flips from excluded to included) exports only the
-newly-eligible surfaces through `export.export_surfaces_to`, an ordinary
-`frame_<tick>_<surface>.stfr` per surface with **no manifest write at all**:
-`baseline.json` keeps meaning exactly what it means for the original,
-once-per-session baseline, and never changes after it is first written.
+`storage.timelapse_excluded_surfaces` is an opt-out set, presence as a key
+meaning excluded, so a new planet or platform records automatically the moment
+it is created with no special casing. `log_event` checks it before anything
+else, and `request_baseline`/`perform_baseline` skip an excluded surface, so
+exclusion also skips that surface's baseline cost.
 
-The Rust side discovers a catch-up by scanning the session folder for
-`frame_<tick>_<surface>.stfr` files `baseline.json` doesn't already name
-(`replay::discover_catch_up_baselines`), since nothing else in a session
-folder is ever named that way. `replay::run`'s tick-ordered walk applies a
-due catch-up (`World::load_baseline`) at the exact point its own tick is
-reached, not eagerly at the start, so the surface it covers is entirely
-absent from every emitted frame before that tick and appears fully formed
-from it onward, exactly as if it had just been visited for the first time.
-Events logged for that surface before its catch-up tick (the mod starts
-logging the instant a surface is included, but the snapshot itself lands
-`BASELINE_WARNING_DELAY_TICKS` later) are dropped, not deferred, since
-whatever they did is already reflected in the snapshot taken after them.
+Un-excluding a surface that already has something on it needs a baseline of its
+own at that moment, or its timelapse starts from empty.
+`storage.timelapse_capture.baselined_surfaces` tracks which surfaces have ever
+had one and at what tick, so `request_baseline`/`perform_baseline` mean
+"baseline whatever included surfaces are not in this table", which covers the
+first baseline, a reset and a later catch-up identically. A catch-up
+(`M.on_surface_included`, when a checkbox flips from excluded to included)
+exports only the newly eligible surfaces through `export.export_surfaces_to`,
+one ordinary `frame_<tick>_<surface>.stfr` each and **no manifest write**:
+`baseline.json` never changes after it is first written.
 
-Snapshotting periodically instead would be pure duplication of what the log
-already says: at roughly 50 bytes per entity, a megabase snapshot every ten
-seconds writes gigabytes an hour. A separate `save-timelapse-snapshot-seconds`
-runtime setting does exactly that anyway, independent of live capture, for
-exercising the export path during real play — but for a *repeating* export
-the freeze that's fine to accept once is not fine to accept every interval,
-so that path stays incremental (see below) rather than sharing the baseline's
-synchronous one.
+The Rust side finds a catch-up by scanning the session folder for
+`frame_<tick>_<surface>.stfr` files `baseline.json` does not name
+(`replay::discover_catch_up_baselines`), nothing else in a session folder being
+named that way. `replay::run`'s tick-ordered walk applies one
+(`World::load_baseline`) at the point its own tick is reached rather than
+eagerly, so the surface is absent from every frame before that tick and fully
+formed from it onward. Events logged for that surface before its catch-up tick
+(logging starts the instant it is included, the snapshot landing
+`BASELINE_WARNING_DELAY_TICKS` later) are dropped rather than deferred, the
+snapshot taken after them already reflecting what they did.
+
+Snapshotting periodically instead duplicates what the log already says: at
+roughly 50 bytes per entity, a megabase snapshot every ten seconds writes
+gigabytes an hour. The `save-timelapse-snapshot-seconds` runtime setting does
+exactly that anyway, independent of live capture, for exercising the export
+path during real play. It uses the incremental exporter rather than the
+baseline's synchronous one, a freeze that is fine once not being fine every
+interval.
 
 ### Event format
 
-Also a custom binary format (`<session>/events_<start_tick>.stev`), for the same reason
-as the frame format: this is written incrementally, live, as the player
-plays, so the cost of formatting and re-parsing text for every single
-construction event is a cost paid during real gameplay, not just at export
-time.
+Also a custom binary format (`<session>/events_<start_tick>.stev`), written
+incrementally as the player plays, so text formatting per construction event
+would be a cost paid during real gameplay.
 
-Unlike the frame format there is no upfront count of anything: the log is
-append only and grows for as long as capture stays on, so it is a plain
-forward stream of tagged records from the magic to whatever the last flush
-wrote.
+There is no upfront count of anything: the log is append only and grows for as
+long as capture stays on, a plain forward stream of tagged records from the
+magic to whatever the last flush wrote.
 
     magic   4 bytes, "STE1", written once when the segment is created
     version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
@@ -661,425 +646,355 @@ wrote.
       tag 7     ResetDictionaries (no payload, version 2 and later)
       tag >=128 Extension         varint len, then that many bytes
 
-`DefineName`/`DefineSurface` name dictionaries work the same way as the frame
-format's, just as two separate dictionaries sharing the same tagged stream
-(surfaces get their own tag, `1`, since a save has only a handful of planets
-and platforms, not worth spending a `DefineName`-sized dictionary entry
-alongside the much larger set of prototype names). `SetTick` is written once
-per distinct tick that has at least one event, rather than on every record,
-since many events (a blueprint landing hundreds of entities) usually share a
-tick; `control.lua` always writes one as the very first record of a fresh
-segment, so a reader never has to handle a data record before any tick is
-known.
+`DefineName`/`DefineSurface` work like the frame format's dictionaries, as two
+separate dictionaries sharing one tagged stream. Surfaces get their own tag, a
+save holding a handful of planets and platforms against a much larger set of
+prototype names. `SetTick` is written once per distinct tick that has an event
+rather than per record, a blueprint landing hundreds of entities in one tick;
+`control.lua` writes one as the first record of a fresh segment, so a reader
+never meets a data record before a tick.
 
-The version byte gives a reader the same "format I don't understand" signal
-the frame format's does, but there is deliberately no checksum trailer to
-go with it, unlike that format. A segment is append only and grows for as
-long as capture stays on, and is simply abandoned, not closed, when a
-rollover starts a new one (see the reload note below), so there is no
-"this segment is now finished" moment to checksum against without inventing
-one. `replay::run` already tolerates a segment that fails to open (skip and
-warn rather than aborting the whole replay, added for exactly this kind of
-partial/orphaned file), which covers what a checksum would otherwise be
-protecting against here.
+There is no checksum trailer here, unlike the frame format. A segment is
+abandoned rather than closed when a rollover starts a new one (see below), so
+there is no "finished" moment to checksum against. `replay::run` skips and
+warns on a segment that fails to open, which covers the same ground.
 
-Extension records work exactly as in the frame format, under the same rule
-and for the same reason (see "Format stability and the extension contract"
-above). They matter more here, though, because of how the old failure looked.
-An unrecognised tag used to fall through to `next` returning `None`, and an
-iterator reports `None` as end of stream, so a segment written by a newer mod
-did not error: the replay just stopped partway through and said nothing.
-`EventStream::unknown_extensions` counts what was stepped over instead, and
-`replay::run` sums it across segments so the difference is visible rather than
-silent.
+Extension records work as in the frame format, under the same rule. An
+unrecognised tag used to fall through to `next` returning `None`, which an
+iterator reports as end of stream, so a segment from a newer mod stopped the
+replay partway through silently. `EventStream::unknown_extensions` counts what
+was stepped over and `replay::run` sums it across segments.
 
-`id` on `AddEntity`/`RemoveEntity` uses `0` to mean "no id" (Factorio's
-`unit_number` is documented to start at 1, and `control.lua` already
-tolerates an entity with none). `RemoveEntity` always carries position, even
-when `id` is present too. The JSON-era format used to send id alone whenever
-one was available, on the reasoning that `unit_number` is unique game-wide
-and unambiguously locates the target. That reasoning had a hole: an entity
-that already existed when the baseline was taken has no id in replay's world
-state (a snapshot records no `unit_number`s), but Factorio still reports its
-*real* id, the one it was assigned whenever it was originally built, when
-that entity is later mined or destroyed. Replay had never registered that id
-anywhere, so the removal resolved nowhere and silently no-opped. The entity
-never disappeared from the replayed timeline. `id` is kept alongside position
-now as a fast-path hint rather than the only key: replay tries it first, and
-falls back to position when the id isn't one it recognizes (see "World state"
-below). The wire format now makes this structurally impossible to get wrong
-in the old way: there is no shape a `RemoveEntity` record can take that omits
-position, unlike the old JSON line where `id` alone was a valid message.
+`id` on `AddEntity`/`RemoveEntity` uses `0` for "no id", Factorio's
+`unit_number` starting at 1. **`RemoveEntity` always carries position, even
+with an id.** An entity present at baseline time has no id in replay's world
+state, a snapshot recording no `unit_number`s, but Factorio still reports its
+real id when it is later mined, so an id-only removal resolves nowhere and
+silently no-ops, leaving the entity in the replayed timeline forever. Replay
+tries the id first and falls back to position (see "World state" below), and no
+shape of `RemoveEntity` omits position.
 
-A segment file is resumed across a save reload: Factorio re-runs all of
-`capture.lua`'s top-level code on every load, which resets the in-memory name
-and surface dictionaries to empty while the file on disk keeps every
-`DefineName`/`DefineSurface` written before that point.
-
-This used to be documented here as harmless, on the reasoning that "a name
-defined twice just gets two ids that both resolve to the same string". That
-reasoning was wrong, and the bug it hid was severe. It holds only while the
-writer keeps counting up. Once the writer's dictionary resets it hands out id
-0 again, while the reader has been assigning ids by encounter order and is
-already past 0, so **every entity and tile logged after any reload decoded as
-whichever name happened to be defined first in that segment**. Nothing about
-the file looks damaged; the names are simply wrong.
+A segment file is resumed across a save reload. Factorio re-runs all of
+`capture.lua`'s top-level code on every load, resetting the in-memory name and
+surface dictionaries to empty while the file on disk keeps every
+`DefineName`/`DefineSurface` written before that point. The writer then hands
+out id 0 again while the reader, assigning ids by encounter order, is already
+past 0, so **every entity and tile logged after a reload decodes as whichever
+name was defined first in that segment.** Nothing about the file looks damaged.
 
 Event format version 2 fixes this with an explicit `ResetDictionaries` record
-(tag 7, no payload), written when a load resumes a segment already on disk.
-Both sides restart their ids from zero at that point. Version 1 files are
-still read, since captures in that format exist, but they carry the bug and
-nothing on the reading side can repair it: the record that would say where
-the reset happened is exactly what is missing.
+(tag 7, no payload), written when a load resumes a segment already on disk;
+both sides restart their ids from zero there. Version 1 files are still read
+and still carry the bug, the record saying where the reset happened being
+exactly what is missing.
 
-Persisting the dictionary in `storage` would not have worked, for the same
-reason the mod cannot detect a reload at all (below): `storage` rewinds with
-the save and would describe fewer names than the file already holds. Starting
-a fresh segment per load would not either, since every counter available to
-name that segment also lives in `storage`, so loading one save twice would
-reuse a filename and overwrite a sibling branch's history.
+Persisting the dictionary in `storage` would not work, for the same reason the
+mod cannot detect a reload at all (below): `storage` rewinds with the save and
+would describe fewer names than the file holds. A fresh segment per load would
+not either, every counter available to name it also living in `storage`, so
+loading one save twice reuses a filename and overwrites a sibling branch.
 
-### Why replay is forgiving
+### Replay tolerates events it cannot apply
 
-The baseline runs inside one tick, but that is not quite the same as being
-atomic with respect to every other event handler Factorio invokes during that
-same tick — a robot completing construction or a biter dying to a turret in
-the exact tick the baseline runs could in principle be logged as an event
-while also already reflected (or not) in what the baseline read. This window
-is now a single tick wide rather than the multi-minute one an incremental
-baseline would leave open, so in practice it is vanishingly rare, but replay
-does not depend on it never happening: an add for something already present,
-or a remove for something it never saw, are both no-ops rather than errors.
+An add for something already present, or a remove for something never seen, are
+no-ops rather than errors. The baseline runs inside one tick but is not atomic
+against every other handler Factorio invokes in that tick, so a robot finishing
+construction in exactly that tick can be both logged and already reflected in
+what the baseline read.
 
-That costs nothing and removes an entire class of edge case for free, so it
-stays even though the baseline it was originally built to cover no longer
-smears. `Replay::no_op_events` tracks the count: a trickle is normal, but a
-large fraction means the log and baseline came from different playthroughs.
+`Replay::no_op_events` counts them: a trickle is normal, a large fraction means
+the log and baseline came from different playthroughs.
 
 Events are applied in whole-tick batches, so a frame is never cut halfway
-through a tick — a blueprint landing 400 entities appears whole or not at all.
+through a tick and a blueprint landing 400 entities appears whole or not at
+all.
 
-A frame is also pinned to its own tick rather than to whenever the next event
-happens to arrive. The two only look the same when events are dense: across a
-gap (a long stretch of research or walking with nothing built), every frame
-boundary inside the gap has to be emitted before the event that ends the gap
-is folded into the world, or all of them render with that event's changes
-already visible, showing something built at the end of a gap as though it had
-been standing there since the start of it. `replay::run` therefore flushes up
-to the tick *before* each incoming event, not up to the batch it just applied.
+A frame is pinned to its own tick rather than to whenever the next event
+arrives. The two differ across a gap, a long stretch of research or walking
+with nothing built: every frame boundary inside the gap has to be emitted
+before the event that ends it is folded into the world, or all of them render
+with that event's changes visible, showing something built at the end of a gap
+as though it stood there from the start. `replay::run` flushes up to the tick
+*before* each incoming event, not up to the batch it just applied.
 
 ### Reloading an earlier save
 
 Going back in time is ordinary play: a player reloads to undo a mistake or
-recover from a biter breach.
+recover from a breach.
 
-**The mod cannot detect this at all.** Every version of `capture.lua` has had
-some form of "compare the tick play resumed at against the last tick we
-recorded, and roll over to a fresh segment if it went backwards". That check
-can never fire: both values come out of the save being loaded, since the
-recorded tick lives in `storage`, which Factorio serializes into the save
-file. A save made at tick T restores a recorded tick no greater than T while
-`game.tick` is exactly T, so the comparison is always false. Nothing else in
-the Lua sandbox helps, because anything durable enough to survive a load is
-also inside the save and rewinds with it.
+**The mod cannot detect it.** Both values a check would compare come out of the
+save being loaded, the recorded tick living in `storage`, which Factorio
+serializes into the save file: a save made at tick T restores a recorded tick
+no greater than T while `game.tick` is exactly T. Anything durable enough to
+survive a load rewinds with it, so the whole question is resolved on the
+reading side.
 
-So reloads are resolved entirely on the reading side, where the evidence
-actually exists: ticks that jump backwards *inside* one segment mark where a
-reload happened, and `event::segment_run_bounds` splits the segment there.
-The cross-segment machinery below still applies to the segments a capture does
-end up with, and the mod still cannot delete or truncate anything it abandoned — Factorio's Lua sandbox offers
-`write_file` and `remove_path` and nothing finer, and removing the file
-outright would also throw away the part of it that is still real history. So
-the abandoned file keeps its records for a future that, from the player's
-perspective, never happened, and bounding it is the Rust side's job.
+The mod also cannot delete or truncate the segment it abandoned, the Lua
+sandbox offering `write_file` and `remove_path` and nothing finer, and removing
+the file would throw away the part that is still real history. So the abandoned
+file keeps records for a future that never happened, and bounding it is the
+Rust side's job.
 
-`event::log_segments` does that. Each segment carries an `end_tick`, and
-events at or past it are dropped (counted as `Replay::superseded_events`,
-reported but deliberately not warned about: a nonzero count is just what a
-reloaded playthrough looks like when it replays correctly).
+`event::log_segments` does that. Each segment carries an `end_tick`, and events
+at or past it are dropped, counted as `Replay::superseded_events` and reported
+rather than warned about: a nonzero count is what a reloaded playthrough looks
+like replaying correctly.
 
-Two things make that bound correct. First, segments are ordered by **mtime,
-not by the tick in the filename**, because start tick stops being
-chronological the moment a playthrough reloads twice: reload from 5000 back to
-3000, play to 8000, then reload again back to 1000, and the segments were
-created in the order 0, 3000, 1000. Sorting those by tick replays the second
-reload's log before the first reload's, which is backwards. mtime recovers the
-real order, since a segment is appended to for exactly as long as it is the
-live one and is never touched again once a rollover abandons it, so segments
-finish being written in the same order they were created.
+Two things make the bound correct.
 
-Second, a segment ends at the **smallest** start tick among all segments
-created after it, not simply the next one's: in that same example the second
-reload reaches back past where the first reload's segment began, so it
-invalidates part of that segment too. A suffix minimum over the creation order
-expresses exactly that. It also keeps the returned segments in ascending tick
-order despite being sorted by mtime, since a segment's events all fall below
-its `end_tick`, which is at most the following segment's `start_tick`.
+Segments are ordered by **mtime, not by the tick in the filename**, start tick
+not being chronological once a playthrough reloads twice. A segment is appended
+to for exactly as long as it is the live one and never touched again after a
+rollover abandons it, so segments finish being written in creation order.
 
-Two segments sharing an mtime (a capture folder copied in a way that flattened
-its timestamps, or a filesystem too coarse to separate two rollovers) fall
-back to ascending start tick, then to the rollover sequence in the filename,
-which stitches them together with the overlaps trimmed. That is still strictly
-better than replaying the overlaps twice.
+A segment ends at the **smallest** start tick among all segments created after
+it, not the next one's, so a second reload reaching further back also
+invalidates part of the first reload's segment. A suffix minimum over the
+creation order expresses that, and also keeps the result in ascending tick
+order despite the mtime sort, since a segment's events all fall below its
+`end_tick`.
+
+Two segments sharing an mtime (a copied capture folder, or a filesystem too
+coarse to separate two rollovers) fall back to ascending start tick, then to
+the rollover sequence in the filename, stitching them together with overlaps
+trimmed.
 
 #### Reloading the *same* save twice
 
-Retrying something means loading the same save again, which resumes at exactly
-the tick the live segment already started at. Rollover used to be inferred
-downstream, by checking whether the tick play resumed at differed from the
-current segment's start; those are equal here, so it read as "no rollback" and
-the second attempt was appended straight onto the first attempt's records, in
-one file, with nothing marking the boundary, and that is simply how a reload
-looks: the mod cannot detect one (see above), so it never rolls over. What it
-does now announce is that its dictionaries were reset, which answers
-that question directly from the tick comparison that actually defines it, and
-`capture_segment_name` takes a rollover sequence so two segments starting at
-the same tick get different filenames (`events_<tick>_<seq>.stev`, with the
-suffix omitted at 0 so nothing that never reloaded changes name).
+Loading the same save again resumes at exactly the tick the live segment
+started at, so nothing distinguishes the second attempt from the first except
+that the ticks jump backwards where it begins. `capture_segment_name` takes a
+rollover sequence so two segments starting at the same tick get different
+filenames (`events_<tick>_<seq>.stev`, the suffix omitted at 0).
 
-Captures recorded before that fix still have both attempts in one file, so
-`event::segment_run_bounds` splits a segment into **append runs** at every
-point its ticks jump backwards, and bounds them by the same suffix minimum
-used across segments. That is the same rule one level down, and it is correct
-for the same reason: records within a file are in append order, which is real
-chronological order. A capture the fixed mod wrote always has exactly one run
-per segment, so the two mechanisms compose rather than overlapping.
+Captures recorded before that have both attempts in one file, so
+`event::segment_run_bounds` splits a segment into **append runs** wherever its
+ticks jump backwards and bounds them by the same suffix minimum used across
+segments: records within a file are in append order, which is chronological
+order. A capture the current mod writes has exactly one run per segment, so the
+two mechanisms compose rather than overlapping.
 
-`Replay::restarted_segments` counts files that held more than one run. It is
-kept separate from `superseded_events` because ticks jumping backwards inside
-one file is also, in principle, what a segment corrupted by deleting
-`script-output` by hand would look like, and the two are indistinguishable
-from the file alone. In practice that corruption produces a header-less file
-that fails to open outright (counted as `skipped_segments`), so treating a
-regression as a reload boundary is the reading that matches what players
-actually do.
+`Replay::restarted_segments` counts files holding more than one run, kept
+separate from `superseded_events` because a segment corrupted by deleting
+`script-output` by hand looks the same from the file alone. In practice that
+corruption produces a header-less file that fails to open outright, counted as
+`skipped_segments`.
 
-A session can also legitimately span more than one segment file (a save
-reload cannot roll over to a fresh one; see above), and the
-mod has no way to notice or clean up a segment orphaned by deleting capture
-files by hand without running `/timelapse-reset-capture` first: its next
-flush recreates the file via a plain append, with no magic header, under the
-same session tag the mod is still using. `replay::run` treats a segment that
-fails to open the same way it treats a bad baseline surface — a warning and
-a skip, not an aborted replay — so one broken segment costs only its own
-events rather than the whole session's.
+A session can legitimately span several segment files, and the mod cannot clean
+up one orphaned by deleting capture files by hand: its next flush recreates the
+file via a plain append with no magic header, under the same session tag.
+`replay::run` treats a segment that fails to open the way it treats a bad
+baseline surface, a warning and a skip, so one broken segment costs only its
+own events.
 
 ### Timer handlers share one on_nth_tick per interval
 
 Factorio keeps a single handler per `on_nth_tick` interval; registering a
-second one for the same interval silently replaces the first rather than
-erroring. The capture flush runs every 600 ticks (10 real seconds), and the
-independent `save-timelapse-snapshot-seconds` test setting is also given in
-seconds, so a value of 10 there collides with it by coincidence, not by doing
-anything unusual. `control.lua` collects every interval a setting wants into
-one table and chains handlers that share an interval, rather than each
-feature calling `on_nth_tick` for itself — see `sync_subscriptions` and
-`set_interval_handlers`.
+second for the same interval silently replaces the first rather than erroring.
+The capture flush runs every 600 ticks (10 seconds) and the independent
+`save-timelapse-snapshot-seconds` setting is also given in seconds, so a value
+of 10 there collides by coincidence. `control.lua` collects every interval a
+setting wants into one table and chains handlers sharing an interval, rather
+than each feature calling `on_nth_tick` for itself: see `sync_subscriptions`
+and `set_interval_handlers`.
 
-`on_tick` itself is not part of that scheme: the mod registers exactly one
-`on_tick` handler, unconditionally, which drives both the headless-scan export
-and the periodic test-snapshot's incremental stepper (`snapshot_step`) off two
-field checks. There is nothing to collide with, since nothing else in the mod
-wants `on_tick`.
+`on_tick` is outside that scheme. The mod registers exactly one, driving both
+the headless-scan export and the periodic snapshot's incremental stepper
+(`snapshot_step`) off two field checks, nothing else in the mod wanting
+`on_tick`.
 
-`snapshot_start`/`snapshot_step` (the incremental, multi-tick exporter) now
-has exactly one caller: the periodic `save-timelapse-snapshot-seconds` test
-setting. The baseline used to share it, but runs synchronously instead (see
-"Live capture and replay" above) — a single-tick export via `export_all_to`,
-the same function `/timelapse-export` and headless scan use.
+`snapshot_start`/`snapshot_step`, the incremental multi-tick exporter, has one
+caller: the periodic `save-timelapse-snapshot-seconds` setting. The baseline
+runs synchronously through `export_all_to` instead, the same function
+`/timelapse-export` and the headless scan use.
 
 ### World state
 
 Entities live in a slab with free-list reuse, indexed by position and by
-`unit_number`. Baseline entities are loaded with no `unit_number` (a snapshot
-records none), so they are never reachable by id no matter what id Factorio
-later reports removing them by — only position resolves them. Replay's
-removal handling reflects this: try `id` first (an O(1) hit for anything
-built after capture began, since its add event registered the same id),
-then fall back to position, which is what makes a baseline-original entity's
-removal work at all.
+`unit_number`. Baseline entities are loaded with no `unit_number`, a snapshot
+recording none, so they are reachable only by position whatever id Factorio
+later reports removing them by. Removal tries `id` first, an O(1) hit for
+anything built after capture began, then falls back to position.
 
 Position keys are scaled by **ten**, not two. Half-tile alignment covers most
 entities but not all: `frame_0000.stfr` holds a
 `logistic-train-stop-lamp-control` at x=326.9 beside its `logistic-train-stop`
-at x=327.0. Keying on half tiles merged them and silently dropped five of that
-frame's 240 entities. One decimal is exactly the precision positions are
-stored at on the wire (see "Frame format" above).
+at x=327.0, and keying on half tiles merges them, dropping five of that frame's
+240 entities. One decimal is the precision positions are stored at on the wire
+(see "Frame format" above).
+
+**A position holds two entities, not one.** Factorio lets two things occupy one
+position, and the pair that happens is a resource with something built on top.
+Keying by position alone means an `AddEntity` evicts the ore and the following
+`RemoveEntity` clears the position, so building across a patch eats it a tile
+at a time and mining the building back never returns it. `Surface::under` holds
+what a position had before something covered it, and removal promotes it back.
+
+A second layer rather than a list per position, the depth needed being two: a
+`Vec` per position allocates once per entity across hundreds of thousands of
+them to express something that almost never happens. A third arrival displaces
+whatever the second was hiding. Nothing in it knows what a resource is;
+covering and uncovering is the behaviour whatever the two things are.
+
+Only an exact key collision covers anything, so an even-sized building sits on
+a tile corner and covers nothing while an odd-sized one covers the single tile
+under its middle.
 
 ## What the tool remembers
 
 Four things, in plain JSON under the user's own config directory
-(`%APPDATA%\save-timelapse\settings.json` on Windows, the platform
-equivalent elsewhere): where Factorio's folder is, where its executable is,
-seconds per emitted frame, and whether to include natural terrain.
+(`%APPDATA%\save-timelapse\settings.json` on Windows, the platform equivalent
+elsewhere): where Factorio's folder is, where its executable is, seconds per
+emitted frame, and whether to include natural terrain.
 
-Beside the executable would have been the more obvious home for a tool that
-ships as a zip, and is exactly wrong: replacing the zip on update wipes it,
-which is when somebody least wants to redo their setup.
+Not beside the executable, which is the obvious home for a tool shipped as a
+zip and is exactly wrong: replacing the zip on update wipes it.
 
 Three rules keep it from becoming a liability:
 
-**Absent means never asked, not a default.** Every field is an `Option`. That
-distinction is what lets the first run explain itself once and never again,
-and it is why no field carries a baked-in value.
+**Absent means never asked, not a default.** Every field is an `Option`, which
+is what lets the first run explain itself once and never again, and why no
+field carries a baked-in value.
 
 **Remembered paths are validated, never trusted.** A Factorio folder that has
-since moved, been renamed, or lived on a drive that is not plugged in falls
-through to auto-detection rather than being handed downstream to fail
-confusingly later. The point of remembering it is to save the user work, not
-to invent a new way to waste it.
+moved, been renamed, or lives on a drive that is not plugged in falls through
+to auto-detection rather than failing confusingly downstream.
 
 **Nothing it does is fatal.** A missing file is the first run. A corrupt file
-is one warning and a fresh start, because a tool that refuses to launch until
-you find and delete a file you never knew about is worse than one that forgets
-your preferences. A failed write is a warning too: not remembering an answer
-costs one prompt next time, which is no reason to abandon a build.
+is one warning and a fresh start, a tool that refuses to launch until you
+delete a file you never knew about being worse than one that forgets your
+preferences. A failed write is a warning too, costing one prompt next time.
 
-Surface choice is deliberately **not** remembered. Which surfaces a capture
-has changes as a playthrough reaches new planets, so a remembered answer would
-quietly pick a stale one, and being shown the wrong world is more annoying than
-being asked. The terrain choice is remembered but still asked every time, since
-it is a real cost decision rather than a preference; what is remembered is only
-which way Enter goes.
+Surface choice is deliberately **not** remembered. Which surfaces a capture has
+changes as a playthrough reaches new planets, so a remembered answer picks a
+stale one. The terrain choice is remembered but still asked every time, being a
+cost decision rather than a preference; what is remembered is which way Enter
+goes.
 
 ## Tile reverts
 
 Removing a placed tile has to restore what it was covering. Mining landfill
-should put the water back, not leave a hole where a lake used to be.
+should put the water back.
 
-Neither side can work that out alone. `RemoveTile` carries only a position, and
-nothing on the reading side can recover what was underneath: a baseline taken
-while the landfill was already down never saw the water, so the information was
-never captured. The obvious fix, extending `RemoveTile` to carry the uncovered
-name, is a core layout change and therefore off the table after the version 3
-freeze.
+`RemoveTile` carries only a position, and nothing on the reading side can
+recover what was underneath: a baseline taken while the landfill was down never
+saw the water. Extending `RemoveTile` to carry the uncovered name is a core
+layout change and off the table after the version 3 freeze.
 
-The mod does it instead, and needs no new record type to. `on_player_mined_tile`
-and `on_robot_mined_tile` fire **after** the tiles have been replaced, so
-`capture.lua` reads `surface.get_tile` at that position and logs an ordinary
-`AddTile` for what is now there, immediately after the `RemoveTile`. Applied in
-order, the position ends up holding the revealed ground. The reader has never
-cared whether an `AddTile` names a placed floor or natural ground, so this is
-additive in the strongest sense: no format change, no version bump, and an
-older tool replaying a newer capture gets the fix for free.
+The mod does it instead, with no new record type. `on_player_mined_tile` and
+`on_robot_mined_tile` fire **after** the tiles are replaced, so `capture.lua`
+reads `surface.get_tile` at that position and logs an ordinary `AddTile` for
+what is now there, immediately after the `RemoveTile`. Applied in order, the
+position ends up holding the revealed ground. The reader has never cared
+whether an `AddTile` names placed floor or natural ground, so this needs no
+format change and an older tool replaying a newer capture gets it for free.
 
-Gated on the terrain capture setting, because that is precisely the opt-out it
-would otherwise violate. With terrain off the timelapse deliberately shows no
-natural ground, and uncovering a patch of water or grass under a removed tile
-would put some back.
+Gated on the terrain capture setting: with terrain off the timelapse shows no
+natural ground, and uncovering water under a removed tile would put some back.
 
 ## Only writing surfaces that changed
 
-An export used to write every surface at every frame. A playthrough only ever
-builds on one surface at a time, so the rest were re-serialized and re-written
-byte for byte unchanged. Measured on a real nine-surface Space Age capture over
-13 minutes of play, at the tool's 60s default: **86% of the files written were
-byte-identical to that surface's own previous file, and 93% of the bytes were.**
-Nauvis alone accounted for 219.7 MB of which 211.5 MB was duplication, because
-the player was on Gleba the whole time.
+A playthrough builds on one surface at a time, so writing every surface at
+every frame re-serializes the rest byte for byte unchanged. Measured on a real
+nine-surface Space Age capture over 13 minutes of play at the 60s default,
+**86% of files written were byte-identical to that surface's previous file, and
+93% of the bytes were**; nauvis alone accounted for 219.7 MB of which 211.5 MB
+was duplication, the player being on Gleba throughout.
 
-`World` therefore keeps a **per-surface revision counter**, bumped by every
-mutation that actually changes that surface and by nothing else, and
-`replay::write_all_surfaces` skips a surface whose revision matches the one it
-last wrote for it. A counter rather than a hash of the frame, because the whole
-point is never to materialise the frame: hashing to detect the duplicate would
-mean doing the expensive half of the work and then discarding it.
+`World` keeps a **per-surface revision counter**, bumped by every mutation that
+changes that surface and nothing else, and `replay::write_all_surfaces` skips a
+surface whose revision matches the one it last wrote. A counter rather than a
+hash of the frame, the point being never to materialise the frame: hashing to
+detect the duplicate means doing the expensive half of the work and discarding
+it.
 
-Precision matters more than it looks, since a spurious bump costs a whole
-redundant file. `Surface::insert` therefore checks whether an add lands on
-exactly what is already there and leaves the revision alone if so. Those are
-not rare: the baseline smear (a snapshot taken slightly after the events
-describing the same construction) produces them by design.
+A spurious bump costs a whole redundant file, so `Surface::insert` checks
+whether an add lands on exactly what is already there and leaves the revision
+alone if so. Those are not rare: the baseline smear, a snapshot taken slightly
+after the events describing the same construction, produces them by design.
 
 **The gap in the numbering is the record.** Files stay named
 `frame_<index>_<surface>.stfr` against a global frame index, so a surface that
-did not change simply has no file at that index. Nothing about the format or
-the naming changes and there is no sidecar to keep in sync. This is also not a
-new shape: `write_all_surfaces` has always skipped a surface with nothing on
-it, so the viewer already groups by surface into independently ordered
-timelines.
+did not change has no file at that index: no format change, no naming change,
+no sidecar to keep in sync. `write_all_surfaces` has always skipped a surface
+with nothing on it, so the viewer already groups by surface into independently
+ordered timelines.
 
 The viewer puts the omitted frames back. `loading::timeline_ticks` takes the
-union of every surface's ticks, which is the set of moments the export covers
-and cannot be read off any single surface, and the loader fills each surface's
-gaps against it with `SequenceBuilder::push_repeats`. That matters because
-`Timeline` is index-addressed: every surface has to agree on how many moments
-there were, or switching surfaces would scrub at a different rate.
+union of every surface's ticks, the set of moments the export covers and not
+readable off any single surface, and the loader fills each surface's gaps
+against it with `SequenceBuilder::push_repeats`. `Timeline` is
+index-addressed, so every surface has to agree on how many moments there were
+or switching surfaces would scrub at a different rate.
 
 Restoring a gap costs **one pass over what is standing per gap, not per
 frame**. Nothing changed across the gap by definition, so every span open when
 it started is still open when it ends and each one's `last` jumps straight to
-the far side. On a megabase surface idling through a long stretch that is one
-walk over ~900k spans instead of dozens. The frame itself was never written,
-never read and never parsed, so the load-time saving comes free with the disk
-one.
+the far side: on a megabase surface idling through a long stretch, one walk
+over ~900k spans instead of dozens. The frame itself was never written, read or
+parsed.
 
-`render_frame.rs` asserts the equivalence this all rests on: a sequence built
-with gaps and repeats is identical, index for index and tick for tick, to one
-built from an export that wrote every frame. Without that, the saving would be
-paid for with a subtly different timelapse.
+`render_frame.rs` asserts the equivalence this rests on: a sequence built with
+gaps and repeats is identical, index for index and tick for tick, to one built
+from an export that wrote every frame.
 
 ## Milestones
 
-Three moments worth marking on a timeline rather than watching for: the first
-time each science pack is produced, the first rocket launch, and each planet
-reached. Both capture paths produce the same `milestones.jsonl`
-(`{"tick":T,"kind":K,"id":I}` per line), so the viewer cannot tell which one
-built a given timelapse. They arrive by completely different routes, though,
-because the two paths have completely different evidence available.
+Three moments worth marking on a timeline: the first time each science pack is
+produced, the first rocket launch, and each planet reached. Both capture paths
+produce the same `milestones.jsonl` (`{"tick":T,"kind":K,"id":I}` per line), so
+the viewer cannot tell which one built a timelapse. They arrive by different
+routes, the two paths having different evidence available.
 
 ### Live capture watches them happen
 
 `mod/milestones.lua` polls on the capture flush that already runs every few
-seconds. Science is polled rather than evented because the game exposes no "an
-assembling machine finished an item" event (`on_player_crafted_item` covers
-hand crafting only, which is not how science gets made past the first hour), so
+seconds. Science is polled rather than evented, the game exposing no "an
+assembling machine finished an item" event: `on_player_crafted_item` covers
+hand crafting only, which is not how science gets made past the first hour, so
 production statistics are the only source. A planet counts as reached when a
-player is standing on a surface with `planet` set, swept over connected players
-rather than hooked to `on_player_changed_surface` alone, since nobody changes
-surface to arrive on Nauvis at the start. Every milestone fires once, tracked in
-`storage.timelapse_milestones`, which is a sibling of `storage.timelapse_capture`
-rather than nested inside it so that a capture reset wipes both together: the
-file recording them is deleted by that reset, and a survivor key would believe
-every milestone had already fired while the record of them was gone.
+player stands on a surface with `planet` set, swept over connected players
+rather than hooked to `on_player_changed_surface`, since nobody changes surface
+to arrive on Nauvis at the start.
+
+Every milestone fires once, tracked in `storage.timelapse_milestones`, a
+sibling of `storage.timelapse_capture` rather than nested inside it so a
+capture reset wipes both together. The reset deletes the file recording them,
+and a surviving key would believe every milestone had already fired.
 
 Ticks from this path are exact.
 
 ### From saves, they are recovered by comparison
 
-A save has no history of its own. It knows that a science pack has been
-produced, never when it first was. So the mod reports **state** rather than
-events: `export.milestone_state` collects the science packs with nonzero
-production, the inhabited planet surfaces, and `force.rockets_launched`, and
-`export_all_to` writes them into the per-save manifest it already produces.
-Riding in the manifest rather than a file of its own is deliberate, since it
-describes the same instant the manifest describes and every consumer that wants
-one wants the other; being JSON, an older reader ignores the field, which is
-what lets `baseline.json` carry it too without disturbing live capture.
+A save knows that a science pack has been produced, never when it first was, so
+the mod reports **state** rather than events: `export.milestone_state` collects
+the science packs with nonzero production, the inhabited planet surfaces, and
+`force.rockets_launched`, and `export_all_to` writes them into the per-save
+manifest. They ride in the manifest rather than a file of their own, describing
+the same instant it describes; being JSON, an older reader ignores the field,
+which is what lets `baseline.json` carry it too without disturbing live
+capture.
 
-`milestone::from_saves` then sorts the per-save states by tick and walks them,
+`milestone::from_saves` sorts the per-save states by tick and walks them,
 emitting a milestone the first time each id appears. Rockets are carried as a
-count rather than a flag precisely so that walk can distinguish a first launch
-from launches that had been happening before the earliest save.
+count rather than a flag so that walk can tell a first launch from launches
+already happening before the earliest save.
 
-Two consequences worth being explicit about, both inherent rather than
-implementation shortcomings:
+Two consequences, both inherent:
 
 **Precision is bounded by save cadence.** The earliest tick at which something
-can be *proved* to have happened is the tick of the first save reporting it, so
-that is the tick used. Interpolating between saves would invent a moment no
-evidence supports.
+can be proved to have happened is the tick of the first save reporting it, so
+that is the tick used.
 
 **An established base opens with a cluster.** Everything already true in the
-earliest save is emitted at that save's tick, because it genuinely happened at
-or before then. This matches what live capture does when switched on
-mid-playthrough, where the first poll records every pack already produced.
+earliest save is emitted at that save's tick, having genuinely happened at or
+before then. Live capture switched on mid-playthrough does the same, its first
+poll recording every pack already produced.
 
-"Planet reached" uses `is_inhabited` rather than mere surface existence,
-because the game creates a planet's surface before anybody goes there. That
-also keeps the marker honest against the timelapse it annotates: a surface only
-appears in frames once inhabited, so a planet is marked reached exactly when it
-starts being shown.
+"Planet reached" uses `is_inhabited` rather than surface existence, the game
+creating a planet's surface before anybody goes there. That also keeps the
+marker aligned with the timelapse: a surface appears in frames once inhabited,
+so a planet is marked reached exactly when it starts being shown.
 
 ## Rendering
 
@@ -1087,23 +1002,23 @@ The viewer converts each parsed `Frame` into a `RenderFrame` at load time and
 drops the parsed form. Two things happen in that conversion.
 
 **Names are interned.** A real base has tens of distinct prototype names
-against hundreds of thousands of entities (or millions of tiles on a fully
-paved one), so `TypeRegistry` maps each name to a `u16` once and resolves its
-color at the same time. Drawing then never hashes a name: the pre-registry
-loop called `color_for` (FNV over the name) and `sprites.get(&e.n)` (SipHash
-over the name) for every entity on every rendered frame. `Frame`'s `n` field
-is `Arc<str>` rather than `String` for the same reason, one level earlier:
-the wire format's own name dictionary (see `frame.rs`) means resolving a
-record's name during parsing only needs a refcount bump, not a fresh
-allocation and copy of one of those same ~58 repeated strings, which was the
-dominant cost of parsing a real megabase frame before it was changed.
+against hundreds of thousands of entities, or millions of tiles on a fully
+paved one, so `TypeRegistry` maps each name to a `u16` once and resolves both
+its colour and what it is at the same time (see What the game says about
+itself). Drawing then never hashes a name, where the pre-registry loop called
+`color_for` (FNV over the name) and `sprites.get(&e.n)` (SipHash over the name)
+per entity per frame. `Frame`'s `n` field is `Arc<str>` rather than `String` for
+the same reason one level earlier: the wire format's name dictionary means
+resolving a record's name during parsing is a refcount bump rather than a fresh
+allocation and copy of one of ~58 repeated strings, which dominated the cost of
+parsing a megabase frame.
 
-**Items are grouped into per-type runs**, by counting sort, so all entities of
-one type sit contiguously and a `Run` names the span. This is what keeps the
-GPU batch intact. macroquad merges geometry only into the *immediately
-preceding* draw call, and starts a new one whenever the bound texture changes
-(`quad_gl.rs::geometry`), so drawing in export order — which interleaves types
-— costs close to one draw call per entity. Untextured rects count as their own
+**Items are grouped into per-type runs** by counting sort, so all entities of
+one type sit contiguously and a `Run` names the span. That is what keeps the
+GPU batch intact: macroquad merges geometry only into the *immediately
+preceding* draw call and starts a new one whenever the bound texture changes
+(`quad_gl.rs::geometry`), so drawing in export order, which interleaves types,
+costs close to one draw call per entity. Untextured rects count as their own
 texture state, so mixing shapes and sprites breaks the batch the same way.
 
 Measured on `tests/fixtures/frames` with `cargo run -p viewer bin drawcalls`,
@@ -1116,49 +1031,136 @@ for fully-visible frames:
 The second lever is macroquad's batch capacity. Its default
 `draw_call_index_capacity` of 5,000 caps a draw call at 833 quads, so even
 perfectly sorted output pays a draw call per 833 items. The viewer raises it
-via `Conf`. That barely shows at fixture scale, where most runs are under 833
-anyway, but at 500,000 entities it is 606 draw calls against 126.
+via `Conf`: barely visible at fixture scale, where most runs are under 833, but
+at 500,000 entities it is 606 draw calls against 126.
 
-Capacity cannot go far higher: indices are `u16` and get offset by the running
+Capacity cannot go far higher. Indices are `u16` and get offset by the running
 vertex count, so vertex capacity above 65,536 corrupts geometry, and macroquad
 allocates one GPU buffer of this size per draw call it has ever used.
 
 `DrawCallCounter` models the batching rule above so the viewer can report its
-real draw-call count in the HUD. macroquad's own `telemetry::drawcalls` is not
-usable for this: `track_drawcall` allocates a 128x128 render texture per call.
+real draw-call count in the diagnostics overlay behind `F3` (see Viewer
+chrome). macroquad's own `telemetry::drawcalls` is not usable for this:
+`track_drawcall` allocates a 128x128 render texture per call.
 
 Culling happens in world space, before the world-to-screen transform, so a
 culled item costs two comparisons rather than a transform plus a screen-bounds
 test.
 
+## Viewer chrome
+
+Everything drawn on top of the world lives in `viewer/src/chrome.rs`. One rule
+decides what is allowed there: **an element earns its place by answering where
+am I, when am I, or what can I do.** Anything answering *how is the renderer
+doing* goes behind `F3`, which is where both diagnostic readouts live, along
+with `s` (sprites off) and `l` (LOD off): those are A/B tests for texture
+binding and per-item CPU cost, and pressing either by accident makes the
+factory render wrongly with no visible reason why.
+
+### Geometry is computed once and read twice
+
+`Chrome::layout` positions every chip and button once per frame. `draw` and
+`hit` both read those rects and neither recomputes anything, which is what
+keeps a control from drifting away from the region that activates it.
+
+Text width and window width are the only things layout needs from macroquad, so
+`Chrome::layout_with` takes them as arguments and `Chrome::layout` is a wrapper
+supplying them from the `Ui` and the window. That is what lets a test lay the
+chrome out and assert every rect answers a click at its centre.
+
+Layout runs *before* input is polled. Afterwards would test this frame's click
+against last frame's rects, which is invisible except on the frame a window is
+resized.
+
+### The font
+
+macroquad bundles exactly one face, ProggyClean, a bitmap font that works and
+looks it. Anything else has to be loaded, so `font_candidates` walks a chain:
+`ui-font.ttf` beside the executable, then the platform's own UI font (Segoe UI,
+or DejaVu and Liberation on Linux), then `None` for the built-in one.
+
+No font is committed. The system face is already on every machine and carries
+no redistribution obligation, and a release wanting one exact face can ship
+`ui-font.ttf` beside the binary without this code changing.
+
+### The active surface is a fill, not a brighter label
+
+Chrome is painted onto the rendered world, which is dark grass in one place and
+a white space platform in the next, so brightness is not a reliable signal: the
+gap between white and a dimmed label disappears over bright terrain. A filled
+pill paints its own ground and reads identically on both. Brightness is left to
+carry hover, where being wrong for one frame costs nothing.
+
+That also sets the weight of the inactive chips, the only dim thing painted
+onto the factory with no fill behind it: at the 55% used elsewhere they
+disappear over a screen of machine icons, so they sit at 72%, as bright as they
+can be while still losing to the active chip.
+
+Chips keep their natural order, reordering on every switch would rearrange the
+row under the cursor. Surfaces that do not fit collapse into a `+N more` chip,
+which matters beyond the five planets because a player can have arbitrarily
+many space platforms. The exception is an active surface that did not fit,
+swapped in for the last visible chip.
+
+### Transport controls sit in the gutters
+
+The bar is 60% of the window and centred (`Timeline::for_screen`), so the
+gutters either side are dead space. The column above the bar is not: the
+activity graph stands on it, the playhead label clears the graph, and the hover
+tooltip clears the label, all derived from each other so they move together.
+
+On a narrow window the left cluster degrades in tiers rather than overflowing:
+speed pill first, then the step buttons, leaving play alone. Everything dropped
+still has a keyboard equivalent, listed in the `?` panel.
+
+### Two ordering constraints in the draw loop
+
+**Surface switches take effect one frame later.** A click on a chip arrives
+while `worlds[current]` is still mutably borrowed by the loop body, so
+`apply_chrome_click` returns the index and the loop applies it at the top of
+the next iteration. That is 16ms and invisible.
+
+**A press on chrome is latched, not tested continuously.** `on_chrome` is set
+when the button goes down and read for the rest of the drag, so a drag starting
+on a control and wandering off it does not become a camera pan halfway through.
+
+### The controls panel shows itself once
+
+`first_run` writes a `seen-controls` marker beside the tool's own
+`settings.json`, and the `?` panel opens by itself the first time the viewer is
+run. Everything else here is on request, but a `?` in the corner only helps
+somebody who already suspects there is something to find.
+
+The marker is a sibling file rather than a field in `Settings`, which holds
+only answers a user would otherwise retype, and deleting it is an obvious way
+to get the panel back. A failed write leaves the panel appearing again next
+launch: one that reappears is a nuisance, one that never appears leaves a
+first-time viewer with nothing to go on.
+
 ## Loading
 
-Frames are parsed with the window already open, yielding to draw a progress
-bar roughly every 33ms. Without that the viewer shows an empty window for as
-long as parsing takes, which on a real save set is many seconds. The bar
-covers three phases: reading frames, converting them, and loading sprites,
-since sprites are loaded once up front rather than on first use — otherwise
-scrubbing stutters the first time a not-yet-seen type appears.
+Frames are parsed with the window already open, yielding to draw a progress bar
+roughly every 33ms. Without that the viewer shows an empty window for as long
+as parsing takes, many seconds on a real save set. The bar covers three phases:
+reading frames, converting them, and loading sprites. Sprites are loaded once
+up front rather than on first use, which would stutter scrubbing the first time
+a not-yet-seen type appears.
 
-Reading and parsing each `.stfr` file is independent work with nothing shared
-until conversion (which needs one consistently numbered `TypeRegistry` across
-every frame), so `ParallelFrameLoad` spreads it across every available CPU
-core instead of one file at a time. It runs on its own OS thread rather than
-blocking the caller, so the async render loop can keep polling and drawing
-the progress bar while it proceeds. Measured on a real ~300k-entity,
-3.1M-tile, 55-frame capture: parallel reading plus switching `Entity`/`Tile`
-names from `String` to `Arc<str>` (see "Rendering" above) took total load
-time from 47s to 20s.
+Reading and parsing each `.stfr` file is independent work, nothing being
+shared until conversion, which needs one consistently numbered `TypeRegistry`
+across every frame, so `ParallelFrameLoad` spreads it across every available
+CPU core. It runs on its own OS thread rather than blocking the caller, so the
+async render loop keeps polling and drawing the progress bar. Measured on a
+real ~300k entity, 3.1M tile, 55 frame capture: parallel reading plus switching
+`Entity`/`Tile` names from `String` to `Arc<str>` (see "Rendering" above) took
+total load time from 47s to 20s.
 
 **Multiple surfaces load as separate worlds.** `group_by_surface` splits a
-loaded batch by each frame's parsed `surface` field (not its filename) into
-one independently ordered timeline per surface, rather than collapsing to
-whichever is busiest the way a single sequence has to. This is what lets the
-viewer's `tab` key switch between worlds: the mod's raw baseline output
-already writes every surface at one tick, and `save-timelapse-replay
-all-surfaces` does the same across a whole timelapse. Each world keeps its
-own `Camera`, fitted to its own frames at load time, so switching to another
-world and back doesn't disturb either one's pan/zoom.
+loaded batch by each frame's parsed `surface` field, not its filename, into one
+independently ordered timeline per surface rather than collapsing to whichever
+is busiest. That is what the viewer's `tab` key switches between. Each world
+keeps its own `Camera`, fitted to its own frames at load time, so switching
+away and back does not disturb either one's pan and zoom.
 
 ## Exporting a video
 
@@ -1209,69 +1211,54 @@ catching, and a fixed-offset assertion sails straight past it.
 
 ### Which way up
 
-Video shipped upside down, and it took two agreeing fixes, which is worth
-recording because either alone just moves the flip.
+Row order has to be declared in two places and they have to agree; either one
+alone just moves the flip.
 
 A render target reads back bottom up, the way OpenGL stores it. macroquad's
-`Image::export_png` undoes that itself, so the PNG sequence was always right
-and the JPEG path, which touches `bytes` directly, was not. The other half is
-`biHeight` in the `BITMAPINFOHEADER`, which carries row order **in its sign**:
-positive means bottom up (the DIB convention, and the one written by
-accident), negative means top down. Declaring the truth is also the more
-compatible choice, since a player that ignores the sign treats MJPEG as top
-down anyway, so both kinds of player agree.
+`Image::export_png` undoes that itself, so the PNG sequence is right without
+help and the JPEG path, which touches `bytes` directly, reverses rows as it
+encodes. The other half is `biHeight` in the `BITMAPINFOHEADER`, which carries
+row order **in its sign**: positive means bottom up, the DIB convention;
+negative means top down, which is what these frames are. Declaring the truth is
+also the more compatible choice, a player that ignores the sign treating MJPEG
+as top down anyway.
 
 ### Full detail, supersampled
 
 An export renders at `N` times the requested size and averages down.
 
-The averaging is not cosmetic. At 1080p a 2,900 tile base puts about three
-tiles behind every output pixel, so at one sample per pixel whichever entity
-a pixel lands on wins it outright and the other two tiles are simply gone,
-and which one wins changes frame to frame as the camera creeps. A box filter
-is the correct kernel rather than merely the cheap one: the samples cover
-exactly one output pixel's area, so their unweighted mean *is* that pixel's
-coverage. Bicubic would be reaching outside the pixel to reconstruct a
-continuous signal, and the source is flat quads with hard edges.
+At 1080p a 2,900 tile base puts about three tiles behind every output pixel, so
+at one sample per pixel whichever entity a pixel lands on wins it outright and
+the other two tiles are gone, and which one wins changes frame to frame as the
+camera creeps. A box filter is the correct kernel rather than the cheap one:
+the samples cover exactly one output pixel's area, so their unweighted mean is
+that pixel's coverage. Bicubic would reconstruct a continuous signal, and the
+source is flat quads with hard edges.
 
-That in turn is what makes **chunk LOD wrong for an export**. LOD exists to
-keep a live frame rate up by not submitting items too small to perceive, and
-an export has no frame rate to protect: it renders one frame at a time, as
-slowly as it likes. What it was costing is real, since a cell keeps only its
-dominant type, so at these zooms a paved area swallowed every belt and
-machine running through it. Full detail is only sound *because* of
-supersampling, since at one sample per pixel the items it restores are
-sub-pixel and alias into speckle.
+That is also what makes **chunk LOD wrong for an export**. LOD keeps a live
+frame rate up by not submitting items too small to perceive, and an export has
+no frame rate to protect. A cell keeps only its dominant type, so at these
+zooms a paved area swallows every belt running through it. Full detail is sound
+only because of supersampling: at one sample per pixel the items it restores
+are sub-pixel and alias into speckle.
 
-Measured on a real 860k entity base, 41 frames at 1080p: 4x supersampling
-cost about 3% more wall clock than 2x, because the bottleneck is submitting
-entities rather than fill rate or the downsample. The shipped default is
-still 2, since a 7680x4320 readback is 132 MB per frame and that is not a
-thing to default to on hardware nobody has checked.
+Measured on a real 860k entity base, 41 frames at 1080p: 4x supersampling costs
+about 3% more wall clock than 2x, the bottleneck being entity submission rather
+than fill rate or the downsample. The default is 2, a 7680x4320 readback being
+132 MB per frame.
 
-### The bug that made all of this hard to see
+### Culling is against the render surface, not the window
 
-`view_bounds` culled against `screen_width()`/`screen_height()`, which are the
-**window's** dimensions. That is the same thing only while drawing to the
-window. An export renders into an offscreen target of whatever size was asked
-for, so culling to the window threw away everything outside a window-sized
-corner of it, and at the default 1280x800 window every 1080p export was
-silently cropped to its top-left two thirds.
+`view_bounds` derives the surface size from `screen_center * 2.0` rather than
+from `screen_width()`/`screen_height()`, which are the **window's**
+dimensions. Those are the same thing only while drawing to the window: an
+export renders into an offscreen target of whatever size was asked for, so
+culling to the window throws away everything outside a window-sized corner of
+it, cropping a 1080p export to its top-left two thirds at a 1280x800 window.
 
-It resisted diagnosis because it looks exactly like a framing problem, and
-framing is genuinely worth improving, so two rounds of camera work went past
-it. What settled it was numeric: two exports with deliberately different
-camera bounds produced byte-identical content boxes. Framing changes could
-not move the output because framing was never what was wrong.
-
-`view_bounds` now derives the surface size from `screen_center * 2.0`. Every
-caller already builds `screen_center` as exactly half the surface it is
+Every caller already builds `screen_center` as exactly half the surface it is
 drawing to, so it is the same number by a route that cannot go stale, and it
-takes the last window global out of the draw path. The lesson worth keeping
-is that a rendering bug deserves a measurement of the rendered pixels before
-any theory about the camera: a ten-line check of a PNG's non-background
-bounding box, and whether it touches an edge, would have found this
-immediately.
+takes the last window global out of the draw path.
 
 ## Concurrency
 

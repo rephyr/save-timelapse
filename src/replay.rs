@@ -1,32 +1,15 @@
 //! Reassembling a timeline from a baseline snapshot plus the event log.
 //!
-//! The capture directory the mod writes looks like this:
-//!
 //! ```text
-//! <session>/baseline.json                 tick + surfaces the original baseline covers
-//! <session>/frame_<tick>_<surface>.stfr   one per surface, that baseline itself
+//! <session>/baseline.json                 tick + surfaces the baseline covers
+//! <session>/frame_<tick>_<surface>.stfr   the baseline itself, one per surface
 //! <session>/events_<start_tick>.stev      append-only, one segment per timeline
 //! <session>/players.jsonl                 optional, sampled player positions
 //! ```
 //!
-//! A surface added to tracking after the original baseline already ran gets
-//! its own later `frame_<tick>_<surface>.stfr`, at its own tick, with no
-//! entry in `baseline.json` (which never changes after it's first written).
-//! `discover_catch_up_baselines` finds these by scanning rather than reading
-//! them out of the manifest; see [`CatchUpBaseline`].
-//!
-//! `<session>` (an 8-digit hex folder name) is which playthrough these files
-//! belong to (see mod/control.lua's `compute_session_id`): the capture
-//! folder is shared by every save that ever turns capture on, and
-//! `game.tick` restarts from 0 for each one, so a bare tick cannot tell two
-//! playthroughs' files apart, and a bare filename cannot tell two
-//! playthroughs' files apart either, but two playthroughs no longer share
-//! one directory to get confused in, since each gets its own.
-//!
-//! `<session>/baseline.json` is written last, so its presence means that
-//! playthrough's baseline finished. Replay loads it, seeds a [`World`], then
-//! walks that session folder's event segments forward, emitting a frame
-//! whenever enough ticks have passed.
+//! `baseline.json` is written last, so its presence means the baseline
+//! finished, and never changes after: a surface added to tracking later gets
+//! its own frame file with no entry in it, found by scanning.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,6 +26,11 @@ pub struct Baseline {
     pub tick: u64,
     #[serde(default)]
     pub entities: usize,
+    /// Only what somebody built, where `entities` also counts the trees, ore
+    /// and nests a capture keeps for context. Absent before the mod wrote it,
+    /// which falls back to `entities`.
+    #[serde(default)]
+    pub buildings: Option<usize>,
     #[serde(default)]
     pub tiles: usize,
     pub surfaces: Vec<String>,
@@ -52,12 +40,9 @@ pub struct Baseline {
     pub session_id: u32,
 }
 
-/// Parses a session's hex folder name (e.g. `00000001` in
-/// `save-timelapse/00000001/baseline.json`). `None` for anything else,
-/// including a `baseline.json` sitting directly in the shared top-level
-/// capture folder (every capture used that shape before playthroughs got
-/// their own folder), which is what makes such a leftover invisible to
-/// `discover_sessions` rather than ambiguous.
+/// Parses a session's hex folder name. `None` for anything else, including a
+/// `baseline.json` sitting directly in the shared capture folder, the shape
+/// every capture used before playthroughs got their own folders.
 fn parse_session_dir_name(path: &Path) -> Option<u32> {
     let name = path.file_name()?.to_str()?;
     if name.len() != 8 {
@@ -89,23 +74,16 @@ impl Baseline {
         Ok(baseline)
     }
 
-    /// The path of one of this baseline's per-surface snapshot files,
-    /// alongside it in the same session folder. Untagged: unlike the
-    /// pre-folder scheme, this never needed the session id in the filename
-    /// itself, since the folder already scopes it.
+    /// The path of one of this baseline's per-surface snapshot files.
+    /// Untagged, the session folder already scoping it.
     pub fn frame_path(&self, dir: &Path, surface: &str) -> PathBuf {
         dir.join(format!("frame_{}_{}.stfr", self.tick, surface))
     }
 }
 
-/// A surface added to tracking after the playthrough's original baseline
-/// already ran (see `mod/capture.lua`'s `M.on_surface_included`): an
-/// ordinary `frame_<tick>_<surface>.stfr` file, just written later and for
-/// a surface `baseline.json` doesn't name, with no manifest entry of its
-/// own. `baseline.json` never changes after it's first written, so this is
-/// how a session accumulates more than one baseline tick over its
-/// lifetime: found by scanning the session folder rather than reading it
-/// out of JSON.
+/// A surface added to tracking after the original baseline ran: an ordinary
+/// frame file for a surface `baseline.json` does not name. That manifest never
+/// changes, so this is how a session accumulates more than one baseline tick.
 #[derive(Debug)]
 struct CatchUpBaseline {
     tick: u64,
@@ -114,12 +92,10 @@ struct CatchUpBaseline {
 }
 
 impl CatchUpBaseline {
-    /// Parses a session folder entry the same way `viewer::loading::frame_is_candidate`
-    /// recognizes a frame file (duplicated, not shared: `viewer` depends on
-    /// this crate, not the other way around). Extension first, then a
-    /// `frame_` prefix, then split once on the first remaining underscore so
-    /// a surface name that itself contains one (a modded planet might)
-    /// survives intact in the second half.
+    /// Parses a session folder entry the way `viewer::loading::frame_is_candidate`
+    /// does, duplicated because `viewer` depends on this crate. Split once on
+    /// the first underscore after the index, so a surface name containing one
+    /// survives.
     fn from_path(path: &Path) -> Option<CatchUpBaseline> {
         if path.extension().and_then(|e| e.to_str()) != Some("stfr") {
             return None;
@@ -135,9 +111,8 @@ impl CatchUpBaseline {
         Some(CatchUpBaseline { tick: tick_part.parse().ok()?, surface: surface_part.to_string(), path: path.to_path_buf() })
     }
 
-    /// Actually reads and parses this catch-up's frame file. Deferred by
-    /// design until `run`'s tick-ordered walk actually reaches its tick,
-    /// since a session can accumulate several of these, each potentially as
+    /// Reads and parses this catch-up's frame file, deferred until `run`
+    /// reaches its tick: a session can accumulate several, each potentially as
     /// large as any other baseline surface.
     fn load(&self) -> io::Result<frame::Frame> {
         let bytes = std::fs::read(&self.path)?;
@@ -145,13 +120,9 @@ impl CatchUpBaseline {
     }
 }
 
-/// Every catch-up baseline in `dir`, ascending by tick: every
-/// `frame_<tick>_<surface>.stfr` file that isn't one of `baseline`'s own
-/// (the original set `load_baseline` already loads eagerly). Filtering by
-/// exact expected path, not by re-deriving and comparing a (tick, surface)
-/// pair, sidesteps needing the original set to ever agree with a filename
-/// parse at all: `baseline.frame_path` already builds each original path
-/// deterministically, so anything else matching the general frame shape is
+/// Every catch-up baseline in `dir`, ascending by tick. Filtered by exact
+/// expected path rather than by re-deriving a (tick, surface) pair, so anything
+/// matching the frame shape and not built by `baseline.frame_path` is
 /// definitionally a catch-up.
 fn discover_catch_up_baselines(dir: &Path, baseline: &Baseline) -> io::Result<Vec<CatchUpBaseline>> {
     let known: std::collections::HashSet<PathBuf> = baseline.surfaces.iter().map(|s| baseline.frame_path(dir, s)).collect();
@@ -179,18 +150,9 @@ pub struct Session {
 }
 
 impl Session {
-    /// A name the user gave this playthrough, if any.
-    ///
-    /// Stored as a plain `label.txt` inside the session folder rather than in
-    /// config somewhere else, so it travels with the capture it names: a
-    /// capture copied to another machine keeps its name, and one deleted (by
-    /// the tool here, or by `/timelapse-reset-capture` in game, which removes
-    /// the whole folder) takes its name with it rather than leaving an
-    /// orphaned entry behind.
-    ///
-    /// Unreadable or empty is the same as unset. There is nothing to
-    /// recover from a corrupt one-line text file, and a capture with no name
-    /// is the ordinary case anyway.
+    /// A name the user gave this playthrough, as a `label.txt` in the session
+    /// folder so it travels with the capture: copied elsewhere it keeps its
+    /// name, deleted it takes it along. Unreadable or empty is unset.
     pub fn label(&self) -> Option<String> {
         let text = std::fs::read_to_string(self.session_dir.join("label.txt")).ok()?;
         let trimmed = text.trim();
@@ -217,13 +179,9 @@ impl Session {
         )
     }
 
-    /// How much disk this capture occupies, for showing what deleting it
-    /// would actually free.
-    ///
-    /// Unreadable entries count as nothing rather than failing the whole
-    /// walk: a size shown next to a delete prompt is guidance, and refusing
-    /// to list a capture because one file inside it could not be stat'd
-    /// would be worse than showing a slightly low number.
+    /// How much disk this capture occupies, for showing what deleting it would
+    /// free. Unreadable entries count as nothing rather than failing the walk:
+    /// a slightly low number beats refusing to list the capture.
     pub fn size_on_disk(&self) -> u64 {
         fn walk(dir: &Path) -> u64 {
             let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
@@ -238,25 +196,17 @@ impl Session {
         walk(&self.session_dir)
     }
 
-    /// Permanently removes this playthrough's capture: baseline, event log,
-    /// player and milestone logs, and its name.
-    ///
-    /// Takes `self` by value because the session cannot be used afterwards,
-    /// so a caller holding a stale one is a compile error rather than a
-    /// runtime surprise.
+    /// Permanently removes this playthrough's capture. Takes `self` by value,
+    /// so holding a stale session is a compile error rather than a surprise.
     pub fn delete(self) -> io::Result<()> {
         std::fs::remove_dir_all(&self.session_dir)
     }
 }
 
-/// Every playthrough with a finished baseline among `dir`'s session
-/// subfolders, newest first.
-///
-/// "Newest" is the latest mtime among the baseline file and every one of
-/// that session's event segments, not just the baseline's own: the baseline
-/// is written once, at the very start of a playthrough's capture, so going
-/// by it alone would rank an old, still actively played session below a
-/// brand new one that simply hasn't logged much yet.
+/// Every playthrough with a finished baseline among `dir`'s session subfolders,
+/// newest first. "Newest" is the latest mtime among the baseline and every
+/// segment, not the baseline alone, which is written once at the start and
+/// would rank an actively played session below a quiet new one.
 pub fn discover_sessions(dir: &Path) -> io::Result<Vec<Session>> {
     let mut sessions = Vec::new();
     for entry in std::fs::read_dir(dir)?.filter_map(Result::ok) {
@@ -313,52 +263,37 @@ impl Default for Options {
 pub struct Replay {
     pub world: World,
     pub baseline: Baseline,
-    /// Events that changed nothing. A steady trickle is normal: it is the
-    /// baseline smear (see `world`) plus removals of entities filtered out of
-    /// snapshots. A large fraction suggests events and baseline disagree,
-    /// e.g. a log replayed against the wrong save.
+    /// Events that changed nothing. A steady trickle is the baseline smear
+    /// plus removals of entities filtered out of snapshots; a large fraction
+    /// suggests a log replayed against the wrong save.
     pub no_op_events: usize,
     pub applied_events: usize,
-    /// Segments skipped for failing to open (bad magic, unreadable). See the
-    /// warning already printed at the skip site in `run`. Never happens for
-    /// an uninterrupted capture; the documented cause is a stale-header
-    /// segment recreated after `script-output` files were deleted by hand
-    /// without running `/timelapse-reset-capture` first.
+    /// Segments skipped for failing to open. Never happens for an
+    /// uninterrupted capture; the documented cause is a stale-header segment
+    /// recreated after `script-output` was deleted by hand.
     pub skipped_segments: usize,
-    /// Batches whose tick was less than the highest tick already applied.
-    /// Never legitimate within one continuous capture: the same stale-header
-    /// segment that causes `skipped_segments` can also land within a
-    /// readable file, sharing tick territory with a real one.
+    /// Batches whose tick was below the highest already applied, never
+    /// legitimate within one continuous capture: a stale-header segment can
+    /// land within a readable file, sharing tick territory with a real one.
     pub out_of_order_batches: usize,
     /// Events dropped for belonging to a timeline the player reloaded away
-    /// from (see `event::Segment`'s `end_tick`). Unlike every other counter
-    /// here this is not a health signal: any nonzero value just means the
-    /// playthrough was reloaded from an earlier save at some point, and
-    /// dropping these is what makes the replay match what actually happened.
+    /// from. Not a health signal: any nonzero value means the playthrough was
+    /// reloaded, and dropping these is what makes the replay match reality.
     pub superseded_events: usize,
-    /// Segments holding more than one append run (see
-    /// `event::segment_run_bounds`): a capture recorded before the mod
-    /// started rolling over on a same-save-twice reload, so one file holds
-    /// two attempts at the same stretch of play. Split and bounded rather
-    /// than replayed on top of each other. Kept as its own counter because
-    /// this shape is also, in principle, what a segment corrupted by
-    /// deleting `script-output` by hand would look like, and the two are
-    /// indistinguishable from the file alone.
+    /// Segments holding more than one append run: a capture predating the
+    /// same-save-twice rollover fix. Its own counter because a segment
+    /// corrupted by hand-deleting `script-output` looks identical.
     pub restarted_segments: usize,
-    /// Records stepped over because their tag postdates this build (see the
-    /// extension contract in `event.rs`). Not a health signal and not
-    /// corruption: it means the mod writing the capture is newer than the
-    /// tool reading it, and the replay is correct as far as it goes but is
-    /// missing whatever those records described.
+    /// Records stepped over because their tag postdates this build. Not
+    /// corruption: the mod writing the capture is newer than the tool reading
+    /// it, and the replay is correct as far as it goes.
     pub unknown_extensions: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
     pending_catch_ups: Vec<CatchUpBaseline>,
-    /// How many catch-up baselines `run` actually applied. Orthogonal to
-    /// `applied_events`/`no_op_events`/`out_of_order_batches`: loading a
-    /// baseline is not an event, exactly like the original baseline's own
-    /// load in `load_baseline` never touches those counters either.
+    /// How many catch-up baselines `run` applied. Orthogonal to the event
+    /// counters, loading a baseline not being an event.
     pub catch_ups_applied: usize,
 }
 
@@ -374,6 +309,13 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
 
     let mut world = World::new();
+    // Before any baseline, since both splits happen as the baseline arrives.
+    // Absent for every capture older than the file, which falls back to the
+    // built-in lists (see `world::is_placed_floor`, `world::is_known_resource`).
+    if let Some(prototypes) = crate::prototypes::read(dir) {
+        world.set_resources(prototypes.resource_names());
+        world.set_floor(prototypes.floor);
+    }
     let mut loaded = 0;
     for path in &paths {
         let bytes = match std::fs::read(path) {
@@ -427,28 +369,18 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
     })
 }
 
-/// Every surface the baseline, a pending catch-up baseline, or the event log
-/// ever names, for offering a complete choice of surfaces before running the
-/// (much more expensive) replay itself. The baseline alone is not enough: a
-/// Space Age planet visited for the first time after capture already started
-/// gets no baseline entry (the baseline is taken once, at the start of a
-/// playthrough's capture), but its own construction events still name it, so
-/// scanning the event log too is what makes it choosable at all instead of
-/// only ever appearing already lumped into "every surface". A surface with a
-/// catch-up baseline but no events of its own yet (included, then nothing
-/// built there before capture stopped) would otherwise be invisible to both
-/// checks, so `replay.pending_catch_ups` is checked directly too.
+/// Every surface the baseline, a pending catch-up, or the event log names, for
+/// offering a complete choice before the expensive replay. The baseline alone
+/// is not enough: a planet first visited after capture started has no entry but
+/// its events name it, and a surface with a catch-up and no events yet is
+/// invisible to both.
 pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<String>> {
     let mut surfaces: std::collections::BTreeSet<String> = replay.world.surface_names().into_iter().map(String::from).collect();
     surfaces.extend(replay.pending_catch_ups.iter().map(|c| c.surface.clone()));
 
-    // Bounded exactly the way `run` bounds them, per append run and not just
-    // per segment, so a surface that exists only in a timeline the player
-    // reloaded away from is not offered as a choice that would then replay to
-    // an empty timelapse. Bounding by `segment.end_tick` alone missed that:
-    // reloads land inside a segment rather than starting a new one (see
-    // `event::segment_run_bounds`), so the per-run bound is the one that
-    // actually fires.
+    // Bounded per append run rather than per segment, so a surface existing
+    // only in a timeline the player reloaded away from is not offered. Reloads
+    // land inside a segment, so the per-run bound is the one that fires.
     for segment in event::log_segments(session_dir)? {
         let run_bounds = event::segment_run_bounds(&segment.path, segment.end_tick).unwrap_or_default();
         if let Ok(stream) = event::stream_log(&segment.path) {
@@ -469,19 +401,13 @@ pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<
     Ok(surfaces.into_iter().collect())
 }
 
-/// Walk the event log forward, calling `emit` with the world at each frame
-/// boundary. Events are applied in whole-tick groups, so a frame is never cut
-/// halfway through a tick's changes: a blueprint landing 400 entities on one
-/// tick shows up whole or not at all. Each frame shows the world as of its own
-/// tick, including across a long gap with no events in it (see the
-/// `flush_until` call below), and a segment superseded by a reload to an
-/// earlier save is bounded rather than replayed (see [`event::Segment`]).
+/// Walk the event log forward, calling `emit` at each frame boundary. Events
+/// apply in whole-tick groups, so a blueprint landing 400 entities shows up
+/// whole or not at all.
 ///
-/// `emit` receives the tick rather than a materialised frame so the caller
-/// decides what to do with the world: write every surface, one surface, or
-/// just measure. `dir` must be one playthrough's own session folder (a
-/// [`Session`]'s `session_dir`), not the shared top-level capture directory:
-/// every segment in it is walked, with nothing left to scope by session.
+/// `emit` receives the tick rather than a materialised frame, so the caller
+/// decides what to do with the world. `dir` must be one playthrough's session
+/// folder.
 pub fn run<F>(replay: &mut Replay, dir: &Path, options: &Options, mut emit: F) -> io::Result<usize>
 where
     F: FnMut(&World, u64),
@@ -499,14 +425,9 @@ where
     };
 
     for segment in event::log_segments(dir)? {
-        // A session can legitimately span more than one segment (a save
-        // reset starts a fresh one), and
-        // the mod has no way to notice or clean up an orphaned segment left
-        // behind by deleting capture files without running
-        // `/timelapse-reset-capture` first (its next flush recreates one via
-        // a plain append, with no magic header, under the same session tag).
-        // One bad segment losing its own events is a much smaller problem
-        // than it sinking replay of an otherwise complete session.
+        // A session can span several segments, and the mod cannot clean up one
+        // orphaned by deleting capture files by hand. One bad segment losing
+        // its own events beats it sinking the rest of the session.
         let mut stream = match event::stream_log(&segment.path) {
             Ok(stream) => stream,
             Err(e) => {
@@ -516,13 +437,9 @@ where
             }
         };
 
-        // One bound per append run (see `event::segment_run_bounds`). A
-        // capture written by the current mod always has exactly one run per
-        // segment; more than one means this file was recorded before the
-        // same-save-twice rollover fix and holds two attempts at the same
-        // stretch of play. A scan that fails leaves the segment on its own
-        // single bound, which is what it had before runs were considered at
-        // all, rather than dropping the segment.
+        // One bound per append run: more than one means the file predates the
+        // same-save-twice rollover fix. A failed scan leaves the segment on
+        // its single bound rather than dropping it.
         let run_bounds = event::segment_run_bounds(&segment.path, segment.end_tick).unwrap_or_default();
         if run_bounds.len() > 1 {
             replay.restarted_segments += 1;
@@ -534,22 +451,17 @@ where
         let mut pending_tick = None;
 
         for logged in &mut stream {
-            // Which append run this record belongs to, tracked over every
-            // record the file holds rather than only the kept ones: a run
-            // boundary is a fact about append order, so skipping a record
-            // must not change where the next boundary is seen.
+            // Tracked over every record rather than only the kept ones: a run
+            // boundary is a fact about append order, so skipping a record must
+            // not move it.
             if previous_tick.is_some_and(|p| logged.tick < p) {
                 run += 1;
             }
             previous_tick = Some(logged.tick);
 
-            // Events at or past this run's bound describe a timeline the
-            // player reloaded away from (see `event::Segment` for the reload
-            // that starts a new file, `event::segment_run_bounds` for the one
-            // that used to continue the same file). Skipped one by one rather
-            // than breaking out of the stream, since what follows a
-            // superseded stretch is the replacement for it, not the end of
-            // the useful data.
+            // Events at or past this run's bound describe a timeline reloaded
+            // away from. Skipped one by one rather than breaking out: what
+            // follows is the replacement, not the end of the useful data.
             let bound = run_bounds.get(run).copied().unwrap_or(segment.end_tick);
             if logged.tick >= bound {
                 replay.superseded_events += 1;
@@ -559,59 +471,33 @@ where
             if logged.tick < replay.baseline.tick {
                 continue;
             }
-            // Same idea, per surface: the mod starts logging a surface's
-            // events the instant it's included, but its catch-up snapshot
-            // itself isn't captured until BASELINE_WARNING_DELAY_TICKS later
-            // (mod/capture.lua), so a handful of real events can be logged
-            // for a tick earlier than the surface's own baseline. Whatever
-            // they did is already reflected in that later snapshot, so they
-            // must not also apply, or it would double count.
+            // Same per surface: the mod logs a surface's events the instant it
+            // is included, but its catch-up snapshot is not taken until
+            // BASELINE_WARNING_DELAY_TICKS later, and already reflects them.
             if pending_catch_up_tick(&replay.pending_catch_ups, &logged.surface).is_some_and(|t| logged.tick < t) {
                 continue;
             }
 
-            // A surface can go long stretches with no events at all before a
-            // catch-up (that's the whole point: it was excluded, so nothing
-            // was being logged for it). Left to the ordinary per-tick
-            // batching below, a catch-up would only ever get applied (via
-            // flush_until's own internal apply_due_catch_ups) once some
-            // *later* event's batch happens to trigger a flush, by which
-            // point that later event has already been applied to the world
-            // too, making every frame across that whole gap retroactively
-            // show it, including ones chronologically before the catch-up's
-            // own tick. Explicitly flushing up through each due catch-up's
-            // tick first, before this event ever gets folded into `pending`,
-            // is what keeps frames before it clean.
+            // Left to the per-tick batching, a catch-up would only apply once
+            // some later event triggered a flush, by which point that event is
+            // in the world too and every frame across the gap shows it.
             while replay.pending_catch_ups.first().is_some_and(|c| c.tick <= logged.tick) {
                 let catch_up_tick = replay.pending_catch_ups[0].tick;
                 apply_batch(replay, &mut pending);
                 pending_tick = None;
                 flush_until(replay, catch_up_tick, &mut next_emit, &mut emitted);
-                // flush_until's own internal apply_due_catch_ups call only
-                // fires when an interval checkpoint lands at or past this
-                // tick, and a coarse interval can overshoot it in a single
-                // jump, never landing on or after it within *this* call.
-                // Applying it directly guarantees it actually happens
-                // (a no-op if flush_until's own call already did), which is
-                // also what keeps this loop from spinning forever on a
-                // catch-up flush_until never gets around to.
+                // `flush_until`'s own call only fires when a checkpoint lands
+                // at or past this tick, which a coarse interval can overshoot.
+                // Applying directly also keeps this loop from spinning.
                 apply_due_catch_ups(replay, catch_up_tick);
             }
 
             if pending_tick != Some(logged.tick) {
                 apply_batch(replay, &mut pending);
-                // Flush every boundary strictly before this new tick, not
-                // just up to the batch just applied. Those two only look
-                // equivalent when events are dense: across a gap (a long
-                // stretch of research or walking with nothing built) the
-                // boundaries inside it would otherwise stay unflushed until
-                // whatever event ends the gap had already been folded into
-                // the world, and each one would then render with that
-                // event's changes already visible, showing something built
-                // at the end of the gap as though it had been there from the
-                // start of it. Bounding the flush by the incoming tick
-                // instead pins every frame in the gap to the world as it
-                // stood while the gap was happening.
+                // Boundaries strictly before this tick, not just up to the
+                // batch applied: across a gap they would otherwise stay
+                // unflushed until the event ending it was already in the
+                // world, showing it as present from the gap's start.
                 flush_until(replay, logged.tick.saturating_sub(1), &mut next_emit, &mut emitted);
                 pending_tick = Some(logged.tick);
             }
@@ -628,10 +514,9 @@ where
         }
     }
 
-    // Every catch-up still outstanding at this point has no later event to
-    // trigger it, but a completed catch-up file is genuinely part of "the
-    // base as it actually was" by the time capture stopped, so it still
-    // belongs in the final frame below.
+    // A catch-up still outstanding has no later event to trigger it, but a
+    // completed file is genuinely part of the base as it was when capture
+    // stopped.
     apply_due_catch_ups(replay, u64::MAX);
 
     // Always land a final frame on the finished world, so the timelapse ends
@@ -645,11 +530,9 @@ where
     Ok(emitted)
 }
 
-/// The tick `surface`'s own catch-up baseline is scheduled for, if it still
-/// has one outstanding. See `run`'s use of this: whether `surface`'s entry
-/// has already been applied to `world` by the time a given event is checked
-/// does not matter here, this only answers "is there a tick this surface's
-/// events must not predate."
+/// The tick `surface`'s catch-up baseline is scheduled for, if still
+/// outstanding. Only answers "is there a tick this surface's events must not
+/// predate"; whether it has been applied yet does not matter here.
 fn pending_catch_up_tick(pending: &[CatchUpBaseline], surface: &str) -> Option<u64> {
     pending.iter().find(|c| c.surface == surface).map(|c| c.tick)
 }
@@ -685,31 +568,16 @@ fn apply_due_catch_ups(replay: &mut Replay, tick: u64) {
     }
 }
 
-/// Writes every surface `world` has at `tick`, one `.stfr` file each, named
-/// `frame_<index>_<surface>.stfr`, the same shape the mod's own baseline
-/// output uses, and what `viewer::group_by_surface` expects in order to show
-/// more than one world. A surface with nothing on it at this tick (not yet
-/// built, or already abandoned) is skipped rather than writing an empty
-/// file.
+/// Writes every surface `world` has at `tick`, one file each, in the shape the
+/// mod's own baseline output uses. A surface with nothing on it is skipped.
 ///
-/// Used by `save-timelapse.exe`'s live-capture flow when the user asks for
-/// every surface rather than picking one busiest.
+/// A surface unchanged since its last written frame is skipped too, which is
+/// where nearly all of a multi-surface export's output went. Callers keep
+/// `written`, mapping surface to last written revision, across the run.
 ///
-/// **A surface unchanged since its own last written frame is skipped too**,
-/// which is where nearly all of a multi-surface export's output went. Callers
-/// keep `written`, mapping surface name to the revision last written for it,
-/// across the whole run; it starts empty and this updates it.
-///
-/// That leaves gaps in a surface's indices, which is not a new situation:
-/// the "nothing on it" skip above has always produced them, so the viewer
-/// already groups by surface into independently ordered timelines. A gap
-/// means "unchanged since the last file present", and
-/// `viewer::loading::group_by_surface` expands it back out. Nothing about
-/// the file format or the naming changes, and the gap itself is the record,
-/// so there is no sidecar to keep in sync.
-///
-/// Returns how many files were actually written, so a caller can report the
-/// saving rather than implying every surface was output.
+/// The gaps that leaves are not new, the "nothing on it" skip having always
+/// produced them, and `viewer::loading::group_by_surface` expands them back
+/// out. The gap is the record, so there is no sidecar to keep in sync.
 pub fn write_all_surfaces(
     world: &World,
     tick: u64,
@@ -724,18 +592,11 @@ pub fn write_all_surfaces(
             None => continue,
         };
 
-        // The saving this exists for. Every surface used to be written at
-        // every frame, but a playthrough only ever builds on one surface at a
-        // time, so the rest were re-serialized and re-written unchanged. On a
-        // real nine-surface capture that was 93% of the bytes.
-        //
-        // Compared against this surface's own last written revision rather
-        // than a global one: "did anything change anywhere" is near always
-        // true on a multi-surface save and would skip nothing at all.
-        //
-        // Checked before `to_frame`, which is the point: materialising the
-        // frame to discover it is unchanged would still pay the expensive
-        // half of the work.
+        // On a real nine-surface capture, re-writing unchanged surfaces was
+        // 93% of the bytes. Against this surface's own last revision, not a
+        // global one: "did anything change anywhere" is near always true.
+        // Checked before `to_frame`, materialising a frame to discover it is
+        // unchanged being the expensive half.
         if written.get(surface) == Some(&revision) {
             continue;
         }
@@ -752,14 +613,9 @@ pub fn write_all_surfaces(
     Ok(files)
 }
 
-/// Writes `surface_name`'s natural-terrain layer to `terrain_<surface>.stfr`
-/// in `out`, once. Unlike `write_all_surfaces`, this is not called per
-/// emitted frame: terrain is fixed the instant the baseline loads (see
-/// `World::terrain_frame`), so one call right after loading the baseline
-/// covers the whole replay. Skipped, not an error, when there is no terrain
-/// to write (terrain capture was off, or this came from an older capture),
-/// so `terrain_<surface>.stfr`'s mere presence tells the viewer whether
-/// terrain is available.
+/// Writes `surface_name`'s terrain layer, once: terrain is fixed the instant
+/// the baseline loads. Skipped rather than an error when there is none, so the
+/// file's presence tells the viewer whether terrain is available.
 pub fn write_terrain(world: &World, surface_name: &str, tick: u64, out: &Path) -> io::Result<()> {
     let frame = world.terrain_frame(surface_name, tick);
     if frame.tiles.is_empty() {
@@ -806,28 +662,16 @@ fn apply_batch(replay: &mut Replay, pending: &mut Vec<LoggedEvent>) {
 mod idle_study {
     use super::*;
 
-    /// Reports how much of an export is frames identical to the one before
-    /// them.
-    ///
-    /// Ignored and environment driven so it never runs in CI and no local
-    /// path is ever committed:
+    /// Reports how much of an export is frames identical to the one before.
     ///
     /// ```text
-    /// SAVE_TIMELAPSE_CAPTURE='<...>/script-output/save-timelapse/<session>' \
+    /// SAVE_TIMELAPSE_CAPTURE='<...>/save-timelapse/<session>' \
     ///   cargo test --lib measure_unchanged_frames -- --ignored --nocapture
     /// ```
     ///
-    /// `SAVE_TIMELAPSE_FRAME_SECONDS` overrides the 60 seconds of game time
-    /// per frame the tool defaults to. Worth sweeping, because the ratio
-    /// moves with it in the obvious direction: the coarser the interval, the
-    /// more chance each frame has of containing at least one change, so a
-    /// fine interval flatters this optimization and a coarse one buries it.
-    ///
-    /// Measures per surface, because that is what an export writes: one file
-    /// per surface per frame. A global "did anything change anywhere" check
-    /// is near always true on a multi-surface save and would report almost no
-    /// duplication while 86% of the files written were byte-identical to that
-    /// surface's own previous one.
+    /// `SAVE_TIMELAPSE_FRAME_SECONDS` overrides the 60 seconds per frame, worth
+    /// sweeping: a coarse interval gives each frame more chance of containing a
+    /// change. Measured per surface, a global check being near always true.
     #[test]
     #[ignore]
     fn measure_unchanged_frames() {
@@ -842,16 +686,10 @@ mod idle_study {
 
         let options = Options { interval: frame_seconds * 60, max_frames: 100_000 };
 
-        // Every surface, because that is what an export writes: one file per
-        // surface per frame (`replay::write_all_surfaces`). Measuring a single
-        // surface understates the opportunity badly on a multi-surface save,
-        // where most surfaces sit idle while one is being worked on.
-        //
-        // Serialized for real rather than estimated: the question is how many
-        // bytes an export actually writes, and `write_binary` decides that.
-        // The comparison skips the 8 byte tick at offset 5 and the 4 byte
-        // trailing checksum, which is precisely "same surface, same entities,
-        // same tiles, different moment".
+        // Every surface, because that is what an export writes; measuring one
+        // understates it badly. Serialized for real rather than estimated, the
+        // question being bytes actually written. The comparison skips the tick
+        // and checksum, which is "same contents, different moment".
         let mut totals = vec![(0usize, 0usize, 0usize); surfaces.len()]; // files, bytes, duplicate files
         let mut duplicate_bytes = vec![0usize; surfaces.len()];
         let mut previous: Vec<Option<Vec<u8>>> = vec![None; surfaces.len()];
@@ -896,12 +734,9 @@ mod idle_study {
         println!("  applied events {}  no-op {}", replay.applied_events, replay.no_op_events);
     }
 
-    /// What the export actually writes, against what it would have written
-    /// before a surface could be skipped.
-    ///
-    /// Runs the real `write_all_surfaces` into a scratch directory rather
-    /// than a model of it, so this measures the shipped path and not an idea
-    /// of it. Same environment variables as the study above.
+    /// What the export writes against what it would have written before a
+    /// surface could be skipped. Runs the real `write_all_surfaces` into a
+    /// scratch directory, so this measures the shipped path.
     #[test]
     #[ignore]
     fn measure_export_size() {
@@ -942,21 +777,38 @@ mod idle_study {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::set_mtime_rank;
     use crate::wire::ByteWriter;
     use std::collections::HashMap;
     use std::fs;
-    use std::time::SystemTime;
 
     /// The session id every test capture uses, as both the raw value and the
     /// hex name its session folder carries.
     const TEST_SESSION: u32 = 1;
     const TEST_SESSION_HEX: &str = "00000001";
 
-    /// Builds a capture directory containing one session subfolder, plus the
-    /// path to its baseline manifest inside that folder, since `load_baseline`
-    /// takes that path directly rather than a directory to search. Callers
-    /// needing the session folder itself (to pass to `run`, or to write more
-    /// segments into) get it via `baseline_path.parent()`.
+    /// `buildings` is what a capture recorded by this mod carries and every
+    /// older one does not, and the picker shows one or the other.
+    #[test]
+    fn a_baseline_reports_its_building_count_when_it_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join(TEST_SESSION_HEX);
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("baseline.json");
+
+        fs::write(&path, r#"{"tick":100,"entities":900,"buildings":120,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
+        let told = Baseline::read_at(&path).unwrap();
+        assert_eq!(told.buildings, Some(120), "the trees and ore are not buildings");
+        assert_eq!(told.entities, 900);
+
+        fs::write(&path, r#"{"tick":100,"entities":900,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
+        let silent = Baseline::read_at(&path).unwrap();
+        assert_eq!(silent.buildings, None, "an older capture says nothing and falls back to the total");
+    }
+
+    /// A capture directory with one session subfolder, plus the path to its
+    /// baseline manifest, `load_baseline` taking that path rather than a
+    /// directory. Callers needing the folder use `baseline_path.parent()`.
     fn capture_dir() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join(TEST_SESSION_HEX);
@@ -972,10 +824,8 @@ mod tests {
         (dir, baseline_path)
     }
 
-    /// Builds one `events_<session>_<tick>.stev` segment's bytes, tracking
-    /// its name and surface dictionaries so a test reads as a sequence of
-    /// events rather than a manual byte layout, the way the real writer
-    /// builds it while logging as play happens.
+    /// Builds one segment's bytes, tracking its dictionaries so a test reads as
+    /// a sequence of events rather than a manual byte layout.
     struct TestLog {
         w: ByteWriter,
         names: HashMap<String, u16>,
@@ -1043,16 +893,6 @@ mod tests {
         }
     }
 
-    /// Stamps a segment's mtime, which is how `event::log_segments` recovers
-    /// the order segments were created in: higher `rank` means created later.
-    /// Set it explicitly wherever a test depends on that order, since writing
-    /// two files back to back does not reliably give them distinguishable
-    /// mtimes. See `event::tests::set_mtime_rank`, which this mirrors.
-    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
-        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
-        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
-    }
-
     #[test]
     fn a_missing_manifest_explains_what_it_means() {
         let dir = tempfile::tempdir().unwrap();
@@ -1081,11 +921,8 @@ mod tests {
         assert!(err.to_string().contains("/timelapse-reset-capture"), "got: {err}");
     }
 
-    /// The bug this guards against: a planet visited for the first time after
-    /// capture already started has no baseline entry (the baseline is taken
-    /// once, at the start of a playthrough's capture), so the surface list
-    /// shown before running the replay must also check the event log, not
-    /// just the baseline the world was seeded from.
+    /// A planet first visited after capture started has no baseline entry, so
+    /// the surface list shown before the replay must check the event log.
     #[test]
     fn discover_surfaces_includes_a_surface_that_only_appears_in_events() {
         let (dir, baseline_path) = capture_dir();
@@ -1179,12 +1016,8 @@ mod tests {
         earlier.tick(200).add_entity("nauvis", "pipe", 1.5, 0.5, 0);
         earlier.write(session_dir, "events_200.stev");
 
-        // Written to the directory newest first above, but played in the
-        // other order: the tick-200 segment is the one capture started with,
-        // and the tick-9000 one is where play resumed after a reload later
-        // on. Stamped rather than inferred, since which segment came first is
-        // exactly what ordering depends on and a bare write order would be
-        // asserting the opposite of the truth here.
+        // Written newest first but played in the other order. Stamped rather
+        // than inferred, write order asserting the opposite of the truth.
         set_mtime_rank(session_dir, "events_200.stev", 0);
         set_mtime_rank(session_dir, "events_9000.stev", 1);
 
@@ -1339,13 +1172,9 @@ mod tests {
         assert_eq!(sessions[0].session_id, 2, "the more recently modified session sorts first");
     }
 
-    /// A real failure mode: clearing script-output by hand without running
-    /// `/timelapse-reset-capture` first leaves the mod believing its current
-    /// segment is already initialized, so the next flush recreates it via a
-    /// plain append with no magic header, alongside whatever segment the
-    /// mod starts fresh with afterward, in the same session folder. One
-    /// orphaned, unreadable segment must not sink replay of the rest of that
-    /// session.
+    /// Clearing script-output by hand leaves the mod believing its segment is
+    /// initialized, so the next flush recreates it via a plain append with no
+    /// magic header. One orphaned segment must not sink the rest.
     #[test]
     fn run_skips_an_unreadable_segment_and_still_replays_the_rest_of_the_session() {
         let (dir, baseline_path) = capture_dir();
@@ -1365,25 +1194,13 @@ mod tests {
         let _dir = dir;
     }
 
-    /// Ticks going backwards inside one segment file, which is what a
-    /// capture recorded before the mod's same-save-twice rollover fix looks
-    /// like: reloading the same save resumed at exactly the tick the live
-    /// segment started at, the old rollover check read that as "no
-    /// rollback", and the second attempt was appended onto the first
-    /// attempt's records in the same file.
+    /// Ticks going backwards inside one segment, which is what a capture from
+    /// before the same-save-twice rollover fix looks like: the second attempt
+    /// was appended onto the first.
     ///
-    /// Read as a run boundary rather than as damage: the tick-500 pipe
-    /// belongs to the attempt that was reloaded away from, so it is
-    /// superseded, and only the tick-200 belt from the second attempt
-    /// survives. This used to be counted as an out-of-order batch and
-    /// applied anyway, which left both attempts' entities in the world at
-    /// once.
-    ///
-    /// The same shape could in principle come from a segment corrupted by
-    /// deleting `script-output` by hand, which is indistinguishable from the
-    /// file alone (though that normally produces a header-less file that
-    /// fails to open outright, counted as `skipped_segments` instead). That
-    /// is what `restarted_segments` stays visible for.
+    /// Read as a run boundary rather than damage, so only the second attempt
+    /// survives. A segment corrupted by hand-deleting `script-output` could
+    /// look the same, which is what `restarted_segments` stays visible for.
     #[test]
     fn ticks_regressing_inside_one_segment_supersede_the_attempt_before_them() {
         let (dir, baseline_path) = capture_dir();
@@ -1404,12 +1221,9 @@ mod tests {
         let _dir = dir;
     }
 
-    /// The whole point of splitting a segment into runs: the second attempt
-    /// replaces the first rather than piling on top of it. Both attempts
-    /// build at the same tick and the same spot, so a replay that applied
-    /// both would still end with one entity there and look fine; the
-    /// distinct position built only in the abandoned attempt is what makes
-    /// the difference observable.
+    /// The second attempt replaces the first. Both build at the same tick and
+    /// spot, so a replay applying both would still look fine; the position
+    /// built only in the abandoned attempt is what makes it observable.
     #[test]
     fn a_same_save_reload_inside_one_segment_does_not_leak_the_abandoned_attempt() {
         let (dir, baseline_path) = capture_dir();
@@ -1437,21 +1251,10 @@ mod tests {
         let _dir = dir;
     }
 
-    /// The cross-segment half of reload handling: the
-    /// player reloads an older save mid playthrough. `ensure_capture_segment`
-    /// reacts by starting a fresh segment at the tick play resumed from, but
-    /// the OLD segment is simply abandoned on disk (control.lua has no API to
-    /// delete or truncate it), so it still contains events for ticks beyond
-    /// the reload point describing a future that, from the player's
-    /// perspective, never actually happened.
-    ///
-    /// `events_100.stev` here plays out as if the player never reloaded:
-    /// something real at tick 200, then an assembling machine at tick 4000
-    /// that only exists in that abandoned future. `events_3000.stev` is what
-    /// the player actually did after reloading their tick-3000 save: build a
-    /// second belt at tick 3500. A correct replay must never show the
-    /// assembling machine, at any tick, since the reload erased it before it
-    /// was ever built for real.
+    /// The cross-segment half of reload handling: a fresh segment starts at
+    /// the resumed tick while the old one is abandoned on disk, still holding
+    /// events for a future that never happened. The assembling machine must
+    /// never show, at any tick.
     #[test]
     fn a_reload_to_an_earlier_save_must_not_leak_the_abandoned_futures_events() {
         let (dir, baseline_path) = capture_dir();
@@ -1478,10 +1281,9 @@ mod tests {
         })
         .unwrap();
 
-        // The real timeline: the baseline's pipe alone until the belt lands
-        // at tick 200, both of them until the post-reload belt lands at 3500,
-        // all three after that. The assembling machine the reload erased has
-        // no tick at which it may appear.
+        // The real timeline: the baseline's pipe until the belt lands at 200,
+        // both until the post-reload belt at 3500, all three after. The
+        // erased assembling machine has no tick at which it may appear.
         for &(tick, count) in &seen {
             let expected = if tick < 200 {
                 1
@@ -1502,19 +1304,9 @@ mod tests {
         let _dir = dir;
     }
 
-    /// Two reloads, the second reaching further back than the first, which is
-    /// the case start-tick ordering cannot express: the segment created last
-    /// (`events_500`) has the middle start tick of the three, so ordering by
-    /// tick would replay it before `events_1000` and let the first reload's
-    /// abandoned events land on top of the second reload's real ones.
-    ///
-    /// Played from tick 0 and built a belt at 300. Reloaded to tick 1000,
-    /// built an assembling machine at 1500. Reloaded again, further back, to
-    /// tick 500, and built a chemical plant at 800. Only the belt (before
-    /// every reload point) and the chemical plant (after the last one) are
-    /// real; the assembling machine belongs to a timeline erased by the
-    /// second reload, and the original segment's own tick-2000 furnace was
-    /// erased by the first.
+    /// Two reloads, the second reaching further back, which start-tick ordering
+    /// cannot express: the segment created last has the middle start tick. Only
+    /// the belt and the chemical plant are real.
     #[test]
     fn a_second_reload_reaching_further_back_supersedes_the_first_reloads_events() {
         let (dir, baseline_path) = capture_dir();
@@ -1552,11 +1344,9 @@ mod tests {
         let _dir = dir;
     }
 
-    /// Nothing to do with reloads: a plain forward capture where the player
-    /// built something, idled a long time (researching, running around), then
-    /// built again. Every frame boundary in that gap must show the world as
-    /// it stood at that boundary, not the world as it stood once the gap
-    /// ended.
+    /// Nothing to do with reloads: a forward capture with a long idle gap.
+    /// Every boundary in that gap must show the world as it stood then, not as
+    /// it stood once the gap ended.
     #[test]
     fn frames_in_a_gap_between_events_show_the_state_at_their_own_tick() {
         let (dir, baseline_path) = capture_dir();
@@ -1584,10 +1374,9 @@ mod tests {
         let _dir = dir;
     }
 
-    /// Writes a hand-built catch-up baseline frame directly into a session
-    /// folder, the same shape `M.export_surfaces_to` (mod/export.lua)
-    /// produces: an ordinary frame_<tick>_<surface>.stfr with no manifest
-    /// entry of its own.
+    /// Writes a hand-built catch-up baseline into a session folder, the shape
+    /// `M.export_surfaces_to` produces: an ordinary frame file with no manifest
+    /// entry.
     fn write_catch_up_frame(session_dir: &Path, tick: u64, surface: &str, entities: Vec<frame::Entity>) {
         let out = frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
         fs::write(session_dir.join(format!("frame_{tick}_{surface}.stfr")), frame::write_binary(&out)).unwrap();
@@ -1758,11 +1547,9 @@ mod tests {
         assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
     }
 
-    /// The saving itself. A playthrough only ever builds on one surface at a
-    /// time, so on a real nine-surface capture 93% of the bytes written were
-    /// a surface being re-serialized unchanged. Only what moved gets written
-    /// now, and the gap it leaves in that surface's indices is the record
-    /// that it did not.
+    /// The saving itself: on a real nine-surface capture 93% of the bytes were
+    /// a surface re-serialized unchanged. The gap left in that surface's
+    /// indices is the record that it did not change.
     #[test]
     fn an_unchanged_surface_is_not_written_again() {
         let entity = |x: f32, y: f32| crate::frame::Entity { n: "pipe".into(), x, y, d: 0, w: 1, h: 1 };
@@ -1812,11 +1599,9 @@ mod tests {
         );
     }
 
-    /// A re-add of exactly what is already there must not count as a change.
-    /// The baseline smear produces these by design (a snapshot taken just
-    /// after the events describing the same construction), so treating one as
-    /// a change would write a duplicate file for every surface every time it
-    /// happened.
+    /// A re-add of exactly what is there must not count as a change: the
+    /// baseline smear produces these by design, so treating one as a change
+    /// would write a duplicate file for every surface every time.
     #[test]
     fn re_adding_an_identical_entity_does_not_force_a_write() {
         let mut world = crate::world::World::new();

@@ -1,99 +1,57 @@
-//! Tracking how much of the base has ever been built, so the camera can
-//! follow it: a monotonically growing bounding box over every entity that
-//! has appeared in any frame so far, extended (never shrunk) as the base
-//! grows.
+//! Tracking how much of the base has ever been built, so the camera can follow
+//! it: a bounding box over every entity seen so far, extended and never shrunk.
 //!
-//! This mirrors TLBE (the most-downloaded Factorio timelapse mod)'s own
-//! "base" tracker, which extends its tracked area on every new entity built
-//! and never shrinks it back down when something is later removed, so the
-//! camera gradually zooms out to keep the whole factory in frame as it
-//! grows, rather than chasing individual build sites around the map. A
-//! smarter, more targeted follow mode (favoring wherever's currently being
-//! built, or wherever the player is) is a real possibility for later, but
-//! this simpler whole-base version is the one that actually matches the
-//! reference this was asked to match.
+//! Mirrors TLBE's own "base" tracker, so the camera zooms out to keep the
+//! factory in frame rather than chasing individual build sites.
 //!
-//! Entities only, deliberately unlike `Camera::fit_frames`'s initial static
-//! view, which also considers tiles: TLBE's own tracker reacts only to
-//! entities being built, never to tiles, and tiles here include natural
-//! terrain (when terrain capture is on) covering a margin around the base,
-//! rendered for context, not something the player built. Including it would
-//! make "how much has been built" track how much of the map has been
-//! revealed instead, holding the camera on a wide, mostly-empty view instead
-//! of the actual buildings.
-//!
-//! Trees and cliffs are excluded for the same reason, even though they're
-//! entities, not tiles: with terrain capture on they're decorative scatter
-//! covering that same margin, naturally spread across a wide area
-//! independent of anything the player placed (see
-//! `registry::is_terrain_scatter`). Resource deposits (ore, oil) are
-//! excluded for the same reason again: with include-resources on, a
-//! resource sits wherever the map generated it, and a distant oil field can
-//! pull the tracked area out toward it just as easily as a distant tree (see
-//! `registry::is_resource`).
-//!
-//! Enemy nests and worm turrets are excluded for that same reason a third
-//! time (see `registry::is_enemy`). They are kept in the capture because
-//! they are stationary, so the format represents them honestly and clearing
-//! them is worth watching, but a spawner sits wherever the map generated it,
-//! exactly like a tree or an ore patch. Counting them was the worst case of
-//! the three: nests cover every generated chunk in every direction, so the
-//! tracked box spanned the whole explored map rather than the factory, and
-//! since the box's midpoint is what the camera centers on, it centered on
-//! the middle of the revealed map instead of on anything built.
+//! Entities only, unlike `Camera::fit_frames`'s initial view: tiles include
+//! natural terrain covering a margin around the base, so counting them would
+//! track how much of the map has been revealed. Trees, cliffs, resources,
+//! nests and worms are excluded for the same reason despite being entities:
+//! all of them sit wherever the map generated them, and nests cover every
+//! generated chunk in every direction.
 //!
 //! ## Not everything built is worth aiming at
 //!
-//! Excluding what the map generated is necessary and turned out not to be
-//! sufficient, because the remaining offenders are genuinely player built.
-//! Measured on a real 860k entity megabase, the four entities defining the
-//! box were a gun turret, two stone walls and a rail chain signal: the
-//! *defended perimeter and the rail outposts*, enclosing a great deal of
-//! land nobody built anything on. The factory filled well under half of the
-//! resulting frame, and no amount of filtering by prototype fixes that,
-//! since a wall is exactly as player built as an assembling machine.
+//! Excluding what the map generated is not sufficient, because the remaining
+//! offenders are genuinely player built. On a real 860k entity megabase the
+//! four entities defining the box were a gun turret, two stone walls and a
+//! rail chain signal: the defended perimeter and rail outposts, enclosing a
+//! great deal of empty land. No filtering by prototype fixes that, a wall
+//! being exactly as player built as an assembler.
 //!
-//! So the box is taken over where the buildings actually *are*, not over
-//! their extremes. Entity counts go into a per-axis histogram of chunk-sized
-//! bins, and each end is walked inward while the entities given up stay
-//! inside a small budget. That is deliberately not a percentile filter with
-//! extra steps: the point is that **empty bins are free**, so the walk
-//! crosses the whole gap between a perimeter and the factory at no cost and
-//! halts the instant it meets real density. A thin wall line is affordable;
-//! the first genuine factory bin never is.
+//! So the box is taken over where the buildings are, not over their extremes.
+//! Counts go into a per-axis histogram of chunk-sized bins, and each end walks
+//! inward while what it gives up stays inside a small budget. Not a percentile
+//! filter with extra steps: **empty bins are free**, so the walk crosses the
+//! gap between a perimeter and the factory at no cost and halts at the first
+//! real density.
 //!
-//! Being per axis rather than per cell is what keeps a real second base
-//! safe. A cell-by-cell density threshold would have to decide whether a
-//! remote outpost is dense enough to keep, and would get it wrong in both
-//! directions. Projecting onto each axis asks only how much is standing
-//! beyond a given line, and a second base is far too much to give up
-//! whatever its shape.
+//! Per axis rather than per cell is what keeps a real second base safe. A
+//! per-cell threshold would have to decide whether a remote outpost is dense
+//! enough to keep; projecting onto each axis only asks how much is standing
+//! beyond a line, and a second base is far too much to give up.
 
 use macroquad::math::Vec2;
 
-use crate::registry::{is_enemy, is_resource, is_terrain_scatter, is_vehicle, TypeRegistry};
+use crate::registry::TypeRegistry;
 use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame};
 
-/// Side of one bin in the density histograms, in tiles. A Factorio chunk,
-/// the granularity the rest of the viewer already thinks in (see
-/// `LOD_CELL_TILES`) and comfortably larger than any single building, so no
-/// one machine straddles enough bins to matter.
+/// Side of one histogram bin, in tiles. A Factorio chunk, which the rest of
+/// the viewer already thinks in and is comfortably larger than any single
+/// building.
 const DENSITY_BIN_TILES: f32 = 32.0;
 
-/// How much of what is standing may be trimmed off each end of each axis
-/// before the box is taken, as a fraction of everything counted.
+/// How much of what is standing may be trimmed off each end of each axis,
+/// as a fraction of everything counted.
 ///
-/// Half a percent per side sounds timid and is not, because **empty bins
-/// cost nothing to trim**. The walk inward stops at the first bin it cannot
-/// afford, so it crosses the entire empty gap between a perimeter and the
-/// factory for free and halts the moment it reaches real density. What the
-/// budget actually has to cover is only the thin outlying structure itself.
+/// Half a percent per side is not timid, because empty bins cost nothing to
+/// trim: the walk crosses the entire gap between a perimeter and the factory
+/// for free, so the budget only has to cover the thin outlying structure.
 ///
-/// Measured against a real 860k entity megabase: its wall line holds about
-/// 3,100 entities against a 4,300 budget, so the perimeter is trimmed and
-/// the first genuine factory bin (thousands in one bin) stops the walk
-/// immediately. Raising this much further would start eating factory, and
-/// there is no need: the gap, not the budget, is what does the work.
+/// On a real 860k entity megabase the wall line holds about 3,100 entities
+/// against a 4,300 budget, and the first genuine factory bin holds thousands
+/// in one bin, which stops the walk immediately.
 const DENSITY_TRIM: f32 = 0.005;
 
 /// A world-space box: a center and half-extent, the shape `Camera::fit_bounds`
@@ -104,31 +62,23 @@ pub struct GrowingBounds {
     pub half_extent: Vec2,
 }
 
-/// Everything in one frame that counts as construction: not terrain
-/// scatter, not a resource deposit, not an enemy structure (see the module
-/// doc comment). Filtering per *run* rather than per entity is why this is
-/// cheap enough to walk twice below: a run is a whole contiguous span of one
-/// prototype, so the name test happens tens of times per frame rather than
-/// hundreds of thousands.
+/// Everything in one frame that counts as construction. Filtered per run
+/// rather than per entity, so the test happens tens of times per frame rather
+/// than hundreds of thousands, which is what makes walking twice affordable.
 fn counted<'a>(frame: &'a RenderFrame, registry: &'a TypeRegistry) -> impl Iterator<Item = &'a RenderEntity> + 'a {
     frame
         .entity_runs
         .iter()
-        .filter(move |run| {
-            let name = registry.name(run.type_id);
-            !is_terrain_scatter(name) && !is_resource(name) && !is_enemy(name) && !is_vehicle(name)
-        })
+        .filter(move |run| registry.is_built(run.type_id))
         .flat_map(move |run| frame.entities[run.range()].iter())
 }
 
-/// First and last surviving bin, after trimming up to `budget` items off
-/// each end. Stops at the first bin it cannot afford, so a run of empty
-/// bins is crossed for free and dense ones halt it immediately.
+/// First and last surviving bin after trimming up to `budget` off each end.
+/// Stops at the first bin it cannot afford.
 ///
-/// The two walks share a budget each rather than one between them, since
-/// they are answering the same question independently at opposite ends, and
-/// neither may cross the other: a frame holding nothing but outliers keeps
-/// its whole range rather than inverting into an empty box.
+/// The two walks get a budget each rather than sharing one, answering the same
+/// question independently at opposite ends, and neither may cross the other: a
+/// frame of nothing but outliers keeps its whole range rather than inverting.
 fn trim_ends(bins: &[u32], budget: u32) -> (usize, usize) {
     let (mut lo, mut hi) = (0usize, bins.len() - 1);
 
@@ -147,15 +97,13 @@ fn trim_ends(bins: &[u32], budget: u32) -> (usize, usize) {
     (lo, hi)
 }
 
-/// The box worth aiming a camera at for one frame, which is not the same as
-/// the box containing everything built (see the module doc comment). `None`
-/// for a frame with nothing built yet.
+/// The box worth aiming a camera at for one frame, which is not the box
+/// containing everything built. `None` for a frame with nothing built.
 ///
-/// Two passes over the frame's entities: the raw extent has to be known
-/// before there is anywhere to put bins, and the total has to be known
-/// before a fraction of it means anything. A hash map keyed by bin index
-/// would fold them into one pass and be slower, since hashing every entity
-/// costs more than reading them a second time in order.
+/// Two passes: the raw extent has to be known before there is anywhere to put
+/// bins, and the total before a fraction of it means anything. A hash map
+/// keyed by bin would fold them into one and be slower, hashing every entity
+/// costing more than a second ordered read.
 fn frame_bounds(frame: &RenderFrame, registry: &TypeRegistry) -> Option<(Vec2, Vec2)> {
     let mut extent: Option<(Vec2, Vec2)> = None;
     let mut total: u32 = 0;
@@ -201,23 +149,19 @@ fn union_min_max(a: (Vec2, Vec2), b: (Vec2, Vec2)) -> (Vec2, Vec2) {
 }
 
 /// The bounding box of everything built by each frame, unioned with every
-/// prior frame's box so it only ever grows. See the module doc comment.
-/// One entry per frame; `None` only for a leading run of frames with
-/// nothing built yet.
+/// prior frame's so it only grows. One entry per frame; `None` only for a
+/// leading run with nothing built.
 ///
-/// Precomputed once here, across the whole sequence, rather than during
-/// playback, for the same reason the chunk-LOD pass in `render_frame.rs` is:
-/// this is O(total entities across the whole sequence) done once at load,
-/// not redone on every step of playback.
+/// Precomputed across the whole sequence at load rather than during playback:
+/// O(total entities) once, not redone on every step.
 pub fn growing_bounds_per_frame(frames: &FrameSequence, registry: &TypeRegistry) -> Vec<Option<GrowingBounds>> {
     let mut result = Vec::with_capacity(frames.len());
     let mut running: Option<(Vec2, Vec2)> = None;
     frames.for_each_frame(|_, frame, repeat| {
-        // A repeat holds exactly what the previous frame held, so its box is
-        // the box already running and unioning it in cannot move it. Skipping
-        // the scan is the whole saving: on a long capture most frames are
-        // repeats, and each one otherwise walks every entity on the surface
-        // to rediscover a box it already has.
+        // A repeat holds what the previous frame held, so its box cannot move
+        // the one already running. On a long capture most frames are repeats,
+        // and each would otherwise walk every entity to rediscover a box it
+        // already has.
         if !repeat {
             running = match (running, frame_bounds(frame, registry)) {
                 (Some(r), Some(f)) => Some(union_min_max(r, f)),
@@ -287,10 +231,8 @@ mod tests {
         assert_eq!(bounds[0], bounds[1], "removing b must not shrink the tracked area");
     }
 
-    /// With terrain capture on, tiles include natural ground covering a
-    /// margin around the base, which is map revealed for context, not
-    /// something the player built. Letting that count would hold the camera
-    /// on a wide, mostly-empty view instead of tracking the actual buildings.
+    /// With terrain capture on, tiles include ground covering a margin around
+    /// the base, which would hold the camera on a wide empty view.
     #[test]
     fn growing_bounds_ignores_tiles_entirely() {
         let mut registry = TypeRegistry::new();
@@ -306,11 +248,9 @@ mod tests {
         assert!(growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].is_none());
     }
 
-    /// The bug this guards against: with terrain capture on, trees and
-    /// cliffs are captured as entities (not tiles), scattered across that
-    /// same margin independent of anything the player placed. Without this
-    /// exclusion the tracked area became "how much of the map has been
-    /// revealed" instead of "where the buildings are".
+    /// With terrain capture on, trees and cliffs are captured as entities
+    /// scattered across that same margin, which made the tracked area "how
+    /// much of the map has been revealed".
     #[test]
     fn growing_bounds_ignores_trees_and_cliffs() {
         let mut registry = TypeRegistry::new();
@@ -330,10 +270,8 @@ mod tests {
         assert!(growing_bounds_per_frame(&FrameSequence::new(frames).unwrap(), &registry)[0].is_none());
     }
 
-    /// The real bug this guards against: with include-resources on, a
-    /// distant crude oil deposit pulled the tracked box out towards it even
-    /// on a fresh save with a single compact starter cluster and nothing
-    /// else built anywhere near the oil field.
+    /// With include-resources on, a distant crude oil deposit pulled the box
+    /// towards it even on a fresh save with one compact starter cluster.
     #[test]
     fn growing_bounds_ignores_resource_deposits() {
         let mut registry = TypeRegistry::new();
@@ -342,12 +280,9 @@ mod tests {
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "the distant oil deposit must not affect the box");
     }
 
-    /// The worst of the three, and the one this file missed for longest:
-    /// nests and worms are kept in the capture on purpose, so they are the
-    /// only unbuilt thing left that the box still counted. They cover every
-    /// generated chunk in every direction, so the box spanned the explored
-    /// map and the camera centered on the middle of that rather than on the
-    /// factory.
+    /// Nests and worms are kept in the capture on purpose, so they were the
+    /// last unbuilt thing the box counted. They cover every generated chunk in
+    /// every direction, so the box spanned the explored map.
     #[test]
     fn growing_bounds_ignores_enemy_nests_and_worms() {
         let mut registry = TypeRegistry::new();
@@ -360,10 +295,9 @@ mod tests {
         assert_eq!(bounds.center, Vec2::new(0.0, 0.0), "distant nests and worms must not affect the box");
     }
 
-    /// A captive biter spawner is player placed (Space Age captivity), so it
-    /// is construction like anything else and has to keep counting. This is
-    /// the one name `is_enemy` deliberately excepts, and the exception is
-    /// only worth anything if this file honours it too.
+    /// A captive biter spawner is player placed, so it counts as construction.
+    /// The one name `is_enemy` excepts, which is only worth anything if this
+    /// file honours it too.
     #[test]
     fn growing_bounds_counts_a_captive_biter_spawner() {
         let mut registry = TypeRegistry::new();

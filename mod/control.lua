@@ -1,15 +1,7 @@
--- save-timelapse
--- Two independent ways to get data out of a save for timelapse rendering,
--- each its own module: one-shot export (export.lua) and live capture
--- (capture.lua), plus a periodic test-snapshot debug feature (snapshot.lua)
--- and an in-game control panel for live capture (gui.lua). This file is
--- just the glue that wires all of them into Factorio's event system: which
--- events/timers are subscribed and when, and the single on_tick dispatcher
--- every feature's pending work runs through.
---
--- Both export.lua and capture.lua share their binary-encoding logic via
--- encode.lua, which has no Factorio dependency and is unit tested
--- standalone (tests/encode_test.lua).
+-- save-timelapse: glue. Wires one-shot export (export.lua), live capture
+-- (capture.lua), the periodic test snapshot (snapshot.lua) and the control
+-- panel (gui.lua) into Factorio's event system, and owns the single on_tick
+-- dispatcher every feature's pending work runs through.
 
 local export = require("export")
 local capture = require("capture")
@@ -20,13 +12,10 @@ local milestones = require("milestones")
 -- Timers
 --
 -- Factorio keeps one handler per on_nth_tick interval, so a second feature
--- registering the same interval silently replaces the first rather than
--- erroring. capture.CAPTURE_FLUSH_TICKS is 240 (4 real seconds), and the
--- periodic test-snapshot setting below is also given in seconds, so a user
--- picking 4 there hits that interval by coincidence, not by doing anything
--- unusual. Anything wanting a periodic callback is therefore collected into
--- one table keyed by interval and chained, rather than each feature calling
--- `script.on_nth_tick` for itself.
+-- registering the same interval silently replaces the first. CAPTURE_FLUSH_TICKS
+-- is 600 and the test-snapshot setting is given in seconds, so a value of 10
+-- collides by coincidence. Everything wanting a periodic callback is therefore
+-- collected by interval and chained.
 
 --- Intervals currently subscribed, so a resync can release the ones no
 --- longer wanted. Reset by on_load along with the rest of Lua state, which
@@ -83,10 +72,8 @@ local function sync_subscriptions()
   end
 
   -- A snapshot on a timer, independent of live capture, for exercising the
-  -- export path during real play without the freeze a synchronous export
-  -- would repeat every interval, unlike the baseline, this one runs over
-  -- and over, so avoiding a stall on every run is worth the extra ticks it
-  -- takes to finish each one.
+  -- export path during play. Incremental rather than synchronous because
+  -- unlike the baseline this repeats, so a stall on every run would not do.
   local test_seconds = settings.global["save-timelapse-snapshot-seconds"].value
   if test_seconds > 0 then
     want(test_seconds * 60, function(event)
@@ -97,13 +84,9 @@ local function sync_subscriptions()
   set_interval_handlers(by_interval)
 end
 
---- The one on_tick subscription in the whole mod, so nothing here can
---- collide with another feature wanting on_tick the way two on_nth_tick
---- features could collide above. Each module's own `run_pending_tick_work`
---- no-ops when it has nothing to do, so this stays a flat, unconditional
---- sequence: order matches the original headless-scan / baseline / snapshot
---- priority, though nothing today can actually make more than one of these
---- pending on the same tick.
+--- The one on_tick subscription in the mod, so nothing can collide the way
+--- two on_nth_tick features could. Each module's `run_pending_tick_work`
+--- no-ops when idle, keeping this a flat unconditional sequence.
 local function on_tick(event)
   export.run_pending_tick_work(event.tick, capture.compute_session_id)
   capture.run_pending_tick_work(event.tick)
@@ -113,13 +96,9 @@ script.on_event(defines.events.on_tick, on_tick)
 
 -- GUI
 --
--- The shortcut-bar button and its hotkey both just toggle the panel for
--- whichever player triggered them. Unlike capture's handlers above, these
--- are registered unconditionally, the same as on_tick: the panel has to
--- work (in particular, to let a player turn live capture ON in the first
--- place) regardless of whether capture happens to be running right now, so
--- gating it behind a setting the way sync_subscriptions gates capture's
--- hot-path handlers would be actively wrong here, not just unnecessary.
+-- Registered unconditionally, unlike capture's handlers: the panel has to
+-- work in order to turn live capture on in the first place, so gating it
+-- behind the capture setting would be actively wrong.
 script.on_event(defines.events.on_lua_shortcut, function(event)
   if event.prototype_name == "save-timelapse-panel" then
     gui.toggle(event.player_index)

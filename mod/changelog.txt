@@ -1,16 +1,44 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.7.0
+Date: 2026-08-12
+  Features:
+    - Your mods are recorded as themselves. The mod now writes down what the loaded prototypes are, so a timelapse takes its terrain and building colours straight from the game's own map view, and knows a modded belt is a belt, a modded ore patch is ore, and how far a modded underground belt reaches. Alien Biomes terrain looks like Alien Biomes, a Krastorio2 belt curves at corners and pairs up underground, and a modded ore field no longer drags the camera off your factory. Nothing to set up, and mods added partway through a playthrough are picked up the next time you load the save
+    - Belts, underground belts, splitters and pipes are drawn with Factorio's own artwork instead of their inventory icons. Belt corners actually curve, an underground belt's two ends face opposite ways, splitters look like splitters from either side, and a run of pipe joins up with corners, tees and crossings
+    - A new viewer interface. Your factory fills the window: a planet switcher in one corner, the time in the other, and playback controls you can click rather than keys you had to know. Everything else is one keypress away and nothing else is in the way
+    - Press ? in the viewer for every control it has. Three of them, jumping between milestones, jumping between busy stretches, and bookmarking a moment, had never been listed anywhere
+    - The tool no longer closes on you. Building a timelapse, watching one, or hitting an error all return to the menu, so making a second one no longer means starting the program again
+  Optimizations:
+    - Floors are drawn in one pass however many kinds of paving a base has. Concrete, refined concrete and hazard concrete each used to interrupt the batch, which on a heavily paved base was a real cost for something that is only ever a backdrop
+  Bugfixes:
+    - Ore comes back when you mine up what you built on it. Anything placed on an ore tile took that tile's place rather than covering it, so building across a patch ate it a tile at a time and removing the building later left a gap where the ore had been
+    - Mining a building that stands on ore removes the building rather than the ore. Which of the two counted as being on top depended on the order they happened to be recorded in, so for anything already standing when recording started, mining it left the building in place and deleted the ore underneath instead
+    - Rotating something that stands on ore no longer destroys the ore. A rotation is recorded as a placement, and that placement pushed the ore out and left a second hidden copy of the building behind, which stayed standing after you mined the real one
+    - The building count counts buildings. Trees, cliffs, ore and nests are recorded as scenery around your base, and every one of them was counted as something you built, so a wooded map reported a factory several times the size it really was
+    - Space platforms grow instead of appearing whole. A platform's own foundation was not counted as floor you lay, so the tiles you place to expand one were never recorded as built and the whole platform showed up finished from the first frame. Aquilo's foundation had the same problem, and so did every floor added by a mod
+    - Rotating a belt is recorded. A belt rotated after it was placed kept its original direction forever, so its corner drew as a straight belt. Belts the game connects up for you as you drag are still not covered; a fresh baseline corrects everything placed so far
+    - The viewer's readouts no longer cover the factory. Entity counts, zoom, frame rate and the draw-call profile moved behind F3, where anybody who wants them can still find them
+  Changes:
+    - Floors are drawn as flat colour rather than a stretched item icon. A floor only needs to show that there is a base under the machines, and the icons did not look like the real thing anyway
+    - The companion tool speaks plainly. Recordings are listed by where they happened and how big the factory got, rather than by a hex id and a raw tick count, and a finished build reports one line instead of six paragraphs of internal detail
+
+---------------------------------------------------------------------------------------------------
 Version: 0.6.0
 Date: 2026-08-11
   Features:
     - Save a timelapse as a video file you can share. Nothing to install: no FFmpeg, no command line tools, no separate encoder. Pick a resolution and a frame rate and the finished video lands in a videos folder next to the program
     - Export a numbered image per frame instead, at any resolution, for editing the result yourself. Both are independent of the window size, so a 1080p export comes out of a small window unchanged
+    - Terrain can be added to a capture you already have. It no longer has to be switched on before your first snapshot, so changing your mind about it does not mean resetting and losing everything recorded so far. You are asked when the timelapse is built, and you choose which save it is read from
+  Optimizations:
+    - The initial snapshot is significantly faster. Terrain is no longer recorded while you play at all: it does not change during a playthrough, so recording it was storing the same answer over and over, and it is now read once from a save afterwards instead
+    - Exports are smaller, especially across several planets, because terrain is no longer repeated in every frame
   Bugfixes:
     - The camera framed the outermost thing you had built rather than your factory. A wall on the far perimeter or a signal at the end of a rail line to an outpost decided the shot, leaving the factory small and off centre in a mostly empty frame. It now aims at where the buildings actually are
     - Biter nests no longer drag the camera. They are generated across every explored chunk, so counting them as construction stretched the view across the whole revealed map. They are still recorded and still drawn in red, they just no longer decide where to look
+    - Terrain covers the whole factory. It used to stop wherever your base reached when recording started, so anything built after that stood on nothing
+    - Trees and cliffs stop where the ground does, instead of extending past its edge
   Changes:
     - Videos are rendered at full detail rather than the simplified drawing used while browsing, and oversampled before being written. The viewer simplifies to hold a frame rate; an export has no frame rate to hold, so it does not have to. On a large factory this is the difference between belts being visible and a paved area reading as a grey block
-    - Nothing that moves is recorded any more, not just biters and robots. Gleba's pentapods and Vulcanus's demolishers were being captured because Space Age gave its enemies new prototype types that the old filter did not cover, and cars, tanks, Spidertron and trains had never been excluded at all. Every one of them was pinned wherever it happened to be while the real one carried on. Rails, signals, stations and roboports stay, being the stationary infrastructure that shows a network growing
-    - Terrain capture is measured from what you built. It was measured from everything exported, which included trees and nests scattered across every generated chunk, so a margin around your factory was really a margin around the whole explored map. That is where most of terrain capture's cost came from
+    - Nothing that moves is recorded any more, not just biters and robots. Gleba's pentapods and Vulcanus's demolishers were being captured because Space Age gave its enemies new prototype types that the old filter did not cover, and cars, tanks, Spidertron and trains had never been excluded at all. Every one of them was pinned wherever it happened to be while the real one carried on. Rails, signals, stations and roboports stay, and so do nests and worms: those are enemies that do not move
     - Captures made with 0.5 keep working and need no reset. Nothing about the capture format changed in this release
 ---------------------------------------------------------------------------------------------------
 Version: 0.5.1

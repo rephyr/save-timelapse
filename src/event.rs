@@ -1,18 +1,12 @@
 //! Reading the live capture event log written by mod/control.lua.
 //!
-//! Wire format (`events_<start_tick>.stev`), all integers little endian.
-//! Every playthrough's segments live in their own subfolder, named after
-//! its session id (the map's terrain seed; see mod/control.lua's
-//! `compute_session_id`), since `script-output/save-timelapse/` is shared by
-//! every save that ever turns capture on and `game.tick` restarts from 0 for
-//! each one, so a raw tick alone cannot tell two playthroughs' segments
-//! apart, but two playthroughs no longer share a directory to get confused
-//! in to begin with:
+//! Wire format (`events_<start_tick>.stev`), all integers little endian. Each
+//! playthrough's segments live in their own session subfolder, `game.tick`
+//! restarting from 0 for every save:
 //!
 //! ```text
 //! magic   4 bytes, "STE1", written once when the segment is created
-//! version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION; written right
-//!         after the magic
+//! version u8, MIN_SUPPORTED_VERSION through CURRENT_VERSION
 //!
 //! then a sequence of tagged records:
 //!   tag 0  DefineName     string                    (id implicit, next in order)
@@ -27,50 +21,22 @@
 //!   tag >=128 Extension    varint len, then that many bytes
 //! ```
 //!
-//! `DefineName`/`DefineSurface` give the next sequential id to a not yet seen
-//! string, so later records only spend two bytes on what would otherwise be
-//! a repeated name. `SetTick` is emitted once per distinct tick that has at
-//! least one event rather than on every record, since many events (a
-//! blueprint landing hundreds of entities) usually share a tick.
-//! `control.lua` always writes a `SetTick` as the very first record of a
-//! fresh segment, right after the magic, so a data record is never expected
-//! before the first `SetTick`.
+//! `SetTick` is emitted once per distinct tick that has events, many events
+//! usually sharing one, and is always a fresh segment's first record. `id`
+//! uses 0 to mean "no id".
 //!
-//! `id` on `AddEntity`/`RemoveEntity` uses 0 to mean "no id": Factorio's
-//! `unit_number` starts at 1, and `control.lua` already tolerates a missing
-//! one (some entity kinds have none).
-//!
-//! The log is append only and flushed periodically, so its last record can
-//! be a partial write if the game was killed. A record that does not fit in
-//! the remaining bytes ends the stream instead of failing it, the same
-//! tolerance the JSON line format used to give a truncated last line.
-//!
-//! Unlike the frame format (see `frame.rs`), a segment has no trailing
-//! checksum: it grows for as long as capture stays on and is simply
-//! abandoned, not closed, when a reset starts a new one, so there is no
-//! "this segment is finished" moment to checksum against. The version byte
-//! still lets a reader tell "this is a format I don't understand" apart
-//! from a generic parse failure, same as the frame format.
+//! Append only and flushed periodically, so the last record can be a partial
+//! write if the game was killed: one that does not fit ends the stream rather
+//! than failing it. No trailing checksum, unlike the frame format: a segment
+//! is abandoned rather than closed, so there is no finished moment.
 //!
 //! # The extension contract
 //!
-//! Version 3 is where this format stops changing shape. Anything added after
-//! it is an extension record: a tag of 128 or above, a varint byte length,
-//! then that many bytes. A reader that does not know the tag skips exactly
-//! that many bytes and keeps going, so a segment written by a newer mod still
-//! replays in an older tool, minus whatever the new record described.
-//!
-//! Skipping matters more here than the symmetry with `frame.rs` suggests.
-//! Factorio updates mods from the portal by itself and the desktop tool does
-//! not update itself, so the mod being ahead of the tool is the normal state
-//! of anyone who installed once and kept playing. Without a skippable record
-//! that combination has only ever had two outcomes, both bad: a hard refusal
-//! of the whole segment, or, for an unknown tag inside an accepted version,
-//! `next` returning `None` and the replay simply stopping early with no
-//! indication it had. `EventStream::unknown_extensions` reports what was
-//! stepped over so the difference is visible rather than silent.
-//!
-//! Core tags stay below 128 so the two kinds never collide.
+//! From version 3 on, additions are extension records: tag 128 or above, a
+//! varint length, then that many bytes, which an older reader skips exactly.
+//! Without it an unknown tag returned `None`, which an iterator reports as the
+//! end of the stream, so a replay stopped partway with nothing to say about
+//! why. Core tags stay below 128, so the two kinds never collide.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -80,17 +46,10 @@ use std::time::SystemTime;
 use crate::wire::ByteReader;
 
 const MAGIC: &[u8; 4] = b"STE1";
-/// Versions this reader understands. Version 1 predates the
-/// dictionary-reset record (tag 7) and is still accepted, since captures in
-/// that format exist and are readable; they simply carry the mislabeling bug
-/// that record was added to fix, which nothing on this side can undo.
-///
-/// Version 3 writes exactly the same records as version 2. It exists only to
-/// declare "this file may contain extension records", so a build predating
-/// them refuses it with a clear message rather than stopping dead at the
-/// first one. See the extension contract in this module's header: from
-/// version 3 onward additions go in extension records, so this is meant to be
-/// the last time this constant moves.
+/// Versions this reader understands. Version 1 predates the dictionary-reset
+/// record and is still accepted, carrying the mislabeling bug that record
+/// fixes, which nothing on this side can undo. Version 3 writes the same
+/// records as version 2 and only declares that extension records may appear.
 const CURRENT_VERSION: u8 = 3;
 const MIN_SUPPORTED_VERSION: u8 = 1;
 /// Tags from here up carry their own length and may be skipped. Core record
@@ -108,14 +67,9 @@ pub enum Event {
         h: u32,
         id: Option<u64>,
     },
-    /// Removal of an entity. `id` (`unit_number`) is a fast, unambiguous
-    /// match when replay's world state has it registered: true for anything
-    /// built after capture began, since its `AddEntity` carried the same id.
-    /// `pos` is what actually resolves an entity that already existed when
-    /// the baseline was taken, since a snapshot records no ids. Both are
-    /// always present in this format (see `control.lua::log_entity`, which
-    /// always has an entity's position and passes its `unit_number` whether
-    /// or not the entity has one).
+    /// Removal of an entity. `id` matches anything built after capture began;
+    /// `pos` is what resolves an entity that existed when the baseline was
+    /// taken, a snapshot recording no ids. Both are always present.
     RemoveEntity {
         id: Option<u64>,
         pos: (f32, f32),
@@ -151,12 +105,9 @@ pub struct EventStream {
 }
 
 impl EventStream {
-    /// Extension records stepped over so far because this build does not
-    /// recognise their tag, which only means the capture was written by a
-    /// newer mod than the tool reading it.
-    ///
-    /// Only meaningful once the stream has been walked, since it counts what
-    /// iteration actually passed over.
+    /// Extension records stepped over because this build does not recognise
+    /// their tag, which only means the capture is newer than the tool. Only
+    /// meaningful once the stream has been walked.
     pub fn unknown_extensions(&self) -> usize {
         self.unknown_extensions
     }
@@ -182,17 +133,11 @@ impl Iterator for EventStream {
                 2 => {
                     self.current_tick = Some(r.u64()?);
                 }
-                // Tag 7, ResetDictionaries. Written when the mod resumes a
-                // segment across a save load, at which point Factorio has
-                // re-run the mod and emptied the writer's dictionaries while
-                // this file kept every name defined before that point. Ids
-                // after it start from 0 again on both sides.
-                //
-                // Version 1 has no such record, so a version 1 file that was
-                // ever resumed silently mislabels everything logged after the
-                // resume. That cannot be repaired from this side: the record
-                // that would have said where it happened is exactly what is
-                // missing.
+                // Written when the mod resumes a segment across a save load:
+                // Factorio has emptied the writer's dictionaries while this
+                // file kept every earlier define, so ids restart on both
+                // sides. Version 1 has no such record, so a version 1 file
+                // that was resumed mislabels everything after it.
                 7 => {
                     self.names.clear();
                     self.surfaces.clear();
@@ -282,15 +227,10 @@ impl Iterator for EventStream {
                     }
                     continue;
                 }
-                // An extension record: a tag this build has no meaning for,
-                // carrying its own length precisely so it can be stepped over
-                // rather than ending the stream. See the extension contract in
-                // this module's header.
-                //
-                // A length running past the end of the file falls out as
-                // `None` from `skip`, which ends the stream, the same
-                // treatment every other record gets when the game was killed
-                // mid write.
+                // A tag this build has no meaning for, carrying its own length
+                // so it can be stepped over. A length past the end of the file
+                // falls out as `None` from `skip`, the same treatment every
+                // record gets when the game was killed mid write.
                 t if t >= TAG_EXTENSION_MIN => {
                     let len = r.varint()? as usize;
                     r.skip(len)?;
@@ -308,14 +248,9 @@ impl Iterator for EventStream {
     }
 }
 
-/// Stream a log rather than reading it whole into a `Vec<LoggedEvent>`: it
-/// still has to be read into memory once (unlike the old line by line
-/// reader), but replay only ever walks forward through it, so there is no
-/// reason to also materialise every decoded event up front.
-///
-/// Returns the concrete [`EventStream`] rather than `impl Iterator` so a
-/// caller that wants [`EventStream::unknown_extensions`] afterwards can ask
-/// for it; iterate through `&mut` to keep the stream alive that long.
+/// Streams rather than collecting into a `Vec<LoggedEvent>`: replay only walks
+/// forward. Returns the concrete [`EventStream`] so a caller can ask for
+/// [`EventStream::unknown_extensions`] afterwards.
 pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
@@ -340,17 +275,12 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None, unknown_extensions: 0 })
 }
 
-/// One segment file, plus the half-open tick range replay should actually
-/// take from it.
+/// One segment file, plus the half-open tick range replay should take from it.
 ///
-/// `end_tick` is what makes reloading an earlier save replayable. The mod
-/// starts a fresh segment whenever play resumes at a tick it has already
-/// recorded past, but it
-/// cannot delete or truncate the segment it just abandoned: Factorio's Lua
-/// sandbox offers `write_file` and `remove_path` and nothing finer, and
-/// removing the file outright would also throw away the part of it that is
-/// still real history. So the abandoned file keeps its records for a future
-/// the player reloaded away from, and bounding it is this side's job.
+/// `end_tick` is what makes reloading an earlier save replayable: the mod
+/// starts a fresh segment when play resumes at a tick it has recorded past,
+/// but cannot delete or truncate the abandoned one, the Lua sandbox offering
+/// only `write_file` and `remove_path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub path: PathBuf,
@@ -362,45 +292,20 @@ pub struct Segment {
     pub end_tick: u64,
 }
 
-/// Every `events_<tick>.stev` segment in `dir`, in the order play actually
-/// happened, each bounded at the tick a later reload superseded it.
+/// Every segment in `dir`, in the order play happened, each bounded at the tick
+/// a later reload superseded it. `dir` is one playthrough's session folder.
 ///
-/// `dir` is expected to already be one playthrough's own session folder (see
-/// `replay::discover_sessions`); there is no session to filter by here
-/// anymore, since two playthroughs can no longer share a directory to get
-/// confused in.
+/// Ordered by mtime rather than the tick in the filename, start tick not being
+/// chronological once a playthrough reloads more than once: a segment is
+/// appended to for exactly as long as it is live.
 ///
-/// Ordered by mtime rather than by the tick in the filename, because start
-/// tick is not chronological once a playthrough reloads more than once.
-/// Reload from tick 5000 back to 3000, play to 8000, then reload again back
-/// to 1000, and the segments were created in the order 0, 3000, 1000: sorting
-/// by tick would replay the second reload's log before the first reload's,
-/// which is backwards. mtime recovers the real order, since a segment is
-/// appended to for exactly as long as it is the live one and never touched
-/// again after a rollover abandons it, so segments finish being written in
-/// the same order they were created.
+/// Each segment ends where the next created one begins, so `end_tick` is the
+/// smallest start tick among all later segments, computed as a suffix minimum
+/// so a second reload reaching further back also invalidates the first's. That
+/// bound is also what keeps the result in ascending tick order.
 ///
-/// Given that order, each segment ends where the next one to be created
-/// begins: a reload rewinds the world to the tick the new segment starts at,
-/// so every record at or past that tick, in every earlier segment, describes
-/// a timeline that no longer happened. `end_tick` is therefore the smallest
-/// start tick among all segments created later, computed as a suffix minimum
-/// below (the smallest, not simply the next one's, so a second reload
-/// reaching further back also invalidates what the first reload's segment
-/// recorded past that point).
-///
-/// That bound is also what keeps the returned segments in ascending tick
-/// order despite being sorted by mtime: a segment's events all fall below its
-/// `end_tick`, which is at most the following segment's `start_tick`, so no
-/// segment can contribute an event later than the next one's first.
-///
-/// Two segments with the same mtime fall back to ascending start tick, then
-/// to the rollover sequence in the filename (see `segment_tick`). That is the
-/// degenerate case (a copied capture folder whose timestamps were all
-/// flattened to the copy time, or a filesystem too coarse to separate two
-/// rollovers), and it degrades to stitching the segments together in tick
-/// order with overlaps trimmed, which is still no worse than replaying the
-/// overlaps twice.
+/// Equal mtimes fall back to start tick, then rollover sequence, degrading to
+/// stitching in tick order with overlaps trimmed.
 pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
     let mut found: Vec<(SystemTime, u64, u32, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -427,33 +332,18 @@ pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
     Ok(segments)
 }
 
-/// The exclusive tick bound for each *append run* inside one segment file,
-/// given the bound the segment as a whole already carries.
+/// The exclusive tick bound for each append run inside one segment, given the
+/// bound the segment already carries.
 ///
-/// A run is a stretch of records whose ticks do not go backwards. A single
-/// segment normally holds exactly one, and every capture the current mod
-/// writes always does, since a rollback now always rolls over to a new file
-/// Reloads land inside a segment rather than starting a new one, since the
-/// mod cannot detect a reload at all (see `mod/encode.lua`). Captures
-/// fix can hold more than one: reloading the same save twice in a row resumed
-/// at exactly the tick the live segment had started at, which the old
-/// rollover check read as "no rollback", so the second attempt was appended
-/// straight onto the first attempt's records. Nothing separates the two
-/// attempts except that the ticks jump backwards where the second begins.
+/// A run is a stretch of records whose ticks do not go backwards. Every capture
+/// the current mod writes holds one; older ones can hold two attempts at the
+/// same stretch, separated only by the ticks jumping backwards.
 ///
-/// Bounding runs is the same problem as bounding segments, one level down,
-/// and gets the same answer: records within a file are in append order, which
-/// is real chronological order, so a run ends at the smallest start tick
-/// among the runs appended after it (and at the segment's own bound, which is
-/// where the suffix minimum below starts from). A capture with one run per
-/// segment gets a single bound equal to the segment's own, which is why this
-/// costs nothing but the scan for everything the fixed mod writes.
-///
-/// Streams the file a second time rather than buffering the first pass: a
-/// bound cannot be known until every later run's start tick has been seen, so
-/// something has to be held until the end, and holding a tick per run is
-/// bounded by how many times a save was reloaded, where holding decoded
-/// events is bounded by how much was built.
+/// Same problem as bounding segments one level down, and the same answer:
+/// records are in append order, so a run ends at the smallest start tick among
+/// those after it. Streams the file a second time rather than buffering, a tick
+/// per run being bounded by reloads where decoded events are bounded by
+/// how much was built.
 pub fn segment_run_bounds(path: &Path, segment_end: u64) -> io::Result<Vec<u64>> {
     let mut starts: Vec<u64> = Vec::new();
     let mut previous: Option<u64> = None;
@@ -474,20 +364,12 @@ pub fn segment_run_bounds(path: &Path, segment_end: u64) -> io::Result<Vec<u64>>
 }
 
 /// Parses `events_<tick>.stev` or `events_<tick>_<seq>.stev` into its start
-/// tick and rollover sequence, `seq` defaulting to 0 for the plain form.
-/// `None` for anything else (a differently-named file sharing this session's
-/// folder, or the wrong extension), so a stray file is silently ignored
-/// rather than crashing discovery.
+/// tick and rollover sequence. `None` for anything else, so a stray file is
+/// ignored rather than crashing discovery.
 ///
-/// `seq` exists because a start tick alone does not name a segment uniquely:
-/// reloading the same save twice in a row resumes at the same tick both
-/// times, and without it the mod would append the second attempt into the
-/// first attempt's file (see `mod/encode.lua`'s `capture_segment_basename`).
-/// It is only ever a tiebreak for ordering, never the primary key: mtime
-/// stays that, since it is the one signal that also orders segments written
-/// before `seq` existed, and segments left behind by a reset whose file
-/// deletion failed (which restarts `seq` from 0 while older files keep
-/// theirs).
+/// `seq` exists because reloading the same save twice resumes at the same tick
+/// both times. Only a tiebreak, mtime staying the primary key since it also
+/// orders segments written before `seq` existed.
 fn segment_tick(path: &Path) -> Option<(u64, u32)> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {
         return None;
@@ -502,6 +384,7 @@ fn segment_tick(path: &Path) -> Option<(u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::set_mtime_rank;
     use crate::wire::ByteWriter;
 
     /// Builds one segment's bytes with the given records, magic and version
@@ -614,20 +497,9 @@ mod tests {
         assert_eq!(events[0].event, Event::AddEntity { name: "pipe".to_string(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(1) });
     }
 
-    /// What a plain quit-and-reload does to a segment that stays open across
-    /// it.
-    ///
-    /// Factorio re-runs `capture.lua`'s top level on every load, which resets
-    /// the writer's name and surface dictionaries to empty, but the segment
-    /// file is appended to rather than restarted. The writer's next new name
-    /// therefore gets id 0 again, while this reader has been assigning ids by
-    /// encounter order and is already past 0. Every record written after the
-    /// reload then names the wrong prototype.
-    ///
-    /// `docs/ARCHITECTURE.md` claims this is harmless on the grounds that a
-    /// name defined twice "just gets two ids that both resolve to the same
-    /// string". That holds only if the writer keeps counting; once it resets,
-    /// the two sides disagree about what id 0 means.
+    /// A plain quit-and-reload on a segment that stays open across it: the
+    /// writer's dictionaries reset while the file is appended to, so its next
+    /// new name gets id 0 again while this reader is already past 0.
     #[test]
     fn a_dictionary_reset_mid_segment_does_not_mislabel_later_records() {
         let bytes = segment(|w| {
@@ -680,11 +552,9 @@ mod tests {
         assert!(matches!(&events[0].event, Event::AddEntity { name, .. } if name == "pipe"));
     }
 
-    /// The failure this record shape exists to prevent. Before it, an
-    /// unrecognised tag returned `None`, which an iterator reports as "the
-    /// stream ended", so a segment written by a newer mod replayed as a
-    /// timelapse that simply stopped partway with nothing to say about why.
-    /// Now the events after it still arrive.
+    /// Before this record shape, an unrecognised tag returned `None`, which an
+    /// iterator reports as the end of the stream, so a newer capture replayed
+    /// as a timelapse that stopped partway.
     #[test]
     fn an_unknown_extension_record_is_skipped_and_the_stream_continues() {
         let bytes = segment(|w| {
@@ -749,22 +619,6 @@ mod tests {
         // implement Debug. err() discards it, needing only the Err side to.
         let err = stream_log(&path).err().unwrap();
         assert!(err.to_string().contains("version 99"), "got: {err}");
-    }
-
-    /// Stamps `name`'s mtime, which is how `log_segments` recovers the order
-    /// segments were created in: higher `rank` means created later, and an
-    /// equal `rank` means an exact tie.
-    ///
-    /// Anchored to a fixed instant rather than `SystemTime::now()` so a tie
-    /// is genuinely a tie (two `now()` calls moments apart are not equal, and
-    /// a test asking for one would quietly get an order instead) and so
-    /// nothing here depends on the wall clock at all. Writing the files back
-    /// to back and letting the filesystem timestamp them would not work
-    /// either: Windows' clock granularity is coarser than the gap between two
-    /// consecutive writes, so their order would be a coin flip.
-    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
-        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
-        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
     }
 
     fn segment_names(dir: &Path) -> Vec<String> {

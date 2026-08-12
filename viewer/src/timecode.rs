@@ -1,10 +1,7 @@
-//! Turning game ticks into readable elapsed time.
-//!
-//! A tick is the only clock a capture carries. Frames record `game.tick` and
-//! nothing else, so there is no wall-clock date to recover: a frame can say
-//! how far into the save it is, never when the player was sitting there
-//! playing it. That is the right thing to show anyway, since a timelapse is
-//! about the factory's own history rather than the calendar it happened on.
+//! Turning game ticks into readable elapsed time. A tick is the only clock a
+//! capture carries, so a frame can say how far into the save it is and never
+//! when the player was sitting there, which is the right thing to show
+//! anyway.
 
 /// Factorio's update rate. Exact by definition rather than measured: ticks
 /// are logical, kept deterministic for multiplayer, so a save that ran at
@@ -18,17 +15,12 @@ const MINUTES_PER_HOUR: u64 = 60;
 /// `tick` as elapsed in-game time: `"4h 12m"`, or `"42m"` before the first
 /// hour.
 ///
-/// Seconds are deliberately dropped. Consecutive timelapse frames are
-/// typically minutes of game time apart (the default is one frame per minute,
-/// see `replay::Options`), so a seconds field would change on every frame
-/// while telling the viewer nothing they act on, and would widen every label
-/// on the bar to buy that.
+/// Seconds are dropped: frames are typically minutes of game time apart, so a
+/// seconds field would change every frame while telling the viewer nothing.
 ///
-/// Hours are not wrapped into days for the opposite reason: they stay
-/// directly comparable between two labels. A long megabase run reading
-/// `"312h 05m"` lets someone see at a glance that it is roughly three times
-/// `"104h 30m"`, where `"13d 00h"` against `"4d 08h"` makes them stop and
-/// multiply.
+/// Hours are not wrapped into days for the opposite reason, staying directly
+/// comparable: `"312h 05m"` against `"104h 30m"` is roughly three times, where
+/// `"13d 00h"` against `"4d 08h"` makes somebody stop and multiply.
 pub fn format_game_time(tick: u64) -> String {
     let total_minutes = tick / TICKS_PER_SECOND / SECONDS_PER_MINUTE;
     let hours = total_minutes / MINUTES_PER_HOUR;

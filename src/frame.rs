@@ -1,5 +1,4 @@
-//! The exported frame format written by the mod (see mod/control.lua) and
-//! consumed by the viewer. Kept in the lib so both can share it.
+//! The exported frame format written by the mod and read by the viewer.
 //!
 //! Wire format (`frame_<tick>_<surface>.stfr`), all integers little endian:
 //!
@@ -21,82 +20,32 @@
 //!   tag 2     TileRun     varint name_id, varint count, then per item
 //!                         varint dx, varint dy
 //!   tag >=128 Extension   varint len, then that many bytes
-//! checksum  u32, djb2 (see `checksum` below) of every byte before it,
-//!           magic and version included
+//! checksum  u32, djb2 of every byte before it, magic and version included
 //! ```
-//!
-//! The version byte lets a reader tell "this is a format I don't understand"
-//! apart from a generic parse failure, which matters here specifically:
-//! this project has already changed this format more than once, each time
-//! with no way for an older build to say anything clearer than a confusing
-//! parse error about a newer file. The checksum catches a narrower,
-//! different problem the tag-based structure alone can't: silent bit-level
-//! corruption that still happens to decode as plausible-looking records.
-//! Both are new as of this version; a file from before it has neither and
-//! will not parse, consistent with this project's existing precedent of
-//! clean breaks over carrying old formats forward at this alpha stage (see
-//! the session-tagging change earlier).
-//!
 //! Coordinates within a run are zigzag varint deltas against the previous
-//! item, starting from the origin. Version 1 predates runs entirely, writing
-//! one fixed width record per entity or tile, and `read_binary` keeps a
-//! separate function for it.
+//! item, from the origin. Version 1 predates runs and has its own reader.
 //!
 //! # The extension contract
 //!
-//! Version 3 is where this format stops changing shape. Everything added
-//! after it goes in an extension record: a tag of 128 or above, a varint byte
-//! length, then that many bytes. A reader that does not recognise the tag
-//! skips exactly that many bytes and carries on, so a capture written by a
-//! newer mod still loads in an older tool, minus whatever the new record
-//! described.
-//!
-//! That property is the point, because of how this project is actually
-//! installed. Factorio updates mods from the portal on its own; the desktop
-//! tool does not update itself. The mod being newer than the tool is
-//! therefore the normal state of anyone who installed once and kept playing,
-//! not an edge case, and before extension records that combination could only
-//! produce a hard refusal.
+//! From version 3 on, additions are extension records: tag 128 or above, a
+//! varint length, then that many bytes, which an older reader skips exactly.
+//! Factorio updates mods on its own while the desktop tool does not, so the
+//! mod being newer than the tool is the normal state, not an edge case.
 //!
 //! Two rules keep it working:
 //!
 //! - Core tags stay below 128, so the two kinds never collide.
-//! - Extension payloads are never interleaved with the data they annotate.
-//!   `RUN_FLAG_DIRECTIONS` is interleaved, and that is precisely why an
-//!   unknown column of that shape is unskippable: without knowing the column
-//!   is there, a reader cannot find where the run ends. A trailing,
-//!   length prefixed block has no such problem.
+//! - Extension payloads never interleave with the data they annotate.
+//!   `RUN_FLAG_DIRECTIONS` does, which is why an unknown column of that shape
+//!   is unskippable: a reader cannot find the run's end.
 //!
-//! A length that runs past the end of the file is still an error. Not
-//! understanding a record is fine; a record that does not fit means the file
-//! is damaged.
+//! A length running past the end of the file is an error: not understanding a
+//! record is fine, one that does not fit means damage.
 //!
-//! There is no entity or tile count anywhere in the file. `find_entities_filtered`
-//! and `find_tiles_filtered` both return a full array, so a count would be
-//! free to compute for the single tick synchronous export path, but the
-//! periodic incremental exporter (`snapshot_step` in control.lua) spreads one
-//! export across many ticks specifically so no single tick has to do the
-//! whole thing, and real play keeps running in between: an entity a batch
-//! has not reached yet can be mined by the player before its turn comes.
-//! Scanning the whole list once at the start just to learn a count would
-//! reintroduce the stall the incremental exporter exists to avoid, and the
-//! count could still be wrong by the time writing finishes. `EndEntities`
-//! sidesteps needing a count at all: each section is a plain forward stream,
-//! and the tile section simply runs until the file ends.
-//!
-//! Entity coordinates are stored as position times ten, rounded to the
-//! nearest integer: the same fixed point scale `world.rs::pos_key` already
-//! keys positions by, and exactly the precision the mod's entities are
-//! aligned to. Tile coordinates are already integers.
-//!
-//! `DefineName` writes a prototype name the first time it is used and gives
-//! it the next sequential id; every later reference to that name is just the
-//! two byte id. One dictionary is shared by both the entity and tile
-//! sections of a file (a name only needs defining once), which is why the
-//! tile section can still reference a name defined during the entity
-//! section. `d`, `w` and `h` are always present now: once a record is this
-//! compact, a variable width encoding to omit a default value costs more
-//! complexity than the bytes it would save.
+//! No item count anywhere, the incremental exporter spreading one export over
+//! many ticks while play continues. Entity coordinates are position times ten,
+//! the fixed point scale `world.rs::pos_key` uses. One `DefineName` dictionary
+//! is shared by both sections.
 
 use std::io;
 use std::sync::Arc;
@@ -104,19 +53,10 @@ use std::sync::Arc;
 use crate::wire::{ByteReader, ByteWriter};
 
 const MAGIC: &[u8; 4] = b"STF1";
-/// Version 2 groups records into per-name runs and encodes coordinates as
-/// zigzag varint deltas, which measured 4.7x smaller than version 1 on a real
-/// frame (see `format_study`). Version 1 is still read: a capture written by
-/// an older mod is worth keeping openable, and the shape is different enough
-/// that the two bodies are simply separate functions.
-///
-/// Version 3 is version 2's body byte for byte. It changes nothing about how
-/// entities and tiles are written and exists only to declare "this file may
-/// contain extension records", so that a build predating them refuses it up
-/// front with a clear message instead of desynchronising on the first one it
-/// cannot skip. See the extension contract in this module's header: from
-/// version 3 onward additions go in extension records, so this constant is
-/// intended never to rise again.
+/// Version 2 groups records into per-name runs with zigzag varint deltas, 4.7x
+/// smaller than version 1, which is still read and has its own reader. Version
+/// 3 is version 2's body byte for byte and only declares that extension
+/// records may appear.
 const CURRENT_VERSION: u8 = 3;
 const MIN_SUPPORTED_VERSION: u8 = 1;
 const TRAILER_LEN: usize = 4;
@@ -129,13 +69,9 @@ const TAG_END_ENTITIES: u8 = 9;
 /// so the two kinds can never collide as the format grows.
 const TAG_EXTENSION_MIN: u8 = 128;
 
-/// djb2, computed in one pass since `read_binary`/`write_binary` always hold
-/// the whole file in memory already, unlike `mod/encode.lua`'s incremental
-/// version of the same hash, which folds each chunk in as it's streamed to
-/// disk. `u32` wrapping arithmetic here is exactly the Lua side's `% 2^32`.
-/// Chosen for being trivial to implement identically on both sides without
-/// a bitwise primitive (Factorio's Lua 5.2 has none), not for cryptographic
-/// strength: it only needs to catch accidental corruption.
+/// djb2, in one pass, this side always holding the whole file. `u32` wrapping
+/// is the Lua side's `% 2^32`. Chosen for being implementable identically
+/// without a bitwise primitive, not for strength.
 fn checksum(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 5381;
     for &b in bytes {
@@ -153,15 +89,10 @@ pub struct Frame {
     pub tiles: Vec<Tile>,
 }
 
-/// `n` is `Arc<str>` rather than `String`: a real base has a few dozen
-/// distinct prototype names against hundreds of thousands (or, for tiles on
-/// a fully paved base, millions) of entries, and the wire format already
-/// carries that small deduplicated dictionary (see `read_binary` below), so
-/// resolving a record's name only needs a cheap refcount bump, not a fresh
-/// heap allocation and copy of the same handful of strings repeated per
-/// entity. That distinction showed up directly: on a real ~300k-entity,
-/// 3.1M-tile capture, `String::clone` per record was the dominant cost of
-/// loading a frame.
+/// `n` is `Arc<str>` rather than `String`: a base has a few dozen distinct
+/// names against hundreds of thousands of entries, and the wire format already
+/// carries that dictionary, so resolving a name is a refcount bump rather than
+/// a per-record allocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub n: Arc<str>,
@@ -279,30 +210,18 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// Steps over one extension record's payload, its tag having already been
-/// read.
-///
-/// A record that runs off the end of the file is still an error: not
-/// understanding a feature is fine, but a length that points past the last
-/// byte means the file is damaged, and quietly accepting it would turn
-/// corruption into a silently short frame.
+/// Steps over one extension record's payload, its tag already read. A record
+/// running off the end is an error: accepting it would turn corruption into a
+/// silently short frame.
 fn skip_extension(r: &mut ByteReader<'_>) -> io::Result<()> {
     let len = r.varint().ok_or_else(truncated)? as usize;
     r.skip(len).ok_or_else(truncated)
 }
 
-/// The tick and surface from a frame file, without reading the rest of it.
-///
-/// Exists so a loader can group and order a whole capture before parsing any
-/// of it. Grouping used to require every frame parsed and resident first,
-/// which is the peak memory a streaming loader is trying to avoid: it needs
-/// to know which surface each file belongs to and what order they go in
-/// *before* it can fold them in one at a time and drop them.
-///
-/// Reads a bounded prefix rather than the file, so this costs one small read
-/// per file regardless of how large the frames are. It deliberately does not
-/// verify the checksum, which would mean reading everything and defeat the
-/// point; the real parse still does, so a corrupt file is caught there.
+/// The tick and surface from a frame file without reading the rest, so a
+/// loader can group and order a capture before parsing any of it. Reads a
+/// bounded prefix, and deliberately skips the checksum, which would mean
+/// reading everything; the real parse still verifies it.
 pub fn read_header(path: &std::path::Path) -> io::Result<(u64, String)> {
     use std::io::Read;
 
@@ -418,32 +337,14 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
 const RUN_FLAG_DIRECTIONS: u8 = 1;
 
 /// Bit 1: a varint length and that many bytes of extension payload follow the
-/// run's coordinates.
-///
-/// The top level extension record can already express anything, so this is
-/// purely the cheaper home for the likeliest kind of future addition: one more
-/// column alongside the existing per-entity ones (quality, say, or health).
-/// Putting it here costs a single flag bit on runs that do not use it, rather
-/// than a fresh dictionary and coordinate list to re-associate a top level
-/// record with the entities it describes.
-///
-/// The payload goes *after* the run, never interleaved with the coordinates.
-/// That is the whole reason it is skippable: `RUN_FLAG_DIRECTIONS` is
-/// interleaved, which is why an old reader meeting an unknown interleaved
-/// column could not find where the run ended. Anything added here must keep
-/// to a trailing block for the same reason.
+/// run's coordinates. The cheaper home for a future per-entity column, a flag
+/// bit rather than a fresh dictionary and coordinate list. The payload trails
+/// the run and never interleaves, which is what makes it skippable.
 const RUN_FLAG_EXTENSION: u8 = 2;
 
-/// Groups items by name, preserving both the order names first appear and the
-/// order of items within each name.
-///
-/// Scan order is kept deliberately. Coordinates are delta encoded against the
-/// previous item in the run, so this only pays off if consecutive items are
-/// near each other, and measuring a real frame showed the export order
-/// already has that locality: players and blueprints lay same-type entities
-/// out in rows and the scan preserves it. Sorting spatially first measured
-/// 0.3% better, which is not worth a sort of every entity during a live
-/// export.
+/// Groups items by name, preserving both the order names appear and the order
+/// within each name. Scan order is kept: coordinates are delta encoded against
+/// the previous item, and a real export already has that locality.
 fn group_by_name<'a, T>(items: &'a [T], name_of: impl Fn(&'a T) -> &'a str) -> Vec<(&'a str, Vec<&'a T>)> {
     let mut order: Vec<&str> = Vec::new();
     let mut groups: std::collections::HashMap<&str, Vec<&T>> = std::collections::HashMap::new();
@@ -658,12 +559,8 @@ mod tests {
         assert_eq!(frame.count, 3);
     }
 
-    /// Pins the exact byte layout by hand, so a change to field order,
-    /// width, or tag value shows up here rather than only as a round trip
-    /// still agreeing with itself. The trailing checksum is verified via
-    /// the same `checksum` function under test elsewhere, rather than a
-    /// hand computed constant that would just be a second copy of the
-    /// algorithm to keep in sync.
+    /// Pins the byte layout by hand, so a change to field order, width or tag
+    /// shows up here rather than as a round trip agreeing with itself.
     #[test]
     fn a_version_1_frame_still_reads_identically() {
         let entities = vec![
@@ -752,11 +649,9 @@ mod tests {
         bytes
     }
 
-    /// The whole point of the extension contract: a record this build has no
-    /// meaning for costs it nothing but the bytes it occupies. Covers both
-    /// section loops, since they are separate code paths, and both ends of a
-    /// section, since a record before the first run and one after the last
-    /// exercise different points in the loop.
+    /// A record this build has no meaning for costs nothing but its bytes.
+    /// Covers both section loops and both ends of a section, which are
+    /// different points in the loop.
     #[test]
     fn unknown_extension_records_are_skipped_rather_than_failing_the_parse() {
         let mut w = ByteWriter::new();
@@ -805,11 +700,9 @@ mod tests {
         assert_eq!(frame.tiles, vec![Tile { n: "concrete".into(), x: -5, y: 12 }]);
     }
 
-    /// The per-run extension point, which is the one a future per-entity
-    /// column would use. Written alongside `RUN_FLAG_DIRECTIONS` on purpose:
-    /// directions are interleaved and the extension block trails the run, and
-    /// a reader has to get both right in the same pass to land on the next
-    /// tag.
+    /// Written alongside `RUN_FLAG_DIRECTIONS` on purpose: directions
+    /// interleave and the extension block trails, and a reader has to get both
+    /// right to land on the next tag.
     #[test]
     fn a_run_extension_payload_is_skipped_and_the_run_still_decodes() {
         let mut w = ByteWriter::new();
@@ -855,12 +748,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
-    /// Version 3 claims to have changed nothing except declaring that
-    /// extension records may appear. Asserted by relabelling a freshly
-    /// written file as version 2 and getting the same parse out: if the
-    /// bodies ever diverge, the promise that an old capture still loads (and
-    /// that an old tool still reads a new capture using no new features)
-    /// quietly stops holding.
+    /// Asserted by relabelling a fresh file as version 2 and getting the same
+    /// parse. If the bodies diverge, the promise that an old capture still
+    /// loads quietly stops holding.
     #[test]
     fn version_3_writes_the_same_body_as_version_2() {
         let entities = vec![entity("transport-belt", -80.5, 28.5, 4, 1, 1), entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3)];
@@ -896,34 +786,22 @@ mod tests {
         assert!(err.to_string().contains("version 99"), "got: {err}");
     }
 
-    /// Regenerates the committed compatibility fixtures that
-    /// `tests/format_compatibility.rs` reads. Ignored because it writes into
-    /// the source tree; run it deliberately with
-    /// `cargo test --lib regenerate_compatibility_fixtures -- --ignored`
-    /// and commit whatever changes.
+    /// Regenerates the fixtures `tests/format_compatibility.rs` reads. Ignored
+    /// because it writes into the source tree.
     ///
-    /// All three hold the same real captured entities and tiles, read back
-    /// out of a version 1 fixture, so what the compatibility test compares is
-    /// three encodings of one frame rather than three synthetic shapes that
-    /// each happen to round trip.
-    ///
-    /// Only ever run again if a genuine format change lands. Regenerating
-    /// these to make a failing test pass would be deleting the evidence: the
-    /// whole point is that they are bytes an older build wrote and this one
-    /// must keep reading.
+    /// All three hold the same real captured contents, read out of a version 1
+    /// fixture, so the compatibility test compares three encodings of one frame
+    /// rather than three synthetic shapes. Only run for a genuine format
+    /// change: regenerating to make a failing test pass deletes the evidence.
     #[test]
     #[ignore]
     fn regenerate_compatibility_fixtures() {
         let source = load_fixture("frame_0001.stfr");
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames"));
 
-        // No v1 fixture is written: `frame_0001.stfr` is already one, and it
-        // is real mod output rather than anything reconstructed here. Asserted
-        // rather than assumed, because it is also what makes the v2 and v3
-        // fixtures below trustworthy: they carry that same real frame's
-        // contents, so if this writer ever stopped reproducing what the old
-        // mod actually wrote, they would silently stop representing a real
-        // capture too.
+        // No v1 fixture is written, `frame_0001.stfr` already being real mod
+        // output. Asserted rather than assumed, since it is what makes the v2
+        // and v3 fixtures trustworthy.
         assert_eq!(
             write_binary_v1(&source.as_out()),
             std::fs::read(dir.join("frame_0001.stfr")).unwrap(),
@@ -977,12 +855,9 @@ mod tests {
 
     #[test]
     fn a_name_used_by_both_an_entity_and_a_tile_is_only_defined_once() {
-        // Contrived (real prototypes never share a name across the two kinds
-        // of thing), but it is the case that proves the dictionary is shared
-        // rather than one per section: if the tile section defined its own
-        // copy of "landfill" it would land at a different id than the
-        // entity section's, and this frame has no way to tell two different
-        // ids called "landfill" apart from just one.
+        // Contrived, but it proves the dictionary is shared rather than one
+        // per section: a tile section defining its own "landfill" would land
+        // at a different id.
         let entities = vec![entity("landfill", 0.5, 0.5, 0, 1, 1)];
         let tiles = vec![Tile { n: "landfill".into(), x: 1, y: 1 }];
         let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &tiles };

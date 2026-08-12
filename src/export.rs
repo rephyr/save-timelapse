@@ -27,13 +27,9 @@ pub struct ExportConfig {
     /// not just what the player built. Roughly 5x'd export size and time in
     /// testing, so this is a real opt-in rather than something to default on.
     pub capture_terrain: bool,
-    /// Scan this save for natural ground and nothing else.
-    ///
-    /// Mutually exclusive with the frame export rather than an addition to
-    /// it, because the two want different saves: frames come from every save
-    /// in the set, ground from one. Ground does not change over a
-    /// playthrough, so describing it once is enough, and doing it in its own
-    /// pass keeps it out of every frame and out of anybody's game.
+    /// Scan this save for natural ground and nothing else. Mutually exclusive
+    /// with the frame export: the two want different saves, frames coming from
+    /// every save in the set and ground from one.
     pub terrain_scan: bool,
 }
 
@@ -45,21 +41,15 @@ pub struct ExportOutcome {
     /// The mod's one-shot player-position sample, if it found anyone with a
     /// valid position to record (see mod/control.lua's `sample_all_players`).
     pub players_log: Option<PathBuf>,
-    /// What this save knows about milestones, read out of the manifest the
-    /// mod writes beside the frames.
-    ///
-    /// `None` for a manifest written by a mod predating milestone state,
-    /// which costs markers and nothing else. One save's state cannot place a
-    /// marker by itself; see `milestone::from_saves`, which compares them.
+    /// What this save knows about milestones, from the manifest the mod writes
+    /// beside the frames. `None` for a manifest predating milestone state,
+    /// which costs markers and nothing else.
     pub milestones: Option<crate::milestone::State>,
 }
 
-/// Read the version from the executable rather than assuming one.
-///
-/// Reads stdout and stderr together. Which stream a program writes a version
-/// banner to is a per-build detail nobody should have to know, and searching
-/// both costs one concatenation against silently returning `None` and
-/// reporting no version at all.
+/// Read the version from the executable rather than assuming one. Reads stdout
+/// and stderr together, which stream a version banner lands on being a
+/// per-build detail nobody should have to know.
 pub fn factorio_version(exe: &Path) -> Option<Version> {
     let output = Command::new(exe).arg("--version").output().ok()?;
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -183,13 +173,8 @@ pub fn install_data_dir(exe: &Path) -> Option<PathBuf> {
 }
 
 /// Export one save. `staged` is a directory this call owns and may delete.
-/// Stage a private Factorio, run the save through it, and return the
-/// directory the mod wrote into.
-///
 /// Shared by the frame export and the ground scan, which differ only in which
-/// startup flag `stage_mods` sets: everything about locating the install,
-/// writing a config that reads real data but writes staged, and reporting a
-/// failed run is identical.
+/// startup flag `stage_mods` sets.
 fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
     let written_to = staged.join("script-output").join(MOD_NAME);
     std::fs::create_dir_all(&written_to)?;
@@ -290,28 +275,21 @@ pub struct TerrainScan {
     pub session_id: u32,
     pub files: Vec<PathBuf>,
     pub seconds: f64,
-    /// The game tick the scanned save was at.
-    ///
-    /// Worth carrying because it is the one thing that can make a scan wrong
-    /// while succeeding: ground only exists in chunks the save had already
-    /// generated, so a save older than the end of a capture cannot describe
-    /// wherever the factory grew after it. The caller has the capture's own
-    /// tick and can compare.
+    /// The game tick the scanned save was at, which is the one thing that can
+    /// make a scan wrong while succeeding: ground exists only in chunks the
+    /// save had generated, so a save older than the end of a capture cannot
+    /// describe where the factory grew after it.
     pub tick: u64,
 }
 
 /// Read one save's natural ground, once, for a whole timelapse.
 ///
-/// Ground is the only part of a capture that does not change, so it needs no
-/// history: entities need a record per placement and placed floor needs one,
-/// but grass is grass for the whole playthrough. Scanning it separately keeps
-/// it out of every frame of a from-saves export and out of the live baseline
-/// that freezes somebody's game, and lets the area be chosen knowing how far
-/// the factory eventually reached.
+/// Ground is the only part of a capture that does not change, so scanning it
+/// separately keeps it out of every frame and out of the live baseline, and
+/// lets the area be chosen knowing how far the factory eventually reached.
 ///
-/// The trade is ground that has since been built over: water landfilled at
-/// hour three reads as landfill at hour ten and its water is never recorded,
-/// so replaying from the start shows a hole there until the landfill is laid.
+/// The trade is ground since built over: water landfilled at hour three reads
+/// as landfill at hour ten, so replaying from the start shows a hole there.
 pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<TerrainScan> {
     let started = Instant::now();
     let scan = ExportConfig { terrain_scan: true, ..config.clone() };

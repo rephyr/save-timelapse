@@ -1,32 +1,24 @@
 //! Storing a whole timelapse as spans rather than as frames.
 //!
-//! A timelapse is overwhelmingly redundant. Consecutive frames of a real
-//! capture differ by the few hundred things built between them, out of
-//! hundreds of thousands standing still, and the old layout paid full price
-//! for every one of them in every frame: a 400k-entity base over 200 frames
-//! is about a gigabyte of `RenderEntity` before anything else. That is not a
-//! speed problem, it is the ceiling on how long a capture can be before the
-//! viewer runs out of memory.
+//! Consecutive frames of a real capture differ by the few hundred things built
+//! between them out of hundreds of thousands standing still, and the old
+//! layout paid full price for every one in every frame: a 400k-entity base
+//! over 200 frames is about a gigabyte before anything else. That was the
+//! ceiling on how long a capture could be, not a speed problem.
 //!
-//! So each thing is stored once, with the half-open range of frames it is
-//! present for, and a frame is recovered by asking which spans cover it. The
-//! same base becomes a few megabytes: cost moves from frames times entities
-//! to distinct entities, and a longer capture of the same factory now costs
-//! almost nothing extra, where before it scaled linearly.
+//! So each thing is stored once with the half-open range of frames it is
+//! present for. Cost moves from frames times entities to distinct entities, so
+//! a longer capture of the same factory costs almost nothing extra.
 //!
-//! Spans are sorted by type, so materializing a frame walks them once and
-//! emits items already grouped by type, which is the order the renderer
-//! batches by. Nothing has to sort per seek.
+//! Spans are sorted by type, so materializing a frame emits items already
+//! grouped the way the renderer batches, with nothing to sort per seek.
 
 use crate::registry::TypeId;
 use crate::render_frame::Run;
 
-/// One item present over a contiguous stretch of frames.
-///
-/// `last` is exclusive, so a thing built in frame 3 and still standing at the
-/// end of a 10-frame capture is `first: 3, last: 10`, and `first == last`
-/// cannot happen: a span is only closed after at least one frame contained
-/// it.
+/// One item present over a contiguous stretch of frames. `last` is exclusive,
+/// and `first == last` cannot happen, a span only being closed after at least
+/// one frame contained it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span<T> {
     pub item: T,
@@ -57,22 +49,18 @@ impl<T: Copy> SpanSet<T> {
     /// Folds one more frame in. Call once per frame, in order, then
     /// [`SpanBuilder::finish`].
     ///
-    /// Identity is the caller's `key`: two items in consecutive frames with
-    /// the same key and the same type are the same thing continuing to exist,
-    /// so its span extends rather than a new one starting. Position is what
-    /// callers use, matching how the replay world keys entities.
+    /// Identity is the caller's `key`: same key and same type in consecutive
+    /// frames is the same thing continuing, so its span extends.
     pub fn iter(&self) -> impl Iterator<Item = &Span<T>> {
         self.spans.iter()
     }
 
     /// The items present at `frame`, appended to `out` grouped by type, with
-    /// one [`Run`] per type describing where each group sits.
+    /// one [`Run`] per type.
     ///
-    /// One linear pass over every span, with no allocation once the buffers
-    /// have grown. That is more work than indexing a prebuilt frame would be,
-    /// but it happens when the displayed frame changes rather than once per
-    /// rendered frame, and a pass over a few hundred thousand contiguous
-    /// spans is far cheaper than having kept every frame resident.
+    /// One linear pass over every span with no allocation once the buffers
+    /// have grown. More work than indexing a prebuilt frame, but it happens
+    /// when the displayed frame changes rather than once per rendered frame.
     pub fn materialize(&self, frame: usize, out: &mut Vec<T>, runs: &mut Vec<Run>) {
         out.clear();
         runs.clear();
@@ -93,28 +81,20 @@ impl<T: Copy> SpanSet<T> {
     }
 }
 
-/// Accumulates frames into a [`SpanSet`], one frame at a time, so the caller
-/// can drop each parsed frame as soon as it has been folded in rather than
-/// holding every frame at once. Holding them all is exactly what this type
-/// exists to avoid, so building from a `&[Frame]` would defeat the purpose at
-/// load time even though the result is small.
+/// Accumulates frames into a [`SpanSet`] one at a time, so the caller can drop
+/// each parsed frame as it is folded in. Building from a `&[Frame]` would hold
+/// every frame at once, which is exactly what this type exists to avoid.
 ///
 /// Sorted vectors and a merge walk rather than the hash map this obviously
-/// wants, for the same reason `activity::analyze_activity` does: this runs on
-/// the load path against every item of every frame, tens of millions of times
-/// on a real capture. A `HashMap` there is 30 million random-access probes
-/// into a table far larger than cache, and the cost is the probing, not the
-/// hashing. Sorting and merging touches the same data almost entirely
-/// sequentially and needs no allocation per frame once the buffers have
-/// grown. Measured on a 150-frame, 400k-entity capture (see `bench` below):
-/// 2.50s with the map, 1.91s with this.
+/// wants, for the same reason as `activity::analyze_activity`: on the load
+/// path against every item of every frame, a `HashMap` is 30 million
+/// random-access probes into a table far larger than cache, and the cost is
+/// the probing rather than the hashing. On a 150-frame, 400k-entity capture,
+/// 2.50s with the map against 1.91s with this.
 ///
-/// A smaller win than the same change bought in `activity.rs` (2.26s to
-/// 1.07s), and for a visible reason: that one sorts bare `u64` keys, where
-/// this sorts `(key, type, item)` tuples three times the size, so the sort
-/// itself is now the floor. Sorting an index array instead would shrink what
-/// moves but scatter the reads, which is the trade this already went through
-/// once in the other direction.
+/// A smaller win than the same change bought in `activity.rs`, which sorts
+/// bare `u64` keys where this sorts tuples three times the size, so the sort
+/// itself is now the floor.
 pub struct SpanBuilder<T> {
     spans: Vec<Span<T>>,
     /// Everything still standing, as `(key, span index)` sorted by key, which
@@ -137,14 +117,12 @@ impl<T: Copy> SpanBuilder<T> {
         Self::default()
     }
 
-    /// Folds in one frame's worth of items, given as `(key, type, item)`.
+    /// Folds in one frame's items, given as `(key, type, item)`.
     ///
-    /// An item whose key is already standing with the same type continues its
-    /// span. A key that was standing and is absent here ends its span at this
-    /// frame. A key that reappears later starts a fresh span, which is right:
-    /// something torn down and rebuilt on the same tile is genuinely absent in
-    /// between, and a single span would draw it through a gap where it was
-    /// not there.
+    /// A key already standing with the same type continues its span; one that
+    /// was standing and is absent ends it; one that reappears later starts a
+    /// fresh span, something rebuilt on the same tile being genuinely absent
+    /// in between.
     pub fn push_frame(&mut self, items: impl IntoIterator<Item = (u64, TypeId, T)>) {
         let frame = self.frames;
 
@@ -160,11 +138,10 @@ impl<T: Copy> SpanBuilder<T> {
         let mut open_at = 0usize;
 
         for &(key, type_id, item) in &self.current {
-            // Both sides are sorted by key, so this pointer only ever moves
-            // forward: anything it steps over was standing last frame and is
-            // absent from this one, which ends its span. Nothing needs doing
-            // to close it, since `last` is exclusive and was already set to
-            // the frame after the one it was last seen in.
+            // Both sides are sorted by key, so this only moves forward:
+            // anything stepped over was standing last frame and is absent now,
+            // which ends its span. Nothing needs doing, `last` being exclusive
+            // and already set to the frame after it was last seen.
             while open_at < self.open.len() && self.open[open_at].0 < key {
                 open_at += 1;
             }
@@ -198,19 +175,14 @@ impl<T: Copy> SpanBuilder<T> {
 
     /// Folds in `n` frames identical to the one just pushed.
     ///
-    /// An export omits a surface's frame entirely when nothing on that
-    /// surface changed (see `replay::write_all_surfaces`), which on a
-    /// multi-surface save is most frames for most surfaces. This puts them
-    /// back, so every surface still has one frame per emitted moment and the
-    /// index-addressed timeline keeps working.
+    /// An export omits a surface's frame when nothing on it changed, which on
+    /// a multi-surface save is most frames for most surfaces. This puts them
+    /// back, so the index-addressed timeline keeps working.
     ///
-    /// One pass over what is standing however large `n` is, rather than `n`
-    /// passes. Nothing changed across the gap by definition, so every span
-    /// open when it started is still open when it ends, and each one's `last`
-    /// can jump straight to the far side. That is the whole reason this takes
-    /// a count instead of being called repeatedly: on a megabase surface
-    /// idling through a long stretch, the difference is one walk over ~900k
-    /// spans versus dozens of them.
+    /// One pass over what is standing however large `n` is: nothing changed
+    /// across the gap, so every open span's `last` jumps straight to the far
+    /// side. On a megabase surface idling through a long stretch that is one
+    /// walk over ~900k spans rather than dozens.
     pub fn push_repeats(&mut self, n: usize) {
         if n == 0 {
             return;
@@ -356,21 +328,17 @@ mod layout {
     use crate::render_frame::RenderEntity;
 
     /// The trade in bytes, pinned so a field added to either side shows up
-    /// here rather than quietly eroding the win.
-    ///
-    /// A span costs more than a bare entity, since it carries the type and
-    /// the two frame bounds alongside it. It breaks even at two frames and
-    /// wins from three onward, which every real capture is.
+    /// here rather than eroding the win. A span carries the type and two frame
+    /// bounds, so it breaks even at two frames and wins from three onward.
     #[test]
     fn a_span_costs_a_fixed_amount_more_than_the_item_it_wraps() {
         let entity = std::mem::size_of::<RenderEntity>();
         let span = std::mem::size_of::<Span<RenderEntity>>();
         assert_eq!(entity, 12, "RenderEntity grew; the numbers below need revisiting");
-        // 12 for the entity, 2 for the type, 4 each for the bounds, padded
-        // to the 4-byte alignment. The type could be dropped to reach 20 by
-        // keeping per-type boundaries alongside the type-sorted spans instead
-        // of one copy per span, which is worth doing only if this ever stops
-        // being comfortably small.
+        // 12 for the entity, 2 for the type, 4 each for the bounds, padded to
+        // 4-byte alignment. The type could be dropped to reach 20 by keeping
+        // per-type boundaries alongside the sorted spans, worth doing only if
+        // this stops being comfortably small.
         assert_eq!(span, 24, "Span<RenderEntity> grew; likewise");
 
         // A 400k-entity base held for 200 frames, the shape this replaced.
@@ -390,12 +358,11 @@ mod bench {
     use crate::registry::TypeRegistry;
     use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
-    /// What the span layout actually costs and saves, on a sequence shaped
-    /// like a real capture: a base growing to 400k entities over 150 frames.
+    /// What the span layout costs and saves on a sequence shaped like a real
+    /// capture: 400k entities over 150 frames.
     ///
     /// `#[ignore]`d because it builds every frame the old way first, which is
-    /// the peak this exists to remove, so it needs the memory it is measuring
-    /// against. Run in release:
+    /// the peak this removes. Run in release:
     ///
     /// ```text
     /// cargo test --release -p viewer --lib gains -- --ignored --nocapture
@@ -420,7 +387,14 @@ mod bench {
             for (t, &type_id) in types.iter().enumerate() {
                 let start = entities.len() as u32;
                 for i in (t..n).step_by(types.len()) {
-                    entities.push(RenderEntity { x: (i % 2000) as f32 + 0.5, y: (i / 2000) as f32 + 0.5, w: 1, h: 1, d: 0 });
+                    entities.push(RenderEntity {
+                        x: (i % 2000) as f32 + 0.5,
+                        y: (i / 2000) as f32 + 0.5,
+                        w: 1,
+                        h: 1,
+                        d: 0,
+                        shape: 0,
+                    });
                 }
                 runs.push(Run { type_id, start, end: entities.len() as u32 });
             }
