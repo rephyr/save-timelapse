@@ -173,24 +173,44 @@ local function ensure_capture_segment()
     storage.timelapse_capture = state
   end
 
+  -- A load always starts a new segment rather than resuming the one this save
+  -- names, which is what `capture_dictionaries_synced` being false means here.
+  --
+  -- Resuming could not be made safe. The file a save names is not necessarily
+  -- still there: deleting a capture cannot reach the saves that describe it, so
+  -- loading a save from before a reset appended to a file that was gone and
+  -- recreated it with no header. Nor was the name honest, since a segment named
+  -- for when it was first created went on to hold events from an entirely
+  -- different branch, and the reader bounds abandoned branches using exactly
+  -- that number.
+  --
+  -- Starting fresh costs one file per load and makes both true: every file gets
+  -- its header from whoever created it, and every filename is the tick its
+  -- records really begin at.
+  if not capture_dictionaries_synced then
+    state.segment_start_tick = game.tick
+    state.segment_initialized = false
+  end
+
+  -- Invariant: `capture_pending` must be empty whenever this changes. Buffered
+  -- records carry dictionary ids belonging to the file they were encoded for,
+  -- so redirecting the buffer mid-flight writes records the new file never
+  -- defines names for, and a reader can only drop them. Safe here because a
+  -- load re-runs this file and empties the buffer; `M.reset_capture` is the
+  -- other place the path moves, and it clears the buffer itself.
   capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()
     capture_surfaces = encode.new_dictionary()
     capture_last_written_tick = nil
+    -- Not an append: a segment starting at a tick some earlier attempt also
+    -- started at is that attempt being redone, and what it wrote is a branch
+    -- the player has just abandoned by loading back to here.
     export.safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
-  elseif not capture_dictionaries_synced then
-    -- Resuming a segment this save was already writing. The module locals
-    -- above were reset by the load while the file still holds every name
-    -- defined before it, so the two sides disagree about what id 0 means.
-    -- See encode.event_reset_dictionaries.
-    export.safe_write_file(capture_path, encode.event_reset_dictionaries(), true)
   end
 
-  -- Set after both branches, so the very first call of a session takes one
-  -- of them and every later call in the same session takes neither.
   capture_dictionaries_synced = true
 end
 

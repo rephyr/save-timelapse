@@ -119,9 +119,42 @@ pub struct EventStream {
     pending_remove_name: Option<String>,
     unknown_extensions: usize,
     undefined_references: usize,
+    /// Set when the walk stopped on a tag it could not read, as opposed to
+    /// simply running out of bytes. That difference is what separates a
+    /// damaged file from one whose last record was cut short by the game being
+    /// killed, and it is what `stream_log` needs to judge a headerless
+    /// segment.
+    unreadable_tag: bool,
+    /// Where records begin, so a headerless segment can be rewound to 0 and a
+    /// normal one past its five byte header.
+    start: usize,
+    headerless: bool,
 }
 
 impl EventStream {
+    fn over(bytes: Vec<u8>, start: usize) -> EventStream {
+        EventStream {
+            bytes,
+            pos: start,
+            start,
+            names: Vec::new(),
+            surfaces: Vec::new(),
+            current_tick: None,
+            pending_remove_name: None,
+            unknown_extensions: 0,
+            undefined_references: 0,
+            unreadable_tag: false,
+            headerless: false,
+        }
+    }
+
+    /// Whether this segment had no header and was accepted on the strength of
+    /// parsing cleanly. Worth reporting: it means a recording was damaged and
+    /// recovered, not that everything was well.
+    pub fn headerless(&self) -> bool {
+        self.headerless
+    }
+
     /// Extension records stepped over because this build does not recognise
     /// their tag, which only means the capture is newer than the tool. Only
     /// meaningful once the stream has been walked.
@@ -140,6 +173,31 @@ impl EventStream {
     /// played.
     pub fn undefined_references(&self) -> usize {
         self.undefined_references
+    }
+
+    /// Walks the whole stream to see whether it reads as events, then puts it
+    /// back so the caller can walk it for real. Used only to judge a segment
+    /// with no header, where guessing wrong would mean feeding a replay
+    /// nonsense.
+    ///
+    /// Reuses this stream rather than copying the bytes: a segment can be
+    /// hundreds of megabytes, and the whole point is that this costs a second
+    /// pass and nothing else.
+    fn reads_as_events(&mut self) -> bool {
+        let mut any = false;
+        for _ in self.by_ref() {
+            any = true;
+        }
+        let clean = any && !self.unreadable_tag;
+        self.pos = self.start;
+        self.names.clear();
+        self.surfaces.clear();
+        self.current_tick = None;
+        self.pending_remove_name = None;
+        self.unknown_extensions = 0;
+        self.undefined_references = 0;
+        self.unreadable_tag = false;
+        clean
     }
 }
 
@@ -319,7 +377,10 @@ impl Iterator for EventStream {
                 // not know can only come from a version whose layout differs,
                 // and `stream_log`'s version check has already refused those.
                 // Reaching here means a damaged file, so stop.
-                _ => return None,
+                _ => {
+                    self.unreadable_tag = true;
+                    return None;
+                }
             }
 
             self.pos += r.consumed();
@@ -335,7 +396,7 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     File::open(path)?.read_to_end(&mut bytes)?;
 
     if bytes.get(0..4) != Some(&MAGIC[..]) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an event log (bad magic)", path.display())));
+        return headerless(path, bytes);
     }
     match bytes.get(4) {
         Some(&v) if (MIN_SUPPORTED_VERSION..=CURRENT_VERSION).contains(&v) => {}
@@ -351,16 +412,28 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
         None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display()))),
     }
 
-    Ok(EventStream {
-        bytes,
-        pos: 5,
-        names: Vec::new(),
-        surfaces: Vec::new(),
-        current_tick: None,
-        pending_remove_name: None,
-        unknown_extensions: 0,
-        undefined_references: 0,
-    })
+    Ok(EventStream::over(bytes, 5))
+}
+
+/// A segment with no header, accepted if it reads as events all the way to the
+/// end and refused otherwise.
+///
+/// These are real and they are not corruption. Deleting a capture cannot reach
+/// the save files that describe it, so a save made before a reset still names
+/// the segment the reset deleted, and loading it appends to a file that is no
+/// longer there. The mod believed the header was written hours ago, so the file
+/// comes back headerless with every record after it intact.
+///
+/// Judged by parsing rather than by guessing: a whole-file walk that never
+/// meets a tag it cannot read is strong evidence, and the alternative is
+/// throwing away somebody's playthrough over five missing bytes.
+fn headerless(path: &Path, bytes: Vec<u8>) -> io::Result<EventStream> {
+    let mut stream = EventStream::over(bytes, 0);
+    if stream.reads_as_events() {
+        stream.headerless = true;
+        return Ok(stream);
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an event log (bad magic)", path.display())))
 }
 
 /// One segment file, plus the half-open tick range replay should take from it.
@@ -664,6 +737,51 @@ mod tests {
         assert_eq!(events.len(), 2, "the record after the extension must still arrive");
         assert_eq!(events[1].event, Event::AddEntity { name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2) });
         assert_eq!(stream.unknown_extensions(), 1);
+    }
+
+    /// A segment that lost its header is recovered rather than thrown away.
+    /// Resetting a capture deletes files that saves still name, so loading one
+    /// of those saves appends to a file that is gone and it comes back with
+    /// every record intact and no magic in front.
+    #[test]
+    fn a_segment_with_no_header_is_recovered_if_it_reads_as_events() {
+        let whole = segment(|w| {
+            w.u8(2).u64(10);
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(15).i32(25).u8(0).u8(1).u8(1).u64(1).u16(0);
+            w.u8(3).u16(0).i32(35).i32(45).u8(0).u8(1).u8(1).u64(2).u16(0);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let intact = write_to(dir.path(), "events_0.stev", &whole);
+        let expected: Vec<LoggedEvent> = stream_log(&intact).unwrap().collect();
+        assert_eq!(expected.len(), 2);
+
+        // The same bytes with the five byte header gone, which is exactly what
+        // the mod leaves behind in this case.
+        let beheaded = write_to(dir.path(), "events_1.stev", &whole[5..]);
+        let mut stream = stream_log(&beheaded).expect("a headerless segment must still open");
+        let recovered: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(recovered, expected, "recovered events must match the intact file exactly");
+        assert!(stream.headerless(), "and the recording must be reported as damaged");
+    }
+
+    /// Recovery only stretches so far. Something that is not an event log must
+    /// still be refused, or a replay would be fed nonsense.
+    #[test]
+    fn something_that_is_not_an_event_log_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("junk.stev", b"this is not a capture at all, it is prose".to_vec()),
+            ("empty.stev", Vec::new()),
+            // A plausible first record followed by a tag no version has.
+            ("half.stev", vec![2, 10, 0, 0, 0, 0, 0, 0, 0, 99]),
+        ] {
+            let path = write_to(dir.path(), name, &bytes);
+            assert!(stream_log(&path).is_err(), "{name} must not be accepted as a headerless segment");
+        }
     }
 
     /// Records that name a dictionary entry their segment never defined are

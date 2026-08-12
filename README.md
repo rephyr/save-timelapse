@@ -130,6 +130,7 @@ The replay is designed to be explored rather than simply watched.
 | `B` | Add or clear bookmark |
 | `F` | Toggle camera auto-follow |
 | `H` | Toggle construction heatmap |
+| `P` | Toggle player markers |
 | `?` | Show every control |
 | `F3` | Renderer diagnostics |
 
@@ -142,6 +143,10 @@ Playback, the planet switcher and reframing are also clickable, so the viewer ca
 Exporting is done from the companion tool rather than from inside the viewer. Run `save-timelapse.exe`, choose the video option, and pick a timelapse, a resolution and a frame rate. The finished file is written to a `videos` folder next to the program.
 
 No FFmpeg or other video software is needed. You can also export a numbered image per frame instead, for editing the result yourself.
+
+You are also asked what to put on top of the video: the in-game clock, so the footage says how long the factory took, and a marker showing where you were, for captures recorded with live capture. Both are burned into the frames, so they are chosen before the render rather than switched on afterwards. Neither is on unless you ask, apart from the clock, which most timelapses want.
+
+If you happen to have FFmpeg on your PATH, the tool offers an MP4 as well. It is roughly fifteen times smaller than the AVI and is what sharing sites accept, since many will not upload or preview an AVI at all. It is only ever offered when FFmpeg is already there, and nothing asks you to install it.
 
 ---
 
@@ -166,6 +171,8 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **Entity rotation is limited.** Belts, underground belts, splitters and pipes are drawn from Factorio's own in-world sprites, so they show their real direction, corners and connections. Most other entities remain unrotated because their inventory icons are not designed to rotate convincingly.
 
 - **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded, and so is the rotation Factorio applies to the belt you dragged from when a line turns a corner. What is still missing is any other way the game changes a facing without an event. Recording a fresh baseline corrects everything built so far.
+
+- **Coming back to a branch you left is not recorded.** Loading an older save and carrying on tells the recording that the play you left behind was replaced, and it is dropped, which is what keeps the timelapse showing one coherent history rather than several contradicting ones. If you later load a save from that abandoned branch and continue it, the part you left behind is already gone, so the factory jumps forward in one step with no record of how it got there. Recording a fresh baseline from where you are now repairs it.
 
 - **Ground you covered before it was read is not recovered either.** Natural ground is scanned once, from a single save, after the fact, which is what keeps it out of your game entirely. A lake you landfilled at hour three is already landfill when that scan happens, so its water was never recorded anywhere: replayed from the beginning the lake is a hole until the tick the landfill goes down, and removing that landfill uncovers nothing. With terrain capture switched off there is deliberately no ground in the timelapse to uncover at all.
 

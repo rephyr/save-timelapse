@@ -15,9 +15,9 @@ use viewer::{
     icon_source_rect, pipe_piece_path, pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path,
     splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_source_rect,
     underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity,
-    RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES,
-    SHEET_ROWS, SPRITE_TILE_PIXELS,
+    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, Mp4Writer, PlayerTrack, ProgressBar,
+    RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES,
+    LOD_CELL_TILES, PIECES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -146,6 +146,9 @@ struct ViewerState {
     sprites_enabled: bool,
     lod_enabled: bool,
     heatmap_enabled: bool,
+    /// Whether player markers are drawn. Unlike the two above it survives the
+    /// session, so it is written back whenever it changes.
+    players_enabled: bool,
     /// Whether the `+N more` surface list is open.
     surfaces_expanded: bool,
 }
@@ -160,8 +163,16 @@ struct ExportRequest {
     /// Frames per second when writing video. Ignored for an image sequence,
     /// which has no notion of a rate.
     fps: u32,
-    /// Write a playable `.avi` instead of a folder of PNGs.
+    /// Write a playable video instead of a folder of PNGs.
     video: bool,
+    /// Burn player markers into the exported frames.
+    overlay_players: bool,
+    /// Burn the in-game clock into the exported frames.
+    overlay_clock: bool,
+    /// H.264 in an MP4 through FFmpeg rather than the built-in MJPEG AVI.
+    /// Only ever set when the CLI found FFmpeg, the tool's own writer being
+    /// what keeps it dependency free.
+    mp4: bool,
     /// Which surface to render. `None` means the busiest, which is what
     /// `group_by_surface` already orders first. `Some("all")` renders every
     /// surface into its own subfolder.
@@ -187,7 +198,8 @@ fn parse_args() -> Args {
     let (mut export_dir, mut width, mut height) = (None, 1920u32, 1080u32);
     let mut supersample = DEFAULT_SUPERSAMPLE;
     let mut surface = None;
-    let (mut fps, mut video) = (30u32, false);
+    let (mut fps, mut video, mut mp4) = (30u32, false, false);
+    let (mut overlay_players, mut overlay_clock) = (false, false);
 
     let mut i = 0;
     while i < args.len() {
@@ -229,6 +241,9 @@ fn parse_args() -> Args {
                 supersample = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(supersample);
             }
             "--video" => video = true,
+            "--mp4" => mp4 = true,
+            "--overlay-players" => overlay_players = true,
+            "--overlay-clock" => overlay_clock = true,
             other => result.path = Some(other.to_string()),
         }
         i += 1;
@@ -250,6 +265,9 @@ fn parse_args() -> Args {
             surface,
             fps: fps.clamp(1, 240),
             video,
+            mp4,
+            overlay_players,
+            overlay_clock,
             // Capped by the render target it implies: GPUs stop honouring
             // texture sizes past 8192 a side, and a refused target is a black
             // export rather than an error.
@@ -1053,6 +1071,12 @@ fn handle_input(
     if is_key_pressed(KeyCode::H) {
         state.heatmap_enabled = !state.heatmap_enabled;
     }
+    // Written back on change rather than on exit: the viewer is closed by
+    // shutting the window, which runs nothing.
+    if is_key_pressed(KeyCode::P) {
+        state.players_enabled = !state.players_enabled;
+        remember_players(state.players_enabled);
+    }
 
     // Renderer A/B tests, not features: either one makes the factory look
     // broken to somebody who pressed the key by accident, so they only answer
@@ -1145,11 +1169,13 @@ async fn export_frames(
     world: &mut WorldView,
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
+    player_track: &PlayerTrack,
+    ui: &Ui,
     request: &ExportRequest,
 ) -> std::io::Result<usize> {
     // For video the target is a file, so only its parent needs to exist; for
     // a sequence the target is the folder itself.
-    let video_path = request.dir.with_extension("avi");
+    let video_path = request.dir.with_extension(if request.mp4 { "mp4" } else { "avi" });
     match request.video {
         true => {
             if let Some(parent) = video_path.parent() {
@@ -1164,9 +1190,10 @@ async fn export_frames(
     let ss = request.supersample;
     let (rw, rh) = (request.width * ss, request.height * ss);
     let (w, h) = (rw as f32, rh as f32);
-    let mut video = match request.video {
-        true => Some(AviWriter::create(&video_path, request.width, request.height, request.fps)?),
-        false => None,
+    let mut video = match (request.video, request.mp4) {
+        (false, _) => None,
+        (true, false) => Some(VideoOut::Avi(AviWriter::create(&video_path, request.width, request.height, request.fps)?)),
+        (true, true) => Some(VideoOut::Mp4(Mp4Writer::create(&video_path, request.width, request.height, request.fps)?)),
     };
     let target = render_target(rw, rh);
     target.texture.set_filter(FilterMode::Nearest);
@@ -1234,6 +1261,16 @@ async fn export_frames(
             None,
             &mut counter,
         );
+        // Into the render target, so before `set_default_camera` hands drawing
+        // back to the window. Sized by `ss` because everything here is drawn
+        // oversized and averaged down.
+        if request.overlay_players {
+            draw_player_markers(ui, player_track, &world.name, frame.tick, &world.camera, screen_center, ss as f32);
+        }
+        if request.overlay_clock {
+            draw_export_clock(ui, frame.tick, h, ss as f32);
+        }
+
         set_default_camera();
 
         // Read back and write before yielding: the texture is what was just
@@ -1241,7 +1278,7 @@ async fn export_frames(
         // frame's clear.
         let image = downsample(&target.texture.get_texture_data(), ss);
         match &mut video {
-            Some(writer) => writer.add_jpeg(&encode_jpeg(&image)?)?,
+            Some(writer) => writer.add(&image)?,
             None => {
                 let path = request.dir.join(format!("frame_{index:05}.png"));
                 image.export_png(&path.to_string_lossy());
@@ -1274,16 +1311,54 @@ async fn export_frames(
 /// One frame as JPEG. macroquad hands back RGBA and JPEG has no alpha, so the
 /// alpha byte is dropped rather than composited: every pixel came from a
 /// clear and opaque draws.
-fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
+/// Where finished frames go when the export is a video. PNG needs no state of
+/// its own and so is not here.
+enum VideoOut {
+    Avi(AviWriter),
+    Mp4(Mp4Writer),
+}
+
+impl VideoOut {
+    /// MJPEG takes a compressed frame; FFmpeg takes raw pixels, so the MP4
+    /// path is encoded once rather than JPEGed and then re-encoded.
+    fn add(&mut self, image: &macroquad::texture::Image) -> std::io::Result<()> {
+        match self {
+            VideoOut::Avi(writer) => writer.add_jpeg(&encode_jpeg(image)?),
+            VideoOut::Mp4(writer) => writer.add_frame(&to_rgb24(image)),
+        }
+    }
+
+    fn frames(&self) -> u32 {
+        match self {
+            VideoOut::Avi(writer) => writer.frames() as u32,
+            VideoOut::Mp4(writer) => writer.frames(),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            VideoOut::Avi(writer) => writer.finish(),
+            VideoOut::Mp4(writer) => writer.finish(),
+        }
+    }
+}
+
+fn to_rgb24(image: &macroquad::texture::Image) -> Vec<u8> {
     // Rows last to first, a render target reading back bottom-up.
     // `Image::export_png` undoes that itself, so the PNG path never needed it.
-    // See `avi.rs`, whose header declares these rows top-down: the two agree.
+    // See `avi.rs`, whose header declares these rows top-down: the two agree,
+    // and so does the raw stream `mp4.rs` pipes to ffmpeg.
     let (width, height) = (image.width as usize, image.height as usize);
     let mut rgb: Vec<u8> = Vec::with_capacity(width * height * 3);
     for y in (0..height).rev() {
         let row = &image.bytes[y * width * 4..(y + 1) * width * 4];
         rgb.extend(row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     }
+    rgb
+}
+
+fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
+    let rgb = to_rgb24(image);
     let mut out = Vec::new();
     // 85 rather than the usual default: flat colour with hard edges is what
     // low-quality JPEG smears into halos, and this content compresses well.
@@ -1914,14 +1989,42 @@ fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, m
 /// Where the player(s) were as of `tick`, on whichever world/surface is
 /// active, looked up fresh each draw rather than cached on the frame,
 /// since it's a cheap scan over a tiny sample count (see PlayerTrack).
-fn draw_player_markers(ui: &Ui, player_track: &PlayerTrack, world_name: &str, tick: u64, camera: &Camera, screen_center: Vec2) {
+/// Saves the player-marker preference, ignoring failure. Not being able to
+/// remember it costs one keypress next time, which is no reason to interrupt
+/// somebody watching a timelapse.
+fn remember_players(enabled: bool) {
+    let mut settings = save_timelapse::settings::Settings::load();
+    settings.show_players = Some(enabled);
+    let _ = settings.save();
+}
+
+/// `scale` is 1 on screen and the supersample factor in an export, where
+/// everything is drawn oversized and averaged down. Without it a marker sized
+/// in screen pixels comes out half that in a 2x export.
+fn draw_player_markers(
+    ui: &Ui,
+    player_track: &PlayerTrack,
+    world_name: &str,
+    tick: u64,
+    camera: &Camera,
+    screen_center: Vec2,
+    scale: f32,
+) {
     for (name, x, y) in player_track.positions_at(world_name, tick) {
         let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
         let color = color_for(name, 0.7, 0.95);
-        draw_circle(screen.x, screen.y, 9.0, Color::new(0.0, 0.0, 0.0, 0.6));
-        draw_circle(screen.x, screen.y, 6.0, color);
-        ui.text_legible(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
+        draw_circle(screen.x, screen.y, 9.0 * scale, Color::new(0.0, 0.0, 0.0, 0.6));
+        draw_circle(screen.x, screen.y, 6.0 * scale, color);
+        ui.text_legible(name, screen.x + 12.0 * scale, screen.y + 4.0 * scale, 18.0 * scale, WHITE);
     }
+}
+
+/// The in-game clock burned into an exported frame, bottom left. Off unless
+/// asked for: an export is the world alone, and anything over it is a choice.
+fn draw_export_clock(ui: &Ui, tick: u64, height: f32, scale: f32) {
+    let text = format_game_time(tick);
+    let size = 28.0 * scale;
+    ui.text_legible(&text, 24.0 * scale, height - 24.0 * scale, size, WHITE);
 }
 
 /// Everything the draw loop needs, assembled once before it starts.
@@ -2050,6 +2153,8 @@ async fn run_export(
     worlds: &mut [WorldView],
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
+    player_track: &PlayerTrack,
+    ui: &Ui,
     request: &ExportRequest,
 ) -> Result<(), String> {
     let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
@@ -2081,9 +2186,12 @@ async fn run_export(
             surface: None,
             fps: request.fps,
             video: request.video,
+            mp4: request.mp4,
+            overlay_players: request.overlay_players,
+            overlay_clock: request.overlay_clock,
             supersample: request.supersample,
         };
-        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, &this).await {
+        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, player_track, ui, &this).await {
             eprintln!("export of {name} failed: {e}");
         }
     }
@@ -2106,6 +2214,9 @@ async fn main() {
         sprites_enabled: true,
         lod_enabled: true,
         heatmap_enabled: false,
+        // Shown unless the viewer has been told otherwise: a capture that has
+        // player positions recorded them on purpose.
+        players_enabled: save_timelapse::settings::Settings::load().show_players.unwrap_or(true),
         surfaces_expanded: false,
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
@@ -2124,7 +2235,10 @@ async fn main() {
     }
 
     if let Some(request) = &args.export {
-        if let Err(message) = run_export(&mut worlds, &registry, &sprites, request).await {
+        // The export path never builds the interactive chrome, so this is the
+        // only thing it needs from it: a font for whatever it burns in.
+        let ui = Ui::new();
+        if let Err(message) = run_export(&mut worlds, &registry, &sprites, &player_track, &ui, request).await {
             eprintln!("{message}");
         }
         return;
@@ -2283,7 +2397,9 @@ async fn main() {
             &mut counter,
         );
 
-        draw_player_markers(&ui, &player_track, world_name, sequence.current().tick, camera, screen_center);
+        if state.players_enabled {
+            draw_player_markers(&ui, &player_track, world_name, sequence.current().tick, camera, screen_center, 1.0);
+        }
         draw_timeline_bar(
             &ui,
             &timeline,

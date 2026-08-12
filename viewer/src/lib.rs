@@ -13,6 +13,7 @@ mod construction;
 mod draw_calls;
 mod loading;
 mod marks;
+mod mp4;
 mod pipes;
 mod player_track;
 mod progress;
@@ -38,6 +39,7 @@ pub use loading::{
     synthetic_frame, synthetic_tiles, terrain_path, terrain_paths, timeline_ticks, ParallelFrameLoad,
 };
 pub use marks::{busy_stretches, frames_for_ticks, next_mark, previous_mark, read_bookmarks, write_bookmarks, Mark};
+pub use mp4::Mp4Writer;
 pub use pipes::{infer_connections, piece_name, PIECES};
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};

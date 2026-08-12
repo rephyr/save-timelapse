@@ -1,7 +1,12 @@
 ---------------------------------------------------------------------------------------------------
 Version: 0.7.1
 Date: 2026-08-12
+  Features:
+    - Choose what goes on top of an exported video. The in-game clock, so the footage says how long the factory took, and a marker showing where you were. You are asked when you export, and the marker is only offered for recordings that have your position in them
+    - Player markers can be turned off with P, and the viewer remembers your answer between runs
+    - Export an MP4 when you have FFmpeg. It is offered only if FFmpeg is already on your PATH, and it is far smaller than the AVI: measured on real frames, about 15 times. It is also what sharing sites accept, where an AVI often will not upload or preview at all. Nothing changes if you do not have FFmpeg, and nothing asks you to install it: the built-in AVI writer is still there and still needs nothing
   Bugfixes:
+    - Loading a save always starts a new stretch of recording rather than continuing the one that save remembers. Continuing could not be made safe: the file a save names may have been deleted by a reset, in which case the game recreated it in a form the tool could not read, and a stretch named for when it started could end up holding a completely different branch of your playthrough. Recordings damaged this way are now recovered when they are read
     - Resetting a recording no longer stops it recording. After /timelapse-reset-capture the mod kept using the name table belonging to the recording it had just deleted, so every change you made afterwards was written in a form the tool could only throw away. The new recording stayed empty until the save was reloaded, and said nothing about it
     - Dragged belt corners face the right way. Turning a corner while dragging a belt line makes Factorio rotate the belt already placed, without telling a mod, so every corner made that way kept the facing it went down with and drew as a straight belt
     - Mining ore out from under a machine takes the ore, not the machine. A removal only said where it happened, and where a deposit and a building share a tile that always meant the building, so hand-mining the ore under one made the building vanish instead

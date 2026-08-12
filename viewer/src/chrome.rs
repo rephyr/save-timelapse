@@ -651,6 +651,7 @@ const KEY_GROUPS: &[(&str, &[Binding])] = &[
         &[
             ("f", "follow the growing base"),
             ("h", "construction heatmap"),
+            ("p", "player markers"),
             ("shift", "with m or c, go back"),
             ("F3", "renderer diagnostics"),
             ("?", "this panel"),

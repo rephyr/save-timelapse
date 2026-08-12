@@ -689,19 +689,34 @@ silently no-ops, leaving the entity in the replayed timeline forever. Replay
 tries the id first and falls back to position (see "World state" below), and no
 shape of `RemoveEntity` omits position.
 
-A segment file is resumed across a save reload. Factorio re-runs all of
-`capture.lua`'s top-level code on every load, resetting the in-memory name and
-surface dictionaries to empty while the file on disk keeps every
-`DefineName`/`DefineSurface` written before that point. The writer then hands
-out id 0 again while the reader, assigning ids by encounter order, is already
-past 0, so **every entity and tile logged after a reload decodes as whichever
-name was defined first in that segment.** Nothing about the file looks damaged.
+**A load starts a new segment.** Factorio re-runs all of `capture.lua`'s
+top-level code on every load, which is how the mod knows a load happened at
+all: `storage` rewinds with the save and cannot tell a fresh load from a long
+session.
 
-Event format version 2 fixes this with an explicit `ResetDictionaries` record
-(tag 7, no payload), written when a load resumes a segment already on disk;
-both sides restart their ids from zero there. Version 1 files are still read
-and still carry the bug, the record saying where the reset happened being
-exactly what is missing.
+Resuming the segment a save names was tried and could not be made safe, for two
+reasons. The file may not exist: deleting a capture cannot reach the saves that
+describe it, so loading a save from before a reset appended to a file that was
+gone and recreated it with no header, which a reader could only refuse. And the
+name stopped being true, since a segment named for when it was first created
+went on to hold events from a different branch entirely, while `log_segments`
+bounds abandoned branches using exactly that number.
+
+Starting fresh costs one file per load and makes both hold: every file gets its
+header from whoever created it, and every filename is the tick its records
+really begin at. A header is written rather than appended, so loading the same
+save twice truncates the first attempt, which is a branch the player abandoned
+by loading back to it.
+
+Version 2 added a `ResetDictionaries` record (tag 7, no payload) for the
+resuming case, where the writer's dictionaries restarted at id 0 while the file
+already held every earlier define, so **every entity logged after a reload
+decoded as whichever name was defined first**. Captures carrying it are still
+read; nothing writes it now.
+
+A segment with no header at all is accepted if it reads as events all the way
+to the end, which recovers recordings damaged by the resuming behaviour before
+it was removed. `Replay::headerless_segments` counts them.
 
 Persisting the dictionary in `storage` would not work, for the same reason the
 mod cannot detect a reload at all (below): `storage` rewinds with the save and
@@ -795,12 +810,29 @@ separate from `superseded_events` because a segment corrupted by deleting
 corruption produces a header-less file that fails to open outright, counted as
 `skipped_segments`.
 
-A session can legitimately span several segment files, and the mod cannot clean
-up one orphaned by deleting capture files by hand: its next flush recreates the
-file via a plain append with no magic header, under the same session tag.
-`replay::run` treats a segment that fails to open the way it treats a bad
-baseline surface, a warning and a skip, so one broken segment costs only its
-own events.
+A session spans several segment files by design, one per load, and a segment
+that fails to open is treated the way a bad baseline surface is, a warning and a
+skip, so one broken file costs only its own events.
+
+#### Returning to a branch already left
+
+Superseding is one directional, and deliberately so. Load an earlier save and
+the branch you left is truncated, which is what keeps a timelapse showing one
+coherent history. Load a save from that abandoned branch later and its history
+is already gone: the timelapse jumps, and events after the return land on a
+world built from the branch that replaced it.
+
+Fixing it means never truncating, keeping every branch, and deciding at read
+time which one the newest save descends from. Nothing in a save says which save
+it came from. A tick is not enough, since two branches share every tick between
+the divergence and the point they were abandoned at, and the mod cannot mark a
+save with a lineage it would have to invent before knowing a branch existed.
+
+So the cost is a permanently growing log, plus a guess at the one thing that
+would make it usable. Truncating loses a branch somebody may come back to;
+keeping everything loses the ability to say which history is the current one,
+which is the whole promise. The first is the better trade, and a fresh baseline
+from where the player actually is repairs it in one step.
 
 ### Timer handlers share one on_nth_tick per interval
 

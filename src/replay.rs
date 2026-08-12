@@ -292,6 +292,15 @@ pub struct Replay {
     /// never defined. Real damage, unlike `unknown_extensions`: the events are
     /// gone and nothing here can recover them.
     pub undefined_references: usize,
+    /// Segments that had no header and were recovered by parsing. A reset
+    /// deletes the files a save still names, so loading that save appends to a
+    /// file that is gone and it comes back headerless.
+    pub headerless_segments: usize,
+    /// Events describing a moment before the snapshot, which cannot be
+    /// applied to it. Normally a handful from the baseline smear; a large
+    /// number means somebody reset and then carried on from an older save, and
+    /// everything they played since is being thrown away.
+    pub pre_baseline_events: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -369,6 +378,8 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         restarted_segments: 0,
         unknown_extensions: 0,
         undefined_references: 0,
+        headerless_segments: 0,
+        pre_baseline_events: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -473,7 +484,11 @@ where
                 continue;
             }
             // Events before the baseline describe a world we did not capture.
+            // Counted rather than dropped in silence: a lot of them is the
+            // signature of a reset followed by loading an older save, and the
+            // player has no other way to find out their play went nowhere.
             if logged.tick < replay.baseline.tick {
+                replay.pre_baseline_events += 1;
                 continue;
             }
             // Same per surface: the mod logs a surface's events the instant it
@@ -513,6 +528,9 @@ where
         // actually stepped over, so it is only complete once the stream is.
         replay.unknown_extensions += stream.unknown_extensions();
         replay.undefined_references += stream.undefined_references();
+        if stream.headerless() {
+            replay.headerless_segments += 1;
+        }
 
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {

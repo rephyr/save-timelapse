@@ -635,6 +635,48 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
         true,
     )?;
 
+    // Only offered when FFmpeg is already installed. The built-in AVI writer is
+    // what keeps the tool dependency free, so MP4 is a bonus for people who
+    // happen to have FFmpeg rather than something the tool asks anyone to go
+    // and install. Asked in terms of what it is for: MJPEG in an AVI is large,
+    // and X will not accept one at all.
+    let mp4 = video
+        && save_timelapse::ffmpeg_available()
+        && ask_yes_no(
+            "
+Make an MP4? It is far smaller and is what sharing sites accept.              Answering no writes an AVI, which needs nothing installed",
+            true,
+        )?;
+    if video && !mp4 && !save_timelapse::ffmpeg_available() {
+        println!(
+            "
+  Writing an AVI. Install FFmpeg and put it on your PATH to get much"
+        );
+        println!("  smaller MP4s that you can post directly.");
+    }
+
+    // Overlays are burned into the pixels, so they are asked before the render
+    // rather than toggled afterwards like the viewer's own.
+    //
+    // The clock defaults on and the marker off, which is not inconsistency:
+    // elapsed time is the context almost every timelapse wants and the one
+    // thing the footage cannot convey by itself, while where the player stood
+    // is a personal touch most videos are better without.
+    let has_players = chosen.path.join("players.jsonl").exists();
+    let overlay_players = video
+        && has_players
+        && ask_yes_no(
+            "
+Show where you were, as a marker following you around the factory?",
+            false,
+        )?;
+    let overlay_clock = video
+        && ask_yes_no(
+            "
+Show the in-game clock, so the video says how long the factory took?",
+            true,
+        )?;
+
     let size = ask_resolution(settings.export_size().unwrap_or(DEFAULT_EXPORT_SIZE))?;
     let fps = if video { ask_fps(settings.export_fps.unwrap_or(DEFAULT_EXPORT_FPS))? } else { DEFAULT_EXPORT_FPS };
 
@@ -648,8 +690,8 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
 
     let root = videos_root();
     std::fs::create_dir_all(&root)?;
-    // No extension here: the viewer appends `.avi` for a video and treats
-    // the path as a folder for an image sequence, so the same argument
+    // No extension here: the viewer appends `.avi` or `.mp4` for a video and
+    // treats the path as a folder for an image sequence, so the same argument
     // serves both.
     let target = root.join(as_folder_name(&chosen.name));
 
@@ -665,6 +707,15 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
         .arg(size.1.to_string());
     if video {
         command.arg("--video").arg("--fps").arg(fps.to_string());
+        if mp4 {
+            command.arg("--mp4");
+        }
+        if overlay_players {
+            command.arg("--overlay-players");
+        }
+        if overlay_clock {
+            command.arg("--overlay-clock");
+        }
     }
     if let Some(name) = &surface {
         command.arg("--surface").arg(name);
@@ -841,6 +892,27 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         );
         println!("  This happens to recordings made before v0.7.1 if the capture was reset");
         println!("  mid-playthrough. Starting a fresh recording in game fixes it.");
+        acted = true;
+    }
+    // Recovered rather than lost, but the recording was damaged and saying so
+    // is how somebody learns that resetting mid-playthrough has a cost.
+    if replay_state.headerless_segments > 0 {
+        println!(
+            "
+  Part of this recording had lost its header and was recovered."
+        );
+        println!("  This happens if you reset a recording and then load a save from before it.");
+    }
+    // The events exist and were readable; they simply describe a moment the
+    // snapshot is already past, so nothing can be done with them.
+    if replay_state.pre_baseline_events > 20 {
+        println!(
+            "
+  {} recorded changes happened before this recording's snapshot and could not be used.",
+            with_thousands(replay_state.pre_baseline_events as u64)
+        );
+        println!("  That usually means a save from before the last reset was loaded and played.");
+        println!("  Resetting again from where you are now starts a clean recording.");
         acted = true;
     }
     if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
