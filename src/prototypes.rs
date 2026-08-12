@@ -29,11 +29,42 @@ pub struct Prototypes {
     /// Which tiles this capture treated as placed floor rather than generated
     /// ground, the split `world.rs` has to reproduce. Empty falls back there.
     pub floor: HashSet<String>,
+    /// Which rails connect to which, one entry per rail prototype and facing.
+    ///
+    /// Factorio will not say where a rail piece's ends are, its collision box
+    /// being hardcoded in the engine, and a capture cannot be measured for it
+    /// either: parallel track two tiles away puts endpoints exactly where a
+    /// real joint would be. Connectivity is what the game will state exactly,
+    /// and the ends follow from it, given that a straight rail's are known.
+    pub rails: Vec<RailSample>,
+}
+
+/// One rail piece and everything attached to it, relative to itself, so the
+/// sample answers for every piece of that prototype and facing.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RailSample {
+    pub name: String,
+    pub direction: u8,
+    pub links: Vec<RailLink>,
+}
+
+/// One rail attached to the piece being described, and where it sits relative
+/// to it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RailLink {
+    pub name: String,
+    pub direction: u8,
+    pub x: f32,
+    pub y: f32,
 }
 
 impl Prototypes {
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty() && self.entities.is_empty() && self.types.is_empty() && self.floor.is_empty()
+        self.tiles.is_empty()
+            && self.entities.is_empty()
+            && self.types.is_empty()
+            && self.floor.is_empty()
+            && self.rails.is_empty()
     }
 
     pub fn kind(&self, name: &str) -> Option<&str> {
@@ -72,6 +103,7 @@ pub fn read(dir: &Path) -> Option<Prototypes> {
         types: section(&root, "types", |value| Some(value.as_str()?.to_string())),
         reach: section(&root, "reach", |value| i32::try_from(value.as_i64()?).ok()),
         floor: names(&root, "floor"),
+        rails: rail_samples(&root),
     };
     (!prototypes.is_empty()).then_some(prototypes)
 }
@@ -98,6 +130,33 @@ fn names(root: &serde_json::Value, key: &str) -> HashSet<String> {
     list.iter().filter_map(|v| Some(v.as_str()?.to_string())).collect()
 }
 
+/// The `rails` section. Entry by entry like `section` above, so one sample
+/// this build cannot read costs only itself.
+fn rail_samples(root: &serde_json::Value) -> Vec<RailSample> {
+    let Some(list) = root.get("rails").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    list.iter().filter_map(rail_sample).collect()
+}
+
+fn rail_sample(value: &serde_json::Value) -> Option<RailSample> {
+    let links = value.get("links")?.as_array()?;
+    Some(RailSample {
+        name: value.get("n")?.as_str()?.to_string(),
+        direction: u8::try_from(value.get("d")?.as_u64()?).ok()?,
+        links: links.iter().filter_map(rail_link).collect(),
+    })
+}
+
+fn rail_link(value: &serde_json::Value) -> Option<RailLink> {
+    Some(RailLink {
+        name: value.get("n")?.as_str()?.to_string(),
+        direction: u8::try_from(value.get("d")?.as_u64()?).ok()?,
+        x: value.get("x")?.as_f64()? as f32,
+        y: value.get("y")?.as_f64()? as f32,
+    })
+}
+
 fn rgb(value: &serde_json::Value) -> Option<Rgb> {
     let [r, g, b] = value.as_array()?.as_slice() else {
         return None;
@@ -117,6 +176,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("prototypes.json"), body).unwrap();
         dir
+    }
+
+    /// The section exists because rail geometry is nowhere else: not in a
+    /// prototype, and not recoverable from a capture.
+    #[test]
+    fn reads_rail_connectivity() {
+        let dir = written(
+            r#"{"rails":[{"n":"curved-rail-a","d":0,"links":[
+                 {"n":"straight-rail","d":0,"x":0.0,"y":3.0},
+                 {"n":"curved-rail-b","d":0,"x":-2.0,"y":-5.0}]}]}"#,
+        );
+
+        let read = read(dir.path()).expect("a description");
+        assert_eq!(read.rails.len(), 1);
+        assert_eq!(read.rails[0].name, "curved-rail-a");
+        assert_eq!(read.rails[0].direction, 0);
+        assert_eq!(
+            read.rails[0].links,
+            vec![
+                RailLink { name: "straight-rail".to_string(), direction: 0, x: 0.0, y: 3.0 },
+                RailLink { name: "curved-rail-b".to_string(), direction: 0, x: -2.0, y: -5.0 },
+            ]
+        );
+    }
+
+    /// A capture from a mod older than the section, which is every capture
+    /// made before rails were drawn as anything but a square.
+    #[test]
+    fn a_description_without_rails_still_reads() {
+        let dir = written(r#"{"types":{"transport-belt":"transport-belt"}}"#);
+        assert!(read(dir.path()).expect("a description").rails.is_empty());
+    }
+
+    /// One unreadable sample must not take the rest with it, the same rule
+    /// every other section follows.
+    #[test]
+    fn a_malformed_rail_sample_costs_only_itself() {
+        let dir = written(
+            r#"{"rails":[{"n":"curved-rail-a"},
+                 {"n":"curved-rail-b","d":4,"links":[{"n":"straight-rail","d":4,"x":1.0,"y":0.0}]}]}"#,
+        );
+
+        let read = read(dir.path()).expect("a description");
+        assert_eq!(read.rails.len(), 1, "the entry with no facing is dropped, the other kept");
+        assert_eq!(read.rails[0].name, "curved-rail-b");
     }
 
     #[test]

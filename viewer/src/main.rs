@@ -16,8 +16,8 @@ use viewer::{
     splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_source_rect,
     underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
     DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, Mp4Writer, PlayerTrack, ProgressBar,
-    RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES,
-    LOD_CELL_TILES, PIECES, SHEET_ROWS, SPRITE_TILE_PIXELS,
+    RailSegment, RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES,
+    LOD_CELL_TILES, PIECES, RAIL_WIDTH_TILES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -514,6 +514,25 @@ struct EntityArt {
 impl EntityArt {
     fn plain(source: Rect, rotation: f32) -> EntityArt {
         EntityArt { texture: 0, source, rotation, flip_x: false, flip_y: false, tiles: None, offset: Vec2::ZERO }
+    }
+
+    /// A rail piece drawn along the path it occupies rather than on the tile
+    /// its centre sits in. Always a flat colour, never the icon: a rail's icon
+    /// is an oblique render of a short piece of track, so rotating it to a
+    /// heading spins the camera angle rather than the track.
+    fn rail(segment: RailSegment) -> EntityArt {
+        EntityArt {
+            texture: 0,
+            source: Rect::default(),
+            rotation: segment.rotation,
+            flip_x: false,
+            flip_y: false,
+            tiles: Some(Vec2::new(segment.length, RAIL_WIDTH_TILES)),
+            // A curve half is not centred on the position it is recorded at,
+            // unlike a straight, so the run is shifted onto where it really
+            // sits rather than drawn around the wrong point.
+            offset: Vec2::new(segment.offset.0, segment.offset.1),
+        }
     }
 
     /// A frame drawn at its own size, worked out from its pixels.
@@ -1506,11 +1525,21 @@ fn draw_world(
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
             let color = registry.entity_color(run.type_id);
             let rotation_allowed = registry.is_rotation_allowed(run.type_id);
+            // Per run rather than per entity: which prototype this is fixes
+            // whether it is track, and only the facing varies below.
+            let track = registry.is_rail_track(run.type_id);
             let (min, max) = bounds_for(run.type_id);
             let mut drawn = 0;
             for entity in &frame.entities[run.range()] {
                 let (w, h) = (entity.w as u32, entity.h as u32);
-                let half = entity_cull_half_extents(w, h, entity.d, rotation_allowed);
+                let segment = track.then(|| registry.rail_segment(run.type_id, entity.d)).flatten();
+                // A rail reaches well past the tile it is recorded on, up to
+                // half of a half diagonal's four tiles, so culling it on its
+                // 1x1 footprint would drop track that is still on screen.
+                let half = match segment {
+                    Some(segment) => Vec2::splat(segment.length / 2.0),
+                    None => entity_cull_half_extents(w, h, entity.d, rotation_allowed),
+                };
                 if entity.x + half.x < min.x
                     || entity.x - half.x > max.x
                     || entity.y + half.y < min.y
@@ -1519,9 +1548,13 @@ fn draw_world(
                     continue;
                 }
                 let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                let art = match sprite {
-                    Some(sprite) => entity_source(sprite, entity, rotation_allowed),
-                    None => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
+                // Track is drawn as a coloured segment, so it takes the plain
+                // rectangle path even where an icon did load for it.
+                let sprite = segment.is_none().then_some(sprite).flatten();
+                let art = match (segment, sprite) {
+                    (Some(segment), _) => EntityArt::rail(segment),
+                    (None, Some(sprite)) => entity_source(sprite, entity, rotation_allowed),
+                    (None, None) => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
                 };
                 // A frame that knows its own size in tiles is drawn at that
                 // size; everything else still fills its footprint.

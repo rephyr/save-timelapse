@@ -745,10 +745,35 @@ do
       .. '"kr-advanced-underground-belt":"underground-belt","radar":"radar",'
       .. '"small-worm-turret":"turret","transport-belt":"transport-belt"},'
       .. '"reach":{"kr-advanced-underground-belt":30},'
+      -- Empty for a game with no rails down, and for one whose rail API this
+      -- mod could not read. The desktop side falls back to its own geometry
+      -- for both, so they need not be told apart.
+      .. '"rails":[],'
       -- Named so the desktop side splits a baseline's tiles the way this
       -- capture recorded them, rather than from a list of its own that would
       -- disagree the moment a mod adds a floor.
       .. '"floor":["cerys-refined-concrete"]}'
+  )
+
+  -- Rail geometry is not in any prototype, so what gets written is which
+  -- rails connect to which and the desktop side works the shape out from
+  -- there. Sorted by name then facing, so two runs of one save agree.
+  check(
+    "prototypes_json: rails carry their neighbours, sorted by name then facing",
+    encode.prototypes_json({
+      { n = "curved-rail-b", d = 0, links = { { n = "straight-rail", d = 0, x = 2, y = 0 } } },
+      { n = "curved-rail-a", d = 4, links = {
+        { n = "straight-rail", d = 4, x = -3, y = 0 },
+        { n = "curved-rail-b", d = 4, x = 1.5, y = -2.5 },
+      } },
+      { n = "curved-rail-a", d = 0, links = { { n = "straight-rail", d = 0, x = 0, y = 3 } } },
+    }):match('("rails":%[.*%]),"floor"'),
+    '"rails":['
+      .. '{"n":"curved-rail-a","d":0,"links":[{"n":"straight-rail","d":0,"x":0.0,"y":3.0}]},'
+      .. '{"n":"curved-rail-a","d":4,"links":[{"n":"straight-rail","d":4,"x":-3.0,"y":0.0},'
+      .. '{"n":"curved-rail-b","d":4,"x":1.5,"y":-2.5}]},'
+      .. '{"n":"curved-rail-b","d":0,"links":[{"n":"straight-rail","d":0,"x":2.0,"y":0.0}]}'
+      .. ']'
   )
   prototypes = nil
 end

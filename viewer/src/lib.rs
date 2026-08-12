@@ -17,6 +17,7 @@ mod mp4;
 mod pipes;
 mod player_track;
 mod progress;
+mod rails;
 mod registry;
 mod render_frame;
 mod resample;
@@ -43,6 +44,7 @@ pub use mp4::Mp4Writer;
 pub use pipes::{infer_connections, piece_name, PIECES};
 pub use player_track::PlayerTrack;
 pub use progress::{LoadProgress, ProgressBar};
+pub use rails::{rail_segment, RailSegment, RAIL_WIDTH_TILES};
 pub use registry::{color_for, TypeId, TypeRegistry};
 pub use render_frame::{
     use_chunk_lod, FrameSequence, LodCell, RenderEntity, RenderFrame, RenderTile, Run, SequenceBuilder, LOD_CELL_TILES,

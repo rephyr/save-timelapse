@@ -58,6 +58,19 @@ local capture_dictionaries_synced = false
 --- which is what makes a capture heal itself when a version that wrote the file
 --- wrongly is replaced.
 local loaded_mods_stamp = nil
+--- Bumped whenever `encode.prototypes_json` gains or changes a section.
+---
+--- Part of the stamp below because the stamp decides whether the file is
+--- rewritten, and a version of this mod that describes more than the last one
+--- did has to rewrite it even though the loaded mods are identical. Without
+--- this a capture kept whatever its first write produced: the rail section
+--- added in 0.8.0 never reached a playthrough already under way, and would
+--- have looked exactly like the sampling failing.
+local PROTOTYPES_FORMAT = 5
+
+--- What the prototype description was written for: every loaded mod and its
+--- version, plus the shape this mod writes. Cached, `script.active_mods`
+--- being fixed for the run.
 local function loaded_mods()
   if not loaded_mods_stamp then
     local parts = {}
@@ -65,7 +78,7 @@ local function loaded_mods()
       parts[#parts + 1] = name .. " " .. version
     end
     table.sort(parts)
-    loaded_mods_stamp = table.concat(parts, ",")
+    loaded_mods_stamp = table.concat(parts, ",") .. ";format " .. PROTOTYPES_FORMAT
   end
   return loaded_mods_stamp
 end

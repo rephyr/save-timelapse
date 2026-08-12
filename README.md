@@ -168,7 +168,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **Live capture starts when enabled.** Earlier factory history requires existing save files.
 - **Save-based milestones depend on save frequency.** Live capture records milestone timing precisely, while existing saves can only identify the first save that shows an event.
 - **Bot construction is less visible in the heatmap.** Automated construction is spread across multiple frames, while manual building can create many entities in a single frame.
-- **Entity rotation is limited.** Belts, underground belts, splitters and pipes are drawn from Factorio's own in-world sprites, so they show their real direction, corners and connections. Most other entities remain unrotated because their inventory icons are not designed to rotate convincingly.
+- **Entity rotation is limited.** Belts, underground belts, splitters and pipes are drawn from Factorio's own in-world sprites, so they show their real direction, corners and connections. Rail is drawn along the path it occupies, so straights, diagonals and corners run continuously instead of stepping. Most other entities remain unrotated because their inventory icons are not designed to rotate convincingly.
 
 - **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded, and so is the rotation Factorio applies to the belt you dragged from when a line turns a corner. What is still missing is any other way the game changes a facing without an event. Recording a fresh baseline corrects everything built so far.
 
@@ -198,6 +198,10 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - [x] Choose what goes on an exported video: the in-game clock, and a marker showing where you were
 - [x] Recordings survive a reset and a reload, and say so when something could not be read
 - [x] The building count counts buildings
+- [x] Going back to a branch of your playthrough you had left keeps the history you left it with
+- [x] Timelapses built from existing saves compare the saves against each other, and order them by the tick inside each one rather than by filename
+- [x] A frame that clears most of the factory loads. Measured on a 4000 hour gigabase going from 3.7 million buildings to 500 thousand in one frame
+- [x] Rail drawn along the track rather than as a square on each piece's centre tile, so runs and corners are continuous
 
 ### v1.0
 

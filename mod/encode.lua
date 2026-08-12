@@ -678,7 +678,26 @@ local REACH_TYPES = {
 --- taking `enemy_map_color`. The two are mutually exclusive per prototype,
 --- `map_color` being what charting uses "if a friendly or enemy color isn't
 --- defined".
-function M.prototypes_json()
+--- Every prototype type that is rail track. Geometry is a property of the
+--- engine rather than of a save, so one sample of each facing answers for
+--- every piece like it.
+M.RAIL_TYPES = {
+  "straight-rail", "curved-rail-a", "curved-rail-b", "half-diagonal-rail",
+  "legacy-straight-rail", "legacy-curved-rail",
+  "elevated-straight-rail", "elevated-curved-rail-a", "elevated-curved-rail-b",
+  "elevated-half-diagonal-rail",
+}
+
+--- Half-tile positions are the finest a rail sits on, so one decimal place is
+--- exact rather than rounded. Written with `%.1f` rather than `%g` so the
+--- output does not change shape between a whole number and a fraction.
+local function rail_offset(value)
+  return string.format("%.1f", value)
+end
+
+--- `rails` is what `export.sample_rail_joints` collected, or nil for a game
+--- with no rails in it. Connectivity rather than geometry: see that function.
+function M.prototypes_json(rails)
   local parts = {}
   local function add(text)
     parts[#parts + 1] = text
@@ -746,7 +765,31 @@ function M.prototypes_json()
   -- splits a baseline's tiles the way this mod recorded them. It kept a copy
   -- of the old list for that, which cannot agree once this side works the
   -- answer out per game. An array, since this says nothing per name.
-  out[#out + 1] = '},"floor":['
+  -- Which rails connect to which, one entry per prototype and facing. An
+  -- array rather than a map: the key would have to be name and facing glued
+  -- together, and every reader would have to take it apart again.
+  -- Sorted so two runs of one save produce one file, `pairs` order over the
+  -- surfaces being unpromised and the desktop side comparing these across
+  -- captures.
+  local rail_list = {}
+  for _, sample in ipairs(rails or {}) do
+    rail_list[#rail_list + 1] = sample
+  end
+  table.sort(rail_list, function(a, b)
+    if a.n ~= b.n then return a.n < b.n end
+    return a.d < b.d
+  end)
+
+  section('},"rails":[', rail_list, function(sample)
+    local links = {}
+    for _, link in ipairs(sample.links) do
+      links[#links + 1] = string.format('{"n":%q,"d":%d,"x":%s,"y":%s}',
+        link.n, link.d, rail_offset(link.x), rail_offset(link.y))
+    end
+    add(string.format('{"n":%q,"d":%d,"links":[%s]}', sample.n, sample.d, table.concat(links, ",")))
+  end)
+
+  out[#out + 1] = '],"floor":['
   local first = #parts
   for _, name in ipairs(M.placed_floor_tiles()) do
     add(string.format('%q', name))
