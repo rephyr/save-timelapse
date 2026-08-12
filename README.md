@@ -192,12 +192,10 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 ### v1.0
 
-- [ ] Broader modded-game support
 - [ ] Smarter camera auto-follow
 - [ ] Camera keyframes and cinematic controls
 - [ ] MP4 export
 - [ ] Single-binary distribution
-- [ ] Stable capture format with migration
 
 ---
 

@@ -39,6 +39,12 @@ impl Prototypes {
     pub fn kind(&self, name: &str) -> Option<&str> {
         self.types.get(name).map(String::as_str)
     }
+
+    /// Every deposit this game has, for `World::set_resources`. Empty when the
+    /// capture described no types, which falls back to the built-in list.
+    pub fn resource_names(&self) -> HashSet<String> {
+        self.types.iter().filter(|(_, kind)| *kind == "resource").map(|(name, _)| name.clone()).collect()
+    }
 }
 
 /// Reads `prototypes.json` from a built timelapse, or `None` if it has none.

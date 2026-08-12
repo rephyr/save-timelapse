@@ -35,6 +35,38 @@ pub struct WorldEntity {
     pub id: Option<u64>,
 }
 
+impl WorldEntity {
+    /// The same entity arriving again rather than a second one at the same
+    /// spot. Factorio cannot put two of one prototype at one position, so the
+    /// name settles it; ids settle it wherever both sides have one, which a
+    /// baseline entity never does.
+    fn is_same_as(&self, other: &WorldEntity) -> bool {
+        match (self.id, other.id) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.name == other.name,
+        }
+    }
+}
+
+/// Whether `name` is a deposit that belongs under whatever is built on it:
+/// what the capture said, or the list below when it said nothing. A free
+/// function for the same reason as `is_floor`.
+fn is_resource(resources: &HashSet<String>, name: &str) -> bool {
+    if resources.is_empty() {
+        return is_known_resource(name);
+    }
+    resources.contains(name)
+}
+
+/// Wube's resources, for a capture that did not say which of its own were
+/// deposits. Named exactly, resource names sharing no prefix.
+fn is_known_resource(name: &str) -> bool {
+    matches!(
+        name,
+        "iron-ore" | "copper-ore" | "coal" | "stone" | "uranium-ore" | "crude-oil" | "tungsten-ore" | "calcite" | "scrap"
+    )
+}
+
 /// Whether `name` is floor somebody laid: what the capture said, or the list
 /// below when it said nothing. A free function so it borrows one field and can
 /// be called while `load_baseline` holds a surface.
@@ -96,7 +128,11 @@ pub struct Surface {
     /// position alone let the add evict the ore and the later remove clear the
     /// tile, so building across a patch ate it. A second layer rather than a
     /// list per position: the depth needed is two, and a `Vec` each would
-    /// allocate per entity. Nothing here knows what a resource is.
+    /// allocate per entity.
+    ///
+    /// Which of the two is here rather than in `by_pos` is decided by
+    /// `insert`'s `sinks`, never by arrival order: a removal carries no name,
+    /// so it can only resolve to whatever the position has on top.
     under: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
     /// Placed floor: seeded from the baseline, then kept current by
@@ -146,23 +182,28 @@ impl Surface {
         self.slots.iter().filter_map(Option::as_ref)
     }
 
-    fn insert(&mut self, entity: WorldEntity) {
+    /// What a frame shows: everything except what something else is standing
+    /// on. Emitting both leaves the renderer to decide which of two quads at
+    /// one position wins, and it has no way to know, so ore under a machine
+    /// could win and hide it. The covered thing is invisible either way, and
+    /// removing what covers it promotes it back into the next frame.
+    pub fn visible_entities(&self) -> impl Iterator<Item = &WorldEntity> {
+        let buried: HashSet<usize> = self.under.values().copied().collect();
+        self.slots.iter().enumerate().filter_map(move |(slot, held)| held.as_ref().filter(|_| !buried.contains(&slot)))
+    }
+
+    /// `sinks` marks something that belongs under whatever is built on it. A
+    /// resource never covers a structure, so a baseline listing the two in
+    /// either order settles the same way and a removal by position resolves to
+    /// the structure rather than to the ore it stands on.
+    fn insert(&mut self, entity: WorldEntity, sinks: bool) {
         let key = pos_key(entity.x, entity.y);
 
-        if let Some(&slot) = self.by_pos.get(&key) {
-            // An unchanged re-add must not bump `revision`: the baseline
-            // smear produces them by design, and a bump costs a whole file.
-            if self.slots[slot] == Some(entity) {
-                return;
-            }
-            // Something different covers what was there rather than replacing
-            // it. Only one thing can be covered; a third arrival displaces
-            // whatever the second was hiding.
-            if let Some(buried) = self.under.insert(key, slot) {
-                self.free_slot(buried);
-            }
+        if self.update_in_place(key, entity) {
+            return;
         }
 
+        let occupant = self.by_pos.get(&key).copied();
         let slot = match self.free.pop() {
             Some(slot) => {
                 self.slots[slot] = Some(entity);
@@ -173,11 +214,58 @@ impl Surface {
                 self.slots.len() - 1
             }
         };
-        self.by_pos.insert(key, slot);
+
+        // Only one thing can be covered either way; a third arrival displaces
+        // whatever the second was hiding.
+        match occupant {
+            Some(_) if sinks => {
+                if let Some(buried) = self.under.insert(key, slot) {
+                    self.free_slot(buried);
+                }
+            }
+            Some(top) => {
+                if let Some(buried) = self.under.insert(key, top) {
+                    self.free_slot(buried);
+                }
+                self.by_pos.insert(key, slot);
+            }
+            None => {
+                self.by_pos.insert(key, slot);
+            }
+        }
+
         if let Some(id) = entity.id {
             self.by_id.insert(id, slot);
         }
         self.revision += 1;
+    }
+
+    /// Rotating is logged as an add, so the same entity arrives again with a
+    /// new direction. It updates its own slot, at whichever layer it sits:
+    /// covering itself would bury a duplicate that outlives the removal and
+    /// evict whatever it was standing on.
+    fn update_in_place(&mut self, key: PosKey, entity: WorldEntity) -> bool {
+        let layers = [self.by_pos.get(&key).copied(), self.under.get(&key).copied()];
+        for slot in layers.into_iter().flatten() {
+            let Some(occupant) = self.slots[slot] else { continue };
+            if !occupant.is_same_as(&entity) {
+                continue;
+            }
+            // An unchanged re-add must not bump `revision`: the baseline smear
+            // produces them by design, and a bump costs a whole file.
+            if occupant != entity {
+                if let Some(id) = occupant.id {
+                    self.by_id.remove(&id);
+                }
+                self.slots[slot] = Some(entity);
+                if let Some(id) = entity.id {
+                    self.by_id.insert(id, slot);
+                }
+                self.revision += 1;
+            }
+            return true;
+        }
+        false
     }
 
     /// Return a slot to the free list. Touches neither position index and does
@@ -245,6 +333,9 @@ pub struct World {
     /// Which tiles this capture called placed floor. Empty falls back to
     /// `is_placed_floor`.
     floor: HashSet<String>,
+    /// Which entities this capture called resources. Empty falls back to
+    /// `is_known_resource`.
+    resources: HashSet<String>,
     pub tick: u64,
 }
 
@@ -260,6 +351,14 @@ impl World {
     pub fn set_floor(&mut self, floor: HashSet<String>) {
         debug_assert!(self.surfaces.is_empty(), "floor must be set before loading a baseline");
         self.floor = floor;
+    }
+
+    /// Must be set before any baseline loads, for the same reason as
+    /// `set_floor`: it decides which of two things sharing a position ends up
+    /// on top, and only the mod can be right about a modded ore.
+    pub fn set_resources(&mut self, resources: HashSet<String>) {
+        debug_assert!(self.surfaces.is_empty(), "resources must be set before loading a baseline");
+        self.resources = resources;
     }
 
     pub fn names(&self) -> &NameTable {
@@ -295,17 +394,21 @@ impl World {
 
         for entity in &frame.entities {
             let name = self.names.intern(&entity.n);
-            surface.insert(WorldEntity {
-                name,
-                x: entity.x,
-                y: entity.y,
-                d: entity.d,
-                w: entity.w,
-                h: entity.h,
-                // Snapshots carry no unit_number, so a baseline entity can
-                // only ever be removed by position.
-                id: None,
-            });
+            let sinks = is_resource(&self.resources, &entity.n);
+            surface.insert(
+                WorldEntity {
+                    name,
+                    x: entity.x,
+                    y: entity.y,
+                    d: entity.d,
+                    w: entity.w,
+                    h: entity.h,
+                    // Snapshots carry no unit_number, so a baseline entity can
+                    // only ever be removed by position.
+                    id: None,
+                },
+                sinks,
+            );
         }
         for tile in &frame.tiles {
             let name = self.names.intern(&tile.n);
@@ -335,11 +438,12 @@ impl World {
     pub fn apply(&mut self, surface: Option<&str>, event: &Event) -> bool {
         match event {
             Event::AddEntity { name, x, y, d, w, h, id } => {
+                let sinks = is_resource(&self.resources, name);
                 let name = self.names.intern(name);
                 let entity = WorldEntity { name, x: *x, y: *y, d: *d, w: *w, h: *h, id: *id };
                 match self.target(surface) {
                     Some(s) => {
-                        s.insert(entity);
+                        s.insert(entity, sinks);
                         true
                     }
                     None => false,
@@ -397,7 +501,7 @@ impl World {
         let names = self.name_table();
 
         let entities: Vec<Entity> = surface
-            .entities()
+            .visible_entities()
             .map(|e| Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
             .collect();
 
@@ -593,9 +697,11 @@ mod tests {
         world.apply(Some("nauvis"), &add("transport-belt", 1.5, 2.5, Some(9)));
         assert_eq!(world.entity_count(), 2, "the ore is still there, under the belt");
 
+        // The frame shows only the belt: the ore it covers is kept, not drawn
+        // (see `visible_entities`).
         let frame = world.to_frame("nauvis", 200);
         let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
-        assert!(names.contains(&"transport-belt") && names.contains(&"iron-ore"), "got {names:?}");
+        assert_eq!(names, vec!["transport-belt"], "got {names:?}");
 
         // Reachable by the id the add carried, and taking it away gives the
         // tile back to the ore rather than emptying it.
@@ -608,6 +714,93 @@ mod tests {
         // only way a baseline entity can be reached at all.
         assert!(world.apply(Some("nauvis"), &remove_at(1.5, 2.5)));
         assert_eq!(world.entity_count(), 0);
+    }
+
+    /// A building already standing on ore when the baseline was taken. Both
+    /// share a position and neither has an id, so its removal can only be
+    /// resolved by position, and the position holds two things.
+    #[test]
+    fn mining_a_building_that_stood_on_ore_since_the_baseline() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("inserter", 1.5, 2.5), entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        assert_eq!(world.entity_count(), 2);
+
+        // Factorio reports the inserter's real unit_number, which replay has
+        // never seen, so this falls through to the position.
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(77), pos: (1.5, 2.5) }));
+
+        let frame = world.to_frame("nauvis", 200);
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["iron-ore"], "the inserter goes, the ore stays");
+    }
+
+    /// Rotating is logged as an add, so the same entity arrives twice with a
+    /// different `d`. It must update in place: covering itself would both bury
+    /// a duplicate that outlives the removal and evict whatever it was standing
+    /// on.
+    #[test]
+    fn rotating_something_that_stands_on_ore_updates_it_in_place() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("transport-belt", 1.5, 2.5, Some(4)));
+
+        let rotated = Event::AddEntity { name: "transport-belt".into(), x: 1.5, y: 2.5, d: 2, w: 1, h: 1, id: Some(4) };
+        world.apply(Some("nauvis"), &rotated);
+        assert_eq!(world.entity_count(), 2, "one belt and the ore it stands on");
+
+        assert!(world.apply(None, &remove_by_id(4, 1.5, 2.5)));
+        let frame = world.to_frame("nauvis", 300);
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["iron-ore"], "mining the belt leaves the ore and no second belt");
+    }
+
+    /// A modded ore is only recognisable from what the capture said, and
+    /// getting it wrong puts it back on top of whatever stands on it.
+    #[test]
+    fn the_captures_own_resource_list_decides_what_sinks() {
+        let mut world = World::new();
+        world.set_resources(["kr-rare-metal-ore".to_string()].into_iter().collect());
+        world.load_baseline(&baseline(
+            vec![entity("assembling-machine-1", 1.5, 2.5), entity("kr-rare-metal-ore", 1.5, 2.5)],
+            Vec::new(),
+        ));
+
+        assert!(world.apply(Some("nauvis"), &remove_at(1.5, 2.5)));
+        let frame = world.to_frame("nauvis", 200);
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["kr-rare-metal-ore"], "the machine goes, the modded ore stays");
+    }
+
+    /// A frame shows the structure, never the ore it stands on, so no renderer
+    /// has to choose between two quads at one position. The ore is still in the
+    /// world and comes back the moment the structure goes.
+    #[test]
+    fn a_frame_leaves_out_what_is_standing_under_something() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("electric-mining-drill", 1.5, 2.5, Some(3)));
+
+        let covered = world.to_frame("nauvis", 200);
+        let names: Vec<&str> = covered.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["electric-mining-drill"], "the ore under it is not drawn");
+        assert_eq!(covered.count, 1, "count matches what is emitted");
+        assert_eq!(world.entity_count(), 2, "but the ore is still in the world");
+
+        assert!(world.apply(None, &remove_by_id(3, 1.5, 2.5)));
+        let uncovered = world.to_frame("nauvis", 300);
+        let names: Vec<&str> = uncovered.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["iron-ore"], "and it is back once nothing stands on it");
+    }
+
+    /// Sinking must not hide a deposit that is standing on its own: exposed
+    /// ore is the common case, and it still has to be removable by position.
+    #[test]
+    fn ore_on_an_empty_position_stays_on_top_of_it() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+
+        assert!(world.apply(Some("nauvis"), &remove_at(1.5, 2.5)));
+        assert_eq!(world.entity_count(), 0, "hand-mined ore goes away");
     }
 
     /// A re-add of the same thing must not bury a copy of it: the baseline

@@ -836,8 +836,26 @@ what a position had before something covered it, and removal promotes it back.
 A second layer rather than a list per position, the depth needed being two: a
 `Vec` per position allocates once per entity across hundreds of thousands of
 them to express something that almost never happens. A third arrival displaces
-whatever the second was hiding. Nothing in it knows what a resource is;
-covering and uncovering is the behaviour whatever the two things are.
+whatever the second was hiding.
+
+**Which of the two is on top is decided by what they are, not by arrival
+order.** A `RemoveEntity` carries a position and an id, never a name, and a
+baseline entity has no id to match on, so a removal can only resolve to
+whatever the position holds on top. Arrival order would make that the ore
+whenever a baseline happened to list the ore second, and mining the building
+would then delete the ore and leave the building standing. `insert` takes a
+`sinks` flag instead: a resource never covers a structure. Which names are
+resources comes from the capture's own prototype types, falling back to a
+built-in list, the same shape as the floor split.
+
+**The same entity arriving twice updates its slot rather than covering
+itself.** Rotating is logged as an add, so a belt re-arrives with a new
+direction. Treating that as a second entity buried a duplicate that outlived
+the belt's removal, and evicted the ore underneath to make room for it, so
+rotating anything standing on ore destroyed the ore and left a copy of the belt
+behind after it was mined. `update_in_place` matches on id where both sides
+have one and on name otherwise, and checks both layers, a rotation of something
+already buried being the same case.
 
 Only an exact key collision covers anything, so an even-sized building sits on
 a tile corner and covers nothing while an odd-sized one covers the single tile
