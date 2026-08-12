@@ -85,40 +85,48 @@ impl TypeRegistry {
         self.tile_colors[id as usize]
     }
 
+    /// This type's kind, or the default for an id this registry never
+    /// interned. Out of range cannot happen where the spans and the registry
+    /// came from the same load, but answering "nothing in particular" beats a
+    /// panic on somebody's timelapse.
+    fn kind(&self, id: TypeId) -> Kind {
+        self.kinds.get(id as usize).copied().unwrap_or_default()
+    }
+
     pub fn is_belt(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].belt
+        self.kind(id).belt
     }
 
     pub fn is_splitter(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].splitter
+        self.kind(id).splitter
     }
 
     pub fn is_pipe(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].pipe
+        self.kind(id).pipe
     }
 
     pub fn is_pipe_to_ground(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].pipe_to_ground
+        self.kind(id).pipe_to_ground
     }
 
     pub fn is_resource(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].resource
+        self.kind(id).resource
     }
 
     pub fn is_terrain_scatter(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].scatter
+        self.kind(id).scatter
     }
 
     pub fn is_vehicle(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].vehicle
+        self.kind(id).vehicle
     }
 
     pub fn is_enemy(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].enemy
+        self.kind(id).enemy
     }
 
     pub fn is_rotation_allowed(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].rotates
+        self.kind(id).rotates
     }
 
     /// Whether somebody placed this rather than the map generating it. One
@@ -127,14 +135,14 @@ impl TypeRegistry {
     /// trees, ore and nests for context, and on a wooded map they outnumber
     /// the factory ten to one.
     pub fn is_built(&self, id: TypeId) -> bool {
-        let kind = &self.kinds[id as usize];
+        let kind = self.kind(id);
         !kind.scatter && !kind.resource && !kind.enemy && !kind.vehicle
     }
 
     /// How far an underground belt of this type reaches, or `None` if it is
     /// not one. The reach is what pairs an entrance with its exit.
     pub fn underground_reach(&self, id: TypeId) -> Option<i32> {
-        self.kinds[id as usize].reach
+        self.kind(id).reach
     }
 }
 

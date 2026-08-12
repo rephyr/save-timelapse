@@ -57,7 +57,7 @@ const MAGIC: &[u8; 4] = b"STF1";
 /// smaller than version 1, which is still read and has its own reader. Version
 /// 3 is version 2's body byte for byte and only declares that extension
 /// records may appear.
-const CURRENT_VERSION: u8 = 4;
+const CURRENT_VERSION: u8 = 5;
 /// Version 4 adds one thing: a frame may say its floor is unchanged since the
 /// surface's previous frame instead of carrying it again.
 ///
@@ -72,6 +72,19 @@ const CURRENT_VERSION: u8 = 4;
 /// only the CLI's own built timelapses use it, and it launches the viewer from
 /// beside itself.
 const FLOOR_UNCHANGED_VERSION: u8 = 4;
+
+/// Version 5: the frame carries what changed since the previous frame for this
+/// surface rather than everything standing.
+///
+/// A real megabase changed by about 200 items a frame out of 4.2 million, so a
+/// full snapshot spent 8.8 MB restating what the reader already had. The viewer
+/// stores spans, which is the same shape, so a delta is what it wanted all
+/// along and a full frame was work done twice.
+///
+/// Written only by the CLI, into its own built timelapses, and only after the
+/// first frame for a surface, which is always full because there is nothing to
+/// be a delta against. The mod still writes version 3.
+const DELTA_VERSION: u8 = 5;
 const MIN_SUPPORTED_VERSION: u8 = 1;
 const TRAILER_LEN: usize = 4;
 const TAG_DEFINE_NAME: u8 = 0;
@@ -85,6 +98,11 @@ const TAG_EXTENSION_MIN: u8 = 128;
 /// In the tile section only, with no payload: this frame's floor is whatever
 /// the previous frame for this surface had.
 const TAG_FLOOR_UNCHANGED: u8 = 128;
+/// Positions whose entity or tile is gone since the previous frame for this
+/// surface, as zigzag varint deltas like every other coordinate list. Only in
+/// a delta frame, where the runs carry what arrived rather than everything
+/// standing.
+const TAG_REMOVED: u8 = 129;
 
 /// djb2, in one pass, this side always holding the whole file. `u32` wrapping
 /// is the Lua side's `% 2^32`. Chosen for being implementable identically
@@ -97,7 +115,7 @@ fn checksum(bytes: &[u8]) -> u32 {
     hash
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Frame {
     pub tick: u64,
     pub surface: String,
@@ -109,6 +127,16 @@ pub struct Frame {
     /// previous one forward; an empty `tiles` without this means a surface with
     /// no floor on it at all.
     pub floor_unchanged: bool,
+    /// `entities` and `tiles` are what arrived since the previous frame for
+    /// this surface rather than everything standing, and `removed` is what
+    /// left. False for every full frame, including the first of a surface.
+    pub delta: bool,
+    /// Entity positions vacated since the previous frame, at the fixed-point
+    /// scale entity coordinates use. Separate from `removed_tiles` because the
+    /// two are different coordinate spaces: an entity sits at a tile's centre.
+    pub removed_entities: Vec<(i32, i32)>,
+    /// Tile positions vacated since the previous frame.
+    pub removed_tiles: Vec<(i32, i32)>,
 }
 
 /// `n` is `Arc<str>` rather than `String`: a base has a few dozen distinct
@@ -127,7 +155,7 @@ pub struct Entity {
 
 /// Unlike entities, tiles are corner positioned and integer aligned: a tile
 /// named at (x,y) occupies world space [x,x+1) x [y,y+1).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Tile {
     pub n: Arc<str>,
     pub x: i32,
@@ -137,6 +165,7 @@ pub struct Tile {
 /// The write side view of a frame. Separate from `Frame` because `Frame::count`
 /// is derived from `entities`: making the write side take that same derived
 /// value as an input field would let it drift from the array it describes.
+#[derive(Default)]
 pub struct FrameOut<'a> {
     pub tick: u64,
     pub surface: &'a str,
@@ -147,6 +176,11 @@ pub struct FrameOut<'a> {
     /// paved megabase is 72% of a frame that changes by under 4% across a whole
     /// playthrough.
     pub floor_unchanged: bool,
+    /// Write what changed rather than everything standing. See
+    /// `DELTA_VERSION`.
+    pub delta: bool,
+    pub removed_entities: &'a [(i32, i32)],
+    pub removed_tiles: &'a [(i32, i32)],
 }
 
 impl Frame {
@@ -157,6 +191,9 @@ impl Frame {
             entities: &self.entities,
             tiles: &self.tiles,
             floor_unchanged: self.floor_unchanged,
+            delta: self.delta,
+            removed_entities: &self.removed_entities,
+            removed_tiles: &self.removed_tiles,
         }
     }
 }
@@ -317,7 +354,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     let surface = r.string().ok_or_else(truncated)?;
 
     if version >= 2 {
-        return read_grouped_body(&mut r, payload_end, tick, surface);
+        return read_grouped_body(&mut r, payload_end, tick, surface, version);
     }
 
     // Arc<str>, not String: a name is defined once here but referenced by
@@ -360,7 +397,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
         }
     }
 
-    Ok(Frame { tick, surface, count: entities.len(), entities, tiles, floor_unchanged: false })
+    Ok(Frame { tick, surface, count: entities.len(), entities, tiles, floor_unchanged: false, ..Default::default() })
 }
 
 /// Bit 0 of an entity run's flags: every item in the run carries a direction
@@ -397,7 +434,11 @@ fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
     // Only claim version 4 when the frame actually omits its floor. A build
     // that never does stays readable by an older viewer, so the newer format
     // costs nothing to anyone not benefiting from it.
-    let version = if frame.floor_unchanged { FLOOR_UNCHANGED_VERSION } else { 3 };
+    let version = match (frame.delta, frame.floor_unchanged) {
+        (true, _) => DELTA_VERSION,
+        (false, true) => FLOOR_UNCHANGED_VERSION,
+        (false, false) => 3,
+    };
     w.magic(MAGIC).u8(version).u64(frame.tick).string(frame.surface);
 
     let mut names = NameDict::new();
@@ -428,6 +469,7 @@ fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
             (px, py) = (x, y);
         }
     }
+    write_removed(&mut w, frame.removed_entities);
     w.u8(TAG_END_ENTITIES);
 
     if frame.floor_unchanged {
@@ -458,19 +500,59 @@ fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
         }
     }
 
+    write_removed(&mut w, frame.removed_tiles);
+
     let mut bytes = w.into_vec();
     let trailer = checksum(&bytes);
     bytes.extend_from_slice(&trailer.to_le_bytes());
     bytes
 }
 
-fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: String) -> io::Result<Frame> {
+/// Positions that emptied, delta encoded like every other coordinate list.
+/// Nothing is written when nothing left, so a full frame never carries one.
+fn write_removed(w: &mut ByteWriter, removed: &[(i32, i32)]) {
+    if removed.is_empty() {
+        return;
+    }
+    let mut payload = ByteWriter::new();
+    payload.varint(removed.len() as u64);
+    let (mut px, mut py) = (0i32, 0i32);
+    for &(x, y) in removed {
+        payload.varint_i32(x - px).varint_i32(y - py);
+        (px, py) = (x, y);
+    }
+    let payload = payload.into_vec();
+    w.u8(TAG_REMOVED).varint(payload.len() as u64);
+    for byte in payload {
+        w.u8(byte);
+    }
+}
+
+/// The other half. Returns the positions, having already consumed the record's
+/// declared length so an unreadable payload cannot desynchronise the stream.
+fn read_removed(r: &mut ByteReader<'_>) -> io::Result<Vec<(i32, i32)>> {
+    let len = r.varint().ok_or_else(truncated)? as usize;
+    let payload = r.bytes(len).ok_or_else(truncated)?;
+    let mut p = ByteReader::new(payload);
+    let count = p.varint().ok_or_else(truncated)? as usize;
+    let mut out = Vec::with_capacity(count.min(1 << 20));
+    let (mut px, mut py) = (0i32, 0i32);
+    for _ in 0..count {
+        px += p.varint_i32().ok_or_else(truncated)?;
+        py += p.varint_i32().ok_or_else(truncated)?;
+        out.push((px, py));
+    }
+    Ok(out)
+}
+
+fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surface: String, version: u8) -> io::Result<Frame> {
     // Name, then the footprint every entity of that name shares.
     let mut names: Vec<(Arc<str>, u32, u32)> = Vec::new();
     let resolve = |names: &[(Arc<str>, u32, u32)], id: usize| {
         names.get(id).cloned().ok_or_else(|| invalid("record references an undefined name id"))
     };
 
+    let mut removed_entities: Vec<(i32, i32)> = Vec::new();
     let mut entities = Vec::new();
     loop {
         match r.tag().ok_or_else(truncated)? {
@@ -500,6 +582,7 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
                     skip_extension(r)?;
                 }
             }
+            TAG_REMOVED => removed_entities = read_removed(r)?,
             TAG_END_ENTITIES => break,
             other if other >= TAG_EXTENSION_MIN => skip_extension(r)?,
             other => return Err(invalid(format!("unexpected tag {other} in entity section"))),
@@ -508,6 +591,7 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
 
     let mut tiles = Vec::new();
     let mut floor_unchanged = false;
+    let mut removed_tiles = Vec::new();
     while r.consumed() < payload_end {
         match r.tag().ok_or_else(truncated)? {
             // Recognised only here, in the tile section, where it stands in for
@@ -518,6 +602,7 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
                 skip_extension(r)?;
                 floor_unchanged = true;
             }
+            TAG_REMOVED => removed_tiles = read_removed(r)?,
             TAG_DEFINE_NAME => {
                 let name = Arc::from(r.string().ok_or_else(truncated)?);
                 let w = r.u8().ok_or_else(truncated)? as u32;
@@ -542,7 +627,19 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
         }
     }
 
-    Ok(Frame { tick, surface, count: entities.len(), entities, tiles, floor_unchanged })
+    Ok(Frame {
+        tick,
+        surface,
+        count: entities.len(),
+        entities,
+        tiles,
+        floor_unchanged,
+        // The version says it, not the presence of removals: a delta frame
+        // where nothing left still carries only what arrived.
+        delta: version >= DELTA_VERSION,
+        removed_entities,
+        removed_tiles,
+    })
 }
 
 #[cfg(test)]
@@ -604,7 +701,14 @@ mod tests {
             entity("stone-furnace", 1.0, 2.0, 0, 1, 1),
         ];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }, Tile { n: "concrete".into(), x: -4, y: -12 }];
-        let out = FrameOut { tick: 22630009, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
+        let out = FrameOut {
+            tick: 22630009,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
 
         let bytes = write_binary(&out);
         let frame = read_binary(&bytes).unwrap();
@@ -626,7 +730,14 @@ mod tests {
             entity("transport-belt", -79.5, 28.5, 6, 1, 1),
         ];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: 12 }];
-        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
+        let out = FrameOut {
+            tick: 4242,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
 
         let old = read_binary(&write_binary_v1(&out)).expect("v1 must still parse");
         let new = read_binary(&write_binary(&out)).expect("v2 must parse");
@@ -662,7 +773,14 @@ mod tests {
     #[test]
     fn a_single_entity_frame_matches_its_documented_byte_layout() {
         let entities = vec![entity("pipe", -80.5, 28.5, 4, 1, 1)];
-        let out = FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 100,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let bytes = write_binary(&out);
 
         let mut expected = ByteWriter::new();
@@ -812,7 +930,14 @@ mod tests {
     fn version_3_writes_the_same_body_as_version_2() {
         let entities = vec![entity("transport-belt", -80.5, 28.5, 4, 1, 1), entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3)];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
-        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
+        let out = FrameOut {
+            tick: 4242,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
 
         let current = write_binary(&out);
         assert_eq!(current[4], 3, "the writer stamps the current version");
@@ -835,7 +960,14 @@ mod tests {
     #[test]
     fn a_wrong_version_is_a_distinct_error_from_a_parse_failure() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let mut bytes = write_binary(&out);
         bytes[4] = 99; // the version byte, right after the 4 byte magic
 
@@ -883,7 +1015,14 @@ mod tests {
     #[test]
     fn a_corrupted_byte_is_caught_by_the_checksum() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let mut bytes = write_binary(&out);
         let last = bytes.len() - 1 - 4; // a byte inside the payload, not the trailer
         bytes[last] ^= 0xFF;
@@ -895,6 +1034,51 @@ mod tests {
     /// The Rust and Lua implementations of this hash must agree, since one
     /// writes what the other reads. Also checked against the same input in
     /// mod/tests/encode_test.lua via lupa.
+    /// A delta frame carries what arrived and what left, and says so by its
+    /// version rather than by whether anything happens to have left.
+    #[test]
+    fn a_delta_frame_round_trips_what_changed() {
+        let entities = vec![Entity { n: "pipe".into(), x: 1.5, y: 2.5, d: 0, w: 1, h: 1 }];
+        let tiles = vec![Tile { n: "concrete".into(), x: 7, y: 8 }];
+        let gone_entities = [(35, 45), (-105, 5)];
+        let gone_tiles = [(1, 1), (400, -400)];
+
+        let out = FrameOut {
+            tick: 4242,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &tiles,
+            delta: true,
+            removed_entities: &gone_entities,
+            removed_tiles: &gone_tiles,
+            ..Default::default()
+        };
+        let read = read_binary(&write_binary(&out)).expect("a delta frame must read back");
+
+        assert!(read.delta, "the version has to say it is a delta");
+        assert_eq!(read.entities.len(), 1, "runs carry what arrived, not everything standing");
+        assert_eq!(read.tiles.len(), 1);
+        assert_eq!(read.removed_entities, gone_entities, "entity removals survive, in their own space");
+        assert_eq!(read.removed_tiles, gone_tiles, "and tile removals in theirs");
+    }
+
+    /// A delta where nothing left is still a delta, and a full frame never
+    /// claims to be one. Getting this backwards would have the reader treat a
+    /// snapshot as a change set and lose everything not in it.
+    #[test]
+    fn delta_and_full_frames_are_never_confused() {
+        let entities = vec![Entity { n: "pipe".into(), x: 1.5, y: 2.5, d: 0, w: 1, h: 1 }];
+
+        let quiet_delta = FrameOut { tick: 1, surface: "nauvis", entities: &entities, delta: true, ..Default::default() };
+        let read = read_binary(&write_binary(&quiet_delta)).unwrap();
+        assert!(read.delta, "nothing having left does not make it a snapshot");
+        assert!(read.removed_entities.is_empty());
+
+        let full = FrameOut { tick: 1, surface: "nauvis", entities: &entities, ..Default::default() };
+        let read = read_binary(&write_binary(&full)).unwrap();
+        assert!(!read.delta, "a snapshot must never read as a change set");
+    }
+
     #[test]
     fn checksum_matches_the_lua_side_known_vector() {
         assert_eq!(checksum(b"ab"), 5863208);
@@ -903,7 +1087,8 @@ mod tests {
     #[test]
     fn tiles_parse_including_negative_coordinates() {
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles, floor_unchanged: false };
+        let out =
+            FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles, floor_unchanged: false, ..Default::default() };
         let frame = read_binary(&write_binary(&out)).unwrap();
 
         assert_eq!(frame.tiles.len(), 1);
@@ -917,7 +1102,14 @@ mod tests {
         // at a different id.
         let entities = vec![entity("landfill", 0.5, 0.5, 0, 1, 1)];
         let tiles = vec![Tile { n: "landfill".into(), x: 1, y: 1 }];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
 
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert_eq!(frame.entities[0].n, "landfill".into());
@@ -927,7 +1119,14 @@ mod tests {
     #[test]
     fn a_frame_with_no_tiles_at_all_still_parses() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert!(frame.tiles.is_empty());
     }
@@ -945,7 +1144,14 @@ mod tests {
     #[test]
     fn a_truncated_file_is_an_error_rather_than_a_panic() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let bytes = write_binary(&out);
 
         let err = read_binary(&bytes[..bytes.len() - 3]).unwrap_err();
@@ -968,7 +1174,14 @@ mod tests {
     #[test]
     fn a_file_ending_right_after_end_entities_is_not_truncated() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
+        let out = FrameOut {
+            tick: 1,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert_eq!(frame.entities.len(), 1);
         assert!(frame.tiles.is_empty());

@@ -192,6 +192,7 @@ fn run_one(seed: u64, steps: usize) {
         entities: baseline,
         tiles: Vec::new(),
         floor_unchanged: false,
+        ..Default::default()
     });
 
     check(&world, &reference, seed, 0);

@@ -280,13 +280,25 @@ mod tests {
             entity_lod_runs: Vec::new(),
             tile_bounds: None,
             floor_unchanged: false,
+            ..Default::default()
         }
     }
 
     /// Wraps built frames into the sequence the pass now reads, which owns
     /// them as spans rather than keeping the vec.
     fn seq(frames: Vec<RenderFrame>) -> FrameSequence {
-        FrameSequence::new(frames).expect("tests always build at least one frame")
+        // A registry that knows every type these frames use. The aggregated
+        // layers are derived at finish and ask it what a type is, so an empty
+        // one would be asked about ids it has never seen.
+        let mut registry = TypeRegistry::new();
+        for frame in &frames {
+            for run in frame.entity_runs.iter().chain(&frame.tile_runs) {
+                while registry.len() <= run.type_id as usize {
+                    registry.intern(&format!("type-{}", registry.len()));
+                }
+            }
+        }
+        FrameSequence::new(frames, &registry).expect("tests always build at least one frame")
     }
 
     #[test]
@@ -565,10 +577,11 @@ mod bench {
                 entity_lod_runs: Vec::new(),
                 tile_bounds: None,
                 floor_unchanged: false,
+                ..Default::default()
             });
         }
         let total: usize = frames.iter().map(|f| f.entities.len()).sum();
-        let sequence = FrameSequence::new(frames).unwrap();
+        let sequence = FrameSequence::new(frames, &registry).unwrap();
         let start = std::time::Instant::now();
         let activity = analyze_activity(&sequence, &registry).counts;
         let ours = start.elapsed();

@@ -8,7 +8,7 @@ use macroquad::math::Vec2;
 use save_timelapse::frame::Frame;
 
 use crate::registry::{TypeId, TypeRegistry};
-use crate::spans::{SpanBuilder, SpanSet};
+use crate::spans::{Span, SpanBuilder, SpanSet};
 
 /// A contiguous span of one type within a [`RenderFrame`]'s array. Draws
 /// iterate runs rather than items, so the texture is bound once per type,
@@ -110,6 +110,7 @@ fn chunk_of(x: i32, y: i32) -> (i32, i32) {
 
 /// A frame in the layout the renderer wants: items grouped into contiguous
 /// per-type runs, names interned away, dense and copyable.
+#[derive(Default)]
 pub struct RenderFrame {
     pub tick: u64,
     pub count: usize,
@@ -131,6 +132,11 @@ pub struct RenderFrame {
     /// This frame carried no floor because the surface's floor had not changed.
     /// `tiles` is empty and the previous frame's floor still stands.
     pub floor_unchanged: bool,
+    /// `entities` and `tiles` are what arrived since the previous frame rather
+    /// than everything standing, and the two removed lists are what left.
+    pub delta: bool,
+    pub removed_entities: Vec<u64>,
+    pub removed_tiles: Vec<u64>,
 }
 
 /// Below this many items the grouping passes run single-threaded, thread-spawn
@@ -331,6 +337,9 @@ impl RenderFrame {
             // per-tick one, so it never has ground to bound.
             tile_bounds: None,
             floor_unchanged: false,
+            delta: false,
+            removed_entities: Vec::new(),
+            removed_tiles: Vec::new(),
         }
     }
 
@@ -422,6 +431,11 @@ impl RenderFrame {
             entity_lod_runs,
             tile_bounds,
             floor_unchanged: frame.floor_unchanged,
+            delta: frame.delta,
+            // Turned into span keys here, the same way the items themselves
+            // are, so the builder compares like with like.
+            removed_entities: frame.removed_entities.iter().map(|&(x, y)| span_key(x as f32 / 10.0, y as f32 / 10.0)).collect(),
+            removed_tiles: frame.removed_tiles.iter().map(|&(x, y)| span_key(x as f32, y as f32)).collect(),
         }
     }
 }
@@ -461,12 +475,12 @@ impl FrameSequence {
     /// Folds `frames` into spans, dropping each as it goes. Takes them all at
     /// once for tests and callers that already have a vec; a loader wanting
     /// the memory win should fold frame by frame as it parses.
-    pub fn new(frames: Vec<RenderFrame>) -> Option<Self> {
+    pub fn new(frames: Vec<RenderFrame>, registry: &TypeRegistry) -> Option<Self> {
         let mut builder = SequenceBuilder::new();
         for frame in frames {
             builder.push(&frame);
         }
-        builder.finish()
+        builder.finish(registry)
     }
 
     /// Folds frames in one at a time, so a loader never has to hold more than
@@ -575,8 +589,6 @@ impl FrameSequence {
 pub struct SequenceBuilder {
     entities: SpanBuilder<RenderEntity>,
     tiles: SpanBuilder<RenderTile>,
-    entity_lod: SpanBuilder<LodCell>,
-    tile_lod: SpanBuilder<LodCell>,
     ticks: Vec<u64>,
     counts: Vec<usize>,
     /// Which frames were reconstructed rather than read. Recorded here because
@@ -594,10 +606,28 @@ impl SequenceBuilder {
     /// can drop it immediately after.
     pub fn push(&mut self, frame: &RenderFrame) {
         self.ticks.push(frame.tick);
-        self.counts.push(frame.count);
+        // A delta says how many arrived, not how many are standing, so the
+        // running total is carried rather than taken from the frame.
+        let standing = match frame.delta {
+            true => self.counts.last().copied().unwrap_or(0) + frame.count - frame.removed_entities.len().min(frame.count),
+            false => frame.count,
+        };
+        self.counts.push(standing);
         self.repeats.push(false);
+
+        if frame.delta {
+            self.entities.push_delta(
+                runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)),
+                frame.removed_entities.iter().copied(),
+            );
+            self.tiles.push_delta(
+                runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)),
+                frame.removed_tiles.iter().copied(),
+            );
+            return;
+        }
+
         self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
-        self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
 
         // A frame that says its floor is unchanged extends the spans already
         // open rather than folding the same millions of tiles in again, which
@@ -609,12 +639,10 @@ impl SequenceBuilder {
         // very first frame claims an unchanged floor has no floor.
         if frame.floor_unchanged {
             self.tiles.push_repeats(1);
-            self.tile_lod.push_repeats(1);
             return;
         }
         self.tiles
             .push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
-        self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
     }
 
     /// Repeats the frame just pushed at each of `ticks`, without that frame
@@ -634,8 +662,6 @@ impl SequenceBuilder {
         self.repeats.extend(std::iter::repeat_n(true, ticks.len()));
         self.entities.push_repeats(ticks.len());
         self.tiles.push_repeats(ticks.len());
-        self.entity_lod.push_repeats(ticks.len());
-        self.tile_lod.push_repeats(ticks.len());
     }
 
     pub fn len(&self) -> usize {
@@ -648,15 +674,20 @@ impl SequenceBuilder {
 
     /// `None` for a capture with no frames in it, matching `FrameSequence`'s
     /// promise of always being non-empty.
-    pub fn finish(self) -> Option<FrameSequence> {
+    pub fn finish(self, registry: &TypeRegistry) -> Option<FrameSequence> {
         if self.ticks.is_empty() {
             return None;
         }
+        let frames = self.ticks.len();
+        let entities = self.entities.finish();
+        let tiles = self.tiles.finish();
+        let entity_lod = derive_lod(&entities, |e: &RenderEntity| chunk_of(e.tile().0, e.tile().1), frames, registry);
+        let tile_lod = derive_lod(&tiles, |t: &RenderTile| chunk_of(t.x, t.y), frames, registry);
         let mut sequence = FrameSequence {
-            entities: self.entities.finish(),
-            tiles: self.tiles.finish(),
-            entity_lod: self.entity_lod.finish(),
-            tile_lod: self.tile_lod.finish(),
+            entities,
+            tiles,
+            entity_lod,
+            tile_lod,
             ticks: self.ticks,
             counts: self.counts,
             repeats: self.repeats,
@@ -681,8 +712,71 @@ fn runs_with_items<'a, T: Copy + 'a>(
     runs.iter().flat_map(move |run| items[run.range()].iter().map(move |item| (key(item), run.type_id, *item)))
 }
 
-fn cell_key(cell: &LodCell) -> u64 {
-    ((cell.cx as u32 as u64) << 32) | (cell.cy as u32 as u64)
+/// When a cell's count for one type moves, and by how much. One entry per span
+/// end, which is what makes deriving the aggregate cost spans rather than
+/// frames times items.
+type CellEvents = HashMap<(i32, i32), Vec<(u32, TypeId, i32)>>;
+
+/// The aggregated layer for one item layer, derived from its spans rather than
+/// maintained alongside them.
+///
+/// Maintaining it per frame cannot work with deltas: a cell shows its dominant
+/// type, which depends on everything in it, not on what just changed. Deriving
+/// is also cheaper than it was. Every span contributes `+1` to its cell's count
+/// for its type over `[first, last)`, so one pass over the spans gives every
+/// cell the frames at which its counts move, and the dominant type only has to
+/// be recomputed at those. Cost is the number of spans, not frames times items.
+fn derive_lod<T: Copy>(
+    items: &SpanSet<T>,
+    cell_of: impl Fn(&T) -> (i32, i32),
+    frames: usize,
+    registry: &TypeRegistry,
+) -> SpanSet<LodCell> {
+    // Per cell, when its count for a type changes and by how much.
+    let mut events: CellEvents = HashMap::new();
+    for span in items.iter() {
+        let cell = cell_of(&span.item);
+        let at = events.entry(cell).or_default();
+        at.push((span.first, span.type_id, 1));
+        at.push((span.last, span.type_id, -1));
+    }
+
+    let mut out: Vec<Span<LodCell>> = Vec::with_capacity(events.len());
+    let mut counts: Vec<(TypeId, i32)> = Vec::new();
+    for ((cx, cy), mut at) in events {
+        at.sort_unstable_by_key(|&(frame, _, _)| frame);
+        counts.clear();
+
+        let (mut showing, mut since) = (None::<TypeId>, 0u32);
+        let mut i = 0;
+        while i < at.len() {
+            let frame = at[i].0;
+            while i < at.len() && at[i].0 == frame {
+                let (_, type_id, delta) = at[i];
+                match counts.iter_mut().find(|(t, _)| *t == type_id) {
+                    Some((_, n)) => *n += delta,
+                    None => counts.push((type_id, delta)),
+                }
+                i += 1;
+            }
+
+            let present: Vec<(TypeId, u32)> = counts.iter().filter(|&&(_, n)| n > 0).map(|&(t, n)| (t, n as u32)).collect();
+            let now = (!present.is_empty()).then(|| dominant_type(&present, registry));
+            if now != showing {
+                if let Some(was) = showing {
+                    out.push(Span { item: LodCell { cx, cy }, type_id: was, first: since, last: frame });
+                }
+                showing = now;
+                since = frame;
+            }
+        }
+        // Still showing something when the capture ended.
+        if let Some(was) = showing {
+            out.push(Span { item: LodCell { cx, cy }, type_id: was, first: since, last: frames as u32 });
+        }
+    }
+
+    SpanSet::from_spans(out, frames)
 }
 
 #[cfg(test)]
@@ -706,6 +800,7 @@ mod tests {
             entities: Vec::new(),
             tiles: Vec::new(),
             floor_unchanged: false,
+            ..Default::default()
         })
     }
 
@@ -745,6 +840,7 @@ mod tests {
                 entities,
                 tiles: Vec::new(),
                 floor_unchanged: false,
+                ..Default::default()
             },
             &mut registry,
         );
@@ -788,6 +884,94 @@ mod tests {
         assert!(cells * 4 < tiles, "aggregating ground has to be worth doing: {cells} cells from {tiles} tiles");
     }
 
+    /// The whole scheme in one check: a timelapse built from deltas has to
+    /// show, frame for frame, exactly what one built from snapshots shows.
+    ///
+    /// Driven through the real world model and the real wire format rather
+    /// than hand-built frames, so it covers what `to_frame_delta` decides,
+    /// what the encoder writes, what the reader gets back and what the span
+    /// builder does with it.
+    #[test]
+    fn a_timelapse_built_from_deltas_shows_the_same_thing_as_one_built_from_snapshots() {
+        use save_timelapse::event::Event;
+        use save_timelapse::world::World;
+
+        let add = |name: &str, x: f32, y: f32, id: u64| Event::AddEntity {
+            name: name.to_string(),
+            x,
+            y,
+            d: 0,
+            w: 1,
+            h: 1,
+            id: Some(id),
+        };
+        // Build, pave, rotate, mine, repave: every shape of change a frame can
+        // carry, including a position that is emptied and one reused.
+        let steps: Vec<Vec<Event>> = vec![
+            vec![add("pipe", 1.5, 1.5, 1), add("pipe", 2.5, 1.5, 2)],
+            vec![
+                Event::AddTile { name: "concrete".to_string(), x: 0, y: 0 },
+                Event::AddTile { name: "concrete".to_string(), x: 1, y: 0 },
+            ],
+            vec![Event::RemoveEntity { id: Some(1), pos: (1.5, 1.5), name: None }],
+            vec![add("transport-belt", 1.5, 1.5, 3), Event::RemoveTile { x: 0, y: 0 }],
+            vec![Event::AddTile { name: "stone-path".to_string(), x: 1, y: 0 }],
+            vec![],
+        ];
+
+        let materialise = |deltas: bool| {
+            let mut world = World::new();
+            world.load_baseline(&save_timelapse::frame::Frame {
+                tick: 0,
+                surface: "nauvis".to_string(),
+                count: 1,
+                entities: vec![Entity { n: "inserter".into(), x: 9.5, y: 9.5, d: 0, w: 1, h: 1 }],
+                tiles: vec![Tile { n: "concrete".into(), x: 9, y: 9 }],
+                ..Default::default()
+            });
+
+            let mut registry = TypeRegistry::new();
+            let mut builder = FrameSequence::builder();
+            for (i, events) in steps.iter().enumerate() {
+                for event in events {
+                    world.apply(Some("nauvis"), event);
+                }
+                let frame = match deltas && i > 0 {
+                    true => world.to_frame_delta("nauvis", i as u64),
+                    false => {
+                        world.clear_changes("nauvis");
+                        world.to_frame("nauvis", i as u64)
+                    }
+                };
+                // Through the wire format, so the encoder and reader are in the
+                // loop rather than assumed.
+                let bytes = save_timelapse::frame::write_binary(&frame.as_out());
+                let read = save_timelapse::frame::read_binary(&bytes).expect("a frame must read back");
+                builder.push(&RenderFrame::from_frame(read, &mut registry));
+            }
+            let mut sequence = builder.finish(&registry).expect("frames");
+
+            let mut shown = Vec::new();
+            for i in 0..steps.len() {
+                sequence.goto(i);
+                let frame = sequence.current();
+                let mut entities: Vec<(i32, i32)> =
+                    frame.entities.iter().map(|e| ((e.x * 10.0) as i32, (e.y * 10.0) as i32)).collect();
+                let mut tiles: Vec<(i32, i32)> = frame.tiles.iter().map(|t| (t.x, t.y)).collect();
+                entities.sort();
+                tiles.sort();
+                shown.push((entities, tiles));
+            }
+            shown
+        };
+
+        let snapshots = materialise(false);
+        let deltas = materialise(true);
+        for (i, (a, b)) in snapshots.iter().zip(&deltas).enumerate() {
+            assert_eq!(a, b, "frame {i} differs between a snapshot build and a delta build");
+        }
+    }
+
     /// The saving is only real if the floor is still there. A frame that leaves
     /// its floor out must show exactly the same floor as the frame before it,
     /// and must cost one pass over open spans rather than a walk over millions
@@ -805,6 +989,7 @@ mod tests {
                 entities: vec![entity("pipe", 1.0, 1.0)],
                 tiles: floor,
                 floor_unchanged: false,
+                ..Default::default()
             },
             &mut registry,
         );
@@ -818,6 +1003,7 @@ mod tests {
                 entities: vec![entity("pipe", 1.0, 1.0), entity("pipe", 2.0, 2.0)],
                 tiles: Vec::new(),
                 floor_unchanged: true,
+                ..Default::default()
             },
             &mut registry,
         );
@@ -825,7 +1011,7 @@ mod tests {
         let mut builder = FrameSequence::builder();
         builder.push(&carried);
         builder.push(&omitted);
-        let mut sequence = builder.finish().expect("two frames");
+        let mut sequence = builder.finish(&registry).expect("two frames");
 
         sequence.goto(0);
         let first: Vec<RenderTile> = sequence.current().tiles.clone();
@@ -856,6 +1042,7 @@ mod tests {
                 entities,
                 tiles: Vec::new(),
                 floor_unchanged: false,
+                ..Default::default()
             }
         };
         let ticks = [10u64, 20, 30, 40];
@@ -865,7 +1052,7 @@ mod tests {
         for &tick in &ticks {
             every.push(&render(at(tick, tick >= 40)));
         }
-        let every = every.finish().unwrap();
+        let every = every.finish(&TypeRegistry::new()).unwrap();
 
         // What an export that skips unchanged surfaces produces: files only
         // at ticks 10 and 40, with 20 and 30 restored by the loader.
@@ -873,7 +1060,7 @@ mod tests {
         skipped.push(&render(at(10, false)));
         skipped.push_repeats(&[20, 30]);
         skipped.push(&render(at(40, true)));
-        let mut skipped = skipped.finish().unwrap();
+        let mut skipped = skipped.finish(&TypeRegistry::new()).unwrap();
         let mut every = every;
 
         assert_eq!(skipped.len(), every.len(), "same number of moments");
@@ -895,7 +1082,7 @@ mod tests {
         let mut builder = FrameSequence::builder();
         builder.push(&sample_frame(10));
         builder.push_repeats(&[20, 30, 40]);
-        let sequence = builder.finish().unwrap();
+        let sequence = builder.finish(&TypeRegistry::new()).unwrap();
 
         assert_eq!(sequence.len(), 4);
         assert_eq!(sequence.tick_at(3), Some(40), "the last moment is the timeline's, not the surface's");
@@ -927,6 +1114,7 @@ mod tests {
             ],
             tiles: Vec::new(),
             floor_unchanged: false,
+            ..Default::default()
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
@@ -964,6 +1152,7 @@ mod tests {
                 Tile { n: "concrete".into(), x: -6, y: 3 },
             ],
             floor_unchanged: false,
+            ..Default::default()
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
         assert_eq!(rendered.tile_runs.len(), 2);
@@ -1054,6 +1243,7 @@ mod tests {
             entities: vec![Entity { n: "huge".into(), x: 0.0, y: 0.0, d: 0, w: 100_000, h: 0 }],
             tiles: Vec::new(),
             floor_unchanged: false,
+            ..Default::default()
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
         assert_eq!(rendered.entities[0].w, u8::MAX);
@@ -1081,8 +1271,15 @@ mod tests {
         // cells. The spill stays under one cell's width, or it would land in
         // three chunks regardless of LOD_CELL_TILES.
         let tiles: Vec<Tile> = (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".into(), x, y: 0 }).collect();
-        let frame =
-            Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false };
+        let frame = Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
         assert_eq!(rendered.tile_lod.len(), 2, "one cell per occupied chunk, not per tile");
@@ -1096,8 +1293,15 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut tiles = vec![Tile { n: "concrete".into(), x: 0, y: 0 }; 5];
         tiles.push(Tile { n: "stone-path".into(), x: 1, y: 0 });
-        let frame =
-            Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false };
+        let frame = Frame {
+            tick: 0,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
         assert_eq!(rendered.tile_lod.len(), 1, "still one chunk");
@@ -1117,6 +1321,7 @@ mod tests {
             entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],
             tiles: Vec::new(),
             floor_unchanged: false,
+            ..Default::default()
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
@@ -1134,12 +1339,12 @@ mod tests {
 
     #[test]
     fn frame_sequence_new_rejects_empty() {
-        assert!(FrameSequence::new(Vec::new()).is_none());
+        assert!(FrameSequence::new(Vec::new(), &TypeRegistry::new()).is_none());
     }
 
     #[test]
     fn frame_sequence_stepping_clamps_at_both_ends() {
-        let mut seq = FrameSequence::new(vec![sample_frame(0), sample_frame(1), sample_frame(2)]).unwrap();
+        let mut seq = FrameSequence::new(vec![sample_frame(0), sample_frame(1), sample_frame(2)], &TypeRegistry::new()).unwrap();
         assert_eq!(seq.index(), 0);
         seq.step_back();
         assert_eq!(seq.index(), 0, "stepping back at the start should clamp, not wrap");

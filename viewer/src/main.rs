@@ -348,7 +348,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         builder.push(&RenderFrame::from_frame(frame, registry));
         // Synthetic/default-fixture loads have no on-disk directory to look
         // for a terrain file in, and nothing produces one for them.
-        if let Some(sequence) = builder.finish() {
+        if let Some(sequence) = builder.finish(registry) {
             result.push((name, sequence, None));
         }
     } else {
@@ -411,7 +411,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
             // A surface that stopped changing before the capture ended still
             // exists for the rest of it.
             builder.push_repeats(&timeline[filled..]);
-            if let Some(sequence) = builder.finish() {
+            if let Some(sequence) = builder.finish(registry) {
                 result.push((name, sequence, None));
             }
         }

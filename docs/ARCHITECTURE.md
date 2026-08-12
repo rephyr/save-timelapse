@@ -960,26 +960,40 @@ whether an add lands on exactly what is already there and leaves the revision
 alone if so. Those are not rare: the baseline smear, a snapshot taken slightly
 after the events describing the same construction, produces them by design.
 
-**The floor is written once, then only when it moves.** A frame is a full
-snapshot, so on a paved base it carries the entire floor every time. Measured on
-a real 660 frame Space Age capture: 6.3 MB of floor against 2.1 MB of entities
-per frame, and across the whole run the tile count changed by 3.3% and the
-entity count by 0.4%. That is 5.5 GB of which roughly 96% was the same data
-written again.
+**A frame carries what changed, not what is standing.** A built frame used to
+be a full snapshot, so on a real Space Age megabase every one of 660 frames
+wrote 863,862 entities and 3,354,339 floor tiles. Across the whole run the
+entity count moved by 0.4% and the tile count by 3.3%: 5.5 GB of which roughly
+96% was the same data written again.
 
-`Surface` therefore keeps a second counter for the placed-floor layer alone, and
-a frame whose floor has not changed writes a `FloorUnchanged` record in place of
-its tile section. The reader carries the previous floor forward, which costs one
-pass over open spans rather than a walk over millions of tiles: `SpanBuilder`
-already had `push_repeats` for restoring skipped frames, and this is the same
-primitive applied to one layer.
+The viewer stores spans, an item plus the frame range it exists over, which is
+the same shape. Writing snapshots to rebuild spans was doing the work twice, and
+paying for it in disk, build time and load time.
 
-Frames that omit a floor declare format version 4, and only those frames do. A
-build that never omits one stays readable by an older viewer. The version rather
-than a skippable extension, because an older reader stepping over the marker
-would see an empty tile section and draw a factory standing on nothing, which
-looks like a bug rather than a missing feature. The mod never writes it, so
-captures stay at version 3 and every recording already on disk is untouched.
+So the first frame for a surface is the picture and every one after it is a
+delta: what arrived, and the positions that emptied. `Surface` records which
+positions changed since it last emitted, keys only, and the frame is built by
+asking what is there now: present means it arrived, absent means it left. That
+collapses build-then-mine, mine-then-rebuild and any number of rotations in one
+interval into the single answer the reader needs, without keeping a copy of the
+previous frame to diff against. Frames skipped because a surface was untouched
+lose nothing, the record accumulating until it emits.
+
+Entity and tile removals travel in separate lists, the two being different
+coordinate spaces: an entity sits at a tile's centre.
+
+**`SpanBuilder` writes `last` when a span closes, not on every frame it
+survives.** That is what makes a delta cost one pass over the change rather than
+over everything standing, and it made `push_repeats` a single addition instead
+of a walk over ~900k open spans. The equivalence is asserted rather than
+assumed: a sequence built from deltas must produce exactly the spans a sequence
+built from snapshots does, through the real world model and the real wire
+format.
+
+Version 5, and only the CLI writes it. The mod still writes version 3, so
+captures and `format_compatibility.rs` are untouched. Version 4 was a step on
+the way, a frame that omitted an unchanged floor, and deltas subsume it: an
+empty tile delta says the same thing.
 
 **The gap in the numbering is the record.** Files stay named
 `frame_<index>_<surface>.stfr` against a global frame index, so a surface that

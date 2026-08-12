@@ -155,6 +155,16 @@ pub struct Surface {
     /// 72% of a frame and changes by under 4% across a whole playthrough, so
     /// writing it again every frame was most of the output.
     floor_revision: u64,
+    /// Positions whose entity changed since the last frame this surface
+    /// emitted, and the same for placed floor.
+    ///
+    /// Only the keys. What to write is decided when the frame is built, by
+    /// asking what is there now: present means added, absent means removed.
+    /// That collapses build-then-mine, mine-then-rebuild and any number of
+    /// rotations in one interval into the one answer that matters, without
+    /// keeping a copy of the previous frame to diff against.
+    changed_entities: HashSet<PosKey>,
+    changed_tiles: HashSet<PosKey>,
 }
 
 impl Surface {
@@ -213,6 +223,7 @@ impl Surface {
         if self.update_in_place(key, entity) {
             return;
         }
+        self.changed_entities.insert(key);
 
         let occupant = self.by_pos.get(&key).copied();
         let slot = match self.free.pop() {
@@ -265,6 +276,7 @@ impl Surface {
             // An unchanged re-add must not bump `revision`: the baseline smear
             // produces them by design, and a bump costs a whole file.
             if occupant != entity {
+                self.changed_entities.insert(key);
                 if let Some(id) = occupant.id {
                     self.by_id.remove(&id);
                 }
@@ -293,6 +305,7 @@ impl Surface {
     fn remove_slot(&mut self, slot: usize) {
         let Some(entity) = self.slots[slot].take() else { return };
         let key = pos_key(entity.x, entity.y);
+        self.changed_entities.insert(key);
 
         // Uncovering: what this was covering takes the position back.
         if self.by_pos.get(&key) == Some(&slot) {
@@ -516,6 +529,7 @@ impl World {
                         if changed {
                             s.revision += 1;
                             s.floor_revision += 1;
+                            s.changed_tiles.insert((*x, *y));
                         }
                         changed
                     }
@@ -532,6 +546,7 @@ impl World {
                 if changed {
                     s.revision += 1;
                     s.floor_revision += 1;
+                    s.changed_tiles.insert((*x, *y));
                 }
                 changed
             }),
@@ -555,6 +570,7 @@ impl World {
                 count: 0,
                 tiles: Vec::new(),
                 floor_unchanged: false,
+                ..Default::default()
             };
         };
 
@@ -570,17 +586,79 @@ impl World {
             false => Vec::new(),
         };
 
-        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles, floor_unchanged: false }
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
     }
 
-    /// The same frame with its floor left out, for a surface whose floor has
-    /// not changed since the reader last saw it. Materialising the tiles is
-    /// what makes `to_frame` expensive on a paved base, so this skips the work
-    /// as well as the bytes.
-    pub fn to_frame_without_floor(&self, surface_name: &str, tick: u64) -> Frame {
-        let mut frame = self.to_frame_inner(surface_name, tick, false);
-        frame.floor_unchanged = true;
-        frame
+    /// What changed on this surface since it last emitted a frame, as a delta
+    /// frame, clearing the record so the next one starts fresh.
+    ///
+    /// Each changed position is resolved by asking what is there now: present
+    /// means it arrived, absent means it left. That is why only keys are kept.
+    /// Build then mine, mine then rebuild, and any number of rotations in one
+    /// interval all collapse to the single answer the reader needs.
+    ///
+    /// The caller must have emitted a full frame for this surface first. A
+    /// delta against nothing is not a picture of anything.
+    pub fn to_frame_delta(&mut self, surface_name: &str, tick: u64) -> Frame {
+        let names = self.name_table();
+        let Some(surface) = self.surfaces.get_mut(surface_name) else {
+            return Frame { tick, surface: surface_name.to_string(), delta: true, ..Default::default() };
+        };
+
+        let buried: HashSet<usize> = surface.under.values().copied().collect();
+        let (mut entities, mut removed_entities) = (Vec::new(), Vec::new());
+        for key in surface.changed_entities.drain() {
+            match surface.by_pos.get(&key).filter(|slot| !buried.contains(slot)).and_then(|&slot| surface.slots[slot]) {
+                Some(e) => {
+                    entities.push(Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
+                }
+                None => removed_entities.push(key),
+            }
+        }
+
+        let (mut tiles, mut removed_tiles) = (Vec::new(), Vec::new());
+        for key in surface.changed_tiles.drain() {
+            match surface.tiles.get(&key) {
+                Some(&name) => tiles.push(Tile { n: Arc::clone(&names[name as usize]), x: key.0, y: key.1 }),
+                None => removed_tiles.push(key),
+            }
+        }
+
+        // Sorted so a delta is byte-stable between runs, a `HashSet` draining
+        // in an order that depends on hashing rather than on contents.
+        entities.sort_by_key(|e| pos_key(e.x, e.y));
+        tiles.sort_by_key(|t| (t.x, t.y));
+        removed_entities.sort_unstable();
+        removed_tiles.sort_unstable();
+
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            delta: true,
+            removed_entities,
+            removed_tiles,
+            floor_unchanged: false,
+        }
+    }
+
+    /// Forgets what changed, so the next frame is a delta against this moment.
+    /// Called after emitting a full frame, which already says everything.
+    pub fn clear_changes(&mut self, surface_name: &str) {
+        if let Some(surface) = self.surfaces.get_mut(surface_name) {
+            surface.changed_entities.clear();
+            surface.changed_tiles.clear();
+        }
     }
 
     /// The natural-terrain layer as a `Frame` (`entities` always empty).
@@ -595,12 +673,21 @@ impl World {
                 count: 0,
                 tiles: Vec::new(),
                 floor_unchanged: false,
+                ..Default::default()
             };
         };
 
         let names = self.name_table();
         let tiles = Self::materialize_tiles(&surface.terrain, &names);
-        Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false }
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
     }
 
     /// Resolved once per call rather than per item: a surface has a few dozen
@@ -625,7 +712,15 @@ mod tests {
     use super::*;
 
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
-        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles, floor_unchanged: false }
+        Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
@@ -998,6 +1093,7 @@ mod tests {
             entities: vec![entity("transport-belt", 1.5, 2.5)],
             tiles: Vec::new(),
             floor_unchanged: false,
+            ..Default::default()
         });
 
         assert_eq!(world.entity_count(), 2);
