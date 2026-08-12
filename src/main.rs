@@ -822,7 +822,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 
     let emitted = match &chosen_surface {
         None => {
-            println!("\n  Building your timelapse. On a big factory this takes a while.\n");
+            println!("\n  Building your timelapse.\n");
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
@@ -839,7 +839,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
             })?
         }
         Some(name) => {
-            println!("\n  Building your timelapse of {}. On a big factory this takes a while.\n", pretty_place(name));
+            println!("\n  Building your timelapse of {}.\n", pretty_place(name));
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
@@ -1016,7 +1016,7 @@ fn offer_terrain_for_capture(
     println!();
     let wanted = ask_yes_no(
         match cached.is_empty() {
-            true => "  Add the grass, water and trees under your factory?\n  It looks much better, and takes about a minute.",
+            true => "  Add the grass, water and trees under your factory?\n  It looks much better.",
             false => {
                 "  Add the grass, water and trees under your factory?\n  Already read for this playthrough, so this is instant."
             }
