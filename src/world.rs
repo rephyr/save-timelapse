@@ -713,9 +713,141 @@ impl World {
     }
 }
 
+/// What changed between two full snapshots of one surface, as a delta frame.
+///
+/// Live capture derives its deltas from the events it has just applied.
+/// Building from saves has no equivalent: each save is a separate Factorio run
+/// reporting everything standing and nothing at all about how it got there, so
+/// the difference has to be found by comparing the two snapshots.
+///
+/// The result is the same shape `World::to_frame_delta` emits, an add at an
+/// occupied position included, which the viewer reads as a replacement. So a
+/// frame gives away nothing about which path built it.
+pub fn delta_between(previous: &Frame, current: &Frame) -> Frame {
+    let before: HashMap<PosKey, &Entity> = previous.entities.iter().map(|e| (pos_key(e.x, e.y), e)).collect();
+    let mut entities = Vec::new();
+    let mut standing: HashSet<PosKey> = HashSet::with_capacity(current.entities.len());
+    for entity in &current.entities {
+        let key = pos_key(entity.x, entity.y);
+        standing.insert(key);
+        // Width and height are not compared, being properties of the name: an
+        // entity whose size changed is one whose name changed.
+        if !matches!(before.get(&key), Some(was) if was.n == entity.n && was.d == entity.d) {
+            entities.push(entity.clone());
+        }
+    }
+    let mut removed_entities: Vec<PosKey> = before.keys().filter(|key| !standing.contains(*key)).copied().collect();
+
+    let paved_before: HashMap<(i32, i32), &Tile> = previous.tiles.iter().map(|t| ((t.x, t.y), t)).collect();
+    let mut tiles = Vec::new();
+    let mut paved: HashSet<(i32, i32)> = HashSet::with_capacity(current.tiles.len());
+    for tile in &current.tiles {
+        let key = (tile.x, tile.y);
+        paved.insert(key);
+        if !matches!(paved_before.get(&key), Some(was) if was.n == tile.n) {
+            tiles.push(tile.clone());
+        }
+    }
+    let mut removed_tiles: Vec<(i32, i32)> = paved_before.keys().filter(|key| !paved.contains(*key)).copied().collect();
+
+    // Sorted for the reason `to_frame_delta` sorts: the same pair of saves has
+    // to produce the same bytes twice, and a `HashMap` iterates in an order
+    // that depends on hashing rather than on contents.
+    entities.sort_by_key(|e| pos_key(e.x, e.y));
+    tiles.sort_by_key(|t| (t.x, t.y));
+    removed_entities.sort_unstable();
+    removed_tiles.sort_unstable();
+
+    Frame {
+        tick: current.tick,
+        surface: current.surface.clone(),
+        count: entities.len(),
+        entities,
+        tiles,
+        delta: true,
+        removed_entities,
+        removed_tiles,
+        floor_unchanged: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(tick: u64, entities: &[(&str, f32, f32, u8)], tiles: &[(&str, i32, i32)]) -> Frame {
+        Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: entities.len(),
+            entities: entities.iter().map(|&(n, x, y, d)| Entity { n: Arc::from(n), x, y, d, w: 1, h: 1 }).collect(),
+            tiles: tiles.iter().map(|&(n, x, y)| Tile { n: Arc::from(n), x, y }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The four things a pair of snapshots can differ by, all at once. A save
+    /// says only what is standing, so every one of these has to be recovered
+    /// by comparison rather than read off the frame.
+    #[test]
+    fn a_delta_between_snapshots_names_what_arrived_left_and_changed() {
+        let before = snapshot(
+            100,
+            &[("pipe", 0.5, 0.5, 0), ("belt", 1.5, 0.5, 2), ("chest", 2.5, 0.5, 0)],
+            &[("concrete", 0, 0), ("stone-path", 1, 0)],
+        );
+        let after = snapshot(
+            200,
+            // pipe stands unchanged, belt turned, chest became an assembler,
+            // and a lamp is new. Nothing is left at (2.5, 0.5) to remove,
+            // something else having taken the spot.
+            &[("pipe", 0.5, 0.5, 0), ("belt", 1.5, 0.5, 4), ("assembler", 2.5, 0.5, 0), ("lamp", 3.5, 0.5, 0)],
+            // concrete repaved, stone path mined up.
+            &[("refined-concrete", 0, 0)],
+        );
+
+        let delta = delta_between(&before, &after);
+
+        assert!(delta.delta);
+        assert_eq!(delta.tick, 200);
+        assert_eq!(
+            delta.entities.iter().map(|e| (&*e.n, e.d)).collect::<Vec<_>>(),
+            vec![("belt", 4), ("assembler", 0), ("lamp", 0)],
+            "the unchanged pipe is not restated"
+        );
+        assert!(delta.removed_entities.is_empty(), "a spot taken by something else is a change, not a removal");
+        assert_eq!(delta.tiles.iter().map(|t| &*t.n).collect::<Vec<_>>(), vec!["refined-concrete"]);
+        assert_eq!(delta.removed_tiles, vec![(1, 0)]);
+    }
+
+    /// The case a snapshot cannot state and only a comparison finds: things
+    /// that were there and are not.
+    #[test]
+    fn a_delta_between_snapshots_reports_a_vacated_position_as_a_removal() {
+        let before = snapshot(100, &[("pipe", 0.5, 0.5, 0), ("chest", 2.5, 0.5, 0)], &[]);
+        let after = snapshot(200, &[("pipe", 0.5, 0.5, 0)], &[]);
+
+        let delta = delta_between(&before, &after);
+
+        assert!(delta.entities.is_empty());
+        assert_eq!(delta.removed_entities, vec![pos_key(2.5, 0.5)]);
+    }
+
+    /// Two runs over one pair of saves have to produce one file, or every
+    /// rebuild looks like a change to anything comparing bytes.
+    #[test]
+    fn a_delta_between_snapshots_is_byte_stable() {
+        let before = snapshot(100, &[("pipe", 0.5, 0.5, 0)], &[("concrete", 0, 0)]);
+        let mut wide: Vec<(&str, f32, f32, u8)> = Vec::new();
+        for i in 0..200 {
+            wide.push(("lamp", i as f32 + 0.5, 0.5, 0));
+        }
+        let after = snapshot(200, &wide, &[("concrete", 0, 0), ("stone-path", 5, 5)]);
+
+        let once = crate::frame::write_binary(&delta_between(&before, &after).as_out());
+        let twice = crate::frame::write_binary(&delta_between(&before, &after).as_out());
+        assert_eq!(once, twice);
+    }
 
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
         Frame {

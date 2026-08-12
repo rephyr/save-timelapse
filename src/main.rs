@@ -14,6 +14,7 @@ use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 use save_timelapse::settings::Settings;
 use save_timelapse::with_thousands;
+use save_timelapse::world;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -313,6 +314,65 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
         }
         println!("\n  Please type a number from 1 to {}.\n", sessions.len());
     }
+}
+
+/// Rewrites a folder of full snapshots as a delta chain, in place: the first
+/// frame stays the whole picture and every one after it becomes only what
+/// changed since the one before. Returns bytes before and after.
+///
+/// Every save reports the entire factory, having no idea another save exists,
+/// so writing them through as exported restates everything standing once per
+/// save. On a megabase that is 30 MB a frame of which almost all is identical
+/// to the frame before, and the live capture path already refuses to pay it.
+///
+/// Ordered by the tick inside each frame rather than by filename, because a
+/// chain has to be built in the order it will be replayed and the viewer
+/// replays in tick order. Filenames cannot carry that: Factorio's autosaves
+/// rotate, so `_autosave1` is as likely to be the newest as the oldest, and
+/// `ordering_key` can only guess from the digits in a name.
+///
+/// Two saves of one moment are dropped to one here rather than at load. The
+/// viewer deduplicates by tick too, but a delta it dropped would take every
+/// frame after it along with it.
+fn write_as_delta_chain(frames: &[PathBuf]) -> io::Result<(u64, u64)> {
+    let size = |path: &PathBuf| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let before: u64 = frames.iter().map(size).sum();
+
+    let mut ordered: Vec<(u64, &PathBuf)> = Vec::new();
+    for path in frames {
+        match frame::read_header(path) {
+            Ok((tick, _)) => ordered.push((tick, path)),
+            // Unreadable here means unreadable to the viewer as well, so it is
+            // removed rather than left to reset the sequence at load.
+            Err(_) => drop(std::fs::remove_file(path)),
+        }
+    }
+    ordered.sort_by_key(|&(tick, _)| tick);
+
+    let mut chain: Vec<&PathBuf> = Vec::new();
+    let mut last_tick: Option<u64> = None;
+    for (tick, path) in ordered {
+        match last_tick == Some(tick) {
+            true => drop(std::fs::remove_file(path)),
+            false => {
+                chain.push(path);
+                last_tick = Some(tick);
+            }
+        }
+    }
+
+    let mut previous: Option<frame::Frame> = None;
+    for path in &chain {
+        let current = frame::read_binary(&std::fs::read(path)?)?;
+        // Read before it is written, so rewriting in place is safe: the folder
+        // shrinks as it goes rather than needing room for both forms at once.
+        if let Some(prev) = &previous {
+            std::fs::write(path, frame::write_binary(&world::delta_between(prev, &current).as_out()))?;
+        }
+        previous = Some(current);
+    }
+
+    Ok((before, chain.iter().copied().map(size).sum()))
 }
 
 /// Saves are usually numbered, so order by that number rather than
@@ -1244,6 +1304,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     let mut done = 0usize;
     let mut milestone_states: Vec<milestone::State> = Vec::new();
+    let mut exported: Vec<PathBuf> = Vec::new();
     for (index, save) in chosen.iter().enumerate() {
         let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
         print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
@@ -1255,6 +1316,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
                 let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
+                exported.push(target.clone());
                 // Appended, not overwritten: each save contributes its own
                 // one-shot sample at its own real tick.
                 if let Some(log) = &outcome.players_log {
@@ -1277,6 +1339,21 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     if done == 0 {
         return Err(io::Error::other("none of the selected saves exported successfully"));
+    }
+
+    match write_as_delta_chain(&exported) {
+        Ok((before, after)) if after < before => println!(
+            "  frames reduced from {} MiB to {} MiB, each one keeping only what changed",
+            before / (1024 * 1024),
+            after / (1024 * 1024)
+        ),
+        Ok(_) => {}
+        // A frame is only rewritten once the one before it has been, so a
+        // failure partway leaves a chain followed by full pictures. The viewer
+        // reads a full frame as a fresh statement of everything standing and
+        // closes whatever it does not mention, so what is left is larger than
+        // intended rather than wrong.
+        Err(err) => println!("  could not reduce the frames ({err}); they are still usable, just larger"),
     }
 
     // The last save chosen: ground is scanned once for the whole timelapse,
@@ -1920,6 +1997,129 @@ mod tests {
         assert_eq!(parse_session_index("4", 3), None);
         assert_eq!(parse_session_index("nope", 3), None);
         assert_eq!(parse_session_index("", 3), None);
+    }
+
+    /// One save's worth of factory, as the mod would have exported it.
+    fn snapshot(tick: u64, names: &[&str]) -> frame::Frame {
+        frame::Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: names.len(),
+            entities: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| frame::Entity { n: std::sync::Arc::from(*n), x: i as f32 + 0.5, y: 0.5, d: 0, w: 1, h: 1 })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Everything standing at each frame, accumulated the way the viewer
+    /// accumulates: a full frame states the world, a delta changes it.
+    fn replay_chain(paths: &[std::path::PathBuf]) -> Vec<Vec<String>> {
+        let mut ordered: Vec<frame::Frame> =
+            paths.iter().filter_map(|p| std::fs::read(p).ok()).filter_map(|b| frame::read_binary(&b).ok()).collect();
+        ordered.sort_by_key(|f| f.tick);
+
+        let mut standing: std::collections::HashMap<(i32, i32), String> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for frame in &ordered {
+            if !frame.delta {
+                standing.clear();
+            }
+            for pos in &frame.removed_entities {
+                standing.remove(pos);
+            }
+            for e in &frame.entities {
+                standing.insert(save_timelapse::world::pos_key(e.x, e.y), e.n.to_string());
+            }
+            let mut names: Vec<String> = standing.values().cloned().collect();
+            names.sort();
+            out.push(names);
+        }
+        out
+    }
+
+    /// Factorio's autosaves rotate, so `_autosave1` is as likely to be the
+    /// newest as the oldest and the digits in a filename are only a guess at
+    /// order. A chain built in the wrong order is not merely mis-sorted: every
+    /// frame after the mistake describes changes against the wrong world.
+    #[test]
+    fn a_delta_chain_is_built_in_tick_order_not_filename_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Written newest first, which is what a rotated autosave set looks
+        // like once `ordering_key` has sorted it by the digits in the name.
+        let written = [snapshot(300, &["pipe", "belt", "lamp"]), snapshot(100, &["pipe"]), snapshot(200, &["pipe", "belt"])];
+        let paths: Vec<std::path::PathBuf> = written
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&f.as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        write_as_delta_chain(&paths).unwrap();
+
+        let full: Vec<u64> = paths
+            .iter()
+            .map(|p| frame::read_binary(&std::fs::read(p).unwrap()).unwrap())
+            .filter(|f| !f.delta)
+            .map(|f| f.tick)
+            .collect();
+        assert_eq!(full, vec![100], "the earliest tick is the picture, whatever it is called");
+
+        assert_eq!(
+            replay_chain(&paths),
+            vec![
+                vec!["pipe".to_string()],
+                vec!["belt".to_string(), "pipe".to_string()],
+                vec!["belt".to_string(), "lamp".to_string(), "pipe".to_string()],
+            ],
+            "replaying the chain rebuilds each save exactly"
+        );
+    }
+
+    /// A delta the viewer dropped would take every frame after it along with
+    /// it, so a duplicated moment is resolved here instead.
+    #[test]
+    fn two_saves_of_one_moment_leave_one_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = [snapshot(100, &["pipe"]), snapshot(200, &["pipe", "belt"]), snapshot(200, &["pipe", "belt"])];
+        let paths: Vec<std::path::PathBuf> = written
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&f.as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        write_as_delta_chain(&paths).unwrap();
+
+        let left: Vec<&std::path::PathBuf> = paths.iter().filter(|p| p.exists()).collect();
+        assert_eq!(left.len(), 2, "the repeated moment is gone");
+        assert_eq!(replay_chain(&paths).last().unwrap(), &vec!["belt".to_string(), "pipe".to_string()]);
+    }
+
+    /// The whole point: a frame that restates an unchanged factory should cost
+    /// almost nothing.
+    #[test]
+    fn an_unchanged_factory_costs_almost_nothing_per_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<&str> = vec!["pipe"; 2000];
+        let paths: Vec<std::path::PathBuf> = (0..5)
+            .map(|i| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&snapshot(100 * (i + 1), &names).as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        let (before, after) = write_as_delta_chain(&paths).unwrap();
+        assert!(after * 4 < before, "five copies of one factory became one copy and four near-empty frames: {before} to {after}");
     }
 
     #[test]

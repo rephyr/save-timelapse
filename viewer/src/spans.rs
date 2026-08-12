@@ -111,12 +111,22 @@ pub struct SpanBuilder<T> {
     /// Reused across frames so a frame costs no allocation of its own.
     current: Vec<(u64, TypeId, T)>,
     next_open: Vec<(u64, u32)>,
+    /// A delta's removals, sorted so they can be merged against `open` in one
+    /// pass. Reused for the same reason as `current`.
+    gone: Vec<u64>,
     frames: u32,
 }
 
 impl<T: Copy> Default for SpanBuilder<T> {
     fn default() -> Self {
-        SpanBuilder { spans: Vec::new(), open: Vec::new(), current: Vec::new(), next_open: Vec::new(), frames: 0 }
+        SpanBuilder {
+            spans: Vec::new(),
+            open: Vec::new(),
+            current: Vec::new(),
+            next_open: Vec::new(),
+            gone: Vec::new(),
+            frames: 0,
+        }
     }
 }
 
@@ -161,7 +171,9 @@ impl<T: Copy> SpanBuilder<T> {
 
             match continues {
                 // Nothing to write: an open span's `last` is not read until it
-                // closes. See `close`.
+                // closes, and closing is where `frame` gets written into it.
+                // `last` is exclusive, so it is exactly the frame that no
+                // longer contained the item.
                 Some(&(_, index)) => self.next_open.push((key, index)),
                 None => {
                     // Either brand new, or the same tile now holding a
@@ -192,13 +204,6 @@ impl<T: Copy> SpanBuilder<T> {
         self.frames += 1;
     }
 
-    /// Ends the span open at `at`, which was last present in the frame before
-    /// `frame`. `last` is exclusive, so it is exactly `frame`.
-    fn close(&mut self, at: usize, frame: u32) {
-        let index = self.open[at].1;
-        self.spans[index as usize].last = frame;
-    }
-
     /// Folds in one frame given only what changed, which is what a delta frame
     /// carries and what this structure has always been shaped like.
     ///
@@ -209,30 +214,80 @@ impl<T: Copy> SpanBuilder<T> {
     ///
     /// `removed` keys that are not standing are ignored, matching how replay
     /// treats a removal for something it never saw.
+    ///
+    /// Both sides are sorted and merged in one pass rather than binary
+    /// searched and spliced item by item. `Vec::remove` and `Vec::insert` move
+    /// everything past the position they touch, so this used to cost
+    /// `standing * changed`. That is invisible at the 200 items a frame an
+    /// ordinary base changes, and it does not finish at all once a single
+    /// frame changes a large share of a large factory: measured, a million
+    /// standing with half of them removed never completed, where the merge
+    /// takes a quarter of a second.
+    ///
+    /// Found by deleting ten million entities in one tick on a gigabase. It
+    /// looks exactly like a hang from outside, there being nothing to report
+    /// progress against inside one `Vec::remove`.
     pub fn push_delta(&mut self, added: impl IntoIterator<Item = (u64, TypeId, T)>, removed: impl IntoIterator<Item = u64>) {
         let frame = self.frames;
 
-        for key in removed {
-            if let Ok(at) = self.open.binary_search_by_key(&key, |&(k, _)| k) {
-                self.close(at, frame);
-                self.open.remove(at);
+        self.gone.clear();
+        self.gone.extend(removed);
+        self.gone.sort_unstable();
+
+        // Removals first, so an add on a key this frame also vacated opens a
+        // fresh span rather than replacing one that is already closed.
+        self.next_open.clear();
+        let mut gone_at = 0usize;
+        for &(key, index) in &self.open {
+            // Both sides sorted, so this only moves forward. A removal for
+            // something not standing is stepped over and ignored.
+            while gone_at < self.gone.len() && self.gone[gone_at] < key {
+                gone_at += 1;
+            }
+            match self.gone.get(gone_at) == Some(&key) {
+                true => self.spans[index as usize].last = frame,
+                false => self.next_open.push((key, index)),
             }
         }
+        std::mem::swap(&mut self.open, &mut self.next_open);
 
-        for (key, type_id, item) in added {
+        self.current.clear();
+        self.current.extend(added);
+        self.current.sort_unstable_by_key(|&(key, _, _)| key);
+        // Same guard as `push_frame`: two items on one key would leave `open`
+        // holding a duplicate, which every merge after it assumes cannot
+        // happen.
+        self.current.dedup_by_key(|&mut (key, _, _)| key);
+
+        self.next_open.clear();
+        let mut open_at = 0usize;
+        for &(key, type_id, item) in &self.current {
+            // Carried across untouched: a delta says nothing about what it
+            // does not mention.
+            while open_at < self.open.len() && self.open[open_at].0 < key {
+                self.next_open.push(self.open[open_at]);
+                open_at += 1;
+            }
+            // Something already here: a tile repaved, or an entity replaced.
+            // The old one ends where the new one begins.
+            if let Some(&(open_key, index)) = self.open.get(open_at) {
+                if open_key == key {
+                    self.spans[index as usize].last = frame;
+                    open_at += 1;
+                }
+            }
             let index = self.spans.len() as u32;
             self.spans.push(Span { item, type_id, first: frame, last: frame + 1 });
-            match self.open.binary_search_by_key(&key, |&(k, _)| k) {
-                // Something already here: a tile repaved, or an entity
-                // replaced. The old one ends where the new one begins.
-                Ok(at) => {
-                    self.close(at, frame);
-                    self.open[at] = (key, index);
-                }
-                Err(at) => self.open.insert(at, (key, index)),
-            }
+            self.next_open.push((key, index));
+        }
+        while open_at < self.open.len() {
+            self.next_open.push(self.open[open_at]);
+            open_at += 1;
         }
 
+        // Both inputs were sorted, so `next_open` came out sorted and is ready
+        // to merge against directly next frame.
+        std::mem::swap(&mut self.open, &mut self.next_open);
         self.frames += 1;
     }
 
@@ -264,6 +319,57 @@ impl<T: Copy> SpanBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame that changes a large fraction of what is standing, which is
+    /// what clearing a factory looks like.
+    ///
+    /// Deliberately large, and a guard on cost rather than on the answer. The
+    /// splice-per-item version this replaced was never wrong, it simply did
+    /// not return: at this size it was still running when it was given up on,
+    /// where the merge takes a quarter of a second. Reintroducing that shape
+    /// makes the suite hang rather than fail, which is the only signal a
+    /// correct-but-unfinishable function can give.
+    #[test]
+    fn a_frame_that_clears_most_of_the_factory_still_folds_in() {
+        const STANDING: u64 = 1_000_000;
+
+        let mut builder = SpanBuilder::new();
+        builder.push_frame((0..STANDING).map(|key| (key, 0, key)));
+        // Every even key mined out, and a new thing built well past all of
+        // them so the merge has to carry the survivors across as well as
+        // append beyond the end.
+        builder.push_delta((STANDING..STANDING + 1000).map(|key| (key, 1, key)), (0..STANDING).filter(|key| key % 2 == 0));
+        let set = builder.finish();
+
+        let mut items = Vec::new();
+        let mut runs = Vec::new();
+        set.materialize(1, &mut items, &mut runs);
+        items.sort_unstable();
+
+        let expected: Vec<u64> = (0..STANDING).filter(|key| key % 2 == 1).chain(STANDING..STANDING + 1000).collect();
+        assert_eq!(items, expected, "the survivors and the new arrivals, and nothing else");
+
+        set.materialize(0, &mut items, &mut runs);
+        items.sort_unstable();
+        assert_eq!(items, (0..STANDING).collect::<Vec<_>>(), "the frame before is untouched by any of it");
+    }
+
+    /// The orders a delta's keys can arrive in. Positions left of the origin
+    /// make a span key wrap into the top half of the range, so a delta's
+    /// removals are not sorted the way the merge needs them even though the
+    /// writer sorted them.
+    #[test]
+    fn a_delta_does_not_depend_on_the_order_its_changes_arrive_in() {
+        let mut ascending = SpanBuilder::new();
+        ascending.push_frame((0..8).map(|key| (key, 0, key)));
+        ascending.push_delta([(9u64, 1u16, 9u64), (8, 1, 8)], [4u64, 1, 6]);
+
+        let mut descending = SpanBuilder::new();
+        descending.push_frame((0..8).rev().map(|key| (key, 0, key)));
+        descending.push_delta([(8u64, 1u16, 8u64), (9, 1, 9)], [6u64, 1, 4]);
+
+        assert_eq!(ascending.finish().iter().collect::<Vec<_>>(), descending.finish().iter().collect::<Vec<_>>());
+    }
 
     /// Deltas and full frames have to be two ways of saying the same thing,
     /// or a timelapse built from one would differ from the same capture built

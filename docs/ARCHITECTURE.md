@@ -85,11 +85,13 @@ launches it; closing the window does not end a job.
         v
     <staged>/script-output/save-timelapse/frame_<tick>_<surface>.stfr
         |
-        |  CLI collects, orders by save sequence
+        |  CLI collects, orders by the tick in each frame, rewrites as deltas
         v
     frames/ -> renderer -> video or viewer bundle
 
-One save produces one frame. Frame count equals the number of saves supplied.
+One save produces one frame, so frame count equals the number of saves supplied,
+minus any two saves that turn out to be of the same moment. Each save reports the
+whole factory; a final pass keeps only what changed between them.
 
 ## Staging model
 
@@ -996,6 +998,41 @@ lose nothing, the record accumulating until it emits.
 
 Entity and tile removals travel in separate lists, the two being different
 coordinate spaces: an entity sits at a tile's centre.
+
+**Building from saves gets there by comparison instead.** Each save is a
+separate Factorio run reporting everything standing and nothing at all about
+how it got there, so there is no record of what changed to build a delta from.
+`world::delta_between` finds it by comparing two snapshots directly, and
+`write_as_delta_chain` rewrites the exported folder in place once every save
+has been exported. A frame is read before it is written, so the folder shrinks
+as it goes rather than needing room for both forms.
+
+That pass orders by the **tick inside each frame, not by filename**, because a
+chain has to be built in the order it will be replayed and the viewer replays in
+tick order. Filenames cannot carry that order: Factorio's autosaves rotate, so
+`_autosave1` is as likely to be the newest as the oldest, and `ordering_key`
+only guesses from the digits in a name. Two saves of one moment are reduced to
+one here as well. The viewer deduplicates by tick too, but a delta it dropped
+would take every frame after it along with it.
+
+A full frame appearing mid-sequence stays legal and is what a partly converted
+folder looks like: `SpanSet::push_frame` closes whatever the frame does not
+mention, so it reads as a fresh statement of everything standing. That is why a
+failure partway through the pass leaves a timelapse that is larger than intended
+rather than wrong.
+
+**A delta is merged against what is standing, never spliced into it.**
+`SpanBuilder::open` is a sorted vector, so a binary search plus a `Vec::remove`
+or `Vec::insert` per changed item costs `standing * changed`: fine at the 200
+items a frame an ordinary base changes, and unfinishable once one frame changes
+a large share of a large factory. Deleting ten million entities in a single tick
+on a gigabase made loading the result never complete. Both halves are sorted and
+merged in one pass instead, which is the same shape `push_frame` already used.
+
+The failure gave nothing away, being correct code that simply did not return,
+and the viewer's phase label pointed at the wrong function entirely: it was set
+before the work and painted after it, leaving the previous phase's text on
+screen throughout. Phase labels are painted before their work for that reason.
 
 **`SpanBuilder` writes `last` when a span closes, not on every frame it
 survives.** That is what makes a delta cost one pass over the change rather than

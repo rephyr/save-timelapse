@@ -379,7 +379,13 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         // whole timeline. See `viewer::timeline_ticks`.
         let timeline = viewer::timeline_ticks(&grouped);
 
+        // Painted before the first batch rather than after it. Setting a phase
+        // and not redrawing until the end of the work leaves the previous
+        // phase's label on screen for the whole of it, so a slow batch reads
+        // as a stuck header scan and sends anyone diagnosing it to the wrong
+        // function entirely.
         progress.phase = "loading frames";
+        redraw_progress(&progress, &mut last, true).await;
         let mut done = 0usize;
         for (name, paths) in grouped {
             let mut builder = FrameSequence::builder();
