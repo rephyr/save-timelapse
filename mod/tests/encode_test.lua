@@ -1,10 +1,10 @@
--- Unit tests for mod/encode.lua: the pure binary-encoding logic shared by
--- snapshot export and live capture. No Factorio required, run with:
+-- Unit tests for mod/encode.lua, the pure encoding logic. No Factorio
+-- required:
 --
 --   lua mod/tests/encode_test.lua
 --
--- Not wired into `cargo test`: that command's promise of needing nothing
--- beyond the Rust toolchain shouldn't start silently depending on `lua`.
+-- Not wired into `cargo test`, whose promise of needing nothing beyond the
+-- Rust toolchain should not start depending on `lua`.
 
 local script_dir = arg[0]:match("(.*/)") or "./"
 local encode = dofile(script_dir .. "../encode.lua")
@@ -175,13 +175,10 @@ do
   check("event_add_entity: a missing id encodes as the 0 sentinel", id_field, encode.u64le(0))
 end
 
--- Position is always sent on removal, even when id is available too: an
--- entity that already existed when the baseline was taken carries its real
--- (pre-existing) unit_number when Factorio reports it removed, but replay's
--- world state never learned that number from a snapshot, which records no
--- ids. Sending id alone, as the JSON format once did, made every such
--- removal an unresolvable no-op. See mod/capture.lua's request_baseline/
--- perform_baseline for the other half of this.
+-- Position is sent on removal even when id is available: an entity that
+-- existed when the baseline was taken carries a real unit_number replay never
+-- learned, a snapshot recording no ids, so id alone made every such removal an
+-- unresolvable no-op.
 do
   local surfaces = encode.new_dictionary()
   local record = encode.event_remove_entity(surfaces, "nauvis", 10.5, 20.5, 8842)
@@ -228,12 +225,10 @@ do
   check("event_add_tile: a second, already defined surface is referenced by its id", record, expected)
 end
 
--- Reload handling deliberately has no test here, because the mod deliberately
--- does not attempt it. Every value that could reveal a reload lives in
--- `storage`, which Factorio saves inside the save file and therefore rewinds
--- along with it, so a comparison against the resumed tick is always false.
--- See the note above `event_reset_dictionaries` in encode.lua; reloads are
--- resolved on the reading side by `event::segment_run_bounds`.
+-- Reload handling has no test here because the mod does not attempt it: every
+-- value that could reveal a reload lives in `storage`, which rewinds with the
+-- save. Reloads are resolved on the reading side by
+-- `event::segment_run_bounds`.
 
 -- milestones
 
@@ -246,11 +241,10 @@ check("is_science_pack: a modded pack is picked up for free",
   encode.is_science_pack("se-deep-space-science-pack"), true)
 check("is_science_pack: an ordinary item is not one", encode.is_science_pack("iron-plate"), false)
 
--- The from-saves half of milestones. A save knows only totals, never when
--- something first became true, so the mod reports state here and src/milestone.rs
--- recovers the timings by comparing consecutive saves. Rockets is a count
--- rather than a flag so that diff can tell a first launch from launches that
--- had been happening all along.
+-- The from-saves half of milestones. A save knows only totals, so the mod
+-- reports state and src/milestone.rs recovers timings by comparing consecutive
+-- saves. Rockets is a count rather than a flag so that diff can tell a first
+-- launch from launches that had been happening all along.
 check("milestone_state: both lists and the rocket count as one JSON object",
   encode.milestone_state({ "automation-science-pack", "logistic-science-pack" }, { "nauvis" }, 3),
   '{"science":["automation-science-pack","logistic-science-pack"],"planets":["nauvis"],"rockets":3}')
@@ -376,10 +370,9 @@ do
   check("terrain_margin: a square base is padded to fill the frame's width",
     encode.terrain_margin(box(1000, 1000), 32), 466)
 
-  -- The two that show why a fraction of the larger dimension cannot work.
-  -- Both have a 2:1 side ratio and each needs an order of magnitude
-  -- different padding, because what a fit exposes depends on the base's
-  -- shape against the frame's, not on how big it is.
+  -- Why a fraction of the larger dimension cannot work: both have a 2:1 side
+  -- ratio and each needs an order of magnitude different padding, what a fit
+  -- exposes depending on shape against the frame rather than on size.
   check("terrain_margin: a base wider than the frame needs very little",
     encode.terrain_margin(box(2000, 1000), 32), 111)
 
@@ -397,12 +390,10 @@ do
       (100 + 2 * m) * (5000 + 2 * m) <= 4000000, true)
   end
 
-  -- The bug this guards against, and it was in the budget rather than the
-  -- margin: as a flat ceiling, any base bigger than the ceiling itself had
-  -- nothing left to spend, the affordable width came out negative, and it
-  -- fell back to the 32 tile floor. The largest factories got the smallest
-  -- margins, which is precisely backwards. A 5000x5000 base has a 25M tile
-  -- footprint and must still be given what its shape asks for.
+  -- The bug was in the budget rather than the margin: as a flat ceiling, any
+  -- base bigger than the ceiling had nothing left to spend, so the affordable
+  -- width came out negative and it fell back to the 32 tile floor. The largest
+  -- factories got the smallest margins.
   check("terrain_margin: a base far larger than the flat budget still gets a real margin",
     encode.terrain_margin(box(5000, 5000), 32), 2330)
 
@@ -467,10 +458,9 @@ check("player_log_line: multiple players are comma separated",
   '{"tick":1,"players":[{"name":"Alice","surface":"nauvis","x":1,"y":2},' ..
     '{"name":"Bob","surface":"vulcanus","x":3,"y":4}]}\n')
 
--- The empty case itself is never actually written: export.lua's callers
--- skip the write_file call entirely when nobody was sampled. Still worth
--- pinning here as a value, since something downstream could start calling
--- this with an empty list directly.
+-- Never actually written: export.lua's callers skip the write entirely when
+-- nobody was sampled. Pinned anyway, since something could start calling this
+-- with an empty list.
 check("player_log_line: an empty player list is an empty JSON array",
   encode.player_log_line(1, {}),
   '{"tick":1,"players":[]}\n')
@@ -496,22 +486,19 @@ check("EXCLUDED_TYPES: contains character", excluded["character"], true)
 check("EXCLUDED_TYPES: does not contain tree", excluded["tree"], nil)
 check("EXCLUDED_TYPES: does not contain cliff", excluded["cliff"], nil)
 check("EXCLUDED_TYPES: still contains the generic decorative scatter type", excluded["simple-entity"], true)
--- Every flying robot type. These are the highest-volume mobile entity in the
--- game: a megabase mid construction job has tens of thousands airborne, each
--- one a record in the baseline and in every from-saves frame, pinned wherever
--- it happened to be since the format cannot update a position.
+-- Every flying robot type, the highest-volume mobile entity in the game: a
+-- megabase mid construction job has tens of thousands airborne, each pinned
+-- wherever it happened to be since the format cannot update a position.
 check("EXCLUDED_TYPES: contains construction-robot", excluded["construction-robot"], true)
 check("EXCLUDED_TYPES: contains logistic-robot", excluded["logistic-robot"], true)
 check("EXCLUDED_TYPES: contains combat-robot", excluded["combat-robot"], true)
 -- The stationary infrastructure that flies them stays: it is the part that
 -- actually shows the factory growing.
 check("EXCLUDED_TYPES: does not contain roboport", excluded["roboport"], nil)
--- Mobile enemies stay excluded: their combat deaths would flood live capture
--- with removals unrelated to construction, and since this format records
--- construction and destruction but never movement, a captured biter would sit
--- frozen wherever it was first logged. Regression: a real capture showed ~6%
--- of exported entities were biters/spitters/spawners before these were added,
--- and that bulk was the mobile units rather than the nests that spawn them.
+-- Mobile enemies stay excluded: their combat deaths would flood capture with
+-- removals unrelated to construction, and a captured biter would sit frozen
+-- where it was first logged. On a real capture ~6% of exported entities were
+-- biters, spitters and spawners before this.
 check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true)
 -- Asteroid chunks drift and are collected continuously, and are never built,
 -- so every one logs a removal for something replay never had. On a real
@@ -519,18 +506,13 @@ check("EXCLUDED_TYPES: contains unit (biters, spitters)", excluded["unit"], true
 check("EXCLUDED_TYPES: contains asteroid-chunk", excluded["asteroid-chunk"], true)
 -- ...but the collector is a structure worth watching go up.
 check("EXCLUDED_TYPES: does not contain asteroid-collector", excluded["asteroid-collector"], nil)
--- Nests are deliberately captured despite being enemies: stationary, so the
--- format represents them honestly, few enough to cost little, and watching
--- them get cleared is how expansion actually reads in a timelapse. The viewer
--- colors them red (see viewer/src/registry.rs's is_enemy).
+-- Nests are captured despite being enemies: stationary, few, and watching them
+-- get cleared is how expansion reads in a timelapse.
 check("EXCLUDED_TYPES: does not contain unit-spawner", excluded["unit-spawner"], nil)
--- Space Age gave its own mobile enemies prototype types of their own, so
--- "unit" above never covered them and every one landed in captures as though
--- somebody had built it. Found in a real Gleba capture holding
--- small-stomper-pentapod, small-strafer-pentapod and both their leg
--- prototypes; because they roam, the auto-follow camera stretched to wherever
--- they had wandered. Read from the game's own prototypes rather than guessed:
--- space-age/prototypes/entity/enemies.lua.
+-- Space Age gave its mobile enemies their own prototype types, so "unit" never
+-- covered them and every one landed in captures as though somebody had built
+-- it. Found in a real Gleba capture; because they roam, the auto-follow camera
+-- stretched to wherever they had wandered.
 check("EXCLUDED_TYPES: contains spider-unit (Gleba stompers and strafers)", excluded["spider-unit"], true)
 check("EXCLUDED_TYPES: contains spider-leg (their legs, and Spidertron's)", excluded["spider-leg"], true)
 check("EXCLUDED_TYPES: contains segmented-unit (Vulcanus demolisher heads)", excluded["segmented-unit"], true)
@@ -558,15 +540,12 @@ check("KNOWN_PLACED_FLOOR_TILES: contains stone-path", known_floor["stone-path"]
 
 -- placed_floor_tiles
 --
--- Asked of the game rather than listed, because the list is Wube's names and
--- was the last place a mod could not be seen. `space-platform-foundation` is
--- the case that proves it and is not even modded: a platform's own floor was
--- missing, so the tiles a player lays to grow a platform were recorded as
--- natural ground and the platform appeared fully formed rather than growing.
+-- Asked of the game rather than listed, the list being Wube's names and the
+-- last place a mod could not be seen. `space-platform-foundation` proves it and
+-- is not even modded: a platform's own floor was missing, so the tiles a player
+-- lays were recorded as natural ground and the platform appeared fully formed.
 --
--- Two properties unioned, because on a real 69 mod game neither covers it
--- alone: nothing places a coloured refined concrete and nothing reports it
--- minable, while the stated list knows nothing of any mod.
+-- Two properties unioned, neither covering it alone on a real 69 mod game.
 
 do
   local tile = function(props) return props end
@@ -600,12 +579,10 @@ end
 -- color_bytes
 --
 -- Factorio writes a Color as 0..1 floats or as 0..255 values and tells them
--- apart by whether anything is above 1, so this has to as well. Assuming
--- floats put an already-byte-ranged prototype colour out of byte range (61
--- became 15555), which the reader could not parse at all: on an Alien Biomes
--- save 357 of 364 tiles were unreadable, and a single one of them was enough
--- to make the desktop side discard the whole file and colour the playthrough
--- from its built-in table.
+-- apart by whether anything is above 1. Assuming floats put an already
+-- byte-ranged colour out of range (61 became 15555), which the reader could not
+-- parse: on an Alien Biomes save 357 of 364 tiles were unreadable, and one was
+-- enough to make the desktop side discard the whole file.
 
 local function color(c)
   return string.format("%d,%d,%d", encode.color_bytes(c))
@@ -626,12 +603,11 @@ check("color_bytes: clamped below", color({ r = -5, g = 5, b = 400 }), "0,5,255"
 -- Reads the `prototypes` global the game provides, which the test stands in
 -- for. Nests and worms take the enemy colour and everything else does not:
 -- `enemy_map_color` is set on most prototypes whatever side they are on, so
--- preferring it painted an entire factory, belts and walls and radars alike,
--- in biter red.
+-- preferring it painted belts, walls and radars alike in biter red.
 --
--- The type of every entity goes out verbatim, which is what lets the desktop
--- side recognise a modded belt as a belt without this file, or that one,
--- naming it. Reach is asked of underground belts and pipes and nothing else.
+-- Every entity's type goes out verbatim, which is what lets the desktop side
+-- recognise a modded belt without naming it. Reach is asked of underground
+-- belts and pipes only.
 
 do
   -- `mineable_properties` is never nil on a real tile prototype, so the

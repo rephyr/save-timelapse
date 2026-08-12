@@ -53,11 +53,10 @@ local capture_last_written_tick = nil
 local capture_dictionaries_synced = false
 
 --- What was loaded, as one string, so the prototype description is rewritten
---- when the answer could have changed and never otherwise.
----
---- `script.active_mods` is what decides it, prototypes being fixed at load
---- time. This mod is in it too, which is what makes a capture heal itself when
---- a version that wrote the file wrongly is replaced.
+--- when the answer could have changed and never otherwise. `script.active_mods`
+--- decides it, prototypes being fixed at load time. This mod is in it too,
+--- which is what makes a capture heal itself when a version that wrote the file
+--- wrongly is replaced.
 local loaded_mods_stamp = nil
 local function loaded_mods()
   if not loaded_mods_stamp then
@@ -118,11 +117,10 @@ function M.set_surface_excluded(surface_name, excluded)
 end
 
 --- Every surface that has had a baseline frame, keyed by name, valued by tick.
---- `request_baseline` diffs this against what is wanted, which is what lets one
---- function serve the first baseline, a reset, and any catch-up.
----
---- Nested inside `storage.timelapse_capture` rather than beside it: this is
---- capture progress, so a reset is supposed to throw it away.
+--- `request_baseline` diffs this against what is wanted, which lets one
+--- function serve the first baseline, a reset, and any catch-up. Nested inside
+--- `storage.timelapse_capture`, this being capture progress a reset throws
+--- away.
 local function baselined_surfaces()
   local capture = storage.timelapse_capture
   capture.baselined_surfaces = capture.baselined_surfaces or {}
@@ -197,14 +195,13 @@ local function ensure_capture_segment()
 end
 
 --- Take the baseline once per save, then never again: everything after is
---- reconstructed from the event log. At roughly 50 bytes per entity, a
+--- reconstructed from the event log, and at roughly 50 bytes per entity a
 --- megabase snapshot every 10 seconds wrote gigabytes an hour.
 ---
---- Runs synchronously in one tick, unlike the incremental snapshot.lua path,
---- which exists to avoid a freeze on something that repeats. A baseline runs
---- at most once per save, so tens of seconds once beats a background cost a
---- save or quit can interrupt. Factorio cannot save mid-tick, and
---- `baseline_tick` is set only after the write succeeds.
+--- Runs synchronously in one tick, unlike snapshot.lua's incremental path,
+--- which exists to avoid a freeze on something that repeats. A baseline runs at
+--- most once per save, so tens of seconds once beats a background cost a save
+--- or quit can interrupt. `baseline_tick` is set only after the write succeeds.
 ---
 --- Split into `request_baseline`/`perform_baseline` because nothing renders
 --- between two calls in one tick, so a warning printed just before the export
@@ -229,12 +226,9 @@ end
 
 --- Warns that a freeze is coming, with a real entity count:
 --- `count_entities_filtered` gives one without materialising the array
---- `export_surface` needs. It cannot promise seconds, the Lua sandbox having
---- no wall clock.
----
---- Covers all three callers, since the first baseline, a reset and the panel's
---- Generate button all mean "some wanted surface has never been baselined", so
---- checking several boxes coalesces into one freeze.
+--- `export_surface` needs. It cannot promise seconds, the Lua sandbox having no
+--- wall clock. Covers all three callers, so checking several boxes before
+--- pressing Generate coalesces into one freeze.
 local function request_baseline(tick)
   ensure_capture_segment()
   if baseline_pending_tick then
@@ -300,11 +294,9 @@ end
 
 --- The mod cannot detect that script-output has been wiped and retake the
 --- baseline: `LuaHelpers` exposes `write_file` and `remove_path` and nothing
---- else, so a mod cannot tell whether a file it wrote still exists, and
---- `baseline_tick` has to be trusted for "already baselined".
----
---- This command and the GUI's reset button are the recovery: deleting this
---- playthrough's own files is something `remove_path` can do.
+--- else, so `baseline_tick` has to be trusted for "already baselined". This
+--- command and the GUI's reset button are the recovery, deleting this
+--- playthrough's own files being something `remove_path` can do.
 function M.reset_capture(player)
   local old_session_id = storage.timelapse_capture and storage.timelapse_capture.session_id
   if old_session_id then
@@ -443,10 +435,8 @@ local function log_tile_change(op, event)
       -- What the removal uncovered, logged as an ordinary add so the position
       -- holds it rather than going empty: mining landfill reveals water no
       -- baseline ever saw, and without this a filled lake un-fills into a hole.
-      --
       -- Readable only because these events fire after the tiles are replaced,
-      -- and needs no new record type, so it stays inside the format freeze.
-      -- Gated on terrain capture, which it would otherwise violate.
+      -- and gated on terrain capture, which it would otherwise violate.
       if surface and terrain_captured() then
         local ok, revealed = pcall(function()
           return surface.get_tile(pos.x, pos.y).name
@@ -468,10 +458,8 @@ M.CAPTURE_HANDLERS = {
   --
   -- Logged as an add, which is what an add already means: `World::insert`
   -- updates an occupied position in place and skips the revision bump when
-  -- nothing changed, so a no-op rotation costs nothing.
-  --
-  -- Covers rotating by hand only. A belt the game turns for you as you drag a
-  -- line past it raises no event this listens for.
+  -- nothing changed. Covers rotating by hand only, a belt the game turns for
+  -- you raising no event this listens for.
   [defines.events.on_player_rotated_entity] = function(e) log_entity("+", e.entity) end,
   [defines.events.on_player_mined_entity] = function(e) log_entity("-", e.entity) end,
   [defines.events.on_robot_mined_entity] = function(e) log_entity("-", e.entity) end,
@@ -494,11 +482,9 @@ local function capture_handler(event_name, handler)
 end
 
 -- Space platforms are a separate event family, and everything on one is placed
--- by platform construction bots, so without these a platform's construction
--- history goes unrecorded: it appears fully formed and never changes.
---
--- The payloads match their robot equivalents, which is why these reuse the
--- same two handlers.
+-- by platform construction bots, so without these a platform appears fully
+-- formed and never changes. The payloads match their robot equivalents, which
+-- is why these reuse the same two handlers.
 capture_handler("on_space_platform_built_entity", function(e) log_entity("+", e.entity) end)
 capture_handler("on_space_platform_mined_entity", function(e) log_entity("-", e.entity) end)
 capture_handler("on_space_platform_built_tile", function(e) log_tile_change("+", e) end)
@@ -542,11 +528,8 @@ end
 
 --- Run when the panel's Generate button is clicked. Checking a box only records
 --- that a surface is wanted; its pre-existing state was never snapshotted, so
---- something has to take the catch-up baseline. A separate step so checking
---- several boxes batches into one freeze.
----
---- A no-op while capture is off, `M.on_capture_enabled` covering the same gap
---- if the player turns it on.
+--- something has to take the catch-up baseline, and keeping it a separate step
+--- batches several boxes into one freeze. A no-op while capture is off.
 function M.generate_pending_baselines(tick)
   if settings.global["save-timelapse-live-capture"].value then
     capture_checked_rollover = true

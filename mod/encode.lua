@@ -65,10 +65,9 @@ end
 -- Floor somebody laid, as opposed to ground the map generated. An include
 -- list, natural terrain vastly outnumbering it.
 --
--- Only the names the game reports as neither placeable nor minable, which
+-- Only names the game reports as neither placeable nor minable, which
 -- `M.placed_floor_tiles` cannot find: the eleven coloured refined concretes.
--- The rest are found by those rules and stay stated so a capture cannot
--- silently lose floor it records. The `frozen-` twins are Aquilo's copies.
+-- The rest stay stated so a capture cannot silently lose floor it records.
 M.KNOWN_PLACED_FLOOR_TILES = {
   "stone-path", "concrete",
   "hazard-concrete-left", "hazard-concrete-right",
@@ -85,13 +84,11 @@ M.KNOWN_PLACED_FLOOR_TILES = {
 }
 
 --- Every tile this game counts as placed floor: placeable by an item, minable,
---- or named above. Two properties because neither covers it alone, and the
---- list alone was Wube's names only, so a platform's own foundation was
---- recorded as natural ground rather than as something built.
+--- or named above. Neither property covers it alone, and the list alone was
+--- Wube's names, so a platform's own foundation was recorded as natural ground
+--- rather than as something built.
 ---
---- Only names this game has, these being handed to `find_tiles_filtered`.
---- Recomputed per call: a few hundred iterations against a whole-surface
---- query, and the one per-tile caller builds its own set.
+--- Only names this game has, these going to `find_tiles_filtered`.
 function M.placed_floor_tiles()
   local known = {}
   for _, name in ipairs(M.KNOWN_PLACED_FLOOR_TILES) do
@@ -181,7 +178,7 @@ local TERRAIN_BUDGET_MULTIPLE = 4
 --- empty world on whichever axis does not bind, so the margin is what the fit
 --- exposes rather than a fraction of the base, which is an order of magnitude
 --- out on anything not square. The first two candidates go negative when their
---- axis binds, so the largest picks the right one; the third is the slack.
+--- axis binds, so the largest picks the right one.
 function M.terrain_margin(bbox, base_margin)
   if not bbox.min_x then
     return base_margin
@@ -304,10 +301,8 @@ end
 
 --- Returns the id for `name`, plus a define chunk to prepend on first use.
 --- Concatenate both onto the record that follows: the dictionary is a stream
---- position, not something written separately.
----
---- `define_tag` is 0 for names and 1 for the event format's surface
---- dictionary. The dictionary does not know which it is.
+--- position, not something written separately. `define_tag` is 0 for names and
+--- 1 for the event format's surface dictionary.
 function M.dictionary_id(dict, name, define_tag)
   local id = dict.ids[name]
   if id then
@@ -377,9 +372,8 @@ end
 --- as a delta from the one before.
 ---
 --- Parallel arrays rather than a table per entity, 1.26x slower at 900k
---- entities against 0.60x here. Caller order is kept rather than sorted, a
---- real export already having the locality. The direction byte is per run,
---- whether a prototype rotates being the same answer for every item.
+--- entities against 0.60x here. Caller order is kept, a real export already
+--- having the locality. The direction byte is per run.
 function M.frame_entity_run(dict, name, w, h, xs, ys, ds, count)
   local id, define = M.frame_define_name(dict, name, w, h)
 
@@ -453,12 +447,10 @@ end
 --- Tells a reader to forget every id defined so far in this segment.
 ---
 --- Factorio re-runs the mod on every load, resetting the writer's dictionaries
---- while the file keeps every define already in it. Without this the writer
---- reissues id 0 while the reader keeps counting, and everything after the
---- reload decodes as the wrong name, silently.
----
---- `storage` cannot hold the dictionary instead, being saved inside the save
---- and rewinding with it.
+--- while the file keeps every define already in it, so without this the writer
+--- reissues id 0 while the reader keeps counting and everything after the
+--- reload decodes as the wrong name, silently. `storage` cannot hold the
+--- dictionary instead, rewinding with the save.
 function M.event_reset_dictionaries()
   return M.u8(7)
 end
@@ -507,18 +499,15 @@ end
 
 -- Reloads are not detected here, and cannot be: every durable value lives in
 -- `storage`, which rewinds with the save, so any "did the tick go backwards"
--- check compares two values from the same save and is always false.
---
--- They are handled on the reading side, where the evidence exists:
--- `event::segment_run_bounds` splits a segment at a backwards tick jump. This
--- side only announces that its dictionaries were reset.
+-- check compares two values from the same save. They are handled on the
+-- reading side by `event::segment_run_bounds`; this side only announces that
+-- its dictionaries were reset.
 
 -- Checksums
 --
--- djb2, with multiply/add/mod rather than the usual XOR/shift form, Lua 5.2
--- having no bit32. For accidental corruption, not tampering. Threaded through
--- every write of a frame file and appended as a trailer; the event log has no
--- finished moment to checksum against.
+-- djb2, with multiply/add/mod rather than XOR/shift, Lua 5.2 having no bit32.
+-- For accidental corruption, not tampering. Threaded through every write of a
+-- frame file and appended as a trailer; the event log has no finished moment.
 
 --- Pure: plain values in and out, so these are testable the same way as
 --- event_reset_dictionaries above.
@@ -538,10 +527,9 @@ end
 
 -- Per-playthrough file naming
 --
--- game.tick restarts from 0 for every save and script-output/save-timelapse/
--- is shared by every save that turns capture on, so a tick cannot tell two
--- playthroughs apart. Each gets a subfolder named after its session_id,
--- holding otherwise untagged names. write_file creates the subfolders.
+-- game.tick restarts from 0 for every save and script-output/save-timelapse/ is
+-- shared by every save that turns capture on, so a tick cannot tell two
+-- playthroughs apart. Each gets a subfolder named after its session_id.
 
 --- Pure: plain values in and out, so these are testable the same way as
 --- event_reset_dictionaries above, with no save/load cycle to trigger them.
@@ -581,9 +569,8 @@ end
 ---
 --- Force belongs to an entity, not a prototype, and this file is keyed by
 --- prototype name. Type is the closest the game comes and for a capture it is
---- exact, the only enemies surviving `EXCLUDED_TYPES` being nests and worms.
---- `turret` is the type worms use; the player's defences are `ammo-turret`,
---- `electric-turret` and `fluid-turret`.
+--- exact. `turret` is the type worms use; the player's defences are
+--- `ammo-turret`, `electric-turret` and `fluid-turret`.
 local ENEMY_TYPES = {
   ["unit"] = true,
   ["unit-spawner"] = true,
@@ -610,14 +597,12 @@ end
 
 --- One prototype colour as three bytes.
 ---
---- Factorio writes a Color as 0..1 floats or 0..255 values and tells them
---- apart by whether any component exceeds 1. Prototypes mostly use the second
---- form, base's own tiles included (`grass-1` is {55, 53, 11}), and the runtime
+--- Factorio writes a Color as 0..1 floats or 0..255 values and tells them apart
+--- by whether any component exceeds 1. Prototypes mostly use the second form,
+--- base's own tiles included (`grass-1` is {55, 53, 11}), and the runtime
 --- returns them as written, so assuming floats puts every colour out of byte
---- range and the file becomes unreadable rather than merely wrong.
----
---- Clamped as well as rounded, the range rule being a convention the game does
---- not enforce on a mod.
+--- range and the file becomes unreadable rather than merely wrong. Clamped as
+--- well as rounded, the range rule being a convention.
 function M.color_bytes(color)
   local r, g, b = color.r or 0, color.g or 0, color.b or 0
   local scale = 255
@@ -638,11 +623,9 @@ local REACH_TYPES = {
 
 --- Everything the desktop side needs to know about this game's prototypes, so
 --- it never has to recognise one by name: colours, each entity's type, and how
---- far an underground belt reaches. None of it exists outside the running
---- game, a mod shipping as a zip.
----
---- Rewritten only when the loaded mods change (see capture.lua's
---- `loaded_mods`), prototypes being fixed at load time.
+--- far an underground belt reaches. None of it exists outside the running game,
+--- a mod shipping as a zip. Rewritten only when the loaded mods change (see
+--- capture.lua's `loaded_mods`).
 ---
 --- Entities take `map_color` and fall back to `friendly_map_color`, with nests
 --- taking `enemy_map_color`. The two are mutually exclusive per prototype,
@@ -771,7 +754,7 @@ end
 --- `{"science":[...],"planets":[...],"rockets":N}`.
 ---
 --- State, not events: a save knows a pack has been produced, never when.
---- Timing is recovered by src/milestone.rs diffing consecutive saves. Rockets
+--- src/milestone.rs recovers timing by diffing consecutive saves, and rockets
 --- is a count rather than a flag so that diff can tell the first from the
 --- hundredth.
 function M.milestone_state(science, planets, rockets)

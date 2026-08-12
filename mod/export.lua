@@ -58,15 +58,14 @@ function M.excluded_types()
   return list
 end
 
---- Scenery: entities the map generated rather than anybody placing, so they
---- sit on every generated chunk. Recorded, but only near the factory, like the
+--- Scenery: entities the map generated rather than anybody placing, so they sit
+--- on every generated chunk. Recorded, but only near the factory, like the
 --- ground they stand on: taken from the whole surface, trees, resources and
---- nests were 69% of every frame on a real megabase and covered 2.3x the area
---- of the ground beneath them.
+--- nests were 69% of every frame on a real megabase.
 ---
 --- Worms cannot join the list, sharing the "turret" type with player turrets.
---- Disjoint from `M.excluded_types()` by construction. The list lives in
---- `encode.lua`, which has no Factorio dependency and can be unit tested.
+--- The list lives in `encode.lua`, which has no Factorio dependency and can be
+--- unit tested.
 function M.context_types()
   return encode.context_types(
     settings.startup["save-timelapse-include-resources"].value,
@@ -136,11 +135,9 @@ local function export_surface(surface, tick, session_id)
   checksum = M.checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
 
   -- Grown as entities and placed floor are scanned, so the terrain pass knows
-  -- its area without a second scan of the surface.
-  --
-  -- Only what somebody built grows it: everything else sits wherever the map
-  -- generated it, so letting those in made this the explored map rather than
-  -- the factory, and multiplied the terrain pass by the difference.
+  -- its area without a second scan. Only what somebody built grows it:
+  -- everything else sits wherever the map generated it, so letting those in
+  -- made this the explored map rather than the factory.
   local bbox = encode.new_bbox()
 
   -- Asked once per distinct name rather than once per entity:
@@ -152,13 +149,11 @@ local function export_surface(surface, tick, session_id)
 
   local pending_count, written = 0, 0
 
-  -- Records are grouped by name into runs, so entities are collected by name
-  -- as they are scanned and written when the batch fills. Per batch rather
-  -- than per frame: buffering a whole megabase to group it would reintroduce
-  -- the stall this exporter exists to avoid.
-  --
-  -- Straight into parallel flat arrays, never a table per entity: at 900k
-  -- entities a table each measured 1.26x slower against 0.60x this way.
+  -- Records are grouped by name into runs, so entities are collected by name as
+  -- they are scanned and written when the batch fills. Per batch rather than
+  -- per frame: buffering a megabase to group it would reintroduce the stall
+  -- this exporter avoids. Straight into parallel flat arrays, a table per
+  -- entity measuring 1.26x slower at 900k against 0.60x this way.
   local order, groups = {}, {}
 
   local function group_for(name, w, h)
@@ -222,12 +217,10 @@ local function export_surface(surface, tick, session_id)
 
   flush_entities()
 
-  -- One area for the scenery pass and the ground pass both, computed from what
-  -- somebody built: the two describing the same region is the point, a tree
-  -- drawn outside the ground it grows on being what this fixes.
-  --
-  -- From entities alone, having to be final before the scenery pass writes
-  -- while placed floor is not read until the tile section.
+  -- One area for the scenery pass and the ground pass both: the two describing
+  -- the same region is the point, a tree drawn outside the ground it grows on
+  -- being what this fixes. From entities alone, having to be final before the
+  -- scenery pass writes while placed floor is not read until the tile section.
   local context_area = encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
 
   if context_area then
@@ -364,15 +357,14 @@ local function export_terrain_to(tick, session_id, surface, area)
 end
 
 --- The area a surface's ground should cover: a margin around everything the
---- player force owns on it, or `nil` if they own nothing.
----
---- Asks for player-force entities directly rather than reusing
---- `export_surface`'s scan, affordable only because this runs unattended.
+--- player force owns on it, or `nil` if they own nothing. Asks for player-force
+--- entities directly rather than reusing `export_surface`'s scan, affordable
+--- only because this runs unattended.
 ---
 --- Reaches further than the scenery box, the two being measured at different
---- moments and never agreeing exactly: on a real capture scenery overhung
---- ground by 33 tiles a side. The viewer clips scenery to whatever ground
---- exists, but clipping throws away trees somebody paid to capture.
+--- moments: on a real capture scenery overhung ground by 33 tiles a side. The
+--- viewer clips scenery to the ground, but clipping throws away trees somebody
+--- paid to capture.
 local TERRAIN_SCAN_OVERSHOOT = 2.0
 
 local function terrain_area_for(surface)
@@ -396,9 +388,6 @@ end
 --- What it gives up is ground since built over: the query asks for everything
 --- that is not placed floor, so water landfilled at hour three reads as
 --- landfill at hour ten.
----
---- Named `terrain_<surface>.stfr`, which is what the viewer looks for,
---- discovered from the directory independently of the frames.
 function M.export_terrain(tick, session_id)
   local written, surfaces = 0, 0
   for _, surface in pairs(game.surfaces) do
@@ -432,14 +421,12 @@ end
 --- Lives here rather than in milestones.lua because that module already
 --- requires this one and Lua handles a require cycle badly. The two do
 --- different jobs: milestones.lua watches transitions during live play, this
---- snapshots totals for a save with no history to watch.
+--- snapshots totals for a save with no history.
 ---
---- A planet counts as reached when its surface is inhabited rather than when
---- it exists, the game creating it first, which also keeps the marker honest
---- against the timelapse: a surface only appears in frames once inhabited.
----
---- Every read is `pcall`'d: a failing statistics call should cost one marker,
---- never the whole export.
+--- A planet counts as reached when its surface is inhabited rather than when it
+--- exists, the game creating it first, which keeps the marker honest against
+--- the timelapse. Every read is `pcall`'d, a failing statistics call costing
+--- one marker rather than the export.
 function M.milestone_state()
   local science, planets, rockets = {}, {}, 0
   local force = game.forces["player"]
@@ -559,14 +546,11 @@ local function sample_all_players(tick, session_id)
 end
 
 --- Exports exactly `surface_names`, already filtered by the caller, and writes
---- no manifest.
----
---- No manifest because `baseline.json` describes the original once-per-session
+--- no manifest: `baseline.json` describes the original once-per-session
 --- baseline, and a catch-up covers a different surface at a later tick, so
 --- overwriting it would corrupt its meaning for every surface it covers. Rust
---- finds a catch-up by spotting a frame file the manifest does not account for.
----
---- Trusts `surface_names` outright, the caller having computed that gap in
+--- finds a catch-up by spotting a frame file the manifest does not account
+--- for. Trusts `surface_names` outright, the caller having computed that gap in
 --- this same tick.
 function M.export_surfaces_to(tick, session_id, surface_names)
   sample_all_players(tick, session_id)
@@ -587,9 +571,9 @@ end
 --- /timelapse-export, the headless scan and the once-per-save baseline, which
 --- differ only in the manifest path, session tagging, and `is_excluded`.
 ---
---- `is_excluded`, when given, skips a surface entirely: one opted out of
---- recording should not pay the baseline's cost either, that being the most
---- expensive part of capture and the reason exclusion exists.
+--- `is_excluded` skips a surface entirely: one opted out of recording should
+--- not pay the baseline's cost either, that being the most expensive part of
+--- capture and the reason exclusion exists.
 function M.export_all_to(tick, manifest_path, session_id, is_excluded)
   sample_all_players(tick, session_id)
   -- One choke point for both paths that produce frames, the live baseline and

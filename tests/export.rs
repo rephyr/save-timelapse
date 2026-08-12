@@ -1,9 +1,8 @@
 //! End-to-end exporter tests that never touch a real Factorio install.
 //!
-//! They run the `fake-factorio` binary in place of the game. It decodes the
+//! They run the `fake-factorio` binary in place of the game, which decodes the
 //! staged `mod-settings.dat` and only emits a frame when the export trigger is
-//! genuinely set, so these tests verify the settings staging for real rather
-//! than assuming it worked.
+//! genuinely set, so the settings staging is verified rather than assumed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,11 +40,9 @@ fn fake_install(root: &Path) -> PathBuf {
     exe
 }
 
-/// `fs::copy` doesn't reliably carry the execute bit over on every platform,
-/// and `Command::new` needs it set to actually run the copy. Windows has no
-/// such bit at all (a `.exe` is executable by extension alone), which is
-/// exactly why this was never needed to make this test pass on a Windows dev
-/// machine, only surfacing on Linux CI.
+/// `fs::copy` does not reliably carry the execute bit, and `Command::new`
+/// needs it. Windows has no such bit at all, which is why this only ever
+/// surfaced on Linux CI.
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -90,13 +87,9 @@ fn version_is_read_from_the_executable() {
     let tmp = tempfile::tempdir().unwrap();
     let exe = fake_install(tmp.path());
 
-    // Reports what the process actually did when this fails, rather than only
-    // that the answer was `None`. Every way this can break (the copy not
-    // being executable, the binary refusing to start, the banner arriving on
-    // a stream nobody read) produces the identical `None`, and a bare
-    // assertion on it sends whoever hits it back to guessing. That is not
-    // hypothetical: it failed exactly this way the first time CI ran on
-    // Linux, having always passed on Windows.
+    // Reports what the process actually did, rather than only that the answer
+    // was `None`. Every way this can break produces the identical `None`, which
+    // sends whoever hits it back to guessing.
     let ran = std::process::Command::new(&exe).arg("--version").output();
     let detail = match &ran {
         Ok(out) => format!(
@@ -127,10 +120,9 @@ fn exporting_produces_a_frame() {
     assert_eq!(frame.count, 4);
 }
 
-/// A save's milestone state comes back out of the manifest the mod writes
-/// beside the frames, which is the only route it has: no single save knows
-/// when anything first happened, so `milestone::from_saves` needs one of
-/// these per save to compare.
+/// A save's milestone state comes out of the manifest the mod writes beside the
+/// frames, which is its only route: no single save knows when anything first
+/// happened, so `milestone::from_saves` needs one of these per save.
 #[test]
 fn exporting_reads_the_saves_milestone_state_from_its_manifest() {
     let tmp = tempfile::tempdir().unwrap();
