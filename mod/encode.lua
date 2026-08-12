@@ -431,7 +431,7 @@ function M.frame_end_entities()
   return M.u8(9)
 end
 
--- Live capture event format (events_<start_tick>.stev)
+-- Live capture event format (events_<tick>_<parent>.stev)
 
 function M.event_header()
   return M.EVENT_MAGIC .. M.u8(M.EVENT_VERSION)
@@ -582,14 +582,20 @@ function M.baseline_manifest_name(session_id)
   return M.session_dir(session_id) .. "baseline.json"
 end
 
-function M.capture_segment_name(session_id, start_tick)
-  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick)
+function M.capture_segment_name(session_id, start_tick, parent)
+  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick, parent)
 end
 
 --- Split out from `capture_segment_name` so a save with no session_id (one
 --- whose capture state predates session folders) can build the same name
 --- without one. See capture.lua's `capture_segment_path`.
-function M.capture_segment_basename(start_tick)
+--- `parent` is the segment this one's save was made during, which is what tells
+--- a branch that was left behind from the history leading to now. Absent for a
+--- capture's very first segment, there being nothing before it.
+function M.capture_segment_basename(start_tick, parent)
+  if parent then
+    return string.format("events_%d_%d.stev", start_tick, parent)
+  end
   return string.format("events_%d.stev", start_tick)
 end
 

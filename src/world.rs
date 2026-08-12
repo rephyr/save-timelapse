@@ -463,6 +463,12 @@ impl World {
             let key = (tile.x, tile.y);
             if is_floor(&self.floor, &tile.n) {
                 surface.tiles.insert(key, name);
+                // Marked like any other change, because a catch-up baseline
+                // lands after frames have already been emitted and its floor
+                // would otherwise never appear in one. The first baseline
+                // marks the whole floor and the caller clears it before the
+                // full frame it is about to write, so nothing is paid twice.
+                surface.changed_tiles.insert(key);
             } else {
                 surface.terrain.insert(key, name);
             }

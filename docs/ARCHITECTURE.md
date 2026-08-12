@@ -522,7 +522,7 @@ reassembles any moment by replaying that log over the baseline.
     <script-output>/save-timelapse/<session>/
         baseline.json                 tick + surfaces the baseline covers
         frame_<tick>_<surface>.stfr   the baseline itself, one per surface
-        events_<start_tick>.stev      append-only, one segment per timeline
+        events_<tick>_<parent>.stev   append-only, one segment per load
         players.jsonl                 optional, sampled player positions
         milestones.jsonl              optional, when each milestone was reached
         prototypes.json               this game's colours and prototype types
@@ -623,7 +623,7 @@ interval.
 
 ### Event format
 
-Also a custom binary format (`<session>/events_<start_tick>.stev`), written
+Also a custom binary format (`<session>/events_<tick>_<parent>.stev`), written
 incrementally as the player plays, so text formatting per construction event
 would be a cost paid during real gameplay.
 
@@ -708,6 +708,11 @@ really begin at. A header is written rather than appended, so loading the same
 save twice truncates the first attempt, which is a branch the player abandoned
 by loading back to it.
 
+The rewound `storage` is also what makes lineage possible: the
+`segment_start_tick` it carries is the segment the save was written during, and
+the rollover copies it into the new segment's name before overwriting it. See
+"Reloading an earlier save" below for what the reading side does with it.
+
 Version 2 added a `ResetDictionaries` record (tag 7, no payload) for the
 resuming case, where the writer's dictionaries restarted at id 0 while the file
 already held every earlier define, so **every entity logged after a reload
@@ -770,32 +775,41 @@ at or past it are dropped, counted as `Replay::superseded_events` and reported
 rather than warned about: a nonzero count is what a reloaded playthrough looks
 like replaying correctly.
 
-Two things make the bound correct.
+Three things make the bound correct.
 
-Segments are ordered by **mtime, not by the tick in the filename**, start tick
-not being chronological once a playthrough reloads twice. A segment is appended
-to for exactly as long as it is the live one and never touched again after a
-rollover abandons it, so segments finish being written in creation order.
+Each segment **names the segment its save was made during**, as
+`events_<tick>_<parent>.stev`. `storage` rewinds with the save, so a save
+carries the `segment_start_tick` that was live when it was written, and the mod
+copies that into the filename on rollover before overwriting it. This is the
+only lineage a save carries, and it costs no file opens to read, being in the
+name.
 
-A segment ends at the **smallest** start tick among all segments created after
-it, not the next one's, so a second reload reaching further back also
-invalidates part of the first reload's segment. A suffix minimum over the
-creation order expresses that, and also keeps the result in ascending tick
-order despite the mtime sort, since a segment's events all fall below its
-`end_tick`.
+The surviving history is the **newest segment's ancestor chain**, walked parent
+by parent in `event::ancestry`. Anything not on that chain is a branch nobody
+came back to and is dropped whole rather than bounded. Which segment is newest
+still comes from mtime, a segment being appended to for exactly as long as it is
+the live one and never touched again after a rollover abandons it.
 
-Two segments sharing an mtime (a copied capture folder, or a filesystem too
-coarse to separate two rollovers) fall back to ascending start tick, then to
-the rollover sequence in the filename, stitching them together with overlaps
-trimmed.
+A segment on the chain ends at the **smallest** start tick among the segments
+after it, not the next one's, because a chain can step back on itself: loading
+a save from earlier in the same branch. A suffix minimum expresses that, and
+also keeps the result in ascending tick order, since a segment's events all fall
+below its `end_tick`.
+
+A capture recorded before the mod wrote parents has nothing to walk, so
+`log_segments` falls back to creation order and the suffix minimum alone, which
+is what it always did and which is right whenever each load continued the one
+before it. A parent naming a segment that is not there (capture files deleted
+by hand) ends the walk rather than dropping everything, so what survives is the
+run of loads leading back to the gap.
 
 #### Reloading the *same* save twice
 
-Loading the same save again resumes at exactly the tick the live segment
-started at, so nothing distinguishes the second attempt from the first except
-that the ticks jump backwards where it begins. `capture_segment_name` takes a
-rollover sequence so two segments starting at the same tick get different
-filenames (`events_<tick>_<seq>.stev`, the suffix omitted at 0).
+Loading the same save again resumes at exactly the tick the live segment started
+at, from the same parent, so it produces the same filename. `ensure_capture_segment`
+writes the header with `append` false, truncating: a segment starting at a tick
+some earlier attempt also started at, from the same save, is that attempt being
+redone, and what it wrote is exactly what the player has just abandoned.
 
 Captures recorded before that have both attempts in one file, so
 `event::segment_run_bounds` splits a segment into **append runs** wherever its
@@ -816,23 +830,24 @@ skip, so one broken file costs only its own events.
 
 #### Returning to a branch already left
 
-Superseding is one directional, and deliberately so. Load an earlier save and
-the branch you left is truncated, which is what keeps a timelapse showing one
-coherent history. Load a save from that abandoned branch later and its history
-is already gone: the timelapse jumps, and events after the return land on a
-world built from the branch that replaced it.
+Forward, back, forward is the sequence lineage exists for. A player builds in
+branch A, loads a save from earlier and builds branch B, then loads a save made
+back in A and carries on as C.
 
-Fixing it means never truncating, keeping every branch, and deciding at read
-time which one the newest save descends from. Nothing in a save says which save
-it came from. A tick is not enough, since two branches share every tick between
-the divergence and the point they were abandoned at, and the mod cannot mark a
-save with a lineage it would have to invent before knowing a branch existed.
+Creation order says B is the most recent history, and it is not. C's save was
+made during A, so `ancestry` walks C to A and stops: B is on nobody's chain and
+goes, however recently it was written. A is then cut where C begins, dropping
+only the part of A that C rewound past. What is left is one coherent history,
+which is what superseding is for.
 
-So the cost is a permanently growing log, plus a guess at the one thing that
-would make it usable. Truncating loses a branch somebody may come back to;
-keeping everything loses the ability to say which history is the current one,
-which is the whole promise. The first is the better trade, and a fresh baseline
-from where the player actually is repairs it in one step.
+This is decided entirely at read time, from three numbers in two filenames. The
+log is not kept whole to allow it: an abandoned branch's records stay on disk
+because the sandbox cannot delete them, and are ignored rather than replayed.
+
+What still cannot be recovered is history whose segment file is gone, or a save
+made before the mod recorded parents, where the chain has nothing to walk back
+through. A fresh baseline from where the player actually is repairs either in
+one step.
 
 ### Timer handlers share one on_nth_tick per interval
 

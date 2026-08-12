@@ -1,8 +1,9 @@
 //! Reading the live capture event log written by mod/control.lua.
 //!
-//! Wire format (`events_<start_tick>.stev`), all integers little endian. Each
-//! playthrough's segments live in their own session subfolder, `game.tick`
-//! restarting from 0 for every save:
+//! Wire format, all integers little endian. Each playthrough's segments live in
+//! their own session subfolder, named `events_<start_tick>_<parent>.stev` for
+//! the segment whose save this one's was made during, or `events_<start_tick>.stev`
+//! for a capture's first segment. `game.tick` restarts from 0 for every save:
 //!
 //! ```text
 //! magic   4 bytes, "STE1", written once when the segment is created
@@ -456,34 +457,50 @@ pub struct Segment {
 /// Every segment in `dir`, in the order play happened, each bounded at the tick
 /// a later reload superseded it. `dir` is one playthrough's session folder.
 ///
-/// Ordered by mtime rather than the tick in the filename, start tick not being
-/// chronological once a playthrough reloads more than once: a segment is
-/// appended to for exactly as long as it is live.
+/// What survives is the newest segment's ancestor chain, each segment naming
+/// the one its save was made during. A branch nothing descends from is dropped
+/// whole, being play the player walked away from. See `ancestry`.
 ///
-/// Each segment ends where the next created one begins, so `end_tick` is the
-/// smallest start tick among all later segments, computed as a suffix minimum
-/// so a second reload reaching further back also invalidates the first's. That
+/// Which segment is newest comes from mtime rather than the tick in the
+/// filename, start tick not being chronological once a playthrough reloads more
+/// than once: a segment is appended to for exactly as long as it is live. Equal
+/// mtimes fall back to ascending start tick.
+///
+/// Each segment on the chain ends where the next one begins, so `end_tick` is
+/// the smallest start tick among all later segments, computed as a suffix
+/// minimum so a reload reaching further back also invalidates the first's. That
 /// bound is also what keeps the result in ascending tick order.
-///
-/// Equal mtimes fall back to start tick, then rollover sequence, degrading to
-/// stitching in tick order with overlaps trimmed.
 pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
-    let mut found: Vec<(SystemTime, u64, u32, PathBuf)> = std::fs::read_dir(dir)?
+    let mut found: Vec<Found> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
-            let (start_tick, seq) = segment_tick(&path)?;
+            let (start_tick, parent) = segment_tick(&path)?;
             // A segment whose mtime cannot be read sorts oldest, which puts
             // it before everything readable rather than silently last.
             let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-            Some((modified, start_tick, seq, path))
+            Some(Found { modified, start_tick, parent, path })
         })
         .collect();
-    found.sort();
+    found.sort_by_key(|f| (f.modified, f.start_tick));
+
+    // The last segment written is the branch being played, and each segment
+    // names the one its save was made during, so its ancestors are the history
+    // that actually leads here. Everything else is a branch left behind.
+    let chain = match found.last().filter(|tip| tip.parent.is_some()) {
+        Some(tip) => ancestry(&found, tip),
+        // Nothing claims a parent, so this capture predates lineage being
+        // recorded. Fall back to creation order, which is right whenever each
+        // load continued the previous one.
+        None => found.iter().collect(),
+    };
 
     let mut segments: Vec<Segment> =
-        found.into_iter().map(|(_, start_tick, _, path)| Segment { path, start_tick, end_tick: u64::MAX }).collect();
+        chain.into_iter().map(|f| Segment { path: f.path.clone(), start_tick: f.start_tick, end_tick: u64::MAX }).collect();
 
+    // Each is superseded where the next one along the chain begins. A suffix
+    // minimum rather than simply the next start tick, because a chain can step
+    // back on itself: loading a save from earlier in the same branch.
     let mut superseded_at = u64::MAX;
     for segment in segments.iter_mut().rev() {
         segment.end_tick = superseded_at;
@@ -491,6 +508,49 @@ pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
     }
 
     Ok(segments)
+}
+
+/// One segment file as found on disk, before it is known whether it is part of
+/// the surviving history.
+struct Found {
+    modified: SystemTime,
+    start_tick: u64,
+    /// The segment this one's save was made during, from the filename. `None`
+    /// for the first segment of a capture, and for every segment written
+    /// before the mod recorded it.
+    parent: Option<u64>,
+    path: PathBuf,
+}
+
+/// `tip` and its ancestors, oldest first.
+///
+/// Walking parents rather than trusting creation order is what makes
+/// forward, back, forward come out right: the third load's save was made in
+/// the first branch, so the second branch is not an ancestor and goes, however
+/// recently it was written.
+///
+/// A parent naming a segment that is not there ends the walk, which is what a
+/// capture assembled from pieces looks like. A cycle cannot happen from a
+/// mod that only ever names an older segment, but the visited set makes it
+/// terminate anyway rather than trusting that.
+fn ancestry<'a>(found: &'a [Found], tip: &'a Found) -> Vec<&'a Found> {
+    let mut chain = vec![tip];
+    let mut seen: Vec<u64> = vec![tip.start_tick];
+    let mut at = tip;
+    while let Some(parent) = at.parent {
+        if seen.contains(&parent) {
+            break;
+        }
+        // The most recently written segment with that start tick: loading one
+        // save twice truncates and rewrites in place, so the newest is the one
+        // whose contents survived.
+        let Some(next) = found.iter().rfind(|f| f.start_tick == parent) else { break };
+        seen.push(parent);
+        chain.push(next);
+        at = next;
+    }
+    chain.reverse();
+    chain
 }
 
 /// The exclusive tick bound for each append run inside one segment, given the
@@ -524,21 +584,21 @@ pub fn segment_run_bounds(path: &Path, segment_end: u64) -> io::Result<Vec<u64>>
     Ok(bounds)
 }
 
-/// Parses `events_<tick>.stev` or `events_<tick>_<seq>.stev` into its start
-/// tick and rollover sequence. `None` for anything else, so a stray file is
-/// ignored rather than crashing discovery.
+/// A segment's own start tick, and the segment its save was made during.
+/// `None` for anything that is not a segment file, so a stray file is ignored
+/// rather than crashing discovery.
 ///
-/// `seq` exists because reloading the same save twice resumes at the same tick
-/// both times. Only a tiebreak, mtime staying the primary key since it also
-/// orders segments written before `seq` existed.
-fn segment_tick(path: &Path) -> Option<(u64, u32)> {
+/// `events_<tick>.stev` is a capture's first segment, or one written before
+/// lineage was recorded. `events_<tick>_<parent>.stev` names its parent, which
+/// is what lets a branch left behind be told from the history leading here.
+fn segment_tick(path: &Path) -> Option<(u64, Option<u64>)> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {
         return None;
     }
     let rest = path.file_stem()?.to_str()?.strip_prefix("events_")?;
     match rest.split_once('_') {
-        Some((tick, seq)) => Some((tick.parse().ok()?, seq.parse().ok()?)),
-        None => Some((rest.parse().ok()?, 0)),
+        Some((tick, parent)) => Some((tick.parse().ok()?, Some(parent.parse().ok()?))),
+        None => Some((rest.parse().ok()?, None)),
     }
 }
 
@@ -960,23 +1020,87 @@ mod tests {
         assert_eq!(bounds, vec![(0, 500), (1000, 500), (500, u64::MAX)]);
     }
 
-    /// The name the mod gives a segment when a reload resumed at the tick the
-    /// live segment already started at, which the plain `events_<tick>.stev`
-    /// form cannot distinguish from the segment already there.
+    /// Forward, back, forward: the exact sequence that used to merge two
+    /// branches into one factory.
+    ///
+    /// A player builds, loads a save from earlier and builds something else,
+    /// then loads a save made in the *first* branch and carries on. Creation
+    /// order says the middle branch is the newest history, and it is not: the
+    /// last segment's save came from the first branch, so the middle one was
+    /// abandoned however recently it was written.
     #[test]
-    fn a_sequence_suffixed_segment_parses_and_keeps_its_start_tick() {
+    fn a_branch_returned_to_supersedes_the_branch_left_behind() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("events_20000.stev"), MAGIC).unwrap();
-        std::fs::write(dir.path().join("events_20000_1.stev"), MAGIC).unwrap();
-        set_mtime_rank(dir.path(), "events_20000.stev", 0);
-        set_mtime_rank(dir.path(), "events_20000_1.stev", 1);
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        // First branch, then a reload back into it, then a reload that returns
+        // to the first branch and continues from a save made at tick 3000.
+        write("events_1000.stev", 0);
+        write("events_1500_1000.stev", 1);
+        write("events_3000_1000.stev", 2);
 
         let segments = log_segments(dir.path()).unwrap();
         assert_eq!(
             segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(),
-            vec![(20000, 20000), (20000, u64::MAX)],
-            "the first attempt is superseded from the tick the second one restarts at"
+            vec![(1000, 3000), (3000, u64::MAX)],
+            "the abandoned branch is gone, and the first is cut where the one that returned to it begins"
         );
+        assert!(
+            !segments.iter().any(|s| s.start_tick == 1500),
+            "the branch nothing descends from must not be in the history at all"
+        );
+    }
+
+    /// Every load continuing the last one, which is the ordinary case and has
+    /// to keep working now that lineage decides rather than creation order.
+    #[test]
+    fn a_straight_run_of_reloads_keeps_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        write("events_1000.stev", 0);
+        write("events_2000_1000.stev", 1);
+        write("events_3000_2000.stev", 2);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(
+            segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(),
+            vec![(1000, 2000), (2000, 3000), (3000, u64::MAX)],
+            "each is cut where the next begins"
+        );
+    }
+
+    /// A capture written before lineage was recorded has no parents to walk,
+    /// and must still replay the way it always did.
+    #[test]
+    fn a_capture_with_no_lineage_falls_back_to_creation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        write("events_1000.stev", 0);
+        write("events_2000.stev", 1);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(), vec![(1000, 2000), (2000, u64::MAX)]);
+    }
+
+    /// A parent naming a segment that is not there, which is what deleting
+    /// capture files by hand leaves behind. The walk stops rather than looping
+    /// or dropping everything.
+    #[test]
+    fn a_parent_that_is_missing_ends_the_history_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_5000_4000.stev"), MAGIC).unwrap();
+        set_mtime_rank(dir.path(), "events_5000_4000.stev", 0);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(segments.iter().map(|s| s.start_tick).collect::<Vec<_>>(), vec![5000]);
     }
 
     /// A `.stev` whose name is neither form must be ignored rather than

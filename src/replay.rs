@@ -3,7 +3,7 @@
 //! ```text
 //! <session>/baseline.json                 tick + surfaces the baseline covers
 //! <session>/frame_<tick>_<surface>.stfr   the baseline itself, one per surface
-//! <session>/events_<start_tick>.stev      append-only, one segment per timeline
+//! <session>/events_<tick>_<parent>.stev   append-only, one segment per load
 //! <session>/players.jsonl                 optional, sampled player positions
 //! ```
 //!

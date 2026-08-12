@@ -500,6 +500,17 @@ check("capture_segment_basename: no session folder, same naming rule",
   encode.capture_segment_basename(22760790),
   "events_22760790.stev")
 
+-- The reader tells a branch that was left behind from the history leading to
+-- now by walking these parents, so the name has to carry one whenever there is
+-- one to carry.
+check("capture_segment_name: a segment names the one its save was made during",
+  encode.capture_segment_name(0x1a2b3c, 22760790, 22000000),
+  "001a2b3c/events_22760790_22000000.stev")
+
+check("capture_segment_basename: a capture's first segment has no parent",
+  encode.capture_segment_basename(22760790, nil),
+  "events_22760790.stev")
+
 check("player_log_name: lives inside the session's own folder",
   encode.player_log_name(0x1a2b3c),
   "001a2b3c/players.jsonl")

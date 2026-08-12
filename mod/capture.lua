@@ -130,11 +130,11 @@ end
 --- See baseline_manifest_path above for why a nil session_id (a save whose
 --- capture state predates this feature) falls back to the untagged name
 --- instead of erroring.
-local function capture_segment_path(session_id, start_tick)
+local function capture_segment_path(session_id, start_tick, parent)
   if not session_id then
-    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick)
+    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick, parent)
   end
-  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
+  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, parent)
 end
 
 --- A playthrough's identity, for tagging files in the shared script-output
@@ -162,8 +162,10 @@ end
 --- played, which keeps the rollback check neither trigger-happy nor blind.
 local function ensure_capture_segment()
   local state = storage.timelapse_capture
+  local started_now = false
 
   if not state then
+    started_now = true
     state = {
       segment_start_tick = game.tick,
       last_tick = game.tick,
@@ -188,6 +190,20 @@ local function ensure_capture_segment()
   -- its header from whoever created it, and every filename is the tick its
   -- records really begin at.
   if not capture_dictionaries_synced then
+    -- The segment this save was written during, recorded before it is
+    -- overwritten. `storage` rewinds with the save, so a save loaded from an
+    -- abandoned branch still names the segment it belonged to, and that is the
+    -- one piece of lineage a save carries. Without it the reading side can
+    -- only assume each load continued the last one, which is wrong the moment
+    -- somebody goes forward, back, then forward again.
+    --
+    -- A capture's first segment stays parentless: the state was created a few
+    -- lines up, so `segment_start_tick` is this same segment rather than one
+    -- before it, and naming itself as its own parent would say a save existed
+    -- before the capture that recorded it.
+    if not started_now then
+      state.segment_parent = state.segment_start_tick
+    end
     state.segment_start_tick = game.tick
     state.segment_initialized = false
   end
@@ -198,7 +214,7 @@ local function ensure_capture_segment()
   -- defines names for, and a reader can only drop them. Safe here because a
   -- load re-runs this file and empties the buffer; `M.reset_capture` is the
   -- other place the path moves, and it clears the buffer itself.
-  capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
+  capture_path = capture_segment_path(state.session_id, state.segment_start_tick, state.segment_parent)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()

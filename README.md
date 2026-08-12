@@ -19,7 +19,7 @@ Reworked ui and belt rotations from v0.7.0:
 
 ![The Save Timelapse viewer, showing a factory drawn with Factorio's own belt, splitter and pipe artwork](assets/sprites.PNG)
 
-> ⚠️ **Alpha.** The core pipeline works, but the project is still under active development. Expect bugs and changes between releases.
+> **Beta.** The recording format is frozen, so a capture you make today keeps working as the tool updates, and every released format is checked against real recorded bytes on every build. The project is still young and moving quickly, so expect the occasional bug. Please report them.
 
 ---
 
@@ -172,7 +172,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 - **A belt that changed direction without being rebuilt may face the wrong way.** Rotating a belt by hand is recorded, and so is the rotation Factorio applies to the belt you dragged from when a line turns a corner. What is still missing is any other way the game changes a facing without an event. Recording a fresh baseline corrects everything built so far.
 
-- **Coming back to a branch you left is not recorded.** Loading an older save and carrying on tells the recording that the play you left behind was replaced, and it is dropped, which is what keeps the timelapse showing one coherent history rather than several contradicting ones. If you later load a save from that abandoned branch and continue it, the part you left behind is already gone, so the factory jumps forward in one step with no record of how it got there. Recording a fresh baseline from where you are now repairs it.
+- **Only branches recorded by this version can be returned to.** Loading an older save and carrying on tells the recording that the play you left behind was replaced, and it is dropped, which is what keeps the timelapse showing one coherent history rather than several contradicting ones. Come back to a branch you left and the recording follows you, because every save made from 0.8.0 on knows which recording it belongs to. Saves made before that do not, so a branch you left with an older version is gone for good, and so is one whose files you deleted by hand. Recording a fresh baseline from where you are now repairs either.
 
 - **Ground you covered before it was read is not recovered either.** Natural ground is scanned once, from a single save, after the fact, which is what keeps it out of your game entirely. A lake you landfilled at hour three is already landfill when that scan happens, so its water was never recorded anywhere: replayed from the beginning the lake is a hole until the tick the landfill goes down, and removing that landfill uncovers nothing. With terrain capture switched off there is deliberately no ground in the timelapse to uncover at all.
 
@@ -188,20 +188,21 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.4:** Timeline timestamps, activity graph, heatmap, milestones, capture management
 - **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
 - **v0.6:** Video export, improved camera framing, moving entities excluded, ground scanned from a save, better scenery cutoff
+- **v0.7:** Modded games recorded as themselves, Factorio's own belt and pipe artwork, reworked viewer, belt rotations recorded
 
-### v0.7
+### v0.8, the beta
 
-- [x] Clean viewer interface: surface switcher, clickable playback controls, keyboard panel
-- [x] Belts, underground belts, splitters and pipes drawn with Factorio's own artwork
-- [x] Belt rotations recorded, so corners stop drawing as straight belts
-- [x] The companion tool stays open and speaks plainly, and failures return to the menu
-- [x] Modded games recorded as themselves: colours, belts, pipes and ores taken from the game's own prototypes
+- [x] A frame records only what changed, taking a real megabase timelapse from 5.5 GB to 69 MB and a rebuild from 15 minutes to under a minute
+- [x] Ground read once per playthrough instead of once per build
+- [x] MP4 export when FFmpeg is already installed, roughly fifteen times smaller than the AVI and accepted by sharing sites
+- [x] Choose what goes on an exported video: the in-game clock, and a marker showing where you were
+- [x] Recordings survive a reset and a reload, and say so when something could not be read
+- [x] The building count counts buildings
 
 ### v1.0
 
 - [ ] Smarter camera auto-follow
 - [ ] Camera keyframes and cinematic controls
-- [ ] MP4 export
 - [ ] Single-binary distribution
 
 ---
