@@ -1010,16 +1010,32 @@ fn offer_terrain_for_capture(
     // later save can only ever cover more of the factory.
     saves.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)));
 
+    // Read once per playthrough. A rebuild otherwise launches Factorio again
+    // to be told the same ground, which is now most of what a rebuild costs.
+    let cached = cached_terrain(user_dir, session_id);
     println!();
     let wanted = ask_yes_no(
-        "  Add the grass, water and trees under your factory?\n  \
-         It looks much better, and takes about a minute.",
+        match cached.is_empty() {
+            true => "  Add the grass, water and trees under your factory?\n  It looks much better, and takes about a minute.",
+            false => {
+                "  Add the grass, water and trees under your factory?\n  Already read for this playthrough, so this is instant."
+            }
+        },
         settings.capture_terrain.unwrap_or(false),
     )?;
     settings.capture_terrain = Some(wanted);
     remember(settings);
     if !wanted {
         return Ok(());
+    }
+
+    if !cached.is_empty() {
+        let copied =
+            cached.iter().filter(|file| file.file_name().is_some_and(|name| std::fs::copy(file, out.join(name)).is_ok())).count();
+        if copied > 0 {
+            println!("  Reused the ground already read for this playthrough.");
+            return Ok(());
+        }
     }
 
     let chosen = ask_terrain_save(&saves)?;
@@ -1035,6 +1051,36 @@ fn offer_terrain_for_capture(
     };
     add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
     Ok(())
+}
+
+/// Where a scan's ground is kept for next time: this playthrough's own capture
+/// folder, which survives a timelapse being rebuilt. `None` when the caller
+/// does not know which playthrough it is, in which case there is nothing safe
+/// to key the ground to.
+fn keep_terrain_beside_capture(session_id: Option<u32>) -> Option<PathBuf> {
+    let dir = locate_factorio()?.join("script-output").join("save-timelapse").join(format!("{:08x}", session_id?));
+    dir.is_dir().then_some(dir)
+}
+
+/// Ground already read for this playthrough, newest first.
+///
+/// Kept beside the capture rather than only in the timelapse, which is deleted
+/// and rebuilt every time. Natural ground does not change, so reading it again
+/// means launching Factorio to be told the same thing, which on a megabase is
+/// most of what a rebuild costs.
+///
+/// Empty for a playthrough nobody has said yes to yet.
+fn cached_terrain(user_dir: &Path, session_id: u32) -> Vec<PathBuf> {
+    let dir = user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}"));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("terrain_") && n.ends_with(".stfr")))
+        .collect();
+    found.sort();
+    found
 }
 
 /// Scan one save for natural ground and put it beside the frames.
@@ -1072,12 +1118,20 @@ fn add_terrain(
                 0
             }
             _ => {
+                // Kept beside the capture as well as in the timelapse, so a
+                // rebuild reuses it instead of launching Factorio to read the
+                // same unchanging ground again. Best effort: failing to keep a
+                // copy costs a scan next time, not this timelapse.
+                let keep = keep_terrain_beside_capture(expect_session);
                 let mut copied = 0usize;
                 for file in &scan.files {
                     let Some(name) = file.file_name() else { continue };
                     match std::fs::copy(file, out.join(name)) {
                         Ok(_) => copied += 1,
                         Err(e) => eprintln!("warning: could not copy {}: {e}", name.to_string_lossy()),
+                    }
+                    if let Some(dir) = &keep {
+                        let _ = std::fs::copy(file, dir.join(name));
                     }
                 }
                 println!("{copied} surface(s) of ground in {:.1}s", scan.seconds);
