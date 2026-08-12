@@ -19,7 +19,7 @@ Reworked ui and belt rotations from v0.7.0:
 
 ![The Save Timelapse viewer, showing a factory drawn with Factorio's own belt, splitter and pipe artwork](assets/sprites.PNG)
 
-> **Beta.** The recording format is frozen, so a capture you make today keeps working as the tool updates, and every released format is checked against real recorded bytes on every build. The project is still young and moving quickly, so expect the occasional bug. Please report them.
+> **Beta.** The recording format is frozen, so a capture you make today keeps working as the tool updates, and every released format is checked against real recorded bytes on every build. There are a few places that need ironing out but all the hard stuff is done and current version seemed stable during testing period.
 
 ---
 
