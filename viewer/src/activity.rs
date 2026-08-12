@@ -279,6 +279,7 @@ mod tests {
             entity_lod: Vec::new(),
             entity_lod_runs: Vec::new(),
             tile_bounds: None,
+            floor_unchanged: false,
         }
     }
 
@@ -563,6 +564,7 @@ mod bench {
                 entity_lod: Vec::new(),
                 entity_lod_runs: Vec::new(),
                 tile_bounds: None,
+                floor_unchanged: false,
             });
         }
         let total: usize = frames.iter().map(|f| f.entities.len()).sum();

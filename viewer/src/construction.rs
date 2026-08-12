@@ -186,7 +186,7 @@ mod tests {
 
     fn render(entities: Vec<Entity>, tiles: Vec<Tile>, registry: &mut TypeRegistry) -> RenderFrame {
         RenderFrame::from_frame(
-            Frame { tick: 0, surface: "nauvis".to_string(), count: entities.len(), entities, tiles },
+            Frame { tick: 0, surface: "nauvis".to_string(), count: entities.len(), entities, tiles, floor_unchanged: false },
             registry,
         )
     }

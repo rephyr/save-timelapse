@@ -2,6 +2,8 @@
 Version: 0.7.1
 Date: 2026-08-12
   Features:
+    - Exporting a video is several times faster on a big base. Every frame was drawing the natural ground tile by tile, which on a real megabase was 19.7 million of the 24 million shapes in a frame, four fifths of the work for the one layer with no detail to lose. Ground is now grouped once it is too small to see, while your factory keeps full detail exactly as before
+    - Built timelapses are far smaller. A frame carried the whole floor of your base every time, even though concrete goes down once and stays: on a real Space Age megabase that was 6.3 MB of paving against 2.1 MB of everything you built, in every one of 660 frames. The floor is now written once and again only when it changes, which on that capture is most of 5.5 GB
     - Choose what goes on top of an exported video. The in-game clock, so the footage says how long the factory took, and a marker showing where you were. You are asked when you export, and the marker is only offered for recordings that have your position in them
     - Player markers can be turned off with P, and the viewer remembers your answer between runs
     - Export an MP4 when you have FFmpeg. It is offered only if FFmpeg is already on your PATH, and it is far smaller than the AVI: measured on real frames, about 15 times. It is also what sharing sites accept, where an AVI often will not upload or preview at all. Nothing changes if you do not have FFmpeg, and nothing asks you to install it: the built-in AVI writer is still there and still needs nothing

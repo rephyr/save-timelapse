@@ -23,7 +23,7 @@ pub fn synthetic_frame(count: usize) -> Frame {
             Entity { n: NAMES[i % NAMES.len()].into(), x: ix as f32 * spacing, y: iy as f32 * spacing, d: 0, w: 1, h: 1 }
         })
         .collect();
-    Frame { tick: 0, surface: "synthetic".to_string(), count, entities, tiles: Vec::new() }
+    Frame { tick: 0, surface: "synthetic".to_string(), count, entities, tiles: Vec::new(), floor_unchanged: false }
 }
 
 /// Filled grid of concrete tiles, for load-testing the case a fully-paved
@@ -349,7 +349,7 @@ mod tests {
     /// tests that only care about tick/surface ordering, not real content.
     fn write_stub_frame(dir: &Path, name: &str, tick: u64, surface: &str, entity_count: usize) {
         let entities = synthetic_frame(entity_count).entities;
-        let out = save_timelapse::frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
+        let out = save_timelapse::frame::FrameOut { tick, surface, entities: &entities, tiles: &[], floor_unchanged: false };
         std::fs::write(dir.join(name), save_timelapse::frame::write_binary(&out)).unwrap();
     }
 
@@ -375,6 +375,7 @@ mod tests {
             surface: "nauvis",
             entities: &[],
             tiles: &[],
+            floor_unchanged: false,
         });
         std::fs::write(&valid, bytes).unwrap();
         std::fs::write(&invalid, b"not a frame").unwrap();

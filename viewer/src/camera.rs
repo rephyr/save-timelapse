@@ -322,6 +322,7 @@ mod tests {
             count: 2,
             entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
             tiles: Vec::new(),
+            floor_unchanged: false,
         });
         let camera = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
         assert_eq!(camera.offset, Vec2::new(5.0, 5.0));
@@ -336,6 +337,7 @@ mod tests {
             count: 1,
             entities: vec![entity("a", 3.0, 3.0)],
             tiles: Vec::new(),
+            floor_unchanged: false,
         });
         let camera = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
         assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
@@ -360,6 +362,7 @@ mod tests {
             count: 1,
             entities: vec![entity("a", 0.0, 0.0)],
             tiles: Vec::new(),
+            floor_unchanged: false,
         });
         let terrain = render(Frame {
             tick: 0,
@@ -370,6 +373,7 @@ mod tests {
                 save_timelapse::frame::Tile { n: "grass-1".into(), x: -50, y: -50 },
                 save_timelapse::frame::Tile { n: "grass-1".into(), x: 50, y: 50 },
             ],
+            floor_unchanged: false,
         });
 
         let without_terrain = Camera::fit_frames(std::slice::from_ref(&frame), None, 800.0, 600.0);
@@ -394,6 +398,7 @@ mod tests {
                 count: 2,
                 entities: vec![entity("a", 0.0, 0.0), entity("b", 10.0, 10.0)],
                 tiles: Vec::new(),
+                floor_unchanged: false,
             })),
             None,
             800.0,

@@ -57,7 +57,21 @@ const MAGIC: &[u8; 4] = b"STF1";
 /// smaller than version 1, which is still read and has its own reader. Version
 /// 3 is version 2's body byte for byte and only declares that extension
 /// records may appear.
-const CURRENT_VERSION: u8 = 3;
+const CURRENT_VERSION: u8 = 4;
+/// Version 4 adds one thing: a frame may say its floor is unchanged since the
+/// surface's previous frame instead of carrying it again.
+///
+/// A version rather than a skippable extension, because the two are not
+/// equivalent here. An older reader stepping over the marker would see an empty
+/// tile section and draw a factory standing on nothing, which looks like a bug
+/// rather than a missing feature. Refusing the file outright says what is
+/// actually wrong.
+///
+/// The mod never writes this. Captures stay version 3, so
+/// `format_compatibility.rs` and every recording already on disk are untouched;
+/// only the CLI's own built timelapses use it, and it launches the viewer from
+/// beside itself.
+const FLOOR_UNCHANGED_VERSION: u8 = 4;
 const MIN_SUPPORTED_VERSION: u8 = 1;
 const TRAILER_LEN: usize = 4;
 const TAG_DEFINE_NAME: u8 = 0;
@@ -68,6 +82,9 @@ const TAG_END_ENTITIES: u8 = 9;
 /// many bytes this reader is free not to understand. Core tags stay below it,
 /// so the two kinds can never collide as the format grows.
 const TAG_EXTENSION_MIN: u8 = 128;
+/// In the tile section only, with no payload: this frame's floor is whatever
+/// the previous frame for this surface had.
+const TAG_FLOOR_UNCHANGED: u8 = 128;
 
 /// djb2, in one pass, this side always holding the whole file. `u32` wrapping
 /// is the Lua side's `% 2^32`. Chosen for being implementable identically
@@ -87,6 +104,11 @@ pub struct Frame {
     pub entities: Vec<Entity>,
     pub count: usize,
     pub tiles: Vec<Tile>,
+    /// This frame carried no floor because the surface's floor had not changed
+    /// since its previous frame. `tiles` is empty and the reader must carry the
+    /// previous one forward; an empty `tiles` without this means a surface with
+    /// no floor on it at all.
+    pub floor_unchanged: bool,
 }
 
 /// `n` is `Arc<str>` rather than `String`: a base has a few dozen distinct
@@ -120,11 +142,22 @@ pub struct FrameOut<'a> {
     pub surface: &'a str,
     pub entities: &'a [Entity],
     pub tiles: &'a [Tile],
+    /// Write a marker instead of the tile section. The caller is saying the
+    /// floor is byte for byte what it last wrote for this surface, which on a
+    /// paved megabase is 72% of a frame that changes by under 4% across a whole
+    /// playthrough.
+    pub floor_unchanged: bool,
 }
 
 impl Frame {
     pub fn as_out(&self) -> FrameOut<'_> {
-        FrameOut { tick: self.tick, surface: &self.surface, entities: &self.entities, tiles: &self.tiles }
+        FrameOut {
+            tick: self.tick,
+            surface: &self.surface,
+            entities: &self.entities,
+            tiles: &self.tiles,
+            floor_unchanged: self.floor_unchanged,
+        }
     }
 }
 
@@ -327,7 +360,7 @@ pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
         }
     }
 
-    Ok(Frame { tick, surface, count: entities.len(), entities, tiles })
+    Ok(Frame { tick, surface, count: entities.len(), entities, tiles, floor_unchanged: false })
 }
 
 /// Bit 0 of an entity run's flags: every item in the run carries a direction
@@ -361,7 +394,11 @@ fn group_by_name<'a, T>(items: &'a [T], name_of: impl Fn(&'a T) -> &'a str) -> V
 
 fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
     let mut w = ByteWriter::new();
-    w.magic(MAGIC).u8(CURRENT_VERSION).u64(frame.tick).string(frame.surface);
+    // Only claim version 4 when the frame actually omits its floor. A build
+    // that never does stays readable by an older viewer, so the newer format
+    // costs nothing to anyone not benefiting from it.
+    let version = if frame.floor_unchanged { FLOOR_UNCHANGED_VERSION } else { 3 };
+    w.magic(MAGIC).u8(version).u64(frame.tick).string(frame.surface);
 
     let mut names = NameDict::new();
     for (name, group) in group_by_name(frame.entities, |e| &e.n) {
@@ -392,6 +429,17 @@ fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
         }
     }
     w.u8(TAG_END_ENTITIES);
+
+    if frame.floor_unchanged {
+        // The whole tile section, replaced by one record. Written with a length
+        // like any extension so the shape stays uniform, even though it is the
+        // absence of a payload that carries the meaning.
+        w.u8(TAG_FLOOR_UNCHANGED).varint(0);
+        let mut bytes = w.into_vec();
+        let trailer = checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        return bytes;
+    }
 
     for (name, group) in group_by_name(frame.tiles, |t| &t.n) {
         let (name_id, is_new) = names.id_for(name);
@@ -459,8 +507,17 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
     }
 
     let mut tiles = Vec::new();
+    let mut floor_unchanged = false;
     while r.consumed() < payload_end {
         match r.tag().ok_or_else(truncated)? {
+            // Recognised only here, in the tile section, where it stands in for
+            // the whole thing. `skip_extension` still steps over its zero
+            // length, so the record is well formed to a reader that does not
+            // know it, which only matters for the version check above.
+            TAG_FLOOR_UNCHANGED => {
+                skip_extension(r)?;
+                floor_unchanged = true;
+            }
             TAG_DEFINE_NAME => {
                 let name = Arc::from(r.string().ok_or_else(truncated)?);
                 let w = r.u8().ok_or_else(truncated)? as u32;
@@ -485,7 +542,7 @@ fn read_grouped_body(r: &mut ByteReader<'_>, payload_end: usize, tick: u64, surf
         }
     }
 
-    Ok(Frame { tick, surface, count: entities.len(), entities, tiles })
+    Ok(Frame { tick, surface, count: entities.len(), entities, tiles, floor_unchanged })
 }
 
 #[cfg(test)]
@@ -547,7 +604,7 @@ mod tests {
             entity("stone-furnace", 1.0, 2.0, 0, 1, 1),
         ];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }, Tile { n: "concrete".into(), x: -4, y: -12 }];
-        let out = FrameOut { tick: 22630009, surface: "nauvis", entities: &entities, tiles: &tiles };
+        let out = FrameOut { tick: 22630009, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
 
         let bytes = write_binary(&out);
         let frame = read_binary(&bytes).unwrap();
@@ -569,7 +626,7 @@ mod tests {
             entity("transport-belt", -79.5, 28.5, 6, 1, 1),
         ];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: 12 }];
-        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles };
+        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
 
         let old = read_binary(&write_binary_v1(&out)).expect("v1 must still parse");
         let new = read_binary(&write_binary(&out)).expect("v2 must parse");
@@ -605,7 +662,7 @@ mod tests {
     #[test]
     fn a_single_entity_frame_matches_its_documented_byte_layout() {
         let entities = vec![entity("pipe", -80.5, 28.5, 4, 1, 1)];
-        let out = FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let bytes = write_binary(&out);
 
         let mut expected = ByteWriter::new();
@@ -755,7 +812,7 @@ mod tests {
     fn version_3_writes_the_same_body_as_version_2() {
         let entities = vec![entity("transport-belt", -80.5, 28.5, 4, 1, 1), entity("assembling-machine-1", 5.0, 5.0, 0, 3, 3)];
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
-        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles };
+        let out = FrameOut { tick: 4242, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
 
         let current = write_binary(&out);
         assert_eq!(current[4], 3, "the writer stamps the current version");
@@ -778,7 +835,7 @@ mod tests {
     #[test]
     fn a_wrong_version_is_a_distinct_error_from_a_parse_failure() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let mut bytes = write_binary(&out);
         bytes[4] = 99; // the version byte, right after the 4 byte magic
 
@@ -826,7 +883,7 @@ mod tests {
     #[test]
     fn a_corrupted_byte_is_caught_by_the_checksum() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let mut bytes = write_binary(&out);
         let last = bytes.len() - 1 - 4; // a byte inside the payload, not the trailer
         bytes[last] ^= 0xFF;
@@ -846,7 +903,7 @@ mod tests {
     #[test]
     fn tiles_parse_including_negative_coordinates() {
         let tiles = vec![Tile { n: "concrete".into(), x: -5, y: -12 }];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles, floor_unchanged: false };
         let frame = read_binary(&write_binary(&out)).unwrap();
 
         assert_eq!(frame.tiles.len(), 1);
@@ -860,7 +917,7 @@ mod tests {
         // at a different id.
         let entities = vec![entity("landfill", 0.5, 0.5, 0, 1, 1)];
         let tiles = vec![Tile { n: "landfill".into(), x: 1, y: 1 }];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &tiles };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &tiles, floor_unchanged: false };
 
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert_eq!(frame.entities[0].n, "landfill".into());
@@ -870,7 +927,7 @@ mod tests {
     #[test]
     fn a_frame_with_no_tiles_at_all_still_parses() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert!(frame.tiles.is_empty());
     }
@@ -888,7 +945,7 @@ mod tests {
     #[test]
     fn a_truncated_file_is_an_error_rather_than_a_panic() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let bytes = write_binary(&out);
 
         let err = read_binary(&bytes[..bytes.len() - 3]).unwrap_err();
@@ -911,7 +968,7 @@ mod tests {
     #[test]
     fn a_file_ending_right_after_end_entities_is_not_truncated() {
         let entities = vec![entity("pipe", 1.0, 2.0, 0, 1, 1)];
-        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = FrameOut { tick: 1, surface: "nauvis", entities: &entities, tiles: &[], floor_unchanged: false };
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert_eq!(frame.entities.len(), 1);
         assert!(frame.tiles.is_empty());

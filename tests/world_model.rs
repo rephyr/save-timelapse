@@ -185,7 +185,14 @@ fn run_one(seed: u64, steps: usize) {
         baseline.reverse();
     }
     let count = baseline.len();
-    world.load_baseline(&Frame { tick: 1, surface: "nauvis".to_string(), count, entities: baseline, tiles: Vec::new() });
+    world.load_baseline(&Frame {
+        tick: 1,
+        surface: "nauvis".to_string(),
+        count,
+        entities: baseline,
+        tiles: Vec::new(),
+        floor_unchanged: false,
+    });
 
     check(&world, &reference, seed, 0);
 

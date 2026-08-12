@@ -1253,11 +1253,16 @@ async fn export_frames(
             registry,
             sprites,
             pixels_per_tile > SPRITE_MIN_PIXELS,
-            // Never aggregated, unlike the interactive view: an export has no
-            // frame rate to protect, and a LOD cell keeps only its dominant
-            // type, which at these zooms is paving swallowing the belts.
-            // Sound only because of supersampling.
-            false,
+            // Items are never aggregated in an export: it has no frame rate to
+            // protect, and a cell keeps only its dominant type, which at these
+            // zooms is paving swallowing the belts. Sound only because of
+            // supersampling.
+            //
+            // Ground is the opposite. It is most of the drawing and has nothing
+            // for a cell to lose, so it follows the same sub-pixel test the
+            // interactive view uses. Measured on the supersampled size, so the
+            // threshold is stricter here than on screen.
+            Detail { items: false, terrain: use_chunk_lod(pixels_per_tile) },
             None,
             &mut counter,
         );
@@ -1368,6 +1373,20 @@ fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Which layers may be collapsed into chunk cells this frame. Two answers
+/// rather than one because the reason to keep full detail applies to only one
+/// of them.
+#[derive(Clone, Copy)]
+struct Detail {
+    /// Entities and placed floor. Off in an export: a cell keeps only its
+    /// dominant type, so a paved area would swallow every belt running through
+    /// it, and an export has no frame rate to protect.
+    items: bool,
+    /// Natural ground. On whenever a tile is already sub-pixel, export
+    /// included, ground having no fine structure for a cell to lose.
+    terrain: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_world(
     frame: &RenderFrame,
@@ -1377,7 +1396,7 @@ fn draw_world(
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
     use_sprites: bool,
-    use_lod: bool,
+    detail: Detail,
     heat: Option<(&[Vec<HeatCell>], u32, usize)>,
     counter: &mut DrawCallCounter,
 ) {
@@ -1404,12 +1423,19 @@ fn draw_world(
         _ => (view_min, view_max),
     };
 
-    if use_lod {
-        // Below LOD_MAX_TILE_PIXELS an item is already sub-pixel, so
-        // collapsing a chunk to one quad loses nothing and turns millions of
-        // per-item costs into thousands. Precomputed at load.
-        if let Some(terrain) = terrain {
-            draw_tile_lod_layer(
+    // Natural ground, on its own terms and before everything else.
+    //
+    // Aggregated whenever a tile is already sub-pixel, an export included,
+    // which is where it matters: on a real megabase the ground was 19.7M of a
+    // frame's 24M quads, 82% of the drawing, and disabling aggregation for it
+    // cost two seconds a frame. A cell keeps only its dominant type, which is
+    // why items keep full detail in an export, but ground has no fine
+    // structure to lose: four tiles of grass are grass. The visible cost is
+    // stair-stepping where two ground types meet, at a scale supersampling is
+    // already averaging away.
+    if let Some(terrain) = terrain {
+        match detail.terrain {
+            true => draw_tile_lod_layer(
                 &terrain.tile_lod,
                 &terrain.tile_lod_runs,
                 camera,
@@ -1418,8 +1444,17 @@ fn draw_world(
                 view_max,
                 registry,
                 counter,
-            );
+            ),
+            false => {
+                draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter)
+            }
         }
+    }
+
+    if detail.items {
+        // Below LOD_MAX_TILE_PIXELS an item is already sub-pixel, so
+        // collapsing a chunk to one quad loses nothing and turns millions of
+        // per-item costs into thousands. Precomputed at load.
         draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
@@ -1444,12 +1479,9 @@ fn draw_world(
             counter.quads(None, drawn);
         }
     } else {
-        // Terrain, then this frame's floor, then buildings, matching how
-        // paving over grass looks in game. Iterating runs keeps the batch
-        // intact, sprite and colour being decided once per type.
-        if let Some(terrain) = terrain {
-            draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
-        }
+        // This frame's floor, then buildings, matching how paving over grass
+        // looks in game. Iterating runs keeps the batch intact, sprite and
+        // colour being decided once per type.
         draw_tile_layer(&frame.tiles, &frame.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
 
         paint_heat(camera);
@@ -2392,7 +2424,7 @@ async fn main() {
             &registry,
             &sprites,
             use_sprites,
-            use_lod,
+            Detail { items: use_lod, terrain: use_lod },
             heat_layer,
             &mut counter,
         );

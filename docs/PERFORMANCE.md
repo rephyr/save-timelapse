@@ -144,6 +144,35 @@ have grown.
 cargo test --release -p viewer --lib measure_cost -- --ignored --nocapture
 ```
 
+### Export: aggregating the ground
+
+An export deliberately keeps full detail, because a chunk cell holds only its
+dominant type and a paved area would swallow the belts running through it. That
+reasoning is about entities and placed floor. It is not about grass.
+
+Measured on a real Space Age megabase, per frame:
+
+| layer | quads | share |
+|---|---|---|
+| natural ground | 19,732,883 | 82% |
+| placed floor | 3,354,339 | 14% |
+| entities | 863,862 | 4% |
+
+The ground alone was four fifths of the drawing, and at roughly 2 seconds a
+frame a 660 frame export took 22 minutes. Binned into the same 4x4 cells the
+interactive view uses, that ground is **1,240,391 cells, 15.9x fewer**, and
+**85% of those cells hold a single ground type**, so collapsing them loses
+nothing whatsoever. Only the 15% straddling a boundary lose anything, at a scale
+supersampling is already averaging away.
+
+Items keep full detail exactly as before, so the belts the original decision
+protected are untouched. Total drawing falls about 4.4x, which should take that
+export from 22 minutes to roughly 5.
+
+```bash
+SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
+```
+
 ## Measured and rejected
 
 The measurements that changed nothing are worth as much as the ones that did.

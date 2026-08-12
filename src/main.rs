@@ -819,6 +819,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // Last revision written per surface, carried across the run so
     // `write_all_surfaces` can skip a surface nothing has touched.
     let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
+    let mut surface_floors: std::collections::HashMap<String, u64> = Default::default();
 
     let emitted = match &chosen_surface {
         None => {
@@ -827,7 +828,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
                 if error.is_some() {
                     return;
                 }
-                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
+                if let Err(e) =
+                    replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions, &mut surface_floors)
+                {
                     error = Some(e);
                     return;
                 }
@@ -844,7 +847,18 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
                 if error.is_some() {
                     return;
                 }
-                let frame = world.to_frame(name, tick);
+                // Same saving as the all-surfaces path: the floor is most of
+                // a frame on a paved base and changes far more rarely than what
+                // stands on it, so it is written once and then only when it
+                // moves. The reader carries the last one forward.
+                let floor = world.surface(name).map(|s| s.floor_revision());
+                let frame = match floor.is_some() && surface_floors.get(name) == floor.as_ref() {
+                    true => world.to_frame_without_floor(name, tick),
+                    false => world.to_frame(name, tick),
+                };
+                if let Some(floor) = floor {
+                    surface_floors.insert(name.clone(), floor);
+                }
                 let path = out.join(format!("frame_{written:04}.stfr"));
                 if let Err(e) = std::fs::write(&path, frame::write_binary(&frame.as_out())) {
                     error = Some(e);

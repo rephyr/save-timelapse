@@ -128,6 +128,9 @@ pub struct RenderFrame {
     /// on every rendered frame: `draw_world` culls scenery against the ground
     /// so trees stop where the grass does.
     pub tile_bounds: Option<(Vec2, Vec2)>,
+    /// This frame carried no floor because the surface's floor had not changed.
+    /// `tiles` is empty and the previous frame's floor still stands.
+    pub floor_unchanged: bool,
 }
 
 /// Below this many items the grouping passes run single-threaded, thread-spawn
@@ -327,6 +330,7 @@ impl RenderFrame {
             // Only ever read off a terrain layer, and this buffer is the
             // per-tick one, so it never has ground to bound.
             tile_bounds: None,
+            floor_unchanged: false,
         }
     }
 
@@ -417,6 +421,7 @@ impl RenderFrame {
             entity_lod,
             entity_lod_runs,
             tile_bounds,
+            floor_unchanged: frame.floor_unchanged,
         }
     }
 }
@@ -592,9 +597,23 @@ impl SequenceBuilder {
         self.counts.push(frame.count);
         self.repeats.push(false);
         self.entities.push_frame(runs_with_items(&frame.entity_runs, &frame.entities, &|e: &RenderEntity| span_key(e.x, e.y)));
+        self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
+
+        // A frame that says its floor is unchanged extends the spans already
+        // open rather than folding the same millions of tiles in again, which
+        // is the whole point: on a paved base the floor is most of a frame and
+        // barely moves. One pass over open spans, not over tiles.
+        //
+        // Before the first frame carries a floor there is nothing to extend,
+        // and `push_repeats` is a no-op then, which is correct: a surface whose
+        // very first frame claims an unchanged floor has no floor.
+        if frame.floor_unchanged {
+            self.tiles.push_repeats(1);
+            self.tile_lod.push_repeats(1);
+            return;
+        }
         self.tiles
             .push_frame(runs_with_items(&frame.tile_runs, &frame.tiles, &|t: &RenderTile| span_key(t.x as f32, t.y as f32)));
-        self.entity_lod.push_frame(runs_with_items(&frame.entity_lod_runs, &frame.entity_lod, &cell_key));
         self.tile_lod.push_frame(runs_with_items(&frame.tile_lod_runs, &frame.tile_lod, &cell_key));
     }
 
@@ -680,7 +699,14 @@ mod tests {
     }
 
     fn sample_frame(tick: u64) -> RenderFrame {
-        render(Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() })
+        render(Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles: Vec::new(),
+            floor_unchanged: false,
+        })
     }
 
     /// The on-screen count is what somebody built, not what the frame holds.
@@ -712,12 +738,103 @@ mod tests {
         let entities: Vec<Entity> = built.iter().chain(&scenery).enumerate().map(|(i, n)| entity(n, i as f32, 0.0)).collect();
 
         let frame = RenderFrame::from_frame(
-            Frame { tick: 1, surface: "nauvis".to_string(), count: entities.len(), entities, tiles: Vec::new() },
+            Frame {
+                tick: 1,
+                surface: "nauvis".to_string(),
+                count: entities.len(),
+                entities,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+            },
             &mut registry,
         );
 
         assert_eq!(frame.count, 9, "the frame holds everything");
         assert_eq!(frame.building_count(&registry), 3, "only what somebody placed is a building");
+    }
+
+    /// What aggregating the ground is worth, over a real terrain layer rather
+    /// than a fixture: the answer is a property of how a map generated, not of
+    /// the code, so no synthetic input can stand in for it.
+    ///
+    /// Ignored, and takes the path from the environment so no local one is
+    /// committed.
+    ///
+    /// ```text
+    /// SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'     ///   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_terrain_lod_on_a_real_ground_layer() {
+        let path = std::env::var("SAVE_TIMELAPSE_TERRAIN")
+            .expect("set SAVE_TIMELAPSE_TERRAIN to a terrain_<surface>.stfr from a built timelapse");
+        let bytes = std::fs::read(&path).expect("reading the terrain layer");
+        let frame = save_timelapse::frame::read_binary(&bytes).expect("parsing the terrain layer");
+
+        let tiles = frame.tiles.len();
+        let mut registry = TypeRegistry::new();
+        let rendered = RenderFrame::from_frame(frame, &mut registry);
+        let cells = rendered.tile_lod.len();
+
+        println!(
+            "
+{path}"
+        );
+        println!("  tiles      {tiles:>12}");
+        println!("  LOD cells  {cells:>12}");
+        println!("  reduction  {:>11.1}x", tiles as f64 / cells.max(1) as f64);
+
+        assert!(cells > 0, "a ground layer must produce cells");
+        assert!(cells * 4 < tiles, "aggregating ground has to be worth doing: {cells} cells from {tiles} tiles");
+    }
+
+    /// The saving is only real if the floor is still there. A frame that leaves
+    /// its floor out must show exactly the same floor as the frame before it,
+    /// and must cost one pass over open spans rather than a walk over millions
+    /// of tiles.
+    #[test]
+    fn a_frame_that_omits_its_floor_still_shows_it() {
+        let mut registry = TypeRegistry::new();
+        let floor: Vec<Tile> = (0..50).map(|i| Tile { n: "concrete".into(), x: i, y: 0 }).collect();
+
+        let carried = RenderFrame::from_frame(
+            Frame {
+                tick: 10,
+                surface: "nauvis".to_string(),
+                count: 1,
+                entities: vec![entity("pipe", 1.0, 1.0)],
+                tiles: floor,
+                floor_unchanged: false,
+            },
+            &mut registry,
+        );
+        // What the writer produces for an unchanged floor: no tiles, and the
+        // flag saying the previous one still stands.
+        let omitted = RenderFrame::from_frame(
+            Frame {
+                tick: 20,
+                surface: "nauvis".to_string(),
+                count: 2,
+                entities: vec![entity("pipe", 1.0, 1.0), entity("pipe", 2.0, 2.0)],
+                tiles: Vec::new(),
+                floor_unchanged: true,
+            },
+            &mut registry,
+        );
+
+        let mut builder = FrameSequence::builder();
+        builder.push(&carried);
+        builder.push(&omitted);
+        let mut sequence = builder.finish().expect("two frames");
+
+        sequence.goto(0);
+        let first: Vec<RenderTile> = sequence.current().tiles.clone();
+        sequence.goto(1);
+        let second: Vec<RenderTile> = sequence.current().tiles.clone();
+
+        assert_eq!(first.len(), 50, "the frame that carried the floor shows it");
+        assert_eq!(second, first, "and the frame that left it out shows exactly the same floor");
+        assert_eq!(sequence.current().entities.len(), 2, "while its own entities are its own");
     }
 
     /// The equivalence the skip-unchanged-frames scheme rests on: the restored
@@ -732,7 +849,14 @@ mod tests {
             if wide {
                 entities.push(entity("belt", 3.0, 2.0));
             }
-            Frame { tick, surface: "nauvis".to_string(), count: entities.len(), entities, tiles: Vec::new() }
+            Frame {
+                tick,
+                surface: "nauvis".to_string(),
+                count: entities.len(),
+                entities,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+            }
         };
         let ticks = [10u64, 20, 30, 40];
 
@@ -802,6 +926,7 @@ mod tests {
                 entity("pipe", 4.0, 0.0),
             ],
             tiles: Vec::new(),
+            floor_unchanged: false,
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
@@ -838,6 +963,7 @@ mod tests {
                 Tile { n: "stone-path".into(), x: 2, y: 2 },
                 Tile { n: "concrete".into(), x: -6, y: 3 },
             ],
+            floor_unchanged: false,
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
         assert_eq!(rendered.tile_runs.len(), 2);
@@ -927,6 +1053,7 @@ mod tests {
             count: 1,
             entities: vec![Entity { n: "huge".into(), x: 0.0, y: 0.0, d: 0, w: 100_000, h: 0 }],
             tiles: Vec::new(),
+            floor_unchanged: false,
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
         assert_eq!(rendered.entities[0].w, u8::MAX);
@@ -954,7 +1081,8 @@ mod tests {
         // cells. The spill stays under one cell's width, or it would land in
         // three chunks regardless of LOD_CELL_TILES.
         let tiles: Vec<Tile> = (0..LOD_CELL_TILES + 1).map(|x| Tile { n: "concrete".into(), x, y: 0 }).collect();
-        let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
+        let frame =
+            Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
         assert_eq!(rendered.tile_lod.len(), 2, "one cell per occupied chunk, not per tile");
@@ -968,7 +1096,8 @@ mod tests {
         let mut registry = TypeRegistry::new();
         let mut tiles = vec![Tile { n: "concrete".into(), x: 0, y: 0 }; 5];
         tiles.push(Tile { n: "stone-path".into(), x: 1, y: 0 });
-        let frame = Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles };
+        let frame =
+            Frame { tick: 0, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 
         assert_eq!(rendered.tile_lod.len(), 1, "still one chunk");
@@ -987,6 +1116,7 @@ mod tests {
             // division, which would floor a negative toward zero.
             entities: vec![entity("pipe", -0.5, -0.5), entity("pipe", (LOD_CELL_TILES - 1) as f32 + 0.5, 0.5)],
             tiles: Vec::new(),
+            floor_unchanged: false,
         };
         let rendered = RenderFrame::from_frame(frame, &mut registry);
 

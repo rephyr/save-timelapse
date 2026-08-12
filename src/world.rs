@@ -150,6 +150,11 @@ pub struct Surface {
     /// the frame. A spurious bump costs a duplicate file, which is why `insert`
     /// checks for an unchanged re-add.
     revision: u64,
+    /// Bumped only by the placed-floor layer, so a frame can say its floor is
+    /// unchanged while its entities are not. On a paved megabase the floor is
+    /// 72% of a frame and changes by under 4% across a whole playthrough, so
+    /// writing it again every frame was most of the output.
+    floor_revision: u64,
 }
 
 impl Surface {
@@ -163,6 +168,11 @@ impl Surface {
     /// same surface.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Same contract as `revision`, for the placed-floor layer alone.
+    pub fn floor_revision(&self) -> u64 {
+        self.floor_revision
     }
 
     /// Both layers together, which is what a baseline's "tiles" count means to
@@ -447,8 +457,10 @@ impl World {
 
         // Once for the whole load and unconditionally: a catch-up baseline is
         // a change however much of it matches, and the entity loop's bumps do
-        // not cover a baseline that is only tiles.
+        // not cover a baseline that is only tiles. The floor counts as changed
+        // too, a baseline being where a surface's floor first arrives.
         surface.revision += 1;
+        surface.floor_revision += 1;
 
         self.tick = self.tick.max(frame.tick);
     }
@@ -503,6 +515,7 @@ impl World {
                         let changed = s.tiles.insert((*x, *y), name) != Some(name);
                         if changed {
                             s.revision += 1;
+                            s.floor_revision += 1;
                         }
                         changed
                     }
@@ -518,6 +531,7 @@ impl World {
                 let changed = s.tiles.remove(&(*x, *y)).is_some();
                 if changed {
                     s.revision += 1;
+                    s.floor_revision += 1;
                 }
                 changed
             }),
@@ -529,8 +543,19 @@ impl World {
     /// floor only: terrain is a separate unchanging layer, and this runs once
     /// per emitted frame. Use `terrain_frame` for that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
+        self.to_frame_inner(surface_name, tick, true)
+    }
+
+    fn to_frame_inner(&self, surface_name: &str, tick: u64, include_floor: bool) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
+            return Frame {
+                tick,
+                surface: surface_name.to_string(),
+                entities: Vec::new(),
+                count: 0,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+            };
         };
 
         let names = self.name_table();
@@ -540,9 +565,22 @@ impl World {
             .map(|e| Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
             .collect();
 
-        let tiles = Self::materialize_tiles(&surface.tiles, &names);
+        let tiles = match include_floor {
+            true => Self::materialize_tiles(&surface.tiles, &names),
+            false => Vec::new(),
+        };
 
-        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles }
+        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles, floor_unchanged: false }
+    }
+
+    /// The same frame with its floor left out, for a surface whose floor has
+    /// not changed since the reader last saw it. Materialising the tiles is
+    /// what makes `to_frame` expensive on a paved base, so this skips the work
+    /// as well as the bytes.
+    pub fn to_frame_without_floor(&self, surface_name: &str, tick: u64) -> Frame {
+        let mut frame = self.to_frame_inner(surface_name, tick, false);
+        frame.floor_unchanged = true;
+        frame
     }
 
     /// The natural-terrain layer as a `Frame` (`entities` always empty).
@@ -550,12 +588,19 @@ impl World {
     /// called once per surface rather than once per replayed frame.
     pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
+            return Frame {
+                tick,
+                surface: surface_name.to_string(),
+                entities: Vec::new(),
+                count: 0,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+            };
         };
 
         let names = self.name_table();
         let tiles = Self::materialize_tiles(&surface.terrain, &names);
-        Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles }
+        Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles, floor_unchanged: false }
     }
 
     /// Resolved once per call rather than per item: a surface has a few dozen
@@ -580,7 +625,7 @@ mod tests {
     use super::*;
 
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
-        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles }
+        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles, floor_unchanged: false }
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
@@ -952,6 +997,7 @@ mod tests {
             count: 1,
             entities: vec![entity("transport-belt", 1.5, 2.5)],
             tiles: Vec::new(),
+            floor_unchanged: false,
         });
 
         assert_eq!(world.entity_count(), 2);
