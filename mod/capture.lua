@@ -308,6 +308,19 @@ function M.reset_capture(player)
 
   storage.timelapse_capture = nil
   capture_checked_rollover = false
+
+  -- Everything below describes the capture just deleted. Left alone, the next
+  -- flush appends events still encoded against the old dictionary into a fresh
+  -- segment that never defines those names, and a reader can only drop them:
+  -- observed as a reset capture recording nothing at all until the save was
+  -- reloaded. `ensure_capture_segment` resets the dictionaries for a new
+  -- segment, but it cannot know the buffer already holds records that used the
+  -- old ones.
+  capture_pending, capture_pending_count = {}, 0
+  capture_path = nil
+  capture_names = encode.new_dictionary()
+  capture_surfaces = encode.new_dictionary()
+  capture_last_written_tick = nil
   -- The milestone file goes with the session folder, so the record of which
   -- milestones already fired has to go too, or none would ever be rewritten.
   milestones.reset()

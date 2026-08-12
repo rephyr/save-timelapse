@@ -118,6 +118,7 @@ pub struct EventStream {
     /// reset clears it.
     pending_remove_name: Option<String>,
     unknown_extensions: usize,
+    undefined_references: usize,
 }
 
 impl EventStream {
@@ -127,6 +128,49 @@ impl EventStream {
     pub fn unknown_extensions(&self) -> usize {
         self.unknown_extensions
     }
+
+    /// Records dropped because they named a dictionary entry this segment
+    /// never defined, which is damage rather than a version difference.
+    ///
+    /// Counted because it used to be silent: a capture reset left the mod's
+    /// buffer holding records encoded against the deleted segment's
+    /// dictionary, they were flushed into a fresh segment that defined none of
+    /// those names, and every one vanished here without a word. A whole
+    /// playthrough recorded nothing and looked like it had simply not been
+    /// played.
+    pub fn undefined_references(&self) -> usize {
+        self.undefined_references
+    }
+}
+
+/// A record's name and surface, counting a miss in `undefined`. Resolved to
+/// owned strings so the caller is not left holding a borrow of the
+/// dictionaries, and every caller cloned them anyway.
+///
+/// Free functions taking one field each because `EventStream::next` holds a
+/// reader over `bytes` for the whole loop body, so nothing there can take
+/// `&mut self`.
+fn resolve(
+    names: &[String],
+    surfaces: &[String],
+    undefined: &mut usize,
+    name_id: usize,
+    surface_id: usize,
+) -> (Option<String>, Option<String>) {
+    let name = names.get(name_id).cloned();
+    let surface = surfaces.get(surface_id).cloned();
+    if name.is_none() || surface.is_none() {
+        *undefined += 1;
+    }
+    (name, surface)
+}
+
+fn resolve_surface(surfaces: &[String], undefined: &mut usize, surface_id: usize) -> Option<String> {
+    let surface = surfaces.get(surface_id).cloned();
+    if surface.is_none() {
+        *undefined += 1;
+    }
+    surface
 }
 
 impl Iterator for EventStream {
@@ -169,12 +213,14 @@ impl Iterator for EventStream {
                     let h = r.u8()?;
                     let id = r.u64()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.names.get(name_id), self.surfaces.get(surface_id)) {
+                    let (name, surface) =
+                        resolve(&self.names, &self.surfaces, &mut self.undefined_references, name_id, surface_id);
+                    let event = match (self.current_tick, name, surface) {
                         (Some(tick), Some(name), Some(surface)) => Some(LoggedEvent {
                             tick,
-                            surface: surface.clone(),
+                            surface,
                             event: Event::AddEntity {
-                                name: name.clone(),
+                                name,
                                 x: x as f32 / 10.0,
                                 y: y as f32 / 10.0,
                                 d,
@@ -196,10 +242,11 @@ impl Iterator for EventStream {
                     let y = r.i32()?;
                     let id = r.u64()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.surfaces.get(surface_id)) {
+                    let surface = resolve_surface(&self.surfaces, &mut self.undefined_references, surface_id);
+                    let event = match (self.current_tick, surface) {
                         (Some(tick), Some(surface)) => Some(LoggedEvent {
                             tick,
-                            surface: surface.clone(),
+                            surface,
                             event: Event::RemoveEntity {
                                 id: (id != 0).then_some(id),
                                 pos: (x as f32 / 10.0, y as f32 / 10.0),
@@ -219,12 +266,12 @@ impl Iterator for EventStream {
                     let x = r.i32()?;
                     let y = r.i32()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.names.get(name_id), self.surfaces.get(surface_id)) {
-                        (Some(tick), Some(name), Some(surface)) => Some(LoggedEvent {
-                            tick,
-                            surface: surface.clone(),
-                            event: Event::AddTile { name: name.clone(), x, y },
-                        }),
+                    let (name, surface) =
+                        resolve(&self.names, &self.surfaces, &mut self.undefined_references, name_id, surface_id);
+                    let event = match (self.current_tick, name, surface) {
+                        (Some(tick), Some(name), Some(surface)) => {
+                            Some(LoggedEvent { tick, surface, event: Event::AddTile { name, x, y } })
+                        }
                         _ => None,
                     };
                     self.pos += r.consumed();
@@ -237,10 +284,9 @@ impl Iterator for EventStream {
                     let x = r.i32()?;
                     let y = r.i32()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.surfaces.get(surface_id)) {
-                        (Some(tick), Some(surface)) => {
-                            Some(LoggedEvent { tick, surface: surface.clone(), event: Event::RemoveTile { x, y } })
-                        }
+                    let surface = resolve_surface(&self.surfaces, &mut self.undefined_references, surface_id);
+                    let event = match (self.current_tick, surface) {
+                        (Some(tick), Some(surface)) => Some(LoggedEvent { tick, surface, event: Event::RemoveTile { x, y } }),
                         _ => None,
                     };
                     self.pos += r.consumed();
@@ -313,6 +359,7 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
         current_tick: None,
         pending_remove_name: None,
         unknown_extensions: 0,
+        undefined_references: 0,
     })
 }
 
@@ -617,6 +664,37 @@ mod tests {
         assert_eq!(events.len(), 2, "the record after the extension must still arrive");
         assert_eq!(events[1].event, Event::AddEntity { name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2) });
         assert_eq!(stream.unknown_extensions(), 1);
+    }
+
+    /// Records that name a dictionary entry their segment never defined are
+    /// lost, and used to be lost in silence. A capture reset left the mod's
+    /// buffer holding records encoded against the deleted segment's
+    /// dictionary; they were flushed into a fresh segment defining none of
+    /// those names, and a whole playthrough recorded nothing while looking
+    /// like it had simply not been played.
+    #[test]
+    fn records_naming_something_the_segment_never_defined_are_counted() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+                             // No DefineSurface and no DefineName, exactly as the reset bug wrote.
+            w.u8(4).i32(15).i32(25).u64(7).u16(0); // RemoveEntity
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
+            w.u8(5).u16(0).i32(1).i32(2).u16(0); // AddTile
+            w.u8(6).i32(1).i32(2).u16(0); // RemoveTile
+                                          // Then a properly defined pair, which must still come through.
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(35).i32(45).u8(0).u8(1).u8(1).u64(2).u16(0);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let mut stream = stream_log(&path).unwrap();
+        let events: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(events.len(), 1, "only the record whose names were defined survives");
+        assert_eq!(stream.undefined_references(), 4, "and the four that did not are counted, not silent");
+        assert_eq!(stream.unknown_extensions(), 0, "this is damage, not a newer mod");
     }
 
     /// A removal that says which of two things at one position was mined. The

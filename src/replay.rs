@@ -288,6 +288,10 @@ pub struct Replay {
     /// corruption: the mod writing the capture is newer than the tool reading
     /// it, and the replay is correct as far as it goes.
     pub unknown_extensions: usize,
+    /// Records dropped because they named a dictionary entry their segment
+    /// never defined. Real damage, unlike `unknown_extensions`: the events are
+    /// gone and nothing here can recover them.
+    pub undefined_references: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -364,6 +368,7 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         superseded_events: 0,
         restarted_segments: 0,
         unknown_extensions: 0,
+        undefined_references: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -507,6 +512,7 @@ where
         // Asked after the walk, not during: the count is of what iteration
         // actually stepped over, so it is only complete once the stream is.
         replay.unknown_extensions += stream.unknown_extensions();
+        replay.undefined_references += stream.undefined_references();
 
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {

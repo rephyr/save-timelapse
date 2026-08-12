@@ -830,6 +830,19 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         println!("  Update Save Timelapse and build again to include it.");
         acted = true;
     }
+    // Distinct from a skipped segment: the file opened and parsed, and the
+    // records inside it named things the file never defined, so they could
+    // only be thrown away.
+    if replay_state.undefined_references > 0 {
+        println!(
+            "
+  {} recorded changes could not be read and were lost.",
+            with_thousands(replay_state.undefined_references as u64)
+        );
+        println!("  This happens to recordings made before v0.7.1 if the capture was reset");
+        println!("  mid-playthrough. Starting a fresh recording in game fixes it.");
+        acted = true;
+    }
     if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
         println!("\n  Some of this recording could not be read, so parts of the history may be missing.");
         acted = true;
