@@ -45,7 +45,19 @@ impl Prototypes {
     pub fn resource_names(&self) -> HashSet<String> {
         self.types.iter().filter(|(_, kind)| *kind == "resource").map(|(name, _)| name.clone()).collect()
     }
+
+    /// Whether somebody placed this rather than the map generating it. An
+    /// undescribed name counts as built, which is what a capture with no
+    /// types at all reports for everything.
+    pub fn is_built(&self, name: &str) -> bool {
+        !self.kind(name).is_some_and(|kind| NOT_BUILT.contains(&kind))
+    }
 }
+
+/// Prototype types nobody placed. `turret` is the worms': the player's three
+/// defences are `ammo-turret`, `electric-turret` and `fluid-turret`, which is
+/// what makes excluding the bare type safe.
+const NOT_BUILT: [&str; 8] = ["resource", "tree", "plant", "cliff", "fish", "simple-entity", "unit-spawner", "turret"];
 
 /// Reads `prototypes.json` from a built timelapse, or `None` if it has none.
 /// Every failure folds into `None`: a missing file is the normal state of an
@@ -121,6 +133,27 @@ mod tests {
         assert_eq!(read.kind("kr-advanced-transport-belt"), Some("transport-belt"));
         assert_eq!(read.reach["kr-advanced-underground-belt"], 30);
         assert_eq!(read.kind("never-mentioned"), None);
+    }
+
+    /// What the "N buildings" counts mean by a building. A capture keeps ore,
+    /// trees and nests for context, and counting those reports the map rather
+    /// than the factory.
+    #[test]
+    fn only_what_somebody_placed_counts_as_built() {
+        let dir = written(
+            r#"{"types":{"assembling-machine-2":"assembling-machine","kr-rare-metal-ore":"resource",
+                "tree-01":"tree","big-rock":"simple-entity","biter-spawner":"unit-spawner",
+                "small-worm-turret":"turret","gun-turret":"ammo-turret","laser-turret":"electric-turret"}}"#,
+        );
+        let read = read(dir.path()).expect("a description");
+
+        for name in ["assembling-machine-2", "gun-turret", "laser-turret"] {
+            assert!(read.is_built(name), "{name} is something somebody placed");
+        }
+        for name in ["kr-rare-metal-ore", "tree-01", "big-rock", "biter-spawner", "small-worm-turret"] {
+            assert!(!read.is_built(name), "{name} is not a building");
+        }
+        assert!(read.is_built("never-mentioned"), "an undescribed name counts, as it always did");
     }
 
     /// No file, unreadable content, and a well-formed file describing

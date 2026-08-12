@@ -301,6 +301,14 @@ fn build_chunk_lod(
 }
 
 impl RenderFrame {
+    /// How many of these somebody built, as opposed to `count`, which is
+    /// everything the frame holds. Summed over runs rather than entities, a
+    /// run knowing its own length, so this is tens of tests per frame rather
+    /// than hundreds of thousands.
+    pub fn building_count(&self, registry: &TypeRegistry) -> usize {
+        self.entity_runs.iter().filter(|run| registry.is_built(run.type_id)).map(Run::len).sum()
+    }
+
     /// A frame with nothing in it, used as the buffer `FrameSequence`
     /// materializes into and reuses, so seeking allocates nothing once the
     /// vectors have grown to the largest frame seen.
@@ -673,6 +681,43 @@ mod tests {
 
     fn sample_frame(tick: u64) -> RenderFrame {
         render(Frame { tick, surface: "nauvis".to_string(), count: 0, entities: Vec::new(), tiles: Vec::new() })
+    }
+
+    /// The on-screen count is what somebody built, not what the frame holds.
+    /// Measured on a real capture, one frame held 13,492 entities of which
+    /// 1,174 were buildings: trees alone were 9,793 of the rest.
+    #[test]
+    fn a_frame_counts_buildings_apart_from_what_the_map_generated() {
+        let mut registry = TypeRegistry::new();
+        registry.set_prototypes(save_timelapse::prototypes::Prototypes {
+            types: [
+                ("assembling-machine-2", "assembling-machine"),
+                ("transport-belt", "transport-belt"),
+                ("gun-turret", "ammo-turret"),
+                ("tree-grassland-k", "tree"),
+                ("iron-ore", "resource"),
+                ("cliff", "cliff"),
+                ("biter-spawner", "unit-spawner"),
+                ("small-worm-turret", "turret"),
+                ("locomotive", "locomotive"),
+            ]
+            .iter()
+            .map(|(n, k)| (n.to_string(), k.to_string()))
+            .collect(),
+            ..Default::default()
+        });
+
+        let built = ["assembling-machine-2", "transport-belt", "gun-turret"];
+        let scenery = ["tree-grassland-k", "iron-ore", "cliff", "biter-spawner", "small-worm-turret", "locomotive"];
+        let entities: Vec<Entity> = built.iter().chain(&scenery).enumerate().map(|(i, n)| entity(n, i as f32, 0.0)).collect();
+
+        let frame = RenderFrame::from_frame(
+            Frame { tick: 1, surface: "nauvis".to_string(), count: entities.len(), entities, tiles: Vec::new() },
+            &mut registry,
+        );
+
+        assert_eq!(frame.count, 9, "the frame holds everything");
+        assert_eq!(frame.building_count(&registry), 3, "only what somebody placed is a building");
     }
 
     /// The equivalence the skip-unchanged-frames scheme rests on: the restored

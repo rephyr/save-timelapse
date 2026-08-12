@@ -221,6 +221,11 @@ local function export_surface(surface, tick, session_id)
   -- the same region is the point, a tree drawn outside the ground it grows on
   -- being what this fixes. From entities alone, having to be final before the
   -- scenery pass writes while placed floor is not read until the tile section.
+  -- Everything so far came from the unbounded pass, which is exactly what
+  -- somebody built. The scenery pass below adds trees, nests and ore, so this
+  -- is the last moment the two are separable without classifying names.
+  local built = written
+
   local context_area = encode.expand_bbox(bbox, encode.terrain_margin(bbox, TERRAIN_MARGIN_TILES))
 
   if context_area then
@@ -298,7 +303,7 @@ local function export_surface(surface, tick, session_id)
   -- checksum, and the reader already knows the trailer's fixed size.
   M.safe_write_file(path, encode.u32le(checksum), true)
 
-  return written, tiles_written
+  return written, tiles_written, built
 end
 
 --- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
@@ -579,13 +584,14 @@ function M.export_all_to(tick, manifest_path, session_id, is_excluded)
   -- One choke point for both paths that produce frames, the live baseline and
   -- the headless save export, so neither can end up undescribed.
   M.write_prototypes(session_id)
-  local names, total, tile_total = {}, 0, 0
+  local names, total, tile_total, built_total = {}, 0, 0, 0
 
   for _, surface in pairs(game.surfaces) do
     if M.is_inhabited(surface) and not (is_excluded and is_excluded(surface.name)) then
-      local entities, tiles = export_surface(surface, tick, session_id)
+      local entities, tiles, built = export_surface(surface, tick, session_id)
       total = total + entities
       tile_total = tile_total + tiles
+      built_total = built_total + built
       names[#names + 1] = encode.quote(surface.name)
     end
   end
@@ -597,8 +603,11 @@ function M.export_all_to(tick, manifest_path, session_id, is_excluded)
 
   helpers.write_file(
     manifest_path,
-    string.format('{"tick":%d,"entities":%d,"tiles":%d,"surfaces":[%s],"milestones":%s}',
-      tick, total, tile_total, table.concat(names, ","),
+    -- `buildings` counts only the unbounded pass, `entities` everything
+    -- written. A reader older than this field falls back to `entities`, which
+    -- is what it always showed.
+    string.format('{"tick":%d,"entities":%d,"buildings":%d,"tiles":%d,"surfaces":[%s],"milestones":%s}',
+      tick, total, built_total, tile_total, table.concat(names, ","),
       encode.milestone_state(science, planets, rockets)),
     false)
 

@@ -121,6 +121,16 @@ impl TypeRegistry {
         self.kinds[id as usize].rotates
     }
 
+    /// Whether somebody placed this rather than the map generating it. One
+    /// definition for the two questions that need it: what the auto-follow
+    /// camera aims at, and what the on-screen count counts. A capture keeps
+    /// trees, ore and nests for context, and on a wooded map they outnumber
+    /// the factory ten to one.
+    pub fn is_built(&self, id: TypeId) -> bool {
+        let kind = &self.kinds[id as usize];
+        !kind.scatter && !kind.resource && !kind.enemy && !kind.vehicle
+    }
+
     /// How far an underground belt of this type reaches, or `None` if it is
     /// not one. The reach is what pairs an entrance with its exit.
     pub fn underground_reach(&self, id: TypeId) -> Option<i32> {

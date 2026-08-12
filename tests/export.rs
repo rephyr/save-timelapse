@@ -35,9 +35,25 @@ fn fake_install(root: &Path) -> PathBuf {
     fs::create_dir_all(root.join("factorio").join("data")).unwrap();
 
     let exe = bin.join(format!("factorio{}", std::env::consts::EXE_SUFFIX));
-    fs::copy(built_binary("fake-factorio"), &exe).unwrap();
+    clone_executable(&built_binary("fake-factorio"), &exe);
     make_executable(&exe);
     exe
+}
+
+/// Linked rather than copied where the filesystem allows it.
+///
+/// `fs::copy` holds the destination open for writing, and tests run in
+/// parallel threads: a `Command::spawn` on another thread forks while that
+/// descriptor is open, the child inherits it, and until the child execs its
+/// own binary the file counts as open for writing. Exec'ing it in that window
+/// fails with ETXTBSY, which is the intermittent Linux CI failure. A hard link
+/// never opens the file at all. Copying is kept for the case the temp
+/// directory is on a different filesystem from the build output.
+fn clone_executable(from: &Path, to: &Path) {
+    if fs::hard_link(from, to).is_ok() {
+        return;
+    }
+    fs::copy(from, to).unwrap();
 }
 
 /// `fs::copy` does not reliably carry the execute bit, and `Command::new`

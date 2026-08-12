@@ -718,7 +718,11 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // it finished.
     step("\nReading your recording");
     let mut replay_state = replay::load_baseline(&chosen.baseline_path)?;
-    println!("{} buildings", with_thousands(replay_state.world.entity_count() as u64));
+    // Only what somebody built: a capture also keeps trees, ore and nests for
+    // context, and counting those reports the map rather than the factory.
+    let described = save_timelapse::prototypes::read(&chosen.session_dir);
+    let buildings = replay_state.world.count_entities(|name| described.as_ref().is_none_or(|p| p.is_built(name)));
+    println!("{} buildings", with_thousands(buildings as u64));
 
     step("Finding places");
     let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
@@ -1308,8 +1312,10 @@ fn describe_play_time(tick: u64) -> String {
 fn describe_session(session: &replay::Session, now: SystemTime) -> String {
     let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
     let places = describe_places(&session.baseline.surfaces);
-    let scale =
-        format!("{} buildings, {}", with_thousands(session.baseline.entities as u64), describe_play_time(session.baseline.tick));
+    // Older captures wrote only a total, which counts the trees and ore a
+    // capture keeps for context alongside what somebody built.
+    let buildings = session.baseline.buildings.unwrap_or(session.baseline.entities);
+    let scale = format!("{} buildings, {}", with_thousands(buildings as u64), describe_play_time(session.baseline.tick));
     match session.label() {
         Some(name) => format!("{name}  ({places})\n     {scale}, last played {age}"),
         None => format!("{places}\n     {scale}, last played {age}"),

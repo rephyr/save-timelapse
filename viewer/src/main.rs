@@ -2188,7 +2188,9 @@ async fn main() {
             playing: state.playing,
             play_speed: state.play_speed,
             clock: &clock,
-            buildings: sequence.current().count,
+            // What somebody built, not what the frame holds: trees, ore and
+            // nests are kept for context and outnumber the factory.
+            buildings: sequence.current().building_count(&registry),
             surfaces_expanded: state.surfaces_expanded,
         };
         let chrome = Chrome::layout(&ui, &timeline, &chrome_state);

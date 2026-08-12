@@ -69,10 +69,7 @@ fn counted<'a>(frame: &'a RenderFrame, registry: &'a TypeRegistry) -> impl Itera
     frame
         .entity_runs
         .iter()
-        .filter(move |run| {
-            let id = run.type_id;
-            !registry.is_terrain_scatter(id) && !registry.is_resource(id) && !registry.is_enemy(id) && !registry.is_vehicle(id)
-        })
+        .filter(move |run| registry.is_built(run.type_id))
         .flat_map(move |run| frame.entities[run.range()].iter())
 }
 

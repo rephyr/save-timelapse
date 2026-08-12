@@ -26,6 +26,11 @@ pub struct Baseline {
     pub tick: u64,
     #[serde(default)]
     pub entities: usize,
+    /// Only what somebody built, where `entities` also counts the trees, ore
+    /// and nests a capture keeps for context. Absent before the mod wrote it,
+    /// which falls back to `entities`.
+    #[serde(default)]
+    pub buildings: Option<usize>,
     #[serde(default)]
     pub tiles: usize,
     pub surfaces: Vec<String>,
@@ -781,6 +786,25 @@ mod tests {
     /// hex name its session folder carries.
     const TEST_SESSION: u32 = 1;
     const TEST_SESSION_HEX: &str = "00000001";
+
+    /// `buildings` is what a capture recorded by this mod carries and every
+    /// older one does not, and the picker shows one or the other.
+    #[test]
+    fn a_baseline_reports_its_building_count_when_it_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join(TEST_SESSION_HEX);
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("baseline.json");
+
+        fs::write(&path, r#"{"tick":100,"entities":900,"buildings":120,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
+        let told = Baseline::read_at(&path).unwrap();
+        assert_eq!(told.buildings, Some(120), "the trees and ore are not buildings");
+        assert_eq!(told.entities, 900);
+
+        fs::write(&path, r#"{"tick":100,"entities":900,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
+        let silent = Baseline::read_at(&path).unwrap();
+        assert_eq!(silent.buildings, None, "an older capture says nothing and falls back to the total");
+    }
 
     /// A capture directory with one session subfolder, plus the path to its
     /// baseline manifest, `load_baseline` taking that path rather than a

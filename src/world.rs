@@ -379,6 +379,13 @@ impl World {
         self.surfaces.values().map(Surface::entity_count).sum()
     }
 
+    /// How many entities `keep` accepts, by name. A predicate rather than a
+    /// stored set: this is asked once, for one line of output, and what counts
+    /// as a building is the caller's question rather than the world's.
+    pub fn count_entities(&self, keep: impl Fn(&str) -> bool) -> usize {
+        self.surfaces.values().flat_map(Surface::entities).filter(|e| keep(self.names.name(e.name))).count()
+    }
+
     pub fn tile_count(&self) -> usize {
         self.surfaces.values().map(Surface::tile_count).sum()
     }
