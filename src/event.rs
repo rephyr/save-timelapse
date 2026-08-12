@@ -384,6 +384,7 @@ fn segment_tick(path: &Path) -> Option<(u64, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::set_mtime_rank;
     use crate::wire::ByteWriter;
 
     /// Builds one segment's bytes with the given records, magic and version
@@ -618,15 +619,6 @@ mod tests {
         // implement Debug. err() discards it, needing only the Err side to.
         let err = stream_log(&path).err().unwrap();
         assert!(err.to_string().contains("version 99"), "got: {err}");
-    }
-
-    /// Stamps `name`'s mtime, which is how `log_segments` recovers creation
-    /// order. Anchored to a fixed instant rather than `now()` so a tie is
-    /// genuinely a tie: Windows' granularity is coarser than the gap between
-    /// two back-to-back writes.
-    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
-        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
-        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
     }
 
     fn segment_names(dir: &Path) -> Vec<String> {

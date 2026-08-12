@@ -79,11 +79,6 @@ pub const PIECES: [&str; 16] = [
     "pipe-cross",
 ];
 
-/// The tile a one tile entity sits on. Pipes are always one tile.
-fn tile_of(entity: &RenderEntity) -> (i32, i32) {
-    (entity.x.floor() as i32, entity.y.floor() as i32)
-}
-
 /// Works out every pipe's connections and writes the mask into
 /// `RenderEntity::shape`.
 ///
@@ -96,7 +91,7 @@ pub fn infer_connections(entities: &mut [RenderEntity], is_pipe: &[bool]) {
     let mut pipes: HashMap<(i32, i32), ()> = HashMap::new();
     for (entity, &pipe) in entities.iter().zip(is_pipe) {
         if pipe {
-            pipes.insert(tile_of(entity), ());
+            pipes.insert(entity.tile(), ());
         }
     }
     if pipes.is_empty() {
@@ -107,7 +102,7 @@ pub fn infer_connections(entities: &mut [RenderEntity], is_pipe: &[bool]) {
         if !pipe {
             continue;
         }
-        let (x, y) = tile_of(entity);
+        let (x, y) = entity.tile();
         let mut mask = 0u8;
         for (bit, (dx, dy)) in [(NORTH, (0, -1)), (EAST, (1, 0)), (SOUTH, (0, 1)), (WEST, (-1, 0))] {
             if pipes.contains_key(&(x + dx, y + dy)) {

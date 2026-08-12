@@ -870,6 +870,70 @@ fn draw_tile_lod_layer(
 
 /// Mouse and keyboard input for the active world: panning, zooming,
 /// timeline scrubbing, and every playback/display toggle.
+/// Applies whatever a left click landed on in the chrome. Returns a surface to
+/// switch to, which the caller applies on the next iteration: `worlds[current]`
+/// is still mutably borrowed here.
+///
+/// Separate from `handle_input` despite taking much the same state, because the
+/// two answer different questions: this one asks what was clicked, that one
+/// asks what the keyboard and the drag are doing.
+#[allow(clippy::too_many_arguments)]
+fn apply_chrome_click(
+    chrome: &Chrome,
+    ui: &mut Ui,
+    state: &mut ViewerState,
+    sequence: &mut FrameSequence,
+    camera: &mut Camera,
+    follow: &mut FollowState,
+    growing_bounds: &[Option<GrowingBounds>],
+) -> Option<usize> {
+    match chrome.hit(mouse_position().into()) {
+        Some(Click::Surface(index)) => {
+            state.surfaces_expanded = false;
+            return Some(index);
+        }
+        Some(Click::MoreSurfaces) => state.surfaces_expanded = !state.surfaces_expanded,
+        Some(Click::StepBack) => {
+            sequence.step_back();
+            state.playing = false;
+            follow.enabled = false;
+        }
+        Some(Click::StepForward) => {
+            sequence.step_forward();
+            state.playing = false;
+            follow.enabled = false;
+        }
+        Some(Click::PlayPause) => {
+            state.playing = !state.playing;
+            state.play_accum = 0.0;
+        }
+        // One direction, wrapping at the top. A pill with no second half cannot
+        // say which end means slower.
+        Some(Click::Speed) => {
+            state.play_speed = if state.play_speed >= 8.0 { 0.25 } else { state.play_speed * 2.0 };
+        }
+        // A one-shot reframe, not the same as `f`: it puts the factory back on
+        // screen and leaves the camera alone.
+        Some(Click::Fit) => {
+            if let Some(bounds) = growing_bounds[sequence.index()] {
+                *camera = Camera::fit_bounds(
+                    bounds.center,
+                    bounds.half_extent * 2.0,
+                    screen_width(),
+                    screen_height(),
+                    AUTO_FOLLOW_MIN_FOCUS_TILES,
+                    AUTO_FOLLOW_FIT_MARGIN,
+                );
+                follow.enabled = false;
+                follow.transition = None;
+            }
+        }
+        Some(Click::Help) => ui.show_keys = true,
+        None => {}
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_input(
     camera: &mut Camera,
@@ -1860,10 +1924,25 @@ fn draw_player_markers(ui: &Ui, player_track: &PlayerTrack, world_name: &str, ti
     }
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
-    let args = parse_args();
+/// Everything the draw loop needs, assembled once before it starts.
+struct Loaded {
+    registry: TypeRegistry,
+    worlds: Vec<WorldView>,
+    sprites: Vec<Option<Sprite>>,
+    player_track: PlayerTrack,
+    milestones: Vec<save_timelapse::milestone::Milestone>,
+    /// Where bookmarks are written back to, or `None` for a synthetic load
+    /// with no directory to keep them in.
+    frames_dir: Option<std::path::PathBuf>,
+}
 
+/// Reads a capture and turns it into what the loop reads: the registry, one
+/// [`WorldView`] per surface, the sprite table, and the player track.
+///
+/// Split from `main` because the two halves share almost nothing: this ends
+/// once `worlds` exists, and the loop below never touches a path or a sidecar
+/// again.
+async fn load_everything(args: &Args) -> Loaded {
     let mut registry = TypeRegistry::new();
     // Before loading anything: colours resolve when a name is first interned.
     // Missing is the normal state of any capture older than the feature.
@@ -1878,7 +1957,7 @@ async fn main() {
             registry.set_prototypes(prototypes);
         }
     }
-    let loaded = load_frames(&args, &mut registry).await;
+    let loaded = load_frames(args, &mut registry).await;
 
     // Absent entirely (an older capture, or nobody was connected during
     // capture) is normal, not an error: no markers drawn, nothing else
@@ -1909,7 +1988,7 @@ async fn main() {
     // a synthetic load, which has no directory to keep them in.
     let frames_dir: Option<std::path::PathBuf> = args.path.as_deref().map(std::path::PathBuf::from).filter(|p| p.is_dir());
 
-    let data_dir = args.factorio.or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
+    let data_dir = args.factorio.clone().or_else(locate_factorio).and_then(|exe| install_data_dir(&exe));
     match &data_dir {
         Some(dir) => println!("factorio data: {}", dir.display()),
         None => println!("no factorio install found (pass --factorio); sprites unavailable, using colored shapes"),
@@ -1920,7 +1999,7 @@ async fn main() {
 
     // One camera per world: panning vulcanus and then tabbing to nauvis with
     // vulcanus's view applied would be disorienting.
-    let mut worlds: Vec<WorldView> = loaded
+    let worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence, terrain)| {
             let camera = Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
@@ -1958,6 +2037,63 @@ async fn main() {
             }
         })
         .collect();
+
+    Loaded { registry, worlds, sprites, player_track, milestones, frames_dir }
+}
+
+/// Renders the surfaces `request` asks for and returns, exporting being a
+/// one-shot job rather than a mode of the browser.
+///
+/// `Err` is a bad `--surface`, which is worth naming before any work starts;
+/// a failed render of one surface is reported and the rest still run.
+async fn run_export(
+    worlds: &mut [WorldView],
+    registry: &TypeRegistry,
+    sprites: &[Option<Sprite>],
+    request: &ExportRequest,
+) -> Result<(), String> {
+    let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
+    let chosen: Vec<usize> = match request.surface.as_deref() {
+        // The default is the busiest surface, which `group_by_surface` already
+        // orders first, so the common single-surface case needs no flag.
+        None => vec![0],
+        Some(name) if name.eq_ignore_ascii_case("all") => (0..worlds.len()).collect(),
+        Some(name) => match available.iter().position(|s| s.eq_ignore_ascii_case(name)) {
+            Some(index) => vec![index],
+            // Naming what is there rather than only what is not: the answer is
+            // always in the timelapse the user just pointed at.
+            None => return Err(format!("no surface called \"{name}\". This timelapse has: {}", available.join(", "))),
+        },
+    };
+
+    // One subfolder per surface only when exporting more than one, so a single
+    // surface export puts its frames where it was told rather than a level
+    // deeper than expected.
+    let per_surface = chosen.len() > 1;
+    for index in chosen {
+        let name = available[index].clone();
+        let dir = if per_surface { request.dir.join(&name) } else { request.dir.clone() };
+        println!("\nsurface {name}");
+        let this = ExportRequest {
+            dir,
+            width: request.width,
+            height: request.height,
+            surface: None,
+            fps: request.fps,
+            video: request.video,
+            supersample: request.supersample,
+        };
+        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, &this).await {
+            eprintln!("export of {name} failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
+    let args = parse_args();
+    let Loaded { registry, mut worlds, sprites, player_track, milestones, frames_dir } = load_everything(&args).await;
     let mut current = 0usize;
 
     let mut state = ViewerState {
@@ -1987,49 +2123,9 @@ async fn main() {
         return;
     }
 
-    // Exporting is a one-shot job rather than a mode of the browser, so it
-    // runs to completion and exits. It exports the first surface, which
-    // `group_by_surface` already orders busiest first.
     if let Some(request) = &args.export {
-        let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
-        let chosen: Vec<usize> = match request.surface.as_deref() {
-            // The default is the busiest surface, which `group_by_surface`
-            // already orders first, so the common single-surface case needs
-            // no flag at all.
-            None => vec![0],
-            Some(name) if name.eq_ignore_ascii_case("all") => (0..worlds.len()).collect(),
-            Some(name) => match available.iter().position(|s| s.eq_ignore_ascii_case(name)) {
-                Some(index) => vec![index],
-                // Naming what *is* there rather than only what is not: a
-                // surface name is easy to misremember, and the answer is
-                // always in the timelapse the user just pointed at.
-                None => {
-                    eprintln!("no surface called \"{name}\". This timelapse has: {}", available.join(", "));
-                    return;
-                }
-            },
-        };
-
-        // One subfolder per surface only when exporting more than one, so a
-        // single-surface export puts its frames exactly where it was told to
-        // rather than one level deeper than expected.
-        let per_surface = chosen.len() > 1;
-        for index in chosen {
-            let name = available[index].clone();
-            let dir = if per_surface { request.dir.join(&name) } else { request.dir.clone() };
-            println!("\nsurface {name}");
-            let this = ExportRequest {
-                dir,
-                width: request.width,
-                height: request.height,
-                surface: None,
-                fps: request.fps,
-                video: request.video,
-                supersample: request.supersample,
-            };
-            if let Err(e) = export_frames(&mut worlds[index], &registry, &sprites, &this).await {
-                eprintln!("export of {name} failed: {e}");
-            }
+        if let Err(message) = run_export(&mut worlds, &registry, &sprites, request).await {
+            eprintln!("{message}");
         }
         return;
     }
@@ -2117,50 +2213,7 @@ async fn main() {
             if ui.show_keys {
                 ui.show_keys = false;
             } else {
-                match chrome.hit(mouse_position().into()) {
-                    Some(Click::Surface(index)) => {
-                        pending_surface = Some(index);
-                        state.surfaces_expanded = false;
-                    }
-                    Some(Click::MoreSurfaces) => state.surfaces_expanded = !state.surfaces_expanded,
-                    Some(Click::StepBack) => {
-                        sequence.step_back();
-                        state.playing = false;
-                        follow.enabled = false;
-                    }
-                    Some(Click::StepForward) => {
-                        sequence.step_forward();
-                        state.playing = false;
-                        follow.enabled = false;
-                    }
-                    Some(Click::PlayPause) => {
-                        state.playing = !state.playing;
-                        state.play_accum = 0.0;
-                    }
-                    // One direction, wrapping at the top. A pill with no
-                    // second half cannot say which end means slower.
-                    Some(Click::Speed) => {
-                        state.play_speed = if state.play_speed >= 8.0 { 0.25 } else { state.play_speed * 2.0 };
-                    }
-                    // A one-shot reframe, not the same as `f`: it puts the
-                    // factory back on screen and leaves the camera alone.
-                    Some(Click::Fit) => {
-                        if let Some(bounds) = growing_bounds[sequence.index()] {
-                            *camera = Camera::fit_bounds(
-                                bounds.center,
-                                bounds.half_extent * 2.0,
-                                screen_width(),
-                                screen_height(),
-                                AUTO_FOLLOW_MIN_FOCUS_TILES,
-                                AUTO_FOLLOW_FIT_MARGIN,
-                            );
-                            follow.enabled = false;
-                            follow.transition = None;
-                        }
-                    }
-                    Some(Click::Help) => ui.show_keys = true,
-                    None => {}
-                }
+                pending_surface = apply_chrome_click(&chrome, &mut ui, &mut state, sequence, camera, follow, growing_bounds);
             }
         }
 

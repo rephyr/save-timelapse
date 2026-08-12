@@ -13,6 +13,7 @@ use save_timelapse::locate::{factorio_user_dir, locate_factorio};
 use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 use save_timelapse::settings::Settings;
+use save_timelapse::with_thousands;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -1273,20 +1274,6 @@ fn describe_places(surfaces: &[String]) -> String {
             format!("{}, {} and {} more", pretty_place(one), pretty_place(two), rest.len())
         }
     }
-}
-
-/// Digits a person can read at a glance. `945480` is a serial number;
-/// `945,480` is a quantity.
-fn with_thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// How much play time a built timelapse covers, from the snapshot it starts

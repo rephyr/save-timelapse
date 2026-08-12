@@ -56,6 +56,14 @@ pub struct RenderEntity {
     pub shape: u8,
 }
 
+impl RenderEntity {
+    /// The tile this entity's own position sits in. Belts and pipes both work
+    /// out their shape from what occupies the neighbouring tiles.
+    pub fn tile(&self) -> (i32, i32) {
+        (self.x.floor() as i32, self.y.floor() as i32)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderTile {
     pub x: i32,

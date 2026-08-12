@@ -9,6 +9,8 @@
 //! What belongs on screen: an element earns its place by answering where am I,
 //! when am I, or what can I do. "How is the renderer doing" lives behind `F3`.
 
+use save_timelapse::with_thousands;
+
 use macroquad::prelude::*;
 
 use crate::camera::Timeline;
@@ -225,10 +227,41 @@ pub struct Chrome {
 }
 
 impl Chrome {
+    /// Every rect this layout produced, with what clicking it should report.
+    /// Only used to hold `hit` to what was laid out; see the tests below.
+    #[cfg(test)]
+    fn regions(&self) -> Vec<(Rect, Click)> {
+        let mut out: Vec<(Rect, Click)> = Vec::new();
+        out.extend(self.expanded.iter().map(|c| (c.rect, Click::Surface(c.index))));
+        out.extend(self.chips.iter().map(|c| (c.rect, Click::Surface(c.index))));
+        if let Some((rect, _)) = self.more {
+            out.push((rect, Click::MoreSurfaces));
+        }
+        out.extend(self.buttons.iter().map(|b| (b.rect, b.click)));
+        out
+    }
+
+    /// What the draw loop calls, having a `Ui` and a window to hand.
     pub fn layout(ui: &Ui, timeline: &Timeline, state: &ChromeState) -> Chrome {
+        Chrome::layout_with(&|text, size| ui.width(text, size), screen_width(), timeline, state)
+    }
+
+    /// The geometry itself, given only how wide text renders and how wide the
+    /// window is.
+    ///
+    /// Those two are the whole of what this needed macroquad for, and taking
+    /// them as arguments is what lets the layout be checked against `hit`. The
+    /// file exists to keep the two in step (see the module comment) and nothing
+    /// could hold them to it while laying out required a font atlas.
+    pub fn layout_with(
+        measure: &dyn Fn(&str, f32) -> f32,
+        screen_width: f32,
+        timeline: &Timeline,
+        state: &ChromeState,
+    ) -> Chrome {
         let mut chrome = Chrome { chips: Vec::new(), more: None, expanded: Vec::new(), buttons: Vec::new() };
-        chrome.layout_chips(ui, state);
-        chrome.layout_transport(ui, timeline, state);
+        chrome.layout_chips(measure, screen_width, state);
+        chrome.layout_transport(measure, screen_width, timeline, state);
         chrome
     }
 
@@ -239,17 +272,17 @@ impl Chrome {
     /// exception is an active surface that did not fit, swapped in for the
     /// last visible chip: a switcher that cannot show where you are has failed
     /// at its only job.
-    fn layout_chips(&mut self, ui: &Ui, state: &ChromeState) {
+    fn layout_chips(&mut self, measure: &dyn Fn(&str, f32) -> f32, screen_width: f32, state: &ChromeState) {
         if state.surfaces.len() <= 1 {
             return;
         }
 
-        let width_of = |label: &str| ui.width(label, CHIP_TEXT) + CHIP_PAD_X * 2.0;
+        let width_of = |label: &str| measure(label, CHIP_TEXT) + CHIP_PAD_X * 2.0;
         // Half the window, so a long surface name can never crowd the clock.
-        let budget = screen_width() * 0.5;
+        let budget = screen_width * 0.5;
 
         let total: f32 = state.surfaces.iter().map(|s| width_of(s) + CHIP_GAP).sum::<f32>() - CHIP_GAP;
-        let more_width = ui.width("+00 more", CHIP_TEXT) + CHIP_PAD_X * 2.0;
+        let more_width = measure("+00 more", CHIP_TEXT) + CHIP_PAD_X * 2.0;
         let available = if total <= budget { budget } else { budget - more_width - CHIP_GAP };
 
         let mut shown: Vec<usize> = Vec::new();
@@ -282,7 +315,7 @@ impl Chrome {
             let rect = Rect::new(x, MARGIN, more_width, CHIP_HEIGHT);
             self.more = Some((rect, hidden));
             if state.surfaces_expanded {
-                self.layout_expanded(ui, state, &shown);
+                self.layout_expanded(measure, state, &shown);
             }
         }
     }
@@ -290,9 +323,9 @@ impl Chrome {
     /// The dropdown behind `+N more`: everything the row could not fit,
     /// stacked under it at the same chip height so the two read as one
     /// control rather than as a list that appeared from somewhere else.
-    fn layout_expanded(&mut self, ui: &Ui, state: &ChromeState, shown: &[usize]) {
+    fn layout_expanded(&mut self, measure: &dyn Fn(&str, f32) -> f32, state: &ChromeState, shown: &[usize]) {
         let hidden: Vec<usize> = (0..state.surfaces.len()).filter(|i| !shown.contains(i)).collect();
-        let width = hidden.iter().map(|&i| ui.width(&state.surfaces[i], CHIP_TEXT) + CHIP_PAD_X * 2.0).fold(0.0f32, f32::max);
+        let width = hidden.iter().map(|&i| measure(&state.surfaces[i], CHIP_TEXT) + CHIP_PAD_X * 2.0).fold(0.0f32, f32::max);
         let mut y = MARGIN + CHIP_HEIGHT + CHIP_GAP;
         for index in hidden {
             let rect = Rect::new(MARGIN, y, width, CHIP_HEIGHT);
@@ -309,10 +342,16 @@ impl Chrome {
     /// space, and putting controls there costs no vertical room. A row over
     /// the bar would have to clear the activity graph, the playhead label and
     /// the hover tooltip, all of which live in that column.
-    fn layout_transport(&mut self, ui: &Ui, timeline: &Timeline, state: &ChromeState) {
+    fn layout_transport(
+        &mut self,
+        measure: &dyn Fn(&str, f32) -> f32,
+        screen_width: f32,
+        timeline: &Timeline,
+        state: &ChromeState,
+    ) {
         let y = timeline.y;
         let speed_label = format!("{}x", state.play_speed);
-        let speed_width = ui.width(&speed_label, CHIP_TEXT).max(ui.width("0.25x", CHIP_TEXT)) + 20.0;
+        let speed_width = measure(&speed_label, CHIP_TEXT).max(measure("0.25x", CHIP_TEXT)) + 20.0;
 
         // Widest first, then progressively less, so a narrow window loses the
         // least important control rather than overflowing. Everything dropped
@@ -357,7 +396,7 @@ impl Chrome {
 
         // Right gutter. Two controls only, so it fits anywhere the window is
         // wide enough to have a bar at all.
-        let right_edge = screen_width() - MARGIN;
+        let right_edge = screen_width - MARGIN;
         let right_start = (timeline.left + timeline.width + GUTTER_PAD).min(right_edge - BUTTON * 2.0 - BUTTON_GAP);
         self.buttons.push(Button { click: Click::Fit, rect: Rect::new(right_start, y - BUTTON / 2.0, BUTTON, BUTTON) });
         self.buttons.push(Button {
@@ -432,7 +471,7 @@ impl Chrome {
         let clock_width = ui.width(state.clock, CLOCK_TEXT);
         ui.text_legible(state.clock, right - clock_width, MARGIN + CLOCK_TEXT, CLOCK_TEXT, INK);
 
-        let buildings = format!("{} buildings", with_thousands(state.buildings));
+        let buildings = format!("{} buildings", with_thousands(state.buildings as u64));
         let count_width = ui.width(&buildings, COUNT_TEXT);
         ui.text_legible(&buildings, right - count_width, MARGIN + CLOCK_TEXT + COUNT_TEXT + 7.0, COUNT_TEXT, INK_DIM);
     }
@@ -553,20 +592,6 @@ fn draw_pill(rect: Rect, radius: f32, fill: Color, edge: Option<Color>) {
     draw_rounded_rect(rect, radius, fill);
 }
 
-/// `22971` reads as a serial number and `22,971` reads as a quantity, which
-/// is the entire reason this count survived the move off the default view.
-fn with_thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// True the first time the viewer is opened on this machine, false after.
 ///
 /// A marker beside the settings file rather than a field inside it:
@@ -679,6 +704,87 @@ pub fn draw_key_panel(ui: &Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every label the same width, so a test states geometry rather than
+    /// depending on a font: the real measurer only ever changes how wide a chip
+    /// is, never which rect answers a click.
+    fn measured(per_char: f32) -> impl Fn(&str, f32) -> f32 {
+        move |text: &str, _size: f32| text.chars().count() as f32 * per_char
+    }
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn state(surfaces: &[String], active: usize, expanded: bool) -> ChromeState<'_> {
+        ChromeState {
+            surfaces,
+            active,
+            clock: "1h 00m",
+            play_speed: 1.0,
+            playing: false,
+            buildings: 0,
+            surfaces_expanded: expanded,
+        }
+    }
+
+    /// The invariant this file exists for: a click at the centre of anything
+    /// laid out reports that thing. Nothing held the two in step before, since
+    /// laying out needed a font atlas and so could not run in a test.
+    #[test]
+    fn every_laid_out_region_answers_a_click_at_its_centre() {
+        let surfaces = names(&["nauvis", "vulcanus", "fulgora", "gleba", "aquilo"]);
+        let mut kinds: Vec<Click> = Vec::new();
+
+        // Several widths, because which controls exist depends on the room
+        // there is for them: everything fits at 1280, the surface row overflows
+        // by 800, and the transport cluster starts dropping buttons below that.
+        for width in [1280.0, 800.0, 520.0] {
+            let timeline = Timeline::for_screen(width, 800.0);
+            for expanded in [false, true] {
+                let state = state(&surfaces, 1, expanded);
+                let chrome = Chrome::layout_with(&measured(9.0), width, &timeline, &state);
+
+                for (rect, click) in chrome.regions() {
+                    let centre = Vec2::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+                    assert_eq!(chrome.hit(centre), Some(click), "{rect:?} laid out but not clickable at {width}px");
+                    kinds.push(click);
+                }
+            }
+        }
+
+        // Asserted rather than assumed: at one width every surface fitted, so
+        // no `+N more` chip was laid out and the case went unchecked.
+        for expected in [Click::MoreSurfaces, Click::PlayPause, Click::Fit, Click::Help, Click::Surface(0)] {
+            assert!(kinds.contains(&expected), "{expected:?} was never laid out, so nothing checked it");
+        }
+    }
+
+    /// The overflow chip and the list it opens have to agree about which
+    /// surfaces did not fit, or `+N more` opens onto the wrong ones.
+    #[test]
+    fn the_overflow_chip_counts_exactly_what_the_expanded_list_holds() {
+        let timeline = Timeline::for_screen(800.0, 600.0);
+        let surfaces = names(&["nauvis", "vulcanus", "fulgora", "gleba", "aquilo"]);
+        let state = state(&surfaces, 0, true);
+        let chrome = Chrome::layout_with(&measured(9.0), 800.0, &timeline, &state);
+
+        let (_, hidden) = chrome.more.expect("five surfaces cannot fit half of an 800px window");
+        assert_eq!(chrome.expanded.len(), hidden, "the dropdown must hold exactly what the chip counts");
+        assert_eq!(chrome.chips.len() + hidden, 5, "every surface is either shown or hidden");
+    }
+
+    /// A click landing on nothing has to fall through to the world, or panning
+    /// would stop working wherever a control used to be.
+    #[test]
+    fn a_click_on_empty_space_hits_nothing() {
+        let timeline = Timeline::for_screen(1280.0, 800.0);
+        let surfaces = names(&["nauvis"]);
+        let state = state(&surfaces, 0, false);
+        let chrome = Chrome::layout_with(&measured(9.0), 1280.0, &timeline, &state);
+
+        assert_eq!(chrome.hit(Vec2::new(640.0, 400.0)), None);
+    }
 
     #[test]
     fn thousands_separators_only_appear_above_a_thousand() {

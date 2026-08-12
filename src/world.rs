@@ -20,7 +20,7 @@ use crate::names::{NameId, NameTable};
 /// limit.
 type PosKey = (i32, i32);
 
-fn pos_key(x: f32, y: f32) -> PosKey {
+pub fn pos_key(x: f32, y: f32) -> PosKey {
     (((x as f64) * 10.0).round() as i32, ((y as f64) * 10.0).round() as i32)
 }
 

@@ -771,10 +771,10 @@ mod idle_study {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::set_mtime_rank;
     use crate::wire::ByteWriter;
     use std::collections::HashMap;
     use std::fs;
-    use std::time::SystemTime;
 
     /// The session id every test capture uses, as both the raw value and the
     /// hex name its session folder carries.
@@ -866,14 +866,6 @@ mod tests {
         fn write(self, dir: &Path, name: &str) {
             fs::write(dir.join(name), self.w.into_vec()).unwrap();
         }
-    }
-
-    /// Stamps a segment's mtime, which is how `event::log_segments` recovers
-    /// creation order. Set explicitly wherever a test depends on it, since
-    /// two files written back to back may not have distinguishable mtimes.
-    fn set_mtime_rank(dir: &Path, name: &str, rank: u64) {
-        let when = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + rank);
-        std::fs::OpenOptions::new().write(true).open(dir.join(name)).unwrap().set_modified(when).unwrap();
     }
 
     #[test]

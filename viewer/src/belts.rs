@@ -128,12 +128,6 @@ fn anticlockwise(direction: u8) -> u8 {
     (direction + 12) % 16
 }
 
-/// The tile a 1x1 entity occupies. Factorio centres a one tile entity at
-/// `x.5`, so flooring lands on the tile itself rather than on a boundary.
-fn tile_of(entity: &RenderEntity) -> (i32, i32) {
-    (entity.x.floor() as i32, entity.y.floor() as i32)
-}
-
 /// The two tiles a splitter covers, from its facing rather than its reported
 /// footprint: a splitter is always two across its facing and one deep, which
 /// needs no field to confirm. Reading width and height instead depends on
@@ -179,7 +173,7 @@ pub fn infer_shapes(entities: &mut [RenderEntity], kinds: &[Option<Carrier>]) {
     for (entity, kind) in entities.iter().zip(kinds) {
         match kind {
             Some(Carrier::Belt) => {
-                belts.insert(tile_of(entity), entity.d);
+                belts.insert(entity.tile(), entity.d);
             }
             // A splitter is two tiles across and one deep, so every tile it
             // covers sits on its output edge and feeds the tile beyond.
@@ -192,7 +186,7 @@ pub fn infer_shapes(entities: &mut [RenderEntity], kinds: &[Option<Carrier>]) {
             // ground. The entrance swallows items, so it feeds nothing and a
             // belt beside it must not bend towards it.
             Some(Carrier::Underground) if UndergroundEnd::from_byte(entity.shape) == UndergroundEnd::Exit => {
-                belts.insert(tile_of(entity), entity.d);
+                belts.insert(entity.tile(), entity.d);
             }
             _ => {}
         }
@@ -215,7 +209,7 @@ pub fn infer_shapes(entities: &mut [RenderEntity], kinds: &[Option<Carrier>]) {
         if step(d) == (0, 0) {
             continue;
         }
-        let tile = tile_of(entity);
+        let tile = entity.tile();
 
         // Behind is opposite the facing, and a belt there feeds this one only
         // if it faces the same way.
@@ -292,7 +286,7 @@ pub fn infer_underground_ends(entities: &mut [RenderEntity], kinds: &[Option<(u1
         if step(d) == (0, 0) {
             continue;
         }
-        let (x, y) = tile_of(&entities[index]);
+        let (x, y) = entities[index].tile();
         // A crossing running north/south stays on one column, east/west on one
         // row, so the other coordinate identifies the line.
         let across = if step(d).0 == 0 { x } else { y };
@@ -304,7 +298,7 @@ pub fn infer_underground_ends(entities: &mut [RenderEntity], kinds: &[Option<(u1
         // Position along the flow, so sorting ascending puts them in the order
         // items reach them whichever way the crossing points.
         let travelled = |entities: &[RenderEntity], i: usize| {
-            let (x, y) = tile_of(&entities[i]);
+            let (x, y) = entities[i].tile();
             x * dx + y * dy
         };
         along.sort_by_key(|&i| travelled(entities, i));

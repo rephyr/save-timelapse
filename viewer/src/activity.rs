@@ -21,7 +21,8 @@ use crate::render_frame::FrameSequence;
 /// Packed into one integer so a frame's positions sort as plain numbers. The
 /// packing only has to be injective; only equality and order are used.
 fn pos_key(x: f32, y: f32) -> u64 {
-    pack(((x as f64) * 10.0).round() as i32, ((y as f64) * 10.0).round() as i32)
+    let (x, y) = save_timelapse::world::pos_key(x, y);
+    pack(x, y)
 }
 
 /// World tiles per heatmap cell. Coarser than `render_frame::LOD_CELL_TILES`,
