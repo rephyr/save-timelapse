@@ -1,4 +1,10 @@
 # Requirements
+ - Use as little disk space as possible
+ - Render large bases quickly
+ - Easy to install, with zero required dependencies
+ - Minimal performance impact in game >>> no stutters
+ - Mod compatable, because who wants to play vanilla anyway
+ - Do not break the recordings I already have
 
 ## Where did they come from?
 
@@ -6,7 +12,7 @@ I came across timelapse mods while browsing the in-game Factorio mod portal and
 became particularly interested in the Factory Timelapse mod. I tried it out and
 could not get it to produce anything.
 
-It was not one bug. Driving Factorio headlessly to make a mod export something
+I went to investigate and it was not one bug. Driving Factorio headlessly to make a mod export something
 turns out to have several ways to fail quietly, and this hit most of them at
 once:
 
