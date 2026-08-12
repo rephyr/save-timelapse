@@ -131,8 +131,9 @@ pub struct Surface {
     /// allocate per entity.
     ///
     /// Which of the two is here rather than in `by_pos` is decided by
-    /// `insert`'s `sinks`, never by arrival order: a removal carries no name,
-    /// so it can only resolve to whatever the position has on top.
+    /// `insert`'s `sinks`, never by arrival order: a removal usually carries no
+    /// name, so it resolves to whatever the position has on top. One that does
+    /// name a deposit reaches this layer through `remove_named_at`.
     under: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
     /// Placed floor: seeded from the baseline, then kept current by
@@ -311,6 +312,23 @@ impl Surface {
         }
     }
 
+    /// The entity of this name at this position, whichever layer it sits in.
+    /// A removal that says what it is for is the only way to reach the buried
+    /// one, since by position alone the structure is what answers. No match is
+    /// a no-op rather than a fallback: removing something the mod did not name
+    /// would be exactly the bug this closes.
+    fn remove_named_at(&mut self, x: f32, y: f32, name: NameId) -> bool {
+        let key = pos_key(x, y);
+        let layers = [self.by_pos.get(&key).copied(), self.under.get(&key).copied()];
+        for slot in layers.into_iter().flatten() {
+            if self.slots[slot].is_some_and(|e| e.name == name) {
+                self.remove_slot(slot);
+                return true;
+            }
+        }
+        false
+    }
+
     fn remove_at(&mut self, x: f32, y: f32) -> bool {
         match self.by_pos.get(&pos_key(x, y)).copied() {
             Some(slot) => {
@@ -459,14 +477,24 @@ impl World {
             // Id first: unique game-wide, so this searches every surface, and
             // O(1) for anything built after capture began. Position is the
             // only thing that can resolve a baseline entity, which has no id.
-            Event::RemoveEntity { id, pos } => {
+            Event::RemoveEntity { id, pos, name } => {
                 if let Some(id) = id {
                     if self.surfaces.values_mut().any(|s| s.remove_by_id(*id)) {
                         return true;
                     }
                 }
                 let (x, y) = *pos;
-                self.target(surface).is_some_and(|s| s.remove_at(x, y))
+                let Some(named) = name.as_deref() else {
+                    return self.target(surface).is_some_and(|s| s.remove_at(x, y));
+                };
+                // Named only when the mod could see two things at one position
+                // and knew which was mined, so a name this capture never
+                // mentioned means that thing is not here. Falling back to
+                // whatever is on top would be the bug this record closes.
+                let Some(named) = self.names.get(named) else {
+                    return false;
+                };
+                self.target(surface).is_some_and(|s| s.remove_named_at(x, y, named))
             }
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
@@ -567,11 +595,11 @@ mod tests {
     /// helper still needs one, even for the id lookup fast path that never
     /// reads it.
     fn remove_by_id(id: u64, x: f32, y: f32) -> Event {
-        Event::RemoveEntity { id: Some(id), pos: (x, y) }
+        Event::RemoveEntity { id: Some(id), pos: (x, y), name: None }
     }
 
     fn remove_at(x: f32, y: f32) -> Event {
-        Event::RemoveEntity { id: None, pos: (x, y) }
+        Event::RemoveEntity { id: None, pos: (x, y), name: None }
     }
 
     /// Regression: keying positions by half-tile merged these two real
@@ -688,7 +716,7 @@ mod tests {
         // A real unit_number Factorio assigned long before capture started,
         // so replay's by_id map was never told about it.
         let unrecognized_id = 999_999;
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5), name: None }));
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
@@ -734,7 +762,7 @@ mod tests {
 
         // Factorio reports the inserter's real unit_number, which replay has
         // never seen, so this falls through to the position.
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(77), pos: (1.5, 2.5) }));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(77), pos: (1.5, 2.5), name: None }));
 
         let frame = world.to_frame("nauvis", 200);
         let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
@@ -797,6 +825,44 @@ mod tests {
         let uncovered = world.to_frame("nauvis", 300);
         let names: Vec<&str> = uncovered.entities.iter().map(|e| &*e.n).collect();
         assert_eq!(names, vec!["iron-ore"], "and it is back once nothing stands on it");
+    }
+
+    /// Hand-mining the ore out from under a machine. By position alone the
+    /// removal resolves to the machine, which is the last case the covering
+    /// rule could not get right; the mod names the deposit so replay can reach
+    /// the buried one.
+    #[test]
+    fn a_removal_that_names_a_deposit_takes_it_from_under_what_stands_on_it() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("electric-mining-drill", 1.5, 2.5, Some(3)));
+
+        let mined_ore = Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("iron-ore".to_string()) };
+        assert!(world.apply(Some("nauvis"), &mined_ore));
+
+        assert_eq!(world.entity_count(), 1, "the ore goes, the drill stays");
+        let frame = world.to_frame("nauvis", 300);
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["electric-mining-drill"]);
+
+        // And the drill is still reachable by its own id afterwards, the
+        // position having been rebuilt around it.
+        assert!(world.apply(None, &remove_by_id(3, 1.5, 2.5)));
+        assert_eq!(world.entity_count(), 0);
+    }
+
+    /// A name the capture never mentioned, or one that is not at that position,
+    /// must not take something else instead: that is the bug this record
+    /// closes, not a new way to hit it.
+    #[test]
+    fn a_removal_naming_something_absent_takes_nothing() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("electric-mining-drill", 1.5, 2.5, Some(3)));
+
+        let wrong = Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("copper-ore".to_string()) };
+        assert!(!world.apply(Some("nauvis"), &wrong), "no copper here, so nothing goes");
+        assert_eq!(world.entity_count(), 2);
     }
 
     /// Sinking must not hide a deposit that is standing on its own: exposed

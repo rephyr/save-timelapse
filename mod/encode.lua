@@ -474,6 +474,20 @@ function M.event_add_entity(names, surfaces, surface, name, x, y, direction, id,
     .. M.u16le(surface_id)
 end
 
+--- Names the entity a following removal is for, as an extension record so the
+--- frozen core layout is untouched and an older tool steps over it.
+---
+--- Only ever written for a resource. A position holds at most a deposit and
+--- the thing standing on it, and a removal carrying only a position resolves
+--- to whatever is on top, which is the structure; without this, hand-mining
+--- the ore under a machine took the machine instead. Nothing else can be the
+--- buried one, so nothing else needs saying.
+function M.event_remove_name(names, name)
+  local name_id, define_name = M.dictionary_id(names, name, 0)
+  local payload = M.varint(name_id)
+  return define_name .. M.u8(128) .. M.varint(#payload) .. payload
+end
+
 --- Position is sent even when `id` is available: a baseline entity has no
 --- recorded id, so `id` alone would make its removal an unresolvable no-op.
 function M.event_remove_entity(surfaces, surface, x, y, id)

@@ -175,6 +175,38 @@ do
   check("event_add_entity: a missing id encodes as the 0 sentinel", id_field, encode.u64le(0))
 end
 
+-- Names what the next removal is for, as an extension record so a tool older
+-- than the field steps over it by its own length. Written for a deposit only:
+-- it is the one thing that can sit under something else, and a removal
+-- carrying just a position resolves to whatever stands on top instead.
+do
+  local names = encode.new_dictionary()
+  local record = encode.event_remove_name(names, "iron-ore")
+  local payload = encode.varint(0)
+  local expected = bytes(0) .. encode.str("iron-ore") -- DefineName, first use
+    .. bytes(128) .. encode.varint(#payload) .. payload
+  check("event_remove_name: defines the name, then tag 128 with its own length", record, expected)
+
+  -- Second use shares the dictionary entry, so only the record itself repeats.
+  local again = encode.event_remove_name(names, "iron-ore")
+  check("event_remove_name: a known name costs only the record", again,
+    bytes(128) .. encode.varint(#payload) .. payload)
+end
+
+do
+  -- The length is what an older reader skips by, so it must count the payload
+  -- and nothing else.
+  local names = encode.new_dictionary()
+  for i = 1, 200 do
+    encode.dictionary_id(names, "filler-" .. i, 0)
+  end
+  local record = encode.event_remove_name(names, "iron-ore")
+  local body = record:sub(#(bytes(0) .. encode.str("iron-ore")) + 1)
+  local declared = body:byte(2)
+  check("event_remove_name: a two-byte name id declares length 2", declared, 2)
+  check("event_remove_name: and the record is exactly that long", #body, 2 + declared)
+end
+
 -- Position is sent on removal even when id is available: an entity that
 -- existed when the baseline was taken carries a real unit_number replay never
 -- learned, a snapshot recording no ids, so id alone made every such removal an

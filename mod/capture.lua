@@ -345,7 +345,10 @@ local function encode_capture_event(op, kind, name, x, y, direction, id, w, h, s
     if op == "+" then
       return encode.event_add_entity(capture_names, capture_surfaces, surface, name, x, y, direction, id, w, h)
     end
-    return encode.event_remove_entity(capture_surfaces, surface, x, y, id)
+    -- `name` reaches here only for a resource, whose removal a position alone
+    -- would resolve to whatever stands on it instead.
+    local names_it = name and encode.event_remove_name(capture_names, name) or ""
+    return names_it .. encode.event_remove_entity(capture_surfaces, surface, x, y, id)
   end
   if op == "+" then
     return encode.event_add_tile(capture_names, capture_surfaces, surface, name, x, y)
@@ -399,7 +402,12 @@ local function log_entity(op, entity)
   local pos = entity.position
 
   if op ~= "+" then
-    log_event(op, "e", nil, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
+    -- Named only when it is a deposit, which is the one thing that can be
+    -- buried under something else and so the one case a position alone cannot
+    -- resolve (see `encode.event_remove_name`). The type was read above
+    -- already, so every other removal still reads exactly what it writes.
+    local buried = entity.type == "resource" and entity.name or nil
+    log_event(op, "e", buried, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
     return
   end
 

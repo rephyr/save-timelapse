@@ -208,7 +208,7 @@ fn run_one(seed: u64, steps: usize) {
             (Some(here), _) => {
                 let reported = here.id.or(Some(900_000 + step as u64));
                 reference.remove(pos, here.id);
-                Event::RemoveEntity { id: reported, pos: (x, y) }
+                Event::RemoveEntity { id: reported, pos: (x, y), name: None }
             }
             // Nothing there: build something.
             (None, _) => {

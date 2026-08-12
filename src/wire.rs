@@ -44,6 +44,13 @@ impl<'a> ByteReader<'a> {
         self.take(n).map(|_| ())
     }
 
+    /// The next `n` bytes, for reading a recognised extension out of its own
+    /// declared length rather than off the stream: a payload that grows in a
+    /// later version is then still stepped over exactly.
+    pub fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        self.take(n)
+    }
+
     pub fn magic(&mut self, expected: &[u8; 4]) -> Option<()> {
         let got = self.take(4)?;
         (got == expected).then_some(())

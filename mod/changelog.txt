@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.7.1
+Date: 2026-08-12
+  Bugfixes:
+    - Mining ore out from under a machine takes the ore, not the machine. A removal only said where it happened, and where a deposit and a building share a tile that always meant the building, so hand-mining the ore under one made the building vanish instead
+
+---------------------------------------------------------------------------------------------------
 Version: 0.7.0
 Date: 2026-08-12
   Features:

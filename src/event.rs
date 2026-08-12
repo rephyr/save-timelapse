@@ -18,6 +18,8 @@
 //!   tag 5  AddTile        u16 name_id, i32 x, i32 y, u16 surface_id
 //!   tag 6  RemoveTile     i32 x, i32 y, u16 surface_id
 //!   tag 7  ResetDictionaries (no payload, version 2 and later)
+//!   tag 128 RemoveName    varint len, then varint name_id: names what the
+//!                         next RemoveEntity is for (version 3 and later)
 //!   tag >=128 Extension    varint len, then that many bytes
 //! ```
 //!
@@ -55,6 +57,11 @@ const MIN_SUPPORTED_VERSION: u8 = 1;
 /// Tags from here up carry their own length and may be skipped. Core record
 /// tags stay below it so the two can never collide as the format grows.
 const TAG_EXTENSION_MIN: u8 = 128;
+/// Names the entity the next `RemoveEntity` is for. An extension rather than a
+/// field on that record, the core layout being frozen at version 3, so a tool
+/// older than this steps over it and resolves the removal the way it always
+/// did. See `encode.event_remove_name`.
+const TAG_REMOVE_NAME: u8 = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -73,6 +80,10 @@ pub enum Event {
     RemoveEntity {
         id: Option<u64>,
         pos: (f32, f32),
+        /// Which of the things sharing this position was mined, when the mod
+        /// said. Only ever set for a resource, the one thing that can be
+        /// buried, so `None` means "whatever is on top" as it always did.
+        name: Option<String>,
     },
     AddTile {
         name: String,
@@ -101,6 +112,11 @@ pub struct EventStream {
     names: Vec<String>,
     surfaces: Vec<String>,
     current_tick: Option<u64>,
+    /// Set by a `TAG_REMOVE_NAME` record and consumed by the removal that
+    /// follows it. A `DefineSurface` may sit between the two, the writer
+    /// emitting one with the removal itself, so only an add or a dictionary
+    /// reset clears it.
+    pending_remove_name: Option<String>,
     unknown_extensions: usize,
 }
 
@@ -141,8 +157,10 @@ impl Iterator for EventStream {
                 7 => {
                     self.names.clear();
                     self.surfaces.clear();
+                    self.pending_remove_name = None;
                 }
                 3 => {
+                    self.pending_remove_name = None;
                     let name_id = r.u16()? as usize;
                     let x = r.i32()?;
                     let y = r.i32()?;
@@ -182,7 +200,11 @@ impl Iterator for EventStream {
                         (Some(tick), Some(surface)) => Some(LoggedEvent {
                             tick,
                             surface: surface.clone(),
-                            event: Event::RemoveEntity { id: (id != 0).then_some(id), pos: (x as f32 / 10.0, y as f32 / 10.0) },
+                            event: Event::RemoveEntity {
+                                id: (id != 0).then_some(id),
+                                pos: (x as f32 / 10.0, y as f32 / 10.0),
+                                name: self.pending_remove_name.take(),
+                            },
                         }),
                         _ => None,
                     };
@@ -231,6 +253,17 @@ impl Iterator for EventStream {
                 // so it can be stepped over. A length past the end of the file
                 // falls out as `None` from `skip`, the same treatment every
                 // record gets when the game was killed mid write.
+                // Names what the next removal is for. Read out of its own
+                // length rather than off the stream, so a payload that grows
+                // later is still stepped over exactly.
+                TAG_REMOVE_NAME => {
+                    let len = r.varint()? as usize;
+                    let payload = r.bytes(len)?;
+                    self.pending_remove_name =
+                        ByteReader::new(payload).varint().and_then(|id| self.names.get(id as usize)).cloned();
+                    self.pos += r.consumed();
+                    continue;
+                }
                 t if t >= TAG_EXTENSION_MIN => {
                     let len = r.varint()? as usize;
                     r.skip(len)?;
@@ -272,7 +305,15 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
         None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display()))),
     }
 
-    Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None, unknown_extensions: 0 })
+    Ok(EventStream {
+        bytes,
+        pos: 5,
+        names: Vec::new(),
+        surfaces: Vec::new(),
+        current_tick: None,
+        pending_remove_name: None,
+        unknown_extensions: 0,
+    })
 }
 
 /// One segment file, plus the half-open tick range replay should take from it.
@@ -454,7 +495,7 @@ mod tests {
         let logged = stream_log(&path).unwrap().next().unwrap();
 
         assert_eq!(logged.surface, "vulcanus");
-        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: (-3.5, 4.5) });
+        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: (-3.5, 4.5), name: None });
     }
 
     #[test]
@@ -564,7 +605,7 @@ mod tests {
             w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
                                                                           // Something a later mod version writes and this build has never
                                                                           // heard of, sitting between two records it does understand.
-            w.u8(TAG_EXTENSION_MIN).varint(4).u32(0xDEADBEEF);
+            w.u8(TAG_EXTENSION_MIN + 40).varint(4).u32(0xDEADBEEF);
             w.u8(3).u16(0).i32(15).i32(5).u8(0).u8(1).u8(1).u64(2).u16(0); // AddEntity
         });
 
@@ -576,6 +617,57 @@ mod tests {
         assert_eq!(events.len(), 2, "the record after the extension must still arrive");
         assert_eq!(events[1].event, Event::AddEntity { name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2) });
         assert_eq!(stream.unknown_extensions(), 1);
+    }
+
+    /// A removal that says which of two things at one position was mined. The
+    /// annotation is its own record, so a tool older than it steps over it and
+    /// resolves the removal the way it always did.
+    #[test]
+    fn a_removal_can_name_what_it_is_for() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+            w.u8(1).string("nauvis"); // DefineSurface
+            w.u8(0).string("iron-ore"); // DefineName
+            w.u8(TAG_REMOVE_NAME).varint(1).varint(0); // RemoveName: iron-ore
+            w.u8(4).i32(15).i32(25).u64(0).u16(0); // RemoveEntity
+            w.u8(4).i32(35).i32(45).u64(7).u16(0); // RemoveEntity, unannotated
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let mut stream = stream_log(&path).unwrap();
+        let events: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("iron-ore".to_string()) });
+        assert_eq!(
+            events[1].event,
+            Event::RemoveEntity { id: Some(7), pos: (3.5, 4.5), name: None },
+            "the annotation applies to one removal only"
+        );
+        assert_eq!(stream.unknown_extensions(), 0, "a record this build understands is not an unknown one");
+    }
+
+    /// A name written but never used, because the game was killed between the
+    /// two records or an add landed in between, must not attach itself to a
+    /// later removal.
+    #[test]
+    fn a_stale_removal_name_does_not_carry_over() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+            w.u8(1).string("nauvis"); // DefineSurface
+            w.u8(0).string("iron-ore"); // DefineName
+            w.u8(TAG_REMOVE_NAME).varint(1).varint(0); // RemoveName, then no removal
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
+            w.u8(4).i32(35).i32(45).u64(7).u16(0); // RemoveEntity
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event, Event::RemoveEntity { id: Some(7), pos: (3.5, 4.5), name: None });
     }
 
     /// A segment is append only and can be cut off mid record by the game

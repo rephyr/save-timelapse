@@ -644,6 +644,7 @@ magic to whatever the last flush wrote.
       tag 5     AddTile           u16 name_id, i32 x, i32 y, u16 surface_id
       tag 6     RemoveTile        i32 x, i32 y, u16 surface_id
       tag 7     ResetDictionaries (no payload, version 2 and later)
+      tag 128   RemoveName        varint len, then varint name_id
       tag >=128 Extension         varint len, then that many bytes
 
 `DefineName`/`DefineSurface` work like the frame format's dictionaries, as two
@@ -664,6 +665,20 @@ unrecognised tag used to fall through to `next` returning `None`, which an
 iterator reports as end of stream, so a segment from a newer mod stopped the
 replay partway through silently. `EventStream::unknown_extensions` counts what
 was stepped over and `replay::run` sums it across segments.
+
+**A removal can name what it is for.** A position holds at most a deposit and
+the thing standing on it, and a removal carrying only a position resolves to
+whatever is on top, which is the structure. Hand-mining the ore out from under
+a machine therefore took the machine. `RemoveName` (tag 128) names the entity
+the next `RemoveEntity` is for, written immediately before it.
+
+An extension record rather than a field on `RemoveEntity`, the core layout
+being frozen at version 3, so a tool older than the field skips it by its own
+length and resolves the removal exactly as it always did. The mod writes it for
+a resource only: nothing else can be the buried one, and `log_entity` already
+reads the entity's type, so every other removal still reads only what it
+writes. A name the capture never mentioned is a no-op rather than a fallback,
+falling back to the top being the bug this closes.
 
 `id` on `AddEntity`/`RemoveEntity` uses `0` for "no id", Factorio's
 `unit_number` starting at 1. **`RemoveEntity` always carries position, even

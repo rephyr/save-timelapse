@@ -1,6 +1,6 @@
 [package]
 name = "viewer"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "Interactive pan/zoom/scrub viewer for save-timelapse frame sequences, with camera auto-follow"
 
