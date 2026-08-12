@@ -38,6 +38,14 @@ pub struct SpanSet<T> {
 }
 
 impl<T: Copy> SpanSet<T> {
+    /// A set built directly rather than frame by frame, for the aggregated
+    /// layers, which are derived from the item spans once at the end instead
+    /// of being maintained alongside them.
+    pub fn from_spans(mut spans: Vec<Span<T>>, frame_count: usize) -> SpanSet<T> {
+        spans.sort_by_key(|span| (span.type_id, span.first));
+        SpanSet { spans, frame_count }
+    }
+
     pub fn frame_count(&self) -> usize {
         self.frame_count
     }
@@ -103,12 +111,22 @@ pub struct SpanBuilder<T> {
     /// Reused across frames so a frame costs no allocation of its own.
     current: Vec<(u64, TypeId, T)>,
     next_open: Vec<(u64, u32)>,
+    /// A delta's removals, sorted so they can be merged against `open` in one
+    /// pass. Reused for the same reason as `current`.
+    gone: Vec<u64>,
     frames: u32,
 }
 
 impl<T: Copy> Default for SpanBuilder<T> {
     fn default() -> Self {
-        SpanBuilder { spans: Vec::new(), open: Vec::new(), current: Vec::new(), next_open: Vec::new(), frames: 0 }
+        SpanBuilder {
+            spans: Vec::new(),
+            open: Vec::new(),
+            current: Vec::new(),
+            next_open: Vec::new(),
+            gone: Vec::new(),
+            frames: 0,
+        }
     }
 }
 
@@ -140,9 +158,9 @@ impl<T: Copy> SpanBuilder<T> {
         for &(key, type_id, item) in &self.current {
             // Both sides are sorted by key, so this only moves forward:
             // anything stepped over was standing last frame and is absent now,
-            // which ends its span. Nothing needs doing, `last` being exclusive
-            // and already set to the frame after it was last seen.
+            // which is where its span ends.
             while open_at < self.open.len() && self.open[open_at].0 < key {
+                self.spans[self.open[open_at].1 as usize].last = frame;
                 open_at += 1;
             }
 
@@ -152,14 +170,21 @@ impl<T: Copy> SpanBuilder<T> {
                 .filter(|&&(open_key, index)| open_key == key && self.spans[index as usize].type_id == type_id);
 
             match continues {
-                Some(&(_, index)) => {
-                    self.spans[index as usize].last = frame + 1;
-                    self.next_open.push((key, index));
-                }
+                // Nothing to write: an open span's `last` is not read until it
+                // closes, and closing is where `frame` gets written into it.
+                // `last` is exclusive, so it is exactly the frame that no
+                // longer contained the item.
+                Some(&(_, index)) => self.next_open.push((key, index)),
                 None => {
                     // Either brand new, or the same tile now holding a
-                    // different type, which is a different thing: leave the
-                    // old span closed where it ended and open one here.
+                    // different type, which is a different thing: end the old
+                    // span here and open one alongside it.
+                    if let Some(&(open_key, index)) = self.open.get(open_at) {
+                        if open_key == key {
+                            self.spans[index as usize].last = frame;
+                            open_at += 1;
+                        }
+                    }
                     let index = self.spans.len() as u32;
                     self.spans.push(Span { item, type_id, first: frame, last: frame + 1 });
                     self.next_open.push((key, index));
@@ -167,8 +192,101 @@ impl<T: Copy> SpanBuilder<T> {
             }
         }
 
+        // Anything past the last key of this frame was standing and is gone.
+        while open_at < self.open.len() {
+            self.spans[self.open[open_at].1 as usize].last = frame;
+            open_at += 1;
+        }
+
         // `current` was sorted, so `next_open` came out sorted too and is
         // ready to be merged against directly next frame.
+        std::mem::swap(&mut self.open, &mut self.next_open);
+        self.frames += 1;
+    }
+
+    /// Folds in one frame given only what changed, which is what a delta frame
+    /// carries and what this structure has always been shaped like.
+    ///
+    /// Costs one pass over the change rather than over everything standing.
+    /// That is the whole point: on a real megabase a frame changed by about
+    /// 200 items out of 4.2 million, and rediscovering that by sorting and
+    /// merging the full set every frame was most of the load time.
+    ///
+    /// `removed` keys that are not standing are ignored, matching how replay
+    /// treats a removal for something it never saw.
+    ///
+    /// Both sides are sorted and merged in one pass rather than binary
+    /// searched and spliced item by item. `Vec::remove` and `Vec::insert` move
+    /// everything past the position they touch, so this used to cost
+    /// `standing * changed`. That is invisible at the 200 items a frame an
+    /// ordinary base changes, and it does not finish at all once a single
+    /// frame changes a large share of a large factory: measured, a million
+    /// standing with half of them removed never completed, where the merge
+    /// takes a quarter of a second.
+    ///
+    /// Found by deleting ten million entities in one tick on a gigabase. It
+    /// looks exactly like a hang from outside, there being nothing to report
+    /// progress against inside one `Vec::remove`.
+    pub fn push_delta(&mut self, added: impl IntoIterator<Item = (u64, TypeId, T)>, removed: impl IntoIterator<Item = u64>) {
+        let frame = self.frames;
+
+        self.gone.clear();
+        self.gone.extend(removed);
+        self.gone.sort_unstable();
+
+        // Removals first, so an add on a key this frame also vacated opens a
+        // fresh span rather than replacing one that is already closed.
+        self.next_open.clear();
+        let mut gone_at = 0usize;
+        for &(key, index) in &self.open {
+            // Both sides sorted, so this only moves forward. A removal for
+            // something not standing is stepped over and ignored.
+            while gone_at < self.gone.len() && self.gone[gone_at] < key {
+                gone_at += 1;
+            }
+            match self.gone.get(gone_at) == Some(&key) {
+                true => self.spans[index as usize].last = frame,
+                false => self.next_open.push((key, index)),
+            }
+        }
+        std::mem::swap(&mut self.open, &mut self.next_open);
+
+        self.current.clear();
+        self.current.extend(added);
+        self.current.sort_unstable_by_key(|&(key, _, _)| key);
+        // Same guard as `push_frame`: two items on one key would leave `open`
+        // holding a duplicate, which every merge after it assumes cannot
+        // happen.
+        self.current.dedup_by_key(|&mut (key, _, _)| key);
+
+        self.next_open.clear();
+        let mut open_at = 0usize;
+        for &(key, type_id, item) in &self.current {
+            // Carried across untouched: a delta says nothing about what it
+            // does not mention.
+            while open_at < self.open.len() && self.open[open_at].0 < key {
+                self.next_open.push(self.open[open_at]);
+                open_at += 1;
+            }
+            // Something already here: a tile repaved, or an entity replaced.
+            // The old one ends where the new one begins.
+            if let Some(&(open_key, index)) = self.open.get(open_at) {
+                if open_key == key {
+                    self.spans[index as usize].last = frame;
+                    open_at += 1;
+                }
+            }
+            let index = self.spans.len() as u32;
+            self.spans.push(Span { item, type_id, first: frame, last: frame + 1 });
+            self.next_open.push((key, index));
+        }
+        while open_at < self.open.len() {
+            self.next_open.push(self.open[open_at]);
+            open_at += 1;
+        }
+
+        // Both inputs were sorted, so `next_open` came out sorted and is ready
+        // to merge against directly next frame.
         std::mem::swap(&mut self.open, &mut self.next_open);
         self.frames += 1;
     }
@@ -179,23 +297,20 @@ impl<T: Copy> SpanBuilder<T> {
     /// a multi-surface save is most frames for most surfaces. This puts them
     /// back, so the index-addressed timeline keeps working.
     ///
-    /// One pass over what is standing however large `n` is: nothing changed
-    /// across the gap, so every open span's `last` jumps straight to the far
-    /// side. On a megabase surface idling through a long stretch that is one
-    /// walk over ~900k spans rather than dozens.
+    /// Free however large `n` is: an open span's `last` is not written until
+    /// it closes, so a gap where nothing changed is a number.
     pub fn push_repeats(&mut self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let last = self.frames + n as u32;
-        for &(_, index) in &self.open {
-            self.spans[index as usize].last = last;
-        }
-        self.frames = last;
+        self.frames += n as u32;
     }
 
     /// Sorts by type and hands back the finished set.
     pub fn finish(mut self) -> SpanSet<T> {
+        // Still standing when the capture ended, so their `last` was never
+        // written. Exclusive, so it is the frame count.
+        let frames = self.frames;
+        for &(_, index) in &self.open {
+            self.spans[index as usize].last = frames;
+        }
         self.spans.sort_by_key(|span| (span.type_id, span.first));
         SpanSet { spans: self.spans, frame_count: self.frames as usize }
     }
@@ -204,6 +319,118 @@ impl<T: Copy> SpanBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame that changes a large fraction of what is standing, which is
+    /// what clearing a factory looks like.
+    ///
+    /// Deliberately large, and a guard on cost rather than on the answer. The
+    /// splice-per-item version this replaced was never wrong, it simply did
+    /// not return: at this size it was still running when it was given up on,
+    /// where the merge takes a quarter of a second. Reintroducing that shape
+    /// makes the suite hang rather than fail, which is the only signal a
+    /// correct-but-unfinishable function can give.
+    #[test]
+    fn a_frame_that_clears_most_of_the_factory_still_folds_in() {
+        const STANDING: u64 = 1_000_000;
+
+        let mut builder = SpanBuilder::new();
+        builder.push_frame((0..STANDING).map(|key| (key, 0, key)));
+        // Every even key mined out, and a new thing built well past all of
+        // them so the merge has to carry the survivors across as well as
+        // append beyond the end.
+        builder.push_delta((STANDING..STANDING + 1000).map(|key| (key, 1, key)), (0..STANDING).filter(|key| key % 2 == 0));
+        let set = builder.finish();
+
+        let mut items = Vec::new();
+        let mut runs = Vec::new();
+        set.materialize(1, &mut items, &mut runs);
+        items.sort_unstable();
+
+        let expected: Vec<u64> = (0..STANDING).filter(|key| key % 2 == 1).chain(STANDING..STANDING + 1000).collect();
+        assert_eq!(items, expected, "the survivors and the new arrivals, and nothing else");
+
+        set.materialize(0, &mut items, &mut runs);
+        items.sort_unstable();
+        assert_eq!(items, (0..STANDING).collect::<Vec<_>>(), "the frame before is untouched by any of it");
+    }
+
+    /// The orders a delta's keys can arrive in. Positions left of the origin
+    /// make a span key wrap into the top half of the range, so a delta's
+    /// removals are not sorted the way the merge needs them even though the
+    /// writer sorted them.
+    #[test]
+    fn a_delta_does_not_depend_on_the_order_its_changes_arrive_in() {
+        let mut ascending = SpanBuilder::new();
+        ascending.push_frame((0..8).map(|key| (key, 0, key)));
+        ascending.push_delta([(9u64, 1u16, 9u64), (8, 1, 8)], [4u64, 1, 6]);
+
+        let mut descending = SpanBuilder::new();
+        descending.push_frame((0..8).rev().map(|key| (key, 0, key)));
+        descending.push_delta([(8u64, 1u16, 8u64), (9, 1, 9)], [6u64, 1, 4]);
+
+        assert_eq!(ascending.finish().iter().collect::<Vec<_>>(), descending.finish().iter().collect::<Vec<_>>());
+    }
+
+    /// Deltas and full frames have to be two ways of saying the same thing,
+    /// or a timelapse built from one would differ from the same capture built
+    /// from the other. Checked by building both and comparing every span.
+    #[test]
+    fn a_delta_build_is_identical_to_a_full_build() {
+        // A base that grows, has something removed, has a tile repaved with a
+        // different type, and then sits still.
+        let frames: Vec<Vec<(u64, TypeId)>> = vec![
+            vec![(1, 0), (2, 0), (3, 1)],
+            vec![(1, 0), (2, 0), (3, 1), (4, 1)],
+            vec![(1, 0), (3, 1), (4, 1)],
+            vec![(1, 0), (3, 2), (4, 1)],
+            vec![(1, 0), (3, 2), (4, 1)],
+        ];
+
+        let mut full = SpanBuilder::new();
+        for frame in &frames {
+            full.push_frame(frame.iter().map(|&(key, type_id)| (key, type_id, key)));
+        }
+        let full = full.finish();
+
+        let mut delta = SpanBuilder::new();
+        let mut standing: Vec<(u64, TypeId)> = Vec::new();
+        for frame in &frames {
+            let added: Vec<(u64, TypeId, u64)> =
+                frame.iter().filter(|e| !standing.contains(e)).map(|&(k, t)| (k, t, k)).collect();
+            // A key whose type changed counts as removed and added, which is
+            // what the writer will emit and what replay already means by it.
+            let removed: Vec<u64> = standing
+                .iter()
+                .filter(|(k, t)| !frame.contains(&(*k, *t)))
+                .map(|&(k, _)| k)
+                .filter(|k| !added.iter().any(|a| a.0 == *k))
+                .collect();
+            delta.push_delta(added, removed);
+            standing = frame.clone();
+        }
+        let delta = delta.finish();
+
+        assert_eq!(delta.frame_count(), full.frame_count());
+        let mine: Vec<_> = delta.iter().collect();
+        let theirs: Vec<_> = full.iter().collect();
+        assert_eq!(mine, theirs, "a delta build must produce exactly the spans a full build does");
+    }
+
+    /// The saving is only real if a gap costs nothing. An open span's `last` is
+    /// not written until it closes, so repeats are a number rather than a walk.
+    #[test]
+    fn repeats_do_not_touch_what_is_standing() {
+        let mut builder = SpanBuilder::new();
+        builder.push_frame([(1u64, 0 as TypeId, 1u64), (2, 0, 2)]);
+        builder.push_repeats(1_000_000);
+        let set = builder.finish();
+
+        assert_eq!(set.frame_count(), 1_000_001);
+        for span in set.iter() {
+            assert_eq!(span.first, 0);
+            assert_eq!(span.last, 1_000_001, "still standing at the end runs to the end");
+        }
+    }
 
     /// Builds a set from frames of `(key, type)` pairs, using the key as the
     /// item too so assertions can name what came back.
@@ -411,7 +638,7 @@ mod bench {
         let old_bytes = per_frame_items * entity_bytes;
 
         let start = std::time::Instant::now();
-        let mut sequence = FrameSequence::new(frames).unwrap();
+        let mut sequence = FrameSequence::new(frames, &TypeRegistry::new()).unwrap();
         let build = start.elapsed();
 
         let new_bytes = sequence.span_estimate() * span_bytes;

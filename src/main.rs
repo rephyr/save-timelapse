@@ -14,6 +14,7 @@ use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 use save_timelapse::settings::Settings;
 use save_timelapse::with_thousands;
+use save_timelapse::world;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -313,6 +314,65 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
         }
         println!("\n  Please type a number from 1 to {}.\n", sessions.len());
     }
+}
+
+/// Rewrites a folder of full snapshots as a delta chain, in place: the first
+/// frame stays the whole picture and every one after it becomes only what
+/// changed since the one before. Returns bytes before and after.
+///
+/// Every save reports the entire factory, having no idea another save exists,
+/// so writing them through as exported restates everything standing once per
+/// save. On a megabase that is 30 MB a frame of which almost all is identical
+/// to the frame before, and the live capture path already refuses to pay it.
+///
+/// Ordered by the tick inside each frame rather than by filename, because a
+/// chain has to be built in the order it will be replayed and the viewer
+/// replays in tick order. Filenames cannot carry that: Factorio's autosaves
+/// rotate, so `_autosave1` is as likely to be the newest as the oldest, and
+/// `ordering_key` can only guess from the digits in a name.
+///
+/// Two saves of one moment are dropped to one here rather than at load. The
+/// viewer deduplicates by tick too, but a delta it dropped would take every
+/// frame after it along with it.
+fn write_as_delta_chain(frames: &[PathBuf]) -> io::Result<(u64, u64)> {
+    let size = |path: &PathBuf| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let before: u64 = frames.iter().map(size).sum();
+
+    let mut ordered: Vec<(u64, &PathBuf)> = Vec::new();
+    for path in frames {
+        match frame::read_header(path) {
+            Ok((tick, _)) => ordered.push((tick, path)),
+            // Unreadable here means unreadable to the viewer as well, so it is
+            // removed rather than left to reset the sequence at load.
+            Err(_) => drop(std::fs::remove_file(path)),
+        }
+    }
+    ordered.sort_by_key(|&(tick, _)| tick);
+
+    let mut chain: Vec<&PathBuf> = Vec::new();
+    let mut last_tick: Option<u64> = None;
+    for (tick, path) in ordered {
+        match last_tick == Some(tick) {
+            true => drop(std::fs::remove_file(path)),
+            false => {
+                chain.push(path);
+                last_tick = Some(tick);
+            }
+        }
+    }
+
+    let mut previous: Option<frame::Frame> = None;
+    for path in &chain {
+        let current = frame::read_binary(&std::fs::read(path)?)?;
+        // Read before it is written, so rewriting in place is safe: the folder
+        // shrinks as it goes rather than needing room for both forms at once.
+        if let Some(prev) = &previous {
+            std::fs::write(path, frame::write_binary(&world::delta_between(prev, &current).as_out()))?;
+        }
+        previous = Some(current);
+    }
+
+    Ok((before, chain.iter().copied().map(size).sum()))
 }
 
 /// Saves are usually numbered, so order by that number rather than
@@ -635,6 +695,48 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
         true,
     )?;
 
+    // Only offered when FFmpeg is already installed. The built-in AVI writer is
+    // what keeps the tool dependency free, so MP4 is a bonus for people who
+    // happen to have FFmpeg rather than something the tool asks anyone to go
+    // and install. Asked in terms of what it is for: MJPEG in an AVI is large,
+    // and X will not accept one at all.
+    let mp4 = video
+        && save_timelapse::ffmpeg_available()
+        && ask_yes_no(
+            "
+Make an MP4? It is far smaller and is what sharing sites accept.              Answering no writes an AVI, which needs nothing installed",
+            true,
+        )?;
+    if video && !mp4 && !save_timelapse::ffmpeg_available() {
+        println!(
+            "
+  Writing an AVI. Install FFmpeg and put it on your PATH to get much"
+        );
+        println!("  smaller MP4s that you can post directly.");
+    }
+
+    // Overlays are burned into the pixels, so they are asked before the render
+    // rather than toggled afterwards like the viewer's own.
+    //
+    // The clock defaults on and the marker off, which is not inconsistency:
+    // elapsed time is the context almost every timelapse wants and the one
+    // thing the footage cannot convey by itself, while where the player stood
+    // is a personal touch most videos are better without.
+    let has_players = chosen.path.join("players.jsonl").exists();
+    let overlay_players = video
+        && has_players
+        && ask_yes_no(
+            "
+Show where you were, as a marker following you around the factory?",
+            false,
+        )?;
+    let overlay_clock = video
+        && ask_yes_no(
+            "
+Show the in-game clock, so the video says how long the factory took?",
+            true,
+        )?;
+
     let size = ask_resolution(settings.export_size().unwrap_or(DEFAULT_EXPORT_SIZE))?;
     let fps = if video { ask_fps(settings.export_fps.unwrap_or(DEFAULT_EXPORT_FPS))? } else { DEFAULT_EXPORT_FPS };
 
@@ -648,8 +750,8 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
 
     let root = videos_root();
     std::fs::create_dir_all(&root)?;
-    // No extension here: the viewer appends `.avi` for a video and treats
-    // the path as a folder for an image sequence, so the same argument
+    // No extension here: the viewer appends `.avi` or `.mp4` for a video and
+    // treats the path as a folder for an image sequence, so the same argument
     // serves both.
     let target = root.join(as_folder_name(&chosen.name));
 
@@ -665,6 +767,15 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
         .arg(size.1.to_string());
     if video {
         command.arg("--video").arg("--fps").arg(fps.to_string());
+        if mp4 {
+            command.arg("--mp4");
+        }
+        if overlay_players {
+            command.arg("--overlay-players");
+        }
+        if overlay_clock {
+            command.arg("--overlay-clock");
+        }
     }
     if let Some(name) = &surface {
         command.arg("--surface").arg(name);
@@ -771,7 +882,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 
     let emitted = match &chosen_surface {
         None => {
-            println!("\n  Building your timelapse. On a big factory this takes a while.\n");
+            println!("\n  Building your timelapse.\n");
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
@@ -788,12 +899,22 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
             })?
         }
         Some(name) => {
-            println!("\n  Building your timelapse of {}. On a big factory this takes a while.\n", pretty_place(name));
+            println!("\n  Building your timelapse of {}.\n", pretty_place(name));
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
-                let frame = world.to_frame(name, tick);
+                // The first frame is the picture; every one after it is what
+                // changed. A real megabase changed by about 200 items a frame
+                // out of 4.2 million, so a snapshot spent 8.8 MB restating what
+                // the reader already had.
+                let frame = match written == 0 {
+                    true => {
+                        world.clear_changes(name);
+                        world.to_frame(name, tick)
+                    }
+                    false => world.to_frame_delta(name, tick),
+                };
                 let path = out.join(format!("frame_{written:04}.stfr"));
                 if let Err(e) = std::fs::write(&path, frame::write_binary(&frame.as_out())) {
                     error = Some(e);
@@ -828,6 +949,40 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     if replay_state.unknown_extensions > 0 {
         println!("\n  Part of this recording came from a newer version of the mod than this tool.");
         println!("  Update Save Timelapse and build again to include it.");
+        acted = true;
+    }
+    // Distinct from a skipped segment: the file opened and parsed, and the
+    // records inside it named things the file never defined, so they could
+    // only be thrown away.
+    if replay_state.undefined_references > 0 {
+        println!(
+            "
+  {} recorded changes could not be read and were lost.",
+            with_thousands(replay_state.undefined_references as u64)
+        );
+        println!("  This happens to recordings made before v0.7.1 if the capture was reset");
+        println!("  mid-playthrough. Starting a fresh recording in game fixes it.");
+        acted = true;
+    }
+    // Recovered rather than lost, but the recording was damaged and saying so
+    // is how somebody learns that resetting mid-playthrough has a cost.
+    if replay_state.headerless_segments > 0 {
+        println!(
+            "
+  Part of this recording had lost its header and was recovered."
+        );
+        println!("  This happens if you reset a recording and then load a save from before it.");
+    }
+    // The events exist and were readable; they simply describe a moment the
+    // snapshot is already past, so nothing can be done with them.
+    if replay_state.pre_baseline_events > 20 {
+        println!(
+            "
+  {} recorded changes happened before this recording's snapshot and could not be used.",
+            with_thousands(replay_state.pre_baseline_events as u64)
+        );
+        println!("  That usually means a save from before the last reset was loaded and played.");
+        println!("  Resetting again from where you are now starts a clean recording.");
         acted = true;
     }
     if replay_state.skipped_segments > 0 || replay_state.out_of_order_batches > 0 {
@@ -915,16 +1070,32 @@ fn offer_terrain_for_capture(
     // later save can only ever cover more of the factory.
     saves.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)));
 
+    // Read once per playthrough. A rebuild otherwise launches Factorio again
+    // to be told the same ground, which is now most of what a rebuild costs.
+    let cached = cached_terrain(user_dir, session_id);
     println!();
     let wanted = ask_yes_no(
-        "  Add the grass, water and trees under your factory?\n  \
-         It looks much better, and takes about a minute.",
+        match cached.is_empty() {
+            true => "  Add the grass, water and trees under your factory?\n  It looks much better.",
+            false => {
+                "  Add the grass, water and trees under your factory?\n  Already read for this playthrough, so this is instant."
+            }
+        },
         settings.capture_terrain.unwrap_or(false),
     )?;
     settings.capture_terrain = Some(wanted);
     remember(settings);
     if !wanted {
         return Ok(());
+    }
+
+    if !cached.is_empty() {
+        let copied =
+            cached.iter().filter(|file| file.file_name().is_some_and(|name| std::fs::copy(file, out.join(name)).is_ok())).count();
+        if copied > 0 {
+            println!("  Reused the ground already read for this playthrough.");
+            return Ok(());
+        }
     }
 
     let chosen = ask_terrain_save(&saves)?;
@@ -940,6 +1111,36 @@ fn offer_terrain_for_capture(
     };
     add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
     Ok(())
+}
+
+/// Where a scan's ground is kept for next time: this playthrough's own capture
+/// folder, which survives a timelapse being rebuilt. `None` when the caller
+/// does not know which playthrough it is, in which case there is nothing safe
+/// to key the ground to.
+fn keep_terrain_beside_capture(session_id: Option<u32>) -> Option<PathBuf> {
+    let dir = locate_factorio()?.join("script-output").join("save-timelapse").join(format!("{:08x}", session_id?));
+    dir.is_dir().then_some(dir)
+}
+
+/// Ground already read for this playthrough, newest first.
+///
+/// Kept beside the capture rather than only in the timelapse, which is deleted
+/// and rebuilt every time. Natural ground does not change, so reading it again
+/// means launching Factorio to be told the same thing, which on a megabase is
+/// most of what a rebuild costs.
+///
+/// Empty for a playthrough nobody has said yes to yet.
+fn cached_terrain(user_dir: &Path, session_id: u32) -> Vec<PathBuf> {
+    let dir = user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}"));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("terrain_") && n.ends_with(".stfr")))
+        .collect();
+    found.sort();
+    found
 }
 
 /// Scan one save for natural ground and put it beside the frames.
@@ -977,12 +1178,20 @@ fn add_terrain(
                 0
             }
             _ => {
+                // Kept beside the capture as well as in the timelapse, so a
+                // rebuild reuses it instead of launching Factorio to read the
+                // same unchanging ground again. Best effort: failing to keep a
+                // copy costs a scan next time, not this timelapse.
+                let keep = keep_terrain_beside_capture(expect_session);
                 let mut copied = 0usize;
                 for file in &scan.files {
                     let Some(name) = file.file_name() else { continue };
                     match std::fs::copy(file, out.join(name)) {
                         Ok(_) => copied += 1,
                         Err(e) => eprintln!("warning: could not copy {}: {e}", name.to_string_lossy()),
+                    }
+                    if let Some(dir) = &keep {
+                        let _ = std::fs::copy(file, dir.join(name));
                     }
                 }
                 println!("{copied} surface(s) of ground in {:.1}s", scan.seconds);
@@ -1095,6 +1304,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     let mut done = 0usize;
     let mut milestone_states: Vec<milestone::State> = Vec::new();
+    let mut exported: Vec<PathBuf> = Vec::new();
     for (index, save) in chosen.iter().enumerate() {
         let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
         print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
@@ -1106,6 +1316,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
                 let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
                 std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
+                exported.push(target.clone());
                 // Appended, not overwritten: each save contributes its own
                 // one-shot sample at its own real tick.
                 if let Some(log) = &outcome.players_log {
@@ -1128,6 +1339,21 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     if done == 0 {
         return Err(io::Error::other("none of the selected saves exported successfully"));
+    }
+
+    match write_as_delta_chain(&exported) {
+        Ok((before, after)) if after < before => println!(
+            "  frames reduced from {} MiB to {} MiB, each one keeping only what changed",
+            before / (1024 * 1024),
+            after / (1024 * 1024)
+        ),
+        Ok(_) => {}
+        // A frame is only rewritten once the one before it has been, so a
+        // failure partway leaves a chain followed by full pictures. The viewer
+        // reads a full frame as a fresh statement of everything standing and
+        // closes whatever it does not mention, so what is left is larger than
+        // intended rather than wrong.
+        Err(err) => println!("  could not reduce the frames ({err}); they are still usable, just larger"),
     }
 
     // The last save chosen: ground is scanned once for the whole timelapse,
@@ -1771,6 +1997,129 @@ mod tests {
         assert_eq!(parse_session_index("4", 3), None);
         assert_eq!(parse_session_index("nope", 3), None);
         assert_eq!(parse_session_index("", 3), None);
+    }
+
+    /// One save's worth of factory, as the mod would have exported it.
+    fn snapshot(tick: u64, names: &[&str]) -> frame::Frame {
+        frame::Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: names.len(),
+            entities: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| frame::Entity { n: std::sync::Arc::from(*n), x: i as f32 + 0.5, y: 0.5, d: 0, w: 1, h: 1 })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Everything standing at each frame, accumulated the way the viewer
+    /// accumulates: a full frame states the world, a delta changes it.
+    fn replay_chain(paths: &[std::path::PathBuf]) -> Vec<Vec<String>> {
+        let mut ordered: Vec<frame::Frame> =
+            paths.iter().filter_map(|p| std::fs::read(p).ok()).filter_map(|b| frame::read_binary(&b).ok()).collect();
+        ordered.sort_by_key(|f| f.tick);
+
+        let mut standing: std::collections::HashMap<(i32, i32), String> = std::collections::HashMap::new();
+        let mut out = Vec::new();
+        for frame in &ordered {
+            if !frame.delta {
+                standing.clear();
+            }
+            for pos in &frame.removed_entities {
+                standing.remove(pos);
+            }
+            for e in &frame.entities {
+                standing.insert(save_timelapse::world::pos_key(e.x, e.y), e.n.to_string());
+            }
+            let mut names: Vec<String> = standing.values().cloned().collect();
+            names.sort();
+            out.push(names);
+        }
+        out
+    }
+
+    /// Factorio's autosaves rotate, so `_autosave1` is as likely to be the
+    /// newest as the oldest and the digits in a filename are only a guess at
+    /// order. A chain built in the wrong order is not merely mis-sorted: every
+    /// frame after the mistake describes changes against the wrong world.
+    #[test]
+    fn a_delta_chain_is_built_in_tick_order_not_filename_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Written newest first, which is what a rotated autosave set looks
+        // like once `ordering_key` has sorted it by the digits in the name.
+        let written = [snapshot(300, &["pipe", "belt", "lamp"]), snapshot(100, &["pipe"]), snapshot(200, &["pipe", "belt"])];
+        let paths: Vec<std::path::PathBuf> = written
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&f.as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        write_as_delta_chain(&paths).unwrap();
+
+        let full: Vec<u64> = paths
+            .iter()
+            .map(|p| frame::read_binary(&std::fs::read(p).unwrap()).unwrap())
+            .filter(|f| !f.delta)
+            .map(|f| f.tick)
+            .collect();
+        assert_eq!(full, vec![100], "the earliest tick is the picture, whatever it is called");
+
+        assert_eq!(
+            replay_chain(&paths),
+            vec![
+                vec!["pipe".to_string()],
+                vec!["belt".to_string(), "pipe".to_string()],
+                vec!["belt".to_string(), "lamp".to_string(), "pipe".to_string()],
+            ],
+            "replaying the chain rebuilds each save exactly"
+        );
+    }
+
+    /// A delta the viewer dropped would take every frame after it along with
+    /// it, so a duplicated moment is resolved here instead.
+    #[test]
+    fn two_saves_of_one_moment_leave_one_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = [snapshot(100, &["pipe"]), snapshot(200, &["pipe", "belt"]), snapshot(200, &["pipe", "belt"])];
+        let paths: Vec<std::path::PathBuf> = written
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&f.as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        write_as_delta_chain(&paths).unwrap();
+
+        let left: Vec<&std::path::PathBuf> = paths.iter().filter(|p| p.exists()).collect();
+        assert_eq!(left.len(), 2, "the repeated moment is gone");
+        assert_eq!(replay_chain(&paths).last().unwrap(), &vec!["belt".to_string(), "pipe".to_string()]);
+    }
+
+    /// The whole point: a frame that restates an unchanged factory should cost
+    /// almost nothing.
+    #[test]
+    fn an_unchanged_factory_costs_almost_nothing_per_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<&str> = vec!["pipe"; 2000];
+        let paths: Vec<std::path::PathBuf> = (0..5)
+            .map(|i| {
+                let path = dir.path().join(format!("frame_{i:04}.stfr"));
+                std::fs::write(&path, frame::write_binary(&snapshot(100 * (i + 1), &names).as_out())).unwrap();
+                path
+            })
+            .collect();
+
+        let (before, after) = write_as_delta_chain(&paths).unwrap();
+        assert!(after * 4 < before, "five copies of one factory became one copy and four near-empty frames: {before} to {after}");
     }
 
     #[test]

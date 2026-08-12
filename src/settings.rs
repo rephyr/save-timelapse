@@ -39,6 +39,14 @@ pub struct Settings {
     pub export_height: Option<u32>,
     /// Frames per second last chosen for a video export.
     pub export_fps: Option<u32>,
+    /// Whether the viewer draws player markers. Absent means never chosen, so
+    /// the viewer's own default applies and changing that default still
+    /// reaches anybody who never expressed a preference.
+    ///
+    /// Remembered, unlike which surface to show: where the player was is a
+    /// standing preference about what a timelapse is for, not an answer that
+    /// goes stale as a playthrough reaches new planets.
+    pub show_players: Option<bool>,
 }
 
 /// Where the settings file lives, per platform convention. `None` only when
@@ -140,6 +148,7 @@ mod tests {
             export_width: Some(2560),
             export_height: Some(1440),
             export_fps: Some(24),
+            show_players: Some(false),
         };
         let text = serde_json::to_string(&settings).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), settings);

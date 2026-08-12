@@ -131,8 +131,9 @@ pub struct Surface {
     /// allocate per entity.
     ///
     /// Which of the two is here rather than in `by_pos` is decided by
-    /// `insert`'s `sinks`, never by arrival order: a removal carries no name,
-    /// so it can only resolve to whatever the position has on top.
+    /// `insert`'s `sinks`, never by arrival order: a removal usually carries no
+    /// name, so it resolves to whatever the position has on top. One that does
+    /// name a deposit reaches this layer through `remove_named_at`.
     under: HashMap<PosKey, usize>,
     by_id: HashMap<u64, usize>,
     /// Placed floor: seeded from the baseline, then kept current by
@@ -149,6 +150,21 @@ pub struct Surface {
     /// the frame. A spurious bump costs a duplicate file, which is why `insert`
     /// checks for an unchanged re-add.
     revision: u64,
+    /// Bumped only by the placed-floor layer, so a frame can say its floor is
+    /// unchanged while its entities are not. On a paved megabase the floor is
+    /// 72% of a frame and changes by under 4% across a whole playthrough, so
+    /// writing it again every frame was most of the output.
+    floor_revision: u64,
+    /// Positions whose entity changed since the last frame this surface
+    /// emitted, and the same for placed floor.
+    ///
+    /// Only the keys. What to write is decided when the frame is built, by
+    /// asking what is there now: present means added, absent means removed.
+    /// That collapses build-then-mine, mine-then-rebuild and any number of
+    /// rotations in one interval into the one answer that matters, without
+    /// keeping a copy of the previous frame to diff against.
+    changed_entities: HashSet<PosKey>,
+    changed_tiles: HashSet<PosKey>,
 }
 
 impl Surface {
@@ -162,6 +178,11 @@ impl Surface {
     /// same surface.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Same contract as `revision`, for the placed-floor layer alone.
+    pub fn floor_revision(&self) -> u64 {
+        self.floor_revision
     }
 
     /// Both layers together, which is what a baseline's "tiles" count means to
@@ -202,6 +223,7 @@ impl Surface {
         if self.update_in_place(key, entity) {
             return;
         }
+        self.changed_entities.insert(key);
 
         let occupant = self.by_pos.get(&key).copied();
         let slot = match self.free.pop() {
@@ -254,6 +276,7 @@ impl Surface {
             // An unchanged re-add must not bump `revision`: the baseline smear
             // produces them by design, and a bump costs a whole file.
             if occupant != entity {
+                self.changed_entities.insert(key);
                 if let Some(id) = occupant.id {
                     self.by_id.remove(&id);
                 }
@@ -282,6 +305,7 @@ impl Surface {
     fn remove_slot(&mut self, slot: usize) {
         let Some(entity) = self.slots[slot].take() else { return };
         let key = pos_key(entity.x, entity.y);
+        self.changed_entities.insert(key);
 
         // Uncovering: what this was covering takes the position back.
         if self.by_pos.get(&key) == Some(&slot) {
@@ -309,6 +333,23 @@ impl Surface {
             }
             None => false,
         }
+    }
+
+    /// The entity of this name at this position, whichever layer it sits in.
+    /// A removal that says what it is for is the only way to reach the buried
+    /// one, since by position alone the structure is what answers. No match is
+    /// a no-op rather than a fallback: removing something the mod did not name
+    /// would be exactly the bug this closes.
+    fn remove_named_at(&mut self, x: f32, y: f32, name: NameId) -> bool {
+        let key = pos_key(x, y);
+        let layers = [self.by_pos.get(&key).copied(), self.under.get(&key).copied()];
+        for slot in layers.into_iter().flatten() {
+            if self.slots[slot].is_some_and(|e| e.name == name) {
+                self.remove_slot(slot);
+                return true;
+            }
+        }
+        false
     }
 
     fn remove_at(&mut self, x: f32, y: f32) -> bool {
@@ -422,6 +463,12 @@ impl World {
             let key = (tile.x, tile.y);
             if is_floor(&self.floor, &tile.n) {
                 surface.tiles.insert(key, name);
+                // Marked like any other change, because a catch-up baseline
+                // lands after frames have already been emitted and its floor
+                // would otherwise never appear in one. The first baseline
+                // marks the whole floor and the caller clears it before the
+                // full frame it is about to write, so nothing is paid twice.
+                surface.changed_tiles.insert(key);
             } else {
                 surface.terrain.insert(key, name);
             }
@@ -429,8 +476,10 @@ impl World {
 
         // Once for the whole load and unconditionally: a catch-up baseline is
         // a change however much of it matches, and the entity loop's bumps do
-        // not cover a baseline that is only tiles.
+        // not cover a baseline that is only tiles. The floor counts as changed
+        // too, a baseline being where a surface's floor first arrives.
         surface.revision += 1;
+        surface.floor_revision += 1;
 
         self.tick = self.tick.max(frame.tick);
     }
@@ -459,14 +508,24 @@ impl World {
             // Id first: unique game-wide, so this searches every surface, and
             // O(1) for anything built after capture began. Position is the
             // only thing that can resolve a baseline entity, which has no id.
-            Event::RemoveEntity { id, pos } => {
+            Event::RemoveEntity { id, pos, name } => {
                 if let Some(id) = id {
                     if self.surfaces.values_mut().any(|s| s.remove_by_id(*id)) {
                         return true;
                     }
                 }
                 let (x, y) = *pos;
-                self.target(surface).is_some_and(|s| s.remove_at(x, y))
+                let Some(named) = name.as_deref() else {
+                    return self.target(surface).is_some_and(|s| s.remove_at(x, y));
+                };
+                // Named only when the mod could see two things at one position
+                // and knew which was mined, so a name this capture never
+                // mentioned means that thing is not here. Falling back to
+                // whatever is on top would be the bug this record closes.
+                let Some(named) = self.names.get(named) else {
+                    return false;
+                };
+                self.target(surface).is_some_and(|s| s.remove_named_at(x, y, named))
             }
             Event::AddTile { name, x, y } => {
                 let name = self.names.intern(name);
@@ -475,6 +534,8 @@ impl World {
                         let changed = s.tiles.insert((*x, *y), name) != Some(name);
                         if changed {
                             s.revision += 1;
+                            s.floor_revision += 1;
+                            s.changed_tiles.insert((*x, *y));
                         }
                         changed
                     }
@@ -490,6 +551,8 @@ impl World {
                 let changed = s.tiles.remove(&(*x, *y)).is_some();
                 if changed {
                     s.revision += 1;
+                    s.floor_revision += 1;
+                    s.changed_tiles.insert((*x, *y));
                 }
                 changed
             }),
@@ -501,8 +564,20 @@ impl World {
     /// floor only: terrain is a separate unchanging layer, and this runs once
     /// per emitted frame. Use `terrain_frame` for that layer, once.
     pub fn to_frame(&self, surface_name: &str, tick: u64) -> Frame {
+        self.to_frame_inner(surface_name, tick, true)
+    }
+
+    fn to_frame_inner(&self, surface_name: &str, tick: u64, include_floor: bool) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
+            return Frame {
+                tick,
+                surface: surface_name.to_string(),
+                entities: Vec::new(),
+                count: 0,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+                ..Default::default()
+            };
         };
 
         let names = self.name_table();
@@ -512,9 +587,84 @@ impl World {
             .map(|e| Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
             .collect();
 
-        let tiles = Self::materialize_tiles(&surface.tiles, &names);
+        let tiles = match include_floor {
+            true => Self::materialize_tiles(&surface.tiles, &names),
+            false => Vec::new(),
+        };
 
-        Frame { tick, surface: surface_name.to_string(), count: entities.len(), entities, tiles }
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
+    }
+
+    /// What changed on this surface since it last emitted a frame, as a delta
+    /// frame, clearing the record so the next one starts fresh.
+    ///
+    /// Each changed position is resolved by asking what is there now: present
+    /// means it arrived, absent means it left. That is why only keys are kept.
+    /// Build then mine, mine then rebuild, and any number of rotations in one
+    /// interval all collapse to the single answer the reader needs.
+    ///
+    /// The caller must have emitted a full frame for this surface first. A
+    /// delta against nothing is not a picture of anything.
+    pub fn to_frame_delta(&mut self, surface_name: &str, tick: u64) -> Frame {
+        let names = self.name_table();
+        let Some(surface) = self.surfaces.get_mut(surface_name) else {
+            return Frame { tick, surface: surface_name.to_string(), delta: true, ..Default::default() };
+        };
+
+        let buried: HashSet<usize> = surface.under.values().copied().collect();
+        let (mut entities, mut removed_entities) = (Vec::new(), Vec::new());
+        for key in surface.changed_entities.drain() {
+            match surface.by_pos.get(&key).filter(|slot| !buried.contains(slot)).and_then(|&slot| surface.slots[slot]) {
+                Some(e) => {
+                    entities.push(Entity { n: Arc::clone(&names[e.name as usize]), x: e.x, y: e.y, d: e.d, w: e.w, h: e.h })
+                }
+                None => removed_entities.push(key),
+            }
+        }
+
+        let (mut tiles, mut removed_tiles) = (Vec::new(), Vec::new());
+        for key in surface.changed_tiles.drain() {
+            match surface.tiles.get(&key) {
+                Some(&name) => tiles.push(Tile { n: Arc::clone(&names[name as usize]), x: key.0, y: key.1 }),
+                None => removed_tiles.push(key),
+            }
+        }
+
+        // Sorted so a delta is byte-stable between runs, a `HashSet` draining
+        // in an order that depends on hashing rather than on contents.
+        entities.sort_by_key(|e| pos_key(e.x, e.y));
+        tiles.sort_by_key(|t| (t.x, t.y));
+        removed_entities.sort_unstable();
+        removed_tiles.sort_unstable();
+
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            delta: true,
+            removed_entities,
+            removed_tiles,
+            floor_unchanged: false,
+        }
+    }
+
+    /// Forgets what changed, so the next frame is a delta against this moment.
+    /// Called after emitting a full frame, which already says everything.
+    pub fn clear_changes(&mut self, surface_name: &str) {
+        if let Some(surface) = self.surfaces.get_mut(surface_name) {
+            surface.changed_entities.clear();
+            surface.changed_tiles.clear();
+        }
     }
 
     /// The natural-terrain layer as a `Frame` (`entities` always empty).
@@ -522,12 +672,28 @@ impl World {
     /// called once per surface rather than once per replayed frame.
     pub fn terrain_frame(&self, surface_name: &str, tick: u64) -> Frame {
         let Some(surface) = self.surfaces.get(surface_name) else {
-            return Frame { tick, surface: surface_name.to_string(), entities: Vec::new(), count: 0, tiles: Vec::new() };
+            return Frame {
+                tick,
+                surface: surface_name.to_string(),
+                entities: Vec::new(),
+                count: 0,
+                tiles: Vec::new(),
+                floor_unchanged: false,
+                ..Default::default()
+            };
         };
 
         let names = self.name_table();
         let tiles = Self::materialize_tiles(&surface.terrain, &names);
-        Frame { tick, surface: surface_name.to_string(), count: 0, entities: Vec::new(), tiles }
+        Frame {
+            tick,
+            surface: surface_name.to_string(),
+            count: 0,
+            entities: Vec::new(),
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
     }
 
     /// Resolved once per call rather than per item: a surface has a few dozen
@@ -547,12 +713,152 @@ impl World {
     }
 }
 
+/// What changed between two full snapshots of one surface, as a delta frame.
+///
+/// Live capture derives its deltas from the events it has just applied.
+/// Building from saves has no equivalent: each save is a separate Factorio run
+/// reporting everything standing and nothing at all about how it got there, so
+/// the difference has to be found by comparing the two snapshots.
+///
+/// The result is the same shape `World::to_frame_delta` emits, an add at an
+/// occupied position included, which the viewer reads as a replacement. So a
+/// frame gives away nothing about which path built it.
+pub fn delta_between(previous: &Frame, current: &Frame) -> Frame {
+    let before: HashMap<PosKey, &Entity> = previous.entities.iter().map(|e| (pos_key(e.x, e.y), e)).collect();
+    let mut entities = Vec::new();
+    let mut standing: HashSet<PosKey> = HashSet::with_capacity(current.entities.len());
+    for entity in &current.entities {
+        let key = pos_key(entity.x, entity.y);
+        standing.insert(key);
+        // Width and height are not compared, being properties of the name: an
+        // entity whose size changed is one whose name changed.
+        if !matches!(before.get(&key), Some(was) if was.n == entity.n && was.d == entity.d) {
+            entities.push(entity.clone());
+        }
+    }
+    let mut removed_entities: Vec<PosKey> = before.keys().filter(|key| !standing.contains(*key)).copied().collect();
+
+    let paved_before: HashMap<(i32, i32), &Tile> = previous.tiles.iter().map(|t| ((t.x, t.y), t)).collect();
+    let mut tiles = Vec::new();
+    let mut paved: HashSet<(i32, i32)> = HashSet::with_capacity(current.tiles.len());
+    for tile in &current.tiles {
+        let key = (tile.x, tile.y);
+        paved.insert(key);
+        if !matches!(paved_before.get(&key), Some(was) if was.n == tile.n) {
+            tiles.push(tile.clone());
+        }
+    }
+    let mut removed_tiles: Vec<(i32, i32)> = paved_before.keys().filter(|key| !paved.contains(*key)).copied().collect();
+
+    // Sorted for the reason `to_frame_delta` sorts: the same pair of saves has
+    // to produce the same bytes twice, and a `HashMap` iterates in an order
+    // that depends on hashing rather than on contents.
+    entities.sort_by_key(|e| pos_key(e.x, e.y));
+    tiles.sort_by_key(|t| (t.x, t.y));
+    removed_entities.sort_unstable();
+    removed_tiles.sort_unstable();
+
+    Frame {
+        tick: current.tick,
+        surface: current.surface.clone(),
+        count: entities.len(),
+        entities,
+        tiles,
+        delta: true,
+        removed_entities,
+        removed_tiles,
+        floor_unchanged: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn snapshot(tick: u64, entities: &[(&str, f32, f32, u8)], tiles: &[(&str, i32, i32)]) -> Frame {
+        Frame {
+            tick,
+            surface: "nauvis".to_string(),
+            count: entities.len(),
+            entities: entities.iter().map(|&(n, x, y, d)| Entity { n: Arc::from(n), x, y, d, w: 1, h: 1 }).collect(),
+            tiles: tiles.iter().map(|&(n, x, y)| Tile { n: Arc::from(n), x, y }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The four things a pair of snapshots can differ by, all at once. A save
+    /// says only what is standing, so every one of these has to be recovered
+    /// by comparison rather than read off the frame.
+    #[test]
+    fn a_delta_between_snapshots_names_what_arrived_left_and_changed() {
+        let before = snapshot(
+            100,
+            &[("pipe", 0.5, 0.5, 0), ("belt", 1.5, 0.5, 2), ("chest", 2.5, 0.5, 0)],
+            &[("concrete", 0, 0), ("stone-path", 1, 0)],
+        );
+        let after = snapshot(
+            200,
+            // pipe stands unchanged, belt turned, chest became an assembler,
+            // and a lamp is new. Nothing is left at (2.5, 0.5) to remove,
+            // something else having taken the spot.
+            &[("pipe", 0.5, 0.5, 0), ("belt", 1.5, 0.5, 4), ("assembler", 2.5, 0.5, 0), ("lamp", 3.5, 0.5, 0)],
+            // concrete repaved, stone path mined up.
+            &[("refined-concrete", 0, 0)],
+        );
+
+        let delta = delta_between(&before, &after);
+
+        assert!(delta.delta);
+        assert_eq!(delta.tick, 200);
+        assert_eq!(
+            delta.entities.iter().map(|e| (&*e.n, e.d)).collect::<Vec<_>>(),
+            vec![("belt", 4), ("assembler", 0), ("lamp", 0)],
+            "the unchanged pipe is not restated"
+        );
+        assert!(delta.removed_entities.is_empty(), "a spot taken by something else is a change, not a removal");
+        assert_eq!(delta.tiles.iter().map(|t| &*t.n).collect::<Vec<_>>(), vec!["refined-concrete"]);
+        assert_eq!(delta.removed_tiles, vec![(1, 0)]);
+    }
+
+    /// The case a snapshot cannot state and only a comparison finds: things
+    /// that were there and are not.
+    #[test]
+    fn a_delta_between_snapshots_reports_a_vacated_position_as_a_removal() {
+        let before = snapshot(100, &[("pipe", 0.5, 0.5, 0), ("chest", 2.5, 0.5, 0)], &[]);
+        let after = snapshot(200, &[("pipe", 0.5, 0.5, 0)], &[]);
+
+        let delta = delta_between(&before, &after);
+
+        assert!(delta.entities.is_empty());
+        assert_eq!(delta.removed_entities, vec![pos_key(2.5, 0.5)]);
+    }
+
+    /// Two runs over one pair of saves have to produce one file, or every
+    /// rebuild looks like a change to anything comparing bytes.
+    #[test]
+    fn a_delta_between_snapshots_is_byte_stable() {
+        let before = snapshot(100, &[("pipe", 0.5, 0.5, 0)], &[("concrete", 0, 0)]);
+        let mut wide: Vec<(&str, f32, f32, u8)> = Vec::new();
+        for i in 0..200 {
+            wide.push(("lamp", i as f32 + 0.5, 0.5, 0));
+        }
+        let after = snapshot(200, &wide, &[("concrete", 0, 0), ("stone-path", 5, 5)]);
+
+        let once = crate::frame::write_binary(&delta_between(&before, &after).as_out());
+        let twice = crate::frame::write_binary(&delta_between(&before, &after).as_out());
+        assert_eq!(once, twice);
+    }
+
     fn baseline(entities: Vec<Entity>, tiles: Vec<Tile>) -> Frame {
-        Frame { tick: 100, surface: "nauvis".to_string(), count: entities.len(), entities, tiles }
+        Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            count: entities.len(),
+            entities,
+            tiles,
+            floor_unchanged: false,
+            ..Default::default()
+        }
     }
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
@@ -567,11 +873,11 @@ mod tests {
     /// helper still needs one, even for the id lookup fast path that never
     /// reads it.
     fn remove_by_id(id: u64, x: f32, y: f32) -> Event {
-        Event::RemoveEntity { id: Some(id), pos: (x, y) }
+        Event::RemoveEntity { id: Some(id), pos: (x, y), name: None }
     }
 
     fn remove_at(x: f32, y: f32) -> Event {
-        Event::RemoveEntity { id: None, pos: (x, y) }
+        Event::RemoveEntity { id: None, pos: (x, y), name: None }
     }
 
     /// Regression: keying positions by half-tile merged these two real
@@ -688,7 +994,7 @@ mod tests {
         // A real unit_number Factorio assigned long before capture started,
         // so replay's by_id map was never told about it.
         let unrecognized_id = 999_999;
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5) }));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(unrecognized_id), pos: (-3.5, 4.5), name: None }));
         assert_eq!(world.entity_count(), 0, "position must resolve it even though the id can't");
     }
 
@@ -734,7 +1040,7 @@ mod tests {
 
         // Factorio reports the inserter's real unit_number, which replay has
         // never seen, so this falls through to the position.
-        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(77), pos: (1.5, 2.5) }));
+        assert!(world.apply(Some("nauvis"), &Event::RemoveEntity { id: Some(77), pos: (1.5, 2.5), name: None }));
 
         let frame = world.to_frame("nauvis", 200);
         let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
@@ -797,6 +1103,44 @@ mod tests {
         let uncovered = world.to_frame("nauvis", 300);
         let names: Vec<&str> = uncovered.entities.iter().map(|e| &*e.n).collect();
         assert_eq!(names, vec!["iron-ore"], "and it is back once nothing stands on it");
+    }
+
+    /// Hand-mining the ore out from under a machine. By position alone the
+    /// removal resolves to the machine, which is the last case the covering
+    /// rule could not get right; the mod names the deposit so replay can reach
+    /// the buried one.
+    #[test]
+    fn a_removal_that_names_a_deposit_takes_it_from_under_what_stands_on_it() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("electric-mining-drill", 1.5, 2.5, Some(3)));
+
+        let mined_ore = Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("iron-ore".to_string()) };
+        assert!(world.apply(Some("nauvis"), &mined_ore));
+
+        assert_eq!(world.entity_count(), 1, "the ore goes, the drill stays");
+        let frame = world.to_frame("nauvis", 300);
+        let names: Vec<&str> = frame.entities.iter().map(|e| &*e.n).collect();
+        assert_eq!(names, vec!["electric-mining-drill"]);
+
+        // And the drill is still reachable by its own id afterwards, the
+        // position having been rebuilt around it.
+        assert!(world.apply(None, &remove_by_id(3, 1.5, 2.5)));
+        assert_eq!(world.entity_count(), 0);
+    }
+
+    /// A name the capture never mentioned, or one that is not at that position,
+    /// must not take something else instead: that is the bug this record
+    /// closes, not a new way to hit it.
+    #[test]
+    fn a_removal_naming_something_absent_takes_nothing() {
+        let mut world = World::new();
+        world.load_baseline(&baseline(vec![entity("iron-ore", 1.5, 2.5)], Vec::new()));
+        world.apply(Some("nauvis"), &add("electric-mining-drill", 1.5, 2.5, Some(3)));
+
+        let wrong = Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("copper-ore".to_string()) };
+        assert!(!world.apply(Some("nauvis"), &wrong), "no copper here, so nothing goes");
+        assert_eq!(world.entity_count(), 2);
     }
 
     /// Sinking must not hide a deposit that is standing on its own: exposed
@@ -886,6 +1230,8 @@ mod tests {
             count: 1,
             entities: vec![entity("transport-belt", 1.5, 2.5)],
             tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
         });
 
         assert_eq!(world.entity_count(), 2);

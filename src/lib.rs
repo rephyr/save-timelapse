@@ -20,6 +20,24 @@ mod test_support;
 pub mod wire;
 pub mod world;
 
+/// Whether FFmpeg can be run. Lives here because both binaries need the same
+/// answer: the CLI to decide whether offering MP4 is honest, the viewer to say
+/// something useful when asked for one. Asked fresh each time rather than
+/// cached, so installing it does not require restarting the tool.
+///
+/// FFmpeg is never required. The built-in AVI writer is what keeps the tool
+/// dependency free; MP4 is a bonus for people who happen to have it.
+pub fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// A count with thousands separators, for anything a person reads. Lives here
 /// rather than in either binary because both display counts and the rule is the
 /// same one.

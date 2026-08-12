@@ -16,6 +16,36 @@ the answers are properties of how somebody actually played, not of the code.
 Those take the folder from an environment variable so no local path is ever
 committed.
 
+## What they were measured on
+
+    CPU      AMD Ryzen 9 5900X, 12 cores/24 threads
+    RAM      32 GB DDR4-3200
+    GPU      NVIDIA GeForce RTX 4080, 16 GB, 
+    Storage  Samsung 970 EVO Plus 2 TB NVMe 
+    OS       Windows 10 
+
+Stated because three of the numbers below are properties of this machine as
+much as of the code, and reading them without it invites the wrong conclusion.
+
+**Thread count changes the load times.** `ParallelFrameLoad` and the grouping
+passes split across `available_parallelism`, which is 24 here. The 47s to 20s
+load figure is that split plus the `Arc<str>` change together; on four cores the
+parallel half of it is worth proportionally less.
+
+**Disk speed changes what skipping unchanged surfaces is worth.** Not writing
+86% of the files saves more on a slow disk than on this one, so that measurement
+is a floor rather than a typical result.
+
+**The GPU barely matters for the draw-call numbers and matters a lot for
+export.** Draw calls are a CPU submission cost, which is the whole reason
+grouping by type is worth doing, and it would look much the same on weaker
+hardware. Export is the opposite: a 4x supersampled 1080p frame is a 132 MB
+readback, and that is where a slower card would show.
+
+The mod's own cost is the exception. It is measured in Factorio's F4 time usage,
+which is a share of a 60 Hz tick budget rather than wall clock, so it is the one
+figure here that travels between machines reasonably well.
+
 ## Results
 
 ### Frame format: entity runs and delta-encoded positions
@@ -112,6 +142,66 @@ have grown.
 
 ```bash
 cargo test --release -p viewer --lib measure_cost -- --ignored --nocapture
+```
+
+### Export: aggregating the ground
+
+An export deliberately keeps full detail, because a chunk cell holds only its
+dominant type and a paved area would swallow the belts running through it. That
+reasoning is about entities and placed floor. It is not about grass.
+
+Measured on a real Space Age megabase, per frame:
+
+| layer | quads | share |
+|---|---|---|
+| natural ground | 19,732,883 | 82% |
+| placed floor | 3,354,339 | 14% |
+| entities | 863,862 | 4% |
+
+The ground alone was four fifths of the drawing, and at roughly 2 seconds a
+frame a 660 frame export took 22 minutes. Binned into the same 4x4 cells the
+interactive view uses, that ground is **1,240,391 cells, 15.9x fewer**, and
+**85% of those cells hold a single ground type**, so collapsing them loses
+nothing whatsoever. Only the 15% straddling a boundary lose anything, at a scale
+supersampling is already averaging away.
+
+Items keep full detail exactly as before, so the belts the original decision
+protected are untouched. Total drawing falls about 4.4x, which should take that
+export from 22 minutes to roughly 5.
+
+```bash
+SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
+```
+
+### Folding a frame that changes most of the factory
+
+`SpanBuilder::open` is everything standing, as a sorted vector. Folding a delta
+in used to binary search it per changed item and splice, and `Vec::remove` and
+`Vec::insert` move everything past the position they touch, so the cost was
+standing multiplied by changed.
+
+That is invisible at what an ordinary base does. The extreme is not: on a real
+4000 hour gigabase, one frame took the factory from **3.7 million buildings to
+500 thousand**, so a single delta carried about 3.2 million removals against a
+list averaging around 2 million entries. Of the order of 3e12 element moves.
+
+| approach | a frame that clears most of the factory |
+|---|---|
+| binary search and splice per item | did not complete, at either scale below |
+| both sides sorted, merged in one pass | 0.25s at a million standing |
+
+The two rows are not the same measurement and cannot be: the splice version has
+no completion time to report. It was abandoned on the real capture, and again on
+the million-entity test below.
+
+The interesting part is what it looked like. Correct code that never returns
+gives no error, no partial output and no progress, so it is indistinguishable
+from a deadlock. It was also being misattributed: the viewer set its phase label
+before the work and painted after it, so the screen named the previous step for
+the whole of it, which pointed diagnosis at the wrong function.
+
+```bash
+cargo test --manifest-path viewer/Cargo.toml a_frame_that_clears_most
 ```
 
 ## Measured and rejected

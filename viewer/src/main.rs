@@ -15,9 +15,9 @@ use viewer::{
     icon_source_rect, pipe_piece_path, pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path,
     splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_source_rect,
     underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, PlayerTrack, ProgressBar, RenderEntity,
-    RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES, LOD_CELL_TILES, PIECES,
-    SHEET_ROWS, SPRITE_TILE_PIXELS,
+    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, Mp4Writer, PlayerTrack, ProgressBar,
+    RailSegment, RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES,
+    LOD_CELL_TILES, PIECES, RAIL_WIDTH_TILES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -146,6 +146,9 @@ struct ViewerState {
     sprites_enabled: bool,
     lod_enabled: bool,
     heatmap_enabled: bool,
+    /// Whether player markers are drawn. Unlike the two above it survives the
+    /// session, so it is written back whenever it changes.
+    players_enabled: bool,
     /// Whether the `+N more` surface list is open.
     surfaces_expanded: bool,
 }
@@ -160,8 +163,16 @@ struct ExportRequest {
     /// Frames per second when writing video. Ignored for an image sequence,
     /// which has no notion of a rate.
     fps: u32,
-    /// Write a playable `.avi` instead of a folder of PNGs.
+    /// Write a playable video instead of a folder of PNGs.
     video: bool,
+    /// Burn player markers into the exported frames.
+    overlay_players: bool,
+    /// Burn the in-game clock into the exported frames.
+    overlay_clock: bool,
+    /// H.264 in an MP4 through FFmpeg rather than the built-in MJPEG AVI.
+    /// Only ever set when the CLI found FFmpeg, the tool's own writer being
+    /// what keeps it dependency free.
+    mp4: bool,
     /// Which surface to render. `None` means the busiest, which is what
     /// `group_by_surface` already orders first. `Some("all")` renders every
     /// surface into its own subfolder.
@@ -187,7 +198,8 @@ fn parse_args() -> Args {
     let (mut export_dir, mut width, mut height) = (None, 1920u32, 1080u32);
     let mut supersample = DEFAULT_SUPERSAMPLE;
     let mut surface = None;
-    let (mut fps, mut video) = (30u32, false);
+    let (mut fps, mut video, mut mp4) = (30u32, false, false);
+    let (mut overlay_players, mut overlay_clock) = (false, false);
 
     let mut i = 0;
     while i < args.len() {
@@ -229,6 +241,9 @@ fn parse_args() -> Args {
                 supersample = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(supersample);
             }
             "--video" => video = true,
+            "--mp4" => mp4 = true,
+            "--overlay-players" => overlay_players = true,
+            "--overlay-clock" => overlay_clock = true,
             other => result.path = Some(other.to_string()),
         }
         i += 1;
@@ -250,6 +265,9 @@ fn parse_args() -> Args {
             surface,
             fps: fps.clamp(1, 240),
             video,
+            mp4,
+            overlay_players,
+            overlay_clock,
             // Capped by the render target it implies: GPUs stop honouring
             // texture sizes past 8192 a side, and a refused target is a black
             // export rather than an error.
@@ -330,7 +348,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         builder.push(&RenderFrame::from_frame(frame, registry));
         // Synthetic/default-fixture loads have no on-disk directory to look
         // for a terrain file in, and nothing produces one for them.
-        if let Some(sequence) = builder.finish() {
+        if let Some(sequence) = builder.finish(registry) {
             result.push((name, sequence, None));
         }
     } else {
@@ -361,7 +379,13 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         // whole timeline. See `viewer::timeline_ticks`.
         let timeline = viewer::timeline_ticks(&grouped);
 
+        // Painted before the first batch rather than after it. Setting a phase
+        // and not redrawing until the end of the work leaves the previous
+        // phase's label on screen for the whole of it, so a slow batch reads
+        // as a stuck header scan and sends anyone diagnosing it to the wrong
+        // function entirely.
         progress.phase = "loading frames";
+        redraw_progress(&progress, &mut last, true).await;
         let mut done = 0usize;
         for (name, paths) in grouped {
             let mut builder = FrameSequence::builder();
@@ -393,7 +417,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
             // A surface that stopped changing before the capture ended still
             // exists for the rest of it.
             builder.push_repeats(&timeline[filled..]);
-            if let Some(sequence) = builder.finish() {
+            if let Some(sequence) = builder.finish(registry) {
                 result.push((name, sequence, None));
             }
         }
@@ -490,6 +514,25 @@ struct EntityArt {
 impl EntityArt {
     fn plain(source: Rect, rotation: f32) -> EntityArt {
         EntityArt { texture: 0, source, rotation, flip_x: false, flip_y: false, tiles: None, offset: Vec2::ZERO }
+    }
+
+    /// A rail piece drawn along the path it occupies rather than on the tile
+    /// its centre sits in. Always a flat colour, never the icon: a rail's icon
+    /// is an oblique render of a short piece of track, so rotating it to a
+    /// heading spins the camera angle rather than the track.
+    fn rail(segment: RailSegment) -> EntityArt {
+        EntityArt {
+            texture: 0,
+            source: Rect::default(),
+            rotation: segment.rotation,
+            flip_x: false,
+            flip_y: false,
+            tiles: Some(Vec2::new(segment.length, RAIL_WIDTH_TILES)),
+            // A curve half is not centred on the position it is recorded at,
+            // unlike a straight, so the run is shifted onto where it really
+            // sits rather than drawn around the wrong point.
+            offset: Vec2::new(segment.offset.0, segment.offset.1),
+        }
     }
 
     /// A frame drawn at its own size, worked out from its pixels.
@@ -1053,6 +1096,12 @@ fn handle_input(
     if is_key_pressed(KeyCode::H) {
         state.heatmap_enabled = !state.heatmap_enabled;
     }
+    // Written back on change rather than on exit: the viewer is closed by
+    // shutting the window, which runs nothing.
+    if is_key_pressed(KeyCode::P) {
+        state.players_enabled = !state.players_enabled;
+        remember_players(state.players_enabled);
+    }
 
     // Renderer A/B tests, not features: either one makes the factory look
     // broken to somebody who pressed the key by accident, so they only answer
@@ -1145,11 +1194,13 @@ async fn export_frames(
     world: &mut WorldView,
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
+    player_track: &PlayerTrack,
+    ui: &Ui,
     request: &ExportRequest,
 ) -> std::io::Result<usize> {
     // For video the target is a file, so only its parent needs to exist; for
     // a sequence the target is the folder itself.
-    let video_path = request.dir.with_extension("avi");
+    let video_path = request.dir.with_extension(if request.mp4 { "mp4" } else { "avi" });
     match request.video {
         true => {
             if let Some(parent) = video_path.parent() {
@@ -1164,9 +1215,10 @@ async fn export_frames(
     let ss = request.supersample;
     let (rw, rh) = (request.width * ss, request.height * ss);
     let (w, h) = (rw as f32, rh as f32);
-    let mut video = match request.video {
-        true => Some(AviWriter::create(&video_path, request.width, request.height, request.fps)?),
-        false => None,
+    let mut video = match (request.video, request.mp4) {
+        (false, _) => None,
+        (true, false) => Some(VideoOut::Avi(AviWriter::create(&video_path, request.width, request.height, request.fps)?)),
+        (true, true) => Some(VideoOut::Mp4(Mp4Writer::create(&video_path, request.width, request.height, request.fps)?)),
     };
     let target = render_target(rw, rh);
     target.texture.set_filter(FilterMode::Nearest);
@@ -1226,14 +1278,29 @@ async fn export_frames(
             registry,
             sprites,
             pixels_per_tile > SPRITE_MIN_PIXELS,
-            // Never aggregated, unlike the interactive view: an export has no
-            // frame rate to protect, and a LOD cell keeps only its dominant
-            // type, which at these zooms is paving swallowing the belts.
-            // Sound only because of supersampling.
-            false,
+            // Items are never aggregated in an export: it has no frame rate to
+            // protect, and a cell keeps only its dominant type, which at these
+            // zooms is paving swallowing the belts. Sound only because of
+            // supersampling.
+            //
+            // Ground is the opposite. It is most of the drawing and has nothing
+            // for a cell to lose, so it follows the same sub-pixel test the
+            // interactive view uses. Measured on the supersampled size, so the
+            // threshold is stricter here than on screen.
+            Detail { items: false, terrain: use_chunk_lod(pixels_per_tile) },
             None,
             &mut counter,
         );
+        // Into the render target, so before `set_default_camera` hands drawing
+        // back to the window. Sized by `ss` because everything here is drawn
+        // oversized and averaged down.
+        if request.overlay_players {
+            draw_player_markers(ui, player_track, &world.name, frame.tick, &world.camera, screen_center, ss as f32);
+        }
+        if request.overlay_clock {
+            draw_export_clock(ui, frame.tick, h, ss as f32);
+        }
+
         set_default_camera();
 
         // Read back and write before yielding: the texture is what was just
@@ -1241,7 +1308,7 @@ async fn export_frames(
         // frame's clear.
         let image = downsample(&target.texture.get_texture_data(), ss);
         match &mut video {
-            Some(writer) => writer.add_jpeg(&encode_jpeg(&image)?)?,
+            Some(writer) => writer.add(&image)?,
             None => {
                 let path = request.dir.join(format!("frame_{index:05}.png"));
                 image.export_png(&path.to_string_lossy());
@@ -1274,16 +1341,54 @@ async fn export_frames(
 /// One frame as JPEG. macroquad hands back RGBA and JPEG has no alpha, so the
 /// alpha byte is dropped rather than composited: every pixel came from a
 /// clear and opaque draws.
-fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
+/// Where finished frames go when the export is a video. PNG needs no state of
+/// its own and so is not here.
+enum VideoOut {
+    Avi(AviWriter),
+    Mp4(Mp4Writer),
+}
+
+impl VideoOut {
+    /// MJPEG takes a compressed frame; FFmpeg takes raw pixels, so the MP4
+    /// path is encoded once rather than JPEGed and then re-encoded.
+    fn add(&mut self, image: &macroquad::texture::Image) -> std::io::Result<()> {
+        match self {
+            VideoOut::Avi(writer) => writer.add_jpeg(&encode_jpeg(image)?),
+            VideoOut::Mp4(writer) => writer.add_frame(&to_rgb24(image)),
+        }
+    }
+
+    fn frames(&self) -> u32 {
+        match self {
+            VideoOut::Avi(writer) => writer.frames() as u32,
+            VideoOut::Mp4(writer) => writer.frames(),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            VideoOut::Avi(writer) => writer.finish(),
+            VideoOut::Mp4(writer) => writer.finish(),
+        }
+    }
+}
+
+fn to_rgb24(image: &macroquad::texture::Image) -> Vec<u8> {
     // Rows last to first, a render target reading back bottom-up.
     // `Image::export_png` undoes that itself, so the PNG path never needed it.
-    // See `avi.rs`, whose header declares these rows top-down: the two agree.
+    // See `avi.rs`, whose header declares these rows top-down: the two agree,
+    // and so does the raw stream `mp4.rs` pipes to ffmpeg.
     let (width, height) = (image.width as usize, image.height as usize);
     let mut rgb: Vec<u8> = Vec::with_capacity(width * height * 3);
     for y in (0..height).rev() {
         let row = &image.bytes[y * width * 4..(y + 1) * width * 4];
         rgb.extend(row.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     }
+    rgb
+}
+
+fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
+    let rgb = to_rgb24(image);
     let mut out = Vec::new();
     // 85 rather than the usual default: flat colour with hard edges is what
     // low-quality JPEG smears into halos, and this content compresses well.
@@ -1291,6 +1396,20 @@ fn encode_jpeg(image: &macroquad::texture::Image) -> std::io::Result<Vec<u8>> {
         .encode(&rgb, image.width as u32, image.height as u32, image::ColorType::Rgb8)
         .map_err(std::io::Error::other)?;
     Ok(out)
+}
+
+/// Which layers may be collapsed into chunk cells this frame. Two answers
+/// rather than one because the reason to keep full detail applies to only one
+/// of them.
+#[derive(Clone, Copy)]
+struct Detail {
+    /// Entities and placed floor. Off in an export: a cell keeps only its
+    /// dominant type, so a paved area would swallow every belt running through
+    /// it, and an export has no frame rate to protect.
+    items: bool,
+    /// Natural ground. On whenever a tile is already sub-pixel, export
+    /// included, ground having no fine structure for a cell to lose.
+    terrain: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1302,7 +1421,7 @@ fn draw_world(
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
     use_sprites: bool,
-    use_lod: bool,
+    detail: Detail,
     heat: Option<(&[Vec<HeatCell>], u32, usize)>,
     counter: &mut DrawCallCounter,
 ) {
@@ -1329,12 +1448,19 @@ fn draw_world(
         _ => (view_min, view_max),
     };
 
-    if use_lod {
-        // Below LOD_MAX_TILE_PIXELS an item is already sub-pixel, so
-        // collapsing a chunk to one quad loses nothing and turns millions of
-        // per-item costs into thousands. Precomputed at load.
-        if let Some(terrain) = terrain {
-            draw_tile_lod_layer(
+    // Natural ground, on its own terms and before everything else.
+    //
+    // Aggregated whenever a tile is already sub-pixel, an export included,
+    // which is where it matters: on a real megabase the ground was 19.7M of a
+    // frame's 24M quads, 82% of the drawing, and disabling aggregation for it
+    // cost two seconds a frame. A cell keeps only its dominant type, which is
+    // why items keep full detail in an export, but ground has no fine
+    // structure to lose: four tiles of grass are grass. The visible cost is
+    // stair-stepping where two ground types meet, at a scale supersampling is
+    // already averaging away.
+    if let Some(terrain) = terrain {
+        match detail.terrain {
+            true => draw_tile_lod_layer(
                 &terrain.tile_lod,
                 &terrain.tile_lod_runs,
                 camera,
@@ -1343,8 +1469,17 @@ fn draw_world(
                 view_max,
                 registry,
                 counter,
-            );
+            ),
+            false => {
+                draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter)
+            }
         }
+    }
+
+    if detail.items {
+        // Below LOD_MAX_TILE_PIXELS an item is already sub-pixel, so
+        // collapsing a chunk to one quad loses nothing and turns millions of
+        // per-item costs into thousands. Precomputed at load.
         draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
@@ -1369,12 +1504,9 @@ fn draw_world(
             counter.quads(None, drawn);
         }
     } else {
-        // Terrain, then this frame's floor, then buildings, matching how
-        // paving over grass looks in game. Iterating runs keeps the batch
-        // intact, sprite and colour being decided once per type.
-        if let Some(terrain) = terrain {
-            draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
-        }
+        // This frame's floor, then buildings, matching how paving over grass
+        // looks in game. Iterating runs keeps the batch intact, sprite and
+        // colour being decided once per type.
         draw_tile_layer(&frame.tiles, &frame.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
 
         paint_heat(camera);
@@ -1393,11 +1525,21 @@ fn draw_world(
             let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
             let color = registry.entity_color(run.type_id);
             let rotation_allowed = registry.is_rotation_allowed(run.type_id);
+            // Per run rather than per entity: which prototype this is fixes
+            // whether it is track, and only the facing varies below.
+            let track = registry.is_rail_track(run.type_id);
             let (min, max) = bounds_for(run.type_id);
             let mut drawn = 0;
             for entity in &frame.entities[run.range()] {
                 let (w, h) = (entity.w as u32, entity.h as u32);
-                let half = entity_cull_half_extents(w, h, entity.d, rotation_allowed);
+                let segment = track.then(|| registry.rail_segment(run.type_id, entity.d)).flatten();
+                // A rail reaches well past the tile it is recorded on, up to
+                // half of a half diagonal's four tiles, so culling it on its
+                // 1x1 footprint would drop track that is still on screen.
+                let half = match segment {
+                    Some(segment) => Vec2::splat(segment.length / 2.0),
+                    None => entity_cull_half_extents(w, h, entity.d, rotation_allowed),
+                };
                 if entity.x + half.x < min.x
                     || entity.x - half.x > max.x
                     || entity.y + half.y < min.y
@@ -1406,9 +1548,13 @@ fn draw_world(
                     continue;
                 }
                 let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                let art = match sprite {
-                    Some(sprite) => entity_source(sprite, entity, rotation_allowed),
-                    None => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
+                // Track is drawn as a coloured segment, so it takes the plain
+                // rectangle path even where an icon did load for it.
+                let sprite = segment.is_none().then_some(sprite).flatten();
+                let art = match (segment, sprite) {
+                    (Some(segment), _) => EntityArt::rail(segment),
+                    (None, Some(sprite)) => entity_source(sprite, entity, rotation_allowed),
+                    (None, None) => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
                 };
                 // A frame that knows its own size in tiles is drawn at that
                 // size; everything else still fills its footprint.
@@ -1914,14 +2060,42 @@ fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, m
 /// Where the player(s) were as of `tick`, on whichever world/surface is
 /// active, looked up fresh each draw rather than cached on the frame,
 /// since it's a cheap scan over a tiny sample count (see PlayerTrack).
-fn draw_player_markers(ui: &Ui, player_track: &PlayerTrack, world_name: &str, tick: u64, camera: &Camera, screen_center: Vec2) {
+/// Saves the player-marker preference, ignoring failure. Not being able to
+/// remember it costs one keypress next time, which is no reason to interrupt
+/// somebody watching a timelapse.
+fn remember_players(enabled: bool) {
+    let mut settings = save_timelapse::settings::Settings::load();
+    settings.show_players = Some(enabled);
+    let _ = settings.save();
+}
+
+/// `scale` is 1 on screen and the supersample factor in an export, where
+/// everything is drawn oversized and averaged down. Without it a marker sized
+/// in screen pixels comes out half that in a 2x export.
+fn draw_player_markers(
+    ui: &Ui,
+    player_track: &PlayerTrack,
+    world_name: &str,
+    tick: u64,
+    camera: &Camera,
+    screen_center: Vec2,
+    scale: f32,
+) {
     for (name, x, y) in player_track.positions_at(world_name, tick) {
         let screen = camera.world_to_screen(Vec2::new(x, y), screen_center);
         let color = color_for(name, 0.7, 0.95);
-        draw_circle(screen.x, screen.y, 9.0, Color::new(0.0, 0.0, 0.0, 0.6));
-        draw_circle(screen.x, screen.y, 6.0, color);
-        ui.text_legible(name, screen.x + 12.0, screen.y + 4.0, 18.0, WHITE);
+        draw_circle(screen.x, screen.y, 9.0 * scale, Color::new(0.0, 0.0, 0.0, 0.6));
+        draw_circle(screen.x, screen.y, 6.0 * scale, color);
+        ui.text_legible(name, screen.x + 12.0 * scale, screen.y + 4.0 * scale, 18.0 * scale, WHITE);
     }
+}
+
+/// The in-game clock burned into an exported frame, bottom left. Off unless
+/// asked for: an export is the world alone, and anything over it is a choice.
+fn draw_export_clock(ui: &Ui, tick: u64, height: f32, scale: f32) {
+    let text = format_game_time(tick);
+    let size = 28.0 * scale;
+    ui.text_legible(&text, 24.0 * scale, height - 24.0 * scale, size, WHITE);
 }
 
 /// Everything the draw loop needs, assembled once before it starts.
@@ -2050,6 +2224,8 @@ async fn run_export(
     worlds: &mut [WorldView],
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
+    player_track: &PlayerTrack,
+    ui: &Ui,
     request: &ExportRequest,
 ) -> Result<(), String> {
     let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
@@ -2081,9 +2257,12 @@ async fn run_export(
             surface: None,
             fps: request.fps,
             video: request.video,
+            mp4: request.mp4,
+            overlay_players: request.overlay_players,
+            overlay_clock: request.overlay_clock,
             supersample: request.supersample,
         };
-        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, &this).await {
+        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, player_track, ui, &this).await {
             eprintln!("export of {name} failed: {e}");
         }
     }
@@ -2106,6 +2285,9 @@ async fn main() {
         sprites_enabled: true,
         lod_enabled: true,
         heatmap_enabled: false,
+        // Shown unless the viewer has been told otherwise: a capture that has
+        // player positions recorded them on purpose.
+        players_enabled: save_timelapse::settings::Settings::load().show_players.unwrap_or(true),
         surfaces_expanded: false,
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
@@ -2124,7 +2306,10 @@ async fn main() {
     }
 
     if let Some(request) = &args.export {
-        if let Err(message) = run_export(&mut worlds, &registry, &sprites, request).await {
+        // The export path never builds the interactive chrome, so this is the
+        // only thing it needs from it: a font for whatever it burns in.
+        let ui = Ui::new();
+        if let Err(message) = run_export(&mut worlds, &registry, &sprites, &player_track, &ui, request).await {
             eprintln!("{message}");
         }
         return;
@@ -2278,12 +2463,14 @@ async fn main() {
             &registry,
             &sprites,
             use_sprites,
-            use_lod,
+            Detail { items: use_lod, terrain: use_lod },
             heat_layer,
             &mut counter,
         );
 
-        draw_player_markers(&ui, &player_track, world_name, sequence.current().tick, camera, screen_center);
+        if state.players_enabled {
+            draw_player_markers(&ui, &player_track, world_name, sequence.current().tick, camera, screen_center, 1.0);
+        }
         draw_timeline_bar(
             &ui,
             &timeline,

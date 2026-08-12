@@ -42,7 +42,14 @@ fn default_frame_bytes() -> Vec<u8> {
         Entity { n: "stone-furnace".into(), x: 6.5, y: -1.5, d: 0, w: 1, h: 1 },
         Entity { n: "inserter".into(), x: 3.5, y: 0.5, d: 2, w: 1, h: 1 },
     ];
-    frame::write_binary(&FrameOut { tick: 216_000, surface: "nauvis", entities: &entities, tiles: &[] })
+    frame::write_binary(&FrameOut {
+        tick: 216_000,
+        surface: "nauvis",
+        entities: &entities,
+        tiles: &[],
+        floor_unchanged: false,
+        ..Default::default()
+    })
 }
 
 fn flag_value(file: &settings_dat::SettingsFile, name: &str) -> bool {

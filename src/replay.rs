@@ -3,7 +3,7 @@
 //! ```text
 //! <session>/baseline.json                 tick + surfaces the baseline covers
 //! <session>/frame_<tick>_<surface>.stfr   the baseline itself, one per surface
-//! <session>/events_<start_tick>.stev      append-only, one segment per timeline
+//! <session>/events_<tick>_<parent>.stev   append-only, one segment per load
 //! <session>/players.jsonl                 optional, sampled player positions
 //! ```
 //!
@@ -288,6 +288,19 @@ pub struct Replay {
     /// corruption: the mod writing the capture is newer than the tool reading
     /// it, and the replay is correct as far as it goes.
     pub unknown_extensions: usize,
+    /// Records dropped because they named a dictionary entry their segment
+    /// never defined. Real damage, unlike `unknown_extensions`: the events are
+    /// gone and nothing here can recover them.
+    pub undefined_references: usize,
+    /// Segments that had no header and were recovered by parsing. A reset
+    /// deletes the files a save still names, so loading that save appends to a
+    /// file that is gone and it comes back headerless.
+    pub headerless_segments: usize,
+    /// Events describing a moment before the snapshot, which cannot be
+    /// applied to it. Normally a handful from the baseline smear; a large
+    /// number means somebody reset and then carried on from an older save, and
+    /// everything they played since is being thrown away.
+    pub pre_baseline_events: usize,
     /// Catch-up baselines (see [`CatchUpBaseline`]) not yet reached by `run`'s
     /// tick-ordered walk, ascending by tick. Emptied out as `run` applies
     /// each one in turn; never re-populated after `load_baseline`.
@@ -364,6 +377,9 @@ pub fn load_baseline(baseline_path: &Path) -> io::Result<Replay> {
         superseded_events: 0,
         restarted_segments: 0,
         unknown_extensions: 0,
+        undefined_references: 0,
+        headerless_segments: 0,
+        pre_baseline_events: 0,
         pending_catch_ups,
         catch_ups_applied: 0,
     })
@@ -410,7 +426,7 @@ pub fn discover_surfaces(session_dir: &Path, replay: &Replay) -> io::Result<Vec<
 /// folder.
 pub fn run<F>(replay: &mut Replay, dir: &Path, options: &Options, mut emit: F) -> io::Result<usize>
 where
-    F: FnMut(&World, u64),
+    F: FnMut(&mut World, u64),
 {
     let mut next_emit = replay.baseline.tick;
     let mut emitted = 0;
@@ -418,7 +434,7 @@ where
     let mut flush_until = |replay: &mut Replay, tick: u64, next: &mut u64, emitted: &mut usize| {
         while tick >= *next && *emitted < options.max_frames {
             apply_due_catch_ups(replay, *next);
-            emit(&replay.world, *next);
+            emit(&mut replay.world, *next);
             *emitted += 1;
             *next += options.interval;
         }
@@ -468,7 +484,11 @@ where
                 continue;
             }
             // Events before the baseline describe a world we did not capture.
+            // Counted rather than dropped in silence: a lot of them is the
+            // signature of a reset followed by loading an older save, and the
+            // player has no other way to find out their play went nowhere.
             if logged.tick < replay.baseline.tick {
+                replay.pre_baseline_events += 1;
                 continue;
             }
             // Same per surface: the mod logs a surface's events the instant it
@@ -507,6 +527,10 @@ where
         // Asked after the walk, not during: the count is of what iteration
         // actually stepped over, so it is only complete once the stream is.
         replay.unknown_extensions += stream.unknown_extensions();
+        replay.undefined_references += stream.undefined_references();
+        if stream.headerless() {
+            replay.headerless_segments += 1;
+        }
 
         apply_batch(replay, &mut pending);
         if let Some(tick) = pending_tick {
@@ -523,7 +547,8 @@ where
     // on the base as it actually was rather than at the last interval
     // boundary that happened to fall before the last event.
     if emitted < options.max_frames {
-        emit(&replay.world, replay.world.tick.max(next_emit.saturating_sub(options.interval)));
+        let at = replay.world.tick.max(next_emit.saturating_sub(options.interval));
+        emit(&mut replay.world, at);
         emitted += 1;
     }
 
@@ -579,14 +604,18 @@ fn apply_due_catch_ups(replay: &mut Replay, tick: u64) {
 /// produced them, and `viewer::loading::group_by_surface` expands them back
 /// out. The gap is the record, so there is no sidecar to keep in sync.
 pub fn write_all_surfaces(
-    world: &World,
+    world: &mut World,
     tick: u64,
     out: &Path,
     index: usize,
     written: &mut std::collections::HashMap<String, u64>,
 ) -> io::Result<usize> {
     let mut files = 0;
-    for surface in world.surface_names() {
+    // Owned up front: the loop needs the world mutably to drain each surface's
+    // change record, which a borrow of its name list would forbid.
+    let names: Vec<String> = world.surface_names().into_iter().map(str::to_string).collect();
+    for surface in &names {
+        let surface = surface.as_str();
         let revision = match world.surface(surface) {
             Some(s) => s.revision(),
             None => continue,
@@ -601,8 +630,19 @@ pub fn write_all_surfaces(
             continue;
         }
 
-        let frame = world.to_frame(surface, tick);
-        if frame.entities.is_empty() && frame.tiles.is_empty() {
+        // The first frame for a surface is the picture; every one after it is
+        // what changed since, which on a megabase is a couple of hundred items
+        // against four million. Frames skipped in between are not lost: the
+        // change record accumulates until the surface actually emits.
+        let first = !written.contains_key(surface);
+        let frame = match first {
+            true => {
+                world.clear_changes(surface);
+                world.to_frame(surface, tick)
+            }
+            false => world.to_frame_delta(surface, tick),
+        };
+        if first && frame.entities.is_empty() && frame.tiles.is_empty() {
             continue;
         }
         let path = out.join(format!("frame_{index:04}_{surface}.stfr"));
@@ -818,7 +858,14 @@ mod tests {
         fs::write(&baseline_path, r#"{"tick":100,"entities":1,"tiles":0,"surfaces":["nauvis"]}"#).unwrap();
 
         let entities = vec![frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
-        let out = frame::FrameOut { tick: 100, surface: "nauvis", entities: &entities, tiles: &[] };
+        let out = frame::FrameOut {
+            tick: 100,
+            surface: "nauvis",
+            entities: &entities,
+            tiles: &[],
+            floor_unchanged: false,
+            ..Default::default()
+        };
         fs::write(session_dir.join("frame_100_nauvis.stfr"), frame::write_binary(&out)).unwrap();
 
         (dir, baseline_path)
@@ -1378,7 +1425,8 @@ mod tests {
     /// `M.export_surfaces_to` produces: an ordinary frame file with no manifest
     /// entry.
     fn write_catch_up_frame(session_dir: &Path, tick: u64, surface: &str, entities: Vec<frame::Entity>) {
-        let out = frame::FrameOut { tick, surface, entities: &entities, tiles: &[] };
+        let out =
+            frame::FrameOut { tick, surface, entities: &entities, tiles: &[], floor_unchanged: false, ..Default::default() };
         fs::write(session_dir.join(format!("frame_{tick}_{surface}.stfr")), frame::write_binary(&out)).unwrap();
     }
 
@@ -1519,6 +1567,58 @@ mod tests {
         assert_eq!(parsed.surface, "my_modded_planet");
     }
 
+    /// The first frame for a surface is the picture and every one after it is
+    /// what changed. Measured on a real megabase: about 200 items changed a
+    /// frame against 4.2 million standing, so a snapshot spent 8.8 MB
+    /// restating what the reader already had.
+    #[test]
+    fn frames_after_the_first_carry_only_what_changed() {
+        let mut world = crate::world::World::new();
+        let floor: Vec<crate::frame::Tile> = (0..500).map(|i| crate::frame::Tile { n: "concrete".into(), x: i, y: 0 }).collect();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            count: 1,
+            entities: vec![crate::frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }],
+            tiles: floor,
+            ..Default::default()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut revisions = std::collections::HashMap::new();
+        write_all_surfaces(&mut world, 100, dir.path(), 0, &mut revisions).unwrap();
+
+        world.apply(
+            Some("nauvis"),
+            &crate::event::Event::AddEntity { name: "pipe".to_string(), x: 9.5, y: 9.5, d: 0, w: 1, h: 1, id: Some(1) },
+        );
+        write_all_surfaces(&mut world, 200, dir.path(), 1, &mut revisions).unwrap();
+
+        let read = |index: usize| {
+            let path = dir.path().join(format!("frame_{index:04}_nauvis.stfr"));
+            let bytes = std::fs::read(&path).unwrap();
+            (bytes.len(), crate::frame::read_binary(&bytes).unwrap())
+        };
+        let (first_len, first) = read(0);
+        let (second_len, second) = read(1);
+
+        assert!(!first.delta, "the first frame for a surface is the picture");
+        assert_eq!(first.tiles.len(), 500, "so it carries the whole floor");
+
+        assert!(second.delta, "and every one after it is what changed");
+        assert_eq!(second.entities.len(), 1, "one pipe arrived");
+        assert!(second.tiles.is_empty(), "no floor was laid, so none is written");
+        assert!(second.removed_entities.is_empty());
+        assert!(second_len * 20 < first_len, "the point is the size: {second_len} against {first_len}");
+
+        // And a removal reaches the delta as a removal.
+        assert!(world.apply(None, &crate::event::Event::RemoveEntity { id: Some(1), pos: (9.5, 9.5), name: None }));
+        write_all_surfaces(&mut world, 300, dir.path(), 2, &mut revisions).unwrap();
+        let (_, third) = read(2);
+        assert_eq!(third.removed_entities.len(), 1, "what left is named");
+        assert!(third.entities.is_empty());
+    }
+
     #[test]
     fn write_all_surfaces_skips_an_empty_surface_and_names_the_rest() {
         let mut world = crate::world::World::new();
@@ -1528,6 +1628,8 @@ mod tests {
             entities: vec![crate::frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }],
             count: 1,
             tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
         });
         // vulcanus exists (an event referenced it) but has nothing on it yet,
         // e.g. a platform not built out this early in the timeline.
@@ -1537,10 +1639,12 @@ mod tests {
             entities: Vec::new(),
             count: 0,
             tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
         });
 
         let dir = tempfile::tempdir().unwrap();
-        write_all_surfaces(&world, 100, dir.path(), 7, &mut Default::default()).unwrap();
+        write_all_surfaces(&mut world, 100, dir.path(), 7, &mut Default::default()).unwrap();
 
         let written: Vec<String> =
             fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
@@ -1559,6 +1663,8 @@ mod tests {
             entities: vec![entity(x, 2.0)],
             count: 1,
             tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
         };
 
         let mut world = crate::world::World::new();
@@ -1569,12 +1675,12 @@ mod tests {
         let mut revisions = std::collections::HashMap::new();
 
         assert_eq!(
-            write_all_surfaces(&world, 100, dir.path(), 0, &mut revisions).unwrap(),
+            write_all_surfaces(&mut world, 100, dir.path(), 0, &mut revisions).unwrap(),
             2,
             "both surfaces are new at the first frame"
         );
         assert_eq!(
-            write_all_surfaces(&world, 200, dir.path(), 1, &mut revisions).unwrap(),
+            write_all_surfaces(&mut world, 200, dir.path(), 1, &mut revisions).unwrap(),
             0,
             "a world where nothing happened writes nothing at all"
         );
@@ -1584,7 +1690,7 @@ mod tests {
             &crate::event::Event::AddEntity { name: "inserter".to_string(), x: 51.0, y: 2.0, d: 0, w: 1, h: 1, id: Some(1) },
         );
         assert_eq!(
-            write_all_surfaces(&world, 300, dir.path(), 2, &mut revisions).unwrap(),
+            write_all_surfaces(&mut world, 300, dir.path(), 2, &mut revisions).unwrap(),
             1,
             "only the surface that actually changed"
         );
@@ -1611,11 +1717,13 @@ mod tests {
             entities: vec![crate::frame::Entity { n: "pipe".into(), x: 1.0, y: 2.0, d: 0, w: 1, h: 1 }],
             count: 1,
             tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
         });
 
         let dir = tempfile::tempdir().unwrap();
         let mut revisions = std::collections::HashMap::new();
-        write_all_surfaces(&world, 100, dir.path(), 0, &mut revisions).unwrap();
+        write_all_surfaces(&mut world, 100, dir.path(), 0, &mut revisions).unwrap();
 
         world.apply(
             Some("nauvis"),
@@ -1623,7 +1731,7 @@ mod tests {
         );
 
         assert_eq!(
-            write_all_surfaces(&world, 200, dir.path(), 1, &mut revisions).unwrap(),
+            write_all_surfaces(&mut world, 200, dir.path(), 1, &mut revisions).unwrap(),
             0,
             "re-adding what was already there changed nothing"
         );
@@ -1641,6 +1749,8 @@ mod tests {
                 crate::frame::Tile { n: "grass-1".into(), x: 0, y: 0 },
                 crate::frame::Tile { n: "concrete".into(), x: 1, y: 0 },
             ],
+            floor_unchanged: false,
+            ..Default::default()
         });
         // vulcanus has placed floor but no natural terrain, e.g. terrain
         // capture was off when this baseline was taken.
@@ -1650,6 +1760,8 @@ mod tests {
             entities: Vec::new(),
             count: 0,
             tiles: vec![crate::frame::Tile { n: "concrete".into(), x: 0, y: 0 }],
+            floor_unchanged: false,
+            ..Default::default()
         });
 
         let dir = tempfile::tempdir().unwrap();
@@ -1675,6 +1787,8 @@ mod tests {
             entities: Vec::new(),
             count: 0,
             tiles: vec![crate::frame::Tile { n: "concrete".into(), x: 0, y: 0 }],
+            floor_unchanged: false,
+            ..Default::default()
         });
 
         let dir = tempfile::tempdir().unwrap();

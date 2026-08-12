@@ -20,6 +20,10 @@ pub struct TypeRegistry {
     /// What the running game said its own prototypes are, when the capture
     /// shipped with an answer. Consulted before every built-in table below.
     prototypes: Option<save_timelapse::prototypes::Prototypes>,
+    /// Rail geometry worked out from the connectivity the mod recorded, keyed
+    /// by prototype and facing. Solved once here rather than per frame, the
+    /// answer being a property of the game rather than of a moment.
+    rail_geometry: HashMap<(String, u8), crate::rails::RailSegment>,
 }
 
 impl TypeRegistry {
@@ -31,7 +35,52 @@ impl TypeRegistry {
     /// intern time, so a description arriving later would apply to nothing.
     pub fn set_prototypes(&mut self, prototypes: save_timelapse::prototypes::Prototypes) {
         debug_assert!(self.names.is_empty(), "prototypes must be set before interning");
+        // Sampled by name, solved by type, so the answer keys the same way
+        // `rail_kind` asks for it and one sample answers for every prototype
+        // sharing that type.
+        let as_kind = |name: &String| prototypes.kind(name).unwrap_or(name).to_string();
+        let samples: Vec<save_timelapse::prototypes::RailSample> = prototypes
+            .rails
+            .iter()
+            .map(|sample| save_timelapse::prototypes::RailSample {
+                name: as_kind(&sample.name),
+                direction: sample.direction,
+                links: sample
+                    .links
+                    .iter()
+                    .map(|link| save_timelapse::prototypes::RailLink {
+                        name: as_kind(&link.name),
+                        direction: link.direction,
+                        x: link.x,
+                        y: link.y,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.rail_geometry = crate::rails::solve(&samples);
         self.prototypes = Some(prototypes);
+    }
+
+    /// How to draw this rail piece, or `None` for anything that is not track
+    /// this can place. What the capture described comes first, so a modded
+    /// rail set answers for itself; the built-in table covers every capture
+    /// recorded before the mod described rails at all.
+    pub fn rail_segment(&self, id: TypeId, direction: u8) -> Option<crate::rails::RailSegment> {
+        let kind = self.rail_kind(id);
+        self.rail_geometry.get(&(kind.to_string(), direction)).copied().or_else(|| crate::rails::rail_segment(kind, direction))
+    }
+
+    /// What sort of rail this is: the prototype's own type when the capture
+    /// described one, otherwise its name.
+    ///
+    /// Type rather than name, because rail geometry belongs to the type. A mod
+    /// adding its own straight rail gives it type `straight-rail`, so it is
+    /// laid out exactly like the vanilla one and needs nothing added here.
+    /// `minimalist-rails` alone contributes a whole `-minimal` family that
+    /// would otherwise not count as track at all.
+    fn rail_kind(&self, id: TypeId) -> &str {
+        let name = self.name(id);
+        self.prototypes.as_ref().and_then(|p| p.kind(name)).unwrap_or(name)
     }
 
     /// Both variants precomputed: nothing guarantees a name is only one, and
@@ -85,40 +134,55 @@ impl TypeRegistry {
         self.tile_colors[id as usize]
     }
 
+    /// This type's kind, or the default for an id this registry never
+    /// interned. Out of range cannot happen where the spans and the registry
+    /// came from the same load, but answering "nothing in particular" beats a
+    /// panic on somebody's timelapse.
+    fn kind(&self, id: TypeId) -> Kind {
+        self.kinds.get(id as usize).copied().unwrap_or_default()
+    }
+
+    /// Whether this is rail track, which is drawn as a segment along the path
+    /// it occupies rather than as a square on its centre tile. See `rail_kind`
+    /// for why the prototype's type decides rather than its name.
+    pub fn is_rail_track(&self, id: TypeId) -> bool {
+        RAIL_TRACK.contains(&self.rail_kind(id))
+    }
+
     pub fn is_belt(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].belt
+        self.kind(id).belt
     }
 
     pub fn is_splitter(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].splitter
+        self.kind(id).splitter
     }
 
     pub fn is_pipe(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].pipe
+        self.kind(id).pipe
     }
 
     pub fn is_pipe_to_ground(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].pipe_to_ground
+        self.kind(id).pipe_to_ground
     }
 
     pub fn is_resource(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].resource
+        self.kind(id).resource
     }
 
     pub fn is_terrain_scatter(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].scatter
+        self.kind(id).scatter
     }
 
     pub fn is_vehicle(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].vehicle
+        self.kind(id).vehicle
     }
 
     pub fn is_enemy(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].enemy
+        self.kind(id).enemy
     }
 
     pub fn is_rotation_allowed(&self, id: TypeId) -> bool {
-        self.kinds[id as usize].rotates
+        self.kind(id).rotates
     }
 
     /// Whether somebody placed this rather than the map generating it. One
@@ -127,14 +191,14 @@ impl TypeRegistry {
     /// trees, ore and nests for context, and on a wooded map they outnumber
     /// the factory ten to one.
     pub fn is_built(&self, id: TypeId) -> bool {
-        let kind = &self.kinds[id as usize];
+        let kind = self.kind(id);
         !kind.scatter && !kind.resource && !kind.enemy && !kind.vehicle
     }
 
     /// How far an underground belt of this type reaches, or `None` if it is
     /// not one. The reach is what pairs an entrance with its exit.
     pub fn underground_reach(&self, id: TypeId) -> Option<i32> {
-        self.kinds[id as usize].reach
+        self.kind(id).reach
     }
 }
 
@@ -1217,6 +1281,46 @@ mod tests {
             ..Default::default()
         });
         registry
+    }
+
+    /// A rail nothing here has heard of, drawn as track because the game said
+    /// what type it is. `minimalist-rails` contributes a whole `-minimal`
+    /// family this way, and under the name matching this replaced not one of
+    /// them counted as track at all.
+    #[test]
+    fn a_modded_rail_is_track_because_of_its_type() {
+        let mut registry = typed(
+            &[
+                ("straight-rail-minimal", "straight-rail"),
+                ("curved-rail-a-minimal", "curved-rail-a"),
+                ("kr-fancy-rail", "half-diagonal-rail"),
+            ],
+            &[],
+        );
+
+        for name in ["straight-rail-minimal", "curved-rail-a-minimal", "kr-fancy-rail"] {
+            let id = registry.intern(name);
+            assert!(registry.is_rail_track(id), "{name} is track");
+        }
+
+        // And laid out like the vanilla piece it shares a type with, rather
+        // than left as a square.
+        let minimal = registry.intern("straight-rail-minimal");
+        let vanilla = crate::rails::rail_segment("straight-rail", 2).unwrap();
+        assert_eq!(registry.rail_segment(minimal, 2), Some(vanilla));
+
+        let modded = registry.intern("kr-fancy-rail");
+        assert_eq!(registry.rail_segment(modded, 4), crate::rails::rail_segment("half-diagonal-rail", 4));
+    }
+
+    /// A capture that never described its prototypes still recognises the
+    /// vanilla names, which is every timelapse built before the mod wrote one.
+    #[test]
+    fn rails_are_still_track_without_a_description() {
+        let mut registry = TypeRegistry::new();
+        let id = registry.intern("straight-rail");
+        assert!(registry.is_rail_track(id));
+        assert!(registry.rail_segment(id, 0).is_some());
     }
 
     /// Names no list here has heard of, recognised because the game said so.

@@ -94,6 +94,13 @@ local capture_write_failed = false
 --- Wraps helpers.write_file so a failed capture write degrades the capture
 --- instead of crashing the game. After one failure every later write no-ops,
 --- rather than re-warning on every flush.
+---
+--- Reported to the log rather than to the game. Whether a write fails is a
+--- property of one machine, its disk and its permissions, so in multiplayer
+--- it can be true on one peer and false on every other. `game.print` changes
+--- game state, and changing it on one peer only is a desync; `log` touches
+--- nothing the game checksums. `capture_write_failed` is a module local for
+--- the same reason and must stay one.
 function M.safe_write_file(path, data, append)
   if capture_write_failed then
     return false
@@ -101,7 +108,7 @@ function M.safe_write_file(path, data, append)
   local ok, err = pcall(helpers.write_file, path, data, append)
   if not ok then
     capture_write_failed = true
-    game.print("[save-timelapse] capture write failed, capture stopped for this session: " .. tostring(err))
+    log("[save-timelapse] capture write failed, capture stopped for this session: " .. tostring(err))
   end
   return ok
 end
@@ -505,13 +512,134 @@ local function prototypes_path(session_id)
   return M.EXPORT_DIR .. encode.prototypes_name(session_id)
 end
 
+--- How many pieces of each prototype and facing to record. More than one
+--- because a piece sitting in a junction has extra neighbours, which would
+--- otherwise pass for the shape of every piece like it.
+local RAIL_SAMPLES_PER_FACING = 3
+
+--- A ceiling on how many rails are looked at per surface. Every facing of
+--- every prototype turns up within a few hundred pieces of track, and a
+--- megabase has hundreds of thousands.
+local RAIL_SCAN_LIMIT = 3000
+
+--- Which rails connect to which, for each rail prototype and facing.
+---
+--- Recorded because Factorio will not say where a rail piece's ends are. The
+--- prototype definitions state that a rail's collision box is hardcoded in the
+--- engine, so there is nothing to read, and a capture cannot be measured for
+--- it either: parallel track two tiles away puts endpoints exactly where a
+--- real joint would be, and no amount of sampling separates them.
+---
+--- What the game will say exactly is which rails are connected. The desktop
+--- side knows where a straight rail's ends are, having measured them from the
+--- step between consecutive pieces in a run, so from a curve's neighbours it
+--- can work out where the curve's own ends must be.
+---
+--- Positions are relative to the piece being described, that being the whole
+--- point: the answer is the same everywhere on the map.
+function M.sample_rail_joints()
+  -- Asked for by name, not by type. `find_entities_filtered` raises on a type
+  -- this game does not have, and one bad entry takes the whole call with it,
+  -- which is what an empty rail section turned out to mean. Building the list
+  -- out of `prototypes.entity` makes every name real by construction, and
+  -- picks up whatever a mod added and the `-minimal` variants besides.
+  local wanted = {}
+  for _, kind in ipairs(encode.RAIL_TYPES) do
+    wanted[kind] = true
+  end
+  local names = {}
+  for name, proto in pairs(prototypes.entity) do
+    if wanted[proto.type] then
+      names[#names + 1] = name
+    end
+  end
+  if #names == 0 then
+    log("[save-timelapse] no rail prototypes in this game, so no rail geometry to record")
+    return {}
+  end
+
+  local samples, counts = {}, {}
+  local seen = 0
+  -- Logged once rather than per rail: a refused branch on a megabase would be
+  -- hundreds of thousands of identical lines.
+  local reported = false
+  for _, surface in pairs(game.surfaces) do
+    -- Per surface, so one that refuses to be scanned costs only itself.
+    local ok, rails = pcall(function()
+      return surface.find_entities_filtered({ name = names, limit = RAIL_SCAN_LIMIT })
+    end)
+    if not ok then
+      log("[save-timelapse] rail scan failed on " .. surface.name .. ": " .. tostring(rails))
+    else
+      for _, rail in pairs(rails) do
+        if rail.valid then
+          seen = seen + 1
+          local key = rail.name .. "|" .. rail.direction
+          if (counts[key] or 0) < RAIL_SAMPLES_PER_FACING then
+            local pos = rail.position
+            -- Asked one end and one branch at a time, which is the only way a
+            -- rail will answer. `get_connected_rails` looks like the obvious
+            -- call and is a rail *signal* method: on a rail it raises "Entity
+            -- is not rail-signal", which is how this was found.
+            --
+            -- Both ends times every branch, so a piece in a junction reports
+            -- all of them. Iterated over the `defines` tables rather than
+            -- written out, so a version that adds a branch direction is
+            -- covered without touching this.
+            local links = {}
+            for _, from_end in pairs(defines.rail_direction) do
+              for _, branch in pairs(defines.rail_connection_direction) do
+                local got, other = pcall(function()
+                  return rail.get_connected_rail({ rail_direction = from_end, rail_connection_direction = branch })
+                end)
+                -- A branch that refuses means nothing is attached there, not
+                -- that rails cannot be read. `rail_connection_direction`
+                -- includes `none`, and asking about it is exactly the kind of
+                -- combination the game may reject; treating that as fatal is
+                -- what emptied this list the first two times.
+                if not got then
+                  if not reported then
+                    log("[save-timelapse] rail branch refused: " .. tostring(other))
+                    reported = true
+                  end
+                elseif other and other.valid then
+                  local at = other.position
+                  links[#links + 1] = { n = other.name, d = other.direction, x = at.x - pos.x, y = at.y - pos.y }
+                end
+              end
+            end
+            -- A piece with nothing attached says nothing about where its ends
+            -- are, so it is not worth a sample slot.
+            if #links > 0 then
+              counts[key] = (counts[key] or 0) + 1
+              samples[#samples + 1] = { n = rail.name, d = rail.direction, links = links }
+            end
+          end
+        end
+      end
+    end
+  end
+  log(string.format("[save-timelapse] rail geometry: %d prototypes, %d rails seen, %d sampled", #names, seen, #samples))
+  return samples
+end
+
 --- Writes what this game's prototypes are. Overwrites rather than appends,
 --- which is how a capture picks up mods added since it started. `pcall`'d
 --- because a description that failed to write must never take a capture down:
 --- the desktop side falls back to its own built-in names.
+---
+--- The rail sampling is `pcall`'d separately and inside that, so a game whose
+--- rail API differs from this one still gets everything else described. An
+--- empty list is what a capture made before this existed also looks like, and
+--- the desktop side already has to handle that.
 function M.write_prototypes(session_id)
   pcall(function()
-    M.safe_write_file(prototypes_path(session_id), encode.prototypes_json(), false)
+    local rails = {}
+    local ok, sampled = pcall(M.sample_rail_joints)
+    if ok and sampled then
+      rails = sampled
+    end
+    M.safe_write_file(prototypes_path(session_id), encode.prototypes_json(rails), false)
   end)
 end
 

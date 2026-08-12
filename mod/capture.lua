@@ -58,6 +58,19 @@ local capture_dictionaries_synced = false
 --- which is what makes a capture heal itself when a version that wrote the file
 --- wrongly is replaced.
 local loaded_mods_stamp = nil
+--- Bumped whenever `encode.prototypes_json` gains or changes a section.
+---
+--- Part of the stamp below because the stamp decides whether the file is
+--- rewritten, and a version of this mod that describes more than the last one
+--- did has to rewrite it even though the loaded mods are identical. Without
+--- this a capture kept whatever its first write produced: the rail section
+--- added in 0.8.0 never reached a playthrough already under way, and would
+--- have looked exactly like the sampling failing.
+local PROTOTYPES_FORMAT = 5
+
+--- What the prototype description was written for: every loaded mod and its
+--- version, plus the shape this mod writes. Cached, `script.active_mods`
+--- being fixed for the run.
 local function loaded_mods()
   if not loaded_mods_stamp then
     local parts = {}
@@ -65,7 +78,7 @@ local function loaded_mods()
       parts[#parts + 1] = name .. " " .. version
     end
     table.sort(parts)
-    loaded_mods_stamp = table.concat(parts, ",")
+    loaded_mods_stamp = table.concat(parts, ",") .. ";format " .. PROTOTYPES_FORMAT
   end
   return loaded_mods_stamp
 end
@@ -130,11 +143,11 @@ end
 --- See baseline_manifest_path above for why a nil session_id (a save whose
 --- capture state predates this feature) falls back to the untagged name
 --- instead of erroring.
-local function capture_segment_path(session_id, start_tick)
+local function capture_segment_path(session_id, start_tick, parent)
   if not session_id then
-    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick)
+    return export.EXPORT_DIR .. encode.capture_segment_basename(start_tick, parent)
   end
-  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick)
+  return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, parent)
 end
 
 --- A playthrough's identity, for tagging files in the shared script-output
@@ -162,8 +175,10 @@ end
 --- played, which keeps the rollback check neither trigger-happy nor blind.
 local function ensure_capture_segment()
   local state = storage.timelapse_capture
+  local started_now = false
 
   if not state then
+    started_now = true
     state = {
       segment_start_tick = game.tick,
       last_tick = game.tick,
@@ -173,24 +188,58 @@ local function ensure_capture_segment()
     storage.timelapse_capture = state
   end
 
-  capture_path = capture_segment_path(state.session_id, state.segment_start_tick)
+  -- A load always starts a new segment rather than resuming the one this save
+  -- names, which is what `capture_dictionaries_synced` being false means here.
+  --
+  -- Resuming could not be made safe. The file a save names is not necessarily
+  -- still there: deleting a capture cannot reach the saves that describe it, so
+  -- loading a save from before a reset appended to a file that was gone and
+  -- recreated it with no header. Nor was the name honest, since a segment named
+  -- for when it was first created went on to hold events from an entirely
+  -- different branch, and the reader bounds abandoned branches using exactly
+  -- that number.
+  --
+  -- Starting fresh costs one file per load and makes both true: every file gets
+  -- its header from whoever created it, and every filename is the tick its
+  -- records really begin at.
+  if not capture_dictionaries_synced then
+    -- The segment this save was written during, recorded before it is
+    -- overwritten. `storage` rewinds with the save, so a save loaded from an
+    -- abandoned branch still names the segment it belonged to, and that is the
+    -- one piece of lineage a save carries. Without it the reading side can
+    -- only assume each load continued the last one, which is wrong the moment
+    -- somebody goes forward, back, then forward again.
+    --
+    -- A capture's first segment stays parentless: the state was created a few
+    -- lines up, so `segment_start_tick` is this same segment rather than one
+    -- before it, and naming itself as its own parent would say a save existed
+    -- before the capture that recorded it.
+    if not started_now then
+      state.segment_parent = state.segment_start_tick
+    end
+    state.segment_start_tick = game.tick
+    state.segment_initialized = false
+  end
+
+  -- Invariant: `capture_pending` must be empty whenever this changes. Buffered
+  -- records carry dictionary ids belonging to the file they were encoded for,
+  -- so redirecting the buffer mid-flight writes records the new file never
+  -- defines names for, and a reader can only drop them. Safe here because a
+  -- load re-runs this file and empties the buffer; `M.reset_capture` is the
+  -- other place the path moves, and it clears the buffer itself.
+  capture_path = capture_segment_path(state.session_id, state.segment_start_tick, state.segment_parent)
 
   if not state.segment_initialized then
     capture_names = encode.new_dictionary()
     capture_surfaces = encode.new_dictionary()
     capture_last_written_tick = nil
+    -- Not an append: a segment starting at a tick some earlier attempt also
+    -- started at is that attempt being redone, and what it wrote is a branch
+    -- the player has just abandoned by loading back to here.
     export.safe_write_file(capture_path, encode.event_header(), false)
     state.segment_initialized = true
-  elseif not capture_dictionaries_synced then
-    -- Resuming a segment this save was already writing. The module locals
-    -- above were reset by the load while the file still holds every name
-    -- defined before it, so the two sides disagree about what id 0 means.
-    -- See encode.event_reset_dictionaries.
-    export.safe_write_file(capture_path, encode.event_reset_dictionaries(), true)
   end
 
-  -- Set after both branches, so the very first call of a session takes one
-  -- of them and every later call in the same session takes neither.
   capture_dictionaries_synced = true
 end
 
@@ -308,6 +357,19 @@ function M.reset_capture(player)
 
   storage.timelapse_capture = nil
   capture_checked_rollover = false
+
+  -- Everything below describes the capture just deleted. Left alone, the next
+  -- flush appends events still encoded against the old dictionary into a fresh
+  -- segment that never defines those names, and a reader can only drop them:
+  -- observed as a reset capture recording nothing at all until the save was
+  -- reloaded. `ensure_capture_segment` resets the dictionaries for a new
+  -- segment, but it cannot know the buffer already holds records that used the
+  -- old ones.
+  capture_pending, capture_pending_count = {}, 0
+  capture_path = nil
+  capture_names = encode.new_dictionary()
+  capture_surfaces = encode.new_dictionary()
+  capture_last_written_tick = nil
   -- The milestone file goes with the session folder, so the record of which
   -- milestones already fired has to go too, or none would ever be rewritten.
   milestones.reset()
@@ -345,7 +407,10 @@ local function encode_capture_event(op, kind, name, x, y, direction, id, w, h, s
     if op == "+" then
       return encode.event_add_entity(capture_names, capture_surfaces, surface, name, x, y, direction, id, w, h)
     end
-    return encode.event_remove_entity(capture_surfaces, surface, x, y, id)
+    -- `name` reaches here only for a resource, whose removal a position alone
+    -- would resolve to whatever stands on it instead.
+    local names_it = name and encode.event_remove_name(capture_names, name) or ""
+    return names_it .. encode.event_remove_entity(capture_surfaces, surface, x, y, id)
   end
   if op == "+" then
     return encode.event_add_tile(capture_names, capture_surfaces, surface, name, x, y)
@@ -388,6 +453,47 @@ local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
   end
 end
 
+--- The type list `find_entities_filtered` wants, built once from the same set
+--- `encode` states, so the two cannot drift.
+local draggable_carrier_types = nil
+local function draggable_carrier_type_list()
+  if not draggable_carrier_types then
+    draggable_carrier_types = {}
+    for name in pairs(encode.DRAGGABLE_CARRIER_TYPES) do
+      draggable_carrier_types[#draggable_carrier_types + 1] = name
+    end
+  end
+  return draggable_carrier_types
+end
+
+--- Dragging a belt line around a corner makes Factorio rotate the belt already
+--- placed, and raises no event for it, so the capture kept the facing that belt
+--- went down with and every dragged corner drew straight.
+---
+--- The rotated one is the tile behind the new belt, opposite the way it faces,
+--- so one lookup per belt placed catches it. Re-logging it as an ordinary add
+--- costs the reader nothing when nothing changed: `World::insert` updates an
+--- occupied position in place and skips the revision bump.
+local function relog_belt_behind(surface, pos, direction)
+  local dx, dy = encode.step_behind(direction)
+  if not dx then
+    return
+  end
+
+  local found = surface.find_entities_filtered({
+    position = { x = pos.x + dx, y = pos.y + dy },
+    type = draggable_carrier_type_list(),
+  })[1]
+  if not found then
+    return
+  end
+
+  local back = found.position
+  log_event("+", "e", found.name, back.x, back.y,
+    found.direction, found.unit_number, found.tile_width, found.tile_height,
+    surface.name)
+end
+
 --- Every field read here crosses the Lua/C++ boundary once per property, and
 --- on a busy tick those crossings are most of what capture costs, so a removal
 --- reads only what a removal record holds. Two calls rather than conditionals,
@@ -399,13 +505,24 @@ local function log_entity(op, entity)
   local pos = entity.position
 
   if op ~= "+" then
-    log_event(op, "e", nil, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
+    -- Named only when it is a deposit, which is the one thing that can be
+    -- buried under something else and so the one case a position alone cannot
+    -- resolve (see `encode.event_remove_name`). The type was read above
+    -- already, so every other removal still reads exactly what it writes.
+    local buried = entity.type == "resource" and entity.name or nil
+    log_event(op, "e", buried, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
     return
   end
 
+  local direction = entity.direction
+  local surface = entity.surface
   log_event(op, "e", entity.name, pos.x, pos.y,
-    entity.direction, entity.unit_number, entity.tile_width, entity.tile_height,
-    entity.surface.name)
+    direction, entity.unit_number, entity.tile_width, entity.tile_height,
+    surface.name)
+
+  if encode.DRAGGABLE_CARRIER_TYPES[entity.type] then
+    relog_belt_behind(surface, pos, direction)
+  end
 end
 
 --- Whether natural ground is being captured at all. Memoized: a startup

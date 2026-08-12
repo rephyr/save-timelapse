@@ -1,8 +1,9 @@
 //! Reading the live capture event log written by mod/control.lua.
 //!
-//! Wire format (`events_<start_tick>.stev`), all integers little endian. Each
-//! playthrough's segments live in their own session subfolder, `game.tick`
-//! restarting from 0 for every save:
+//! Wire format, all integers little endian. Each playthrough's segments live in
+//! their own session subfolder, named `events_<start_tick>_<parent>.stev` for
+//! the segment whose save this one's was made during, or `events_<start_tick>.stev`
+//! for a capture's first segment. `game.tick` restarts from 0 for every save:
 //!
 //! ```text
 //! magic   4 bytes, "STE1", written once when the segment is created
@@ -18,6 +19,8 @@
 //!   tag 5  AddTile        u16 name_id, i32 x, i32 y, u16 surface_id
 //!   tag 6  RemoveTile     i32 x, i32 y, u16 surface_id
 //!   tag 7  ResetDictionaries (no payload, version 2 and later)
+//!   tag 128 RemoveName    varint len, then varint name_id: names what the
+//!                         next RemoveEntity is for (version 3 and later)
 //!   tag >=128 Extension    varint len, then that many bytes
 //! ```
 //!
@@ -55,6 +58,11 @@ const MIN_SUPPORTED_VERSION: u8 = 1;
 /// Tags from here up carry their own length and may be skipped. Core record
 /// tags stay below it so the two can never collide as the format grows.
 const TAG_EXTENSION_MIN: u8 = 128;
+/// Names the entity the next `RemoveEntity` is for. An extension rather than a
+/// field on that record, the core layout being frozen at version 3, so a tool
+/// older than this steps over it and resolves the removal the way it always
+/// did. See `encode.event_remove_name`.
+const TAG_REMOVE_NAME: u8 = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -73,6 +81,10 @@ pub enum Event {
     RemoveEntity {
         id: Option<u64>,
         pos: (f32, f32),
+        /// Which of the things sharing this position was mined, when the mod
+        /// said. Only ever set for a resource, the one thing that can be
+        /// buried, so `None` means "whatever is on top" as it always did.
+        name: Option<String>,
     },
     AddTile {
         name: String,
@@ -101,16 +113,123 @@ pub struct EventStream {
     names: Vec<String>,
     surfaces: Vec<String>,
     current_tick: Option<u64>,
+    /// Set by a `TAG_REMOVE_NAME` record and consumed by the removal that
+    /// follows it. A `DefineSurface` may sit between the two, the writer
+    /// emitting one with the removal itself, so only an add or a dictionary
+    /// reset clears it.
+    pending_remove_name: Option<String>,
     unknown_extensions: usize,
+    undefined_references: usize,
+    /// Set when the walk stopped on a tag it could not read, as opposed to
+    /// simply running out of bytes. That difference is what separates a
+    /// damaged file from one whose last record was cut short by the game being
+    /// killed, and it is what `stream_log` needs to judge a headerless
+    /// segment.
+    unreadable_tag: bool,
+    /// Where records begin, so a headerless segment can be rewound to 0 and a
+    /// normal one past its five byte header.
+    start: usize,
+    headerless: bool,
 }
 
 impl EventStream {
+    fn over(bytes: Vec<u8>, start: usize) -> EventStream {
+        EventStream {
+            bytes,
+            pos: start,
+            start,
+            names: Vec::new(),
+            surfaces: Vec::new(),
+            current_tick: None,
+            pending_remove_name: None,
+            unknown_extensions: 0,
+            undefined_references: 0,
+            unreadable_tag: false,
+            headerless: false,
+        }
+    }
+
+    /// Whether this segment had no header and was accepted on the strength of
+    /// parsing cleanly. Worth reporting: it means a recording was damaged and
+    /// recovered, not that everything was well.
+    pub fn headerless(&self) -> bool {
+        self.headerless
+    }
+
     /// Extension records stepped over because this build does not recognise
     /// their tag, which only means the capture is newer than the tool. Only
     /// meaningful once the stream has been walked.
     pub fn unknown_extensions(&self) -> usize {
         self.unknown_extensions
     }
+
+    /// Records dropped because they named a dictionary entry this segment
+    /// never defined, which is damage rather than a version difference.
+    ///
+    /// Counted because it used to be silent: a capture reset left the mod's
+    /// buffer holding records encoded against the deleted segment's
+    /// dictionary, they were flushed into a fresh segment that defined none of
+    /// those names, and every one vanished here without a word. A whole
+    /// playthrough recorded nothing and looked like it had simply not been
+    /// played.
+    pub fn undefined_references(&self) -> usize {
+        self.undefined_references
+    }
+
+    /// Walks the whole stream to see whether it reads as events, then puts it
+    /// back so the caller can walk it for real. Used only to judge a segment
+    /// with no header, where guessing wrong would mean feeding a replay
+    /// nonsense.
+    ///
+    /// Reuses this stream rather than copying the bytes: a segment can be
+    /// hundreds of megabytes, and the whole point is that this costs a second
+    /// pass and nothing else.
+    fn reads_as_events(&mut self) -> bool {
+        let mut any = false;
+        for _ in self.by_ref() {
+            any = true;
+        }
+        let clean = any && !self.unreadable_tag;
+        self.pos = self.start;
+        self.names.clear();
+        self.surfaces.clear();
+        self.current_tick = None;
+        self.pending_remove_name = None;
+        self.unknown_extensions = 0;
+        self.undefined_references = 0;
+        self.unreadable_tag = false;
+        clean
+    }
+}
+
+/// A record's name and surface, counting a miss in `undefined`. Resolved to
+/// owned strings so the caller is not left holding a borrow of the
+/// dictionaries, and every caller cloned them anyway.
+///
+/// Free functions taking one field each because `EventStream::next` holds a
+/// reader over `bytes` for the whole loop body, so nothing there can take
+/// `&mut self`.
+fn resolve(
+    names: &[String],
+    surfaces: &[String],
+    undefined: &mut usize,
+    name_id: usize,
+    surface_id: usize,
+) -> (Option<String>, Option<String>) {
+    let name = names.get(name_id).cloned();
+    let surface = surfaces.get(surface_id).cloned();
+    if name.is_none() || surface.is_none() {
+        *undefined += 1;
+    }
+    (name, surface)
+}
+
+fn resolve_surface(surfaces: &[String], undefined: &mut usize, surface_id: usize) -> Option<String> {
+    let surface = surfaces.get(surface_id).cloned();
+    if surface.is_none() {
+        *undefined += 1;
+    }
+    surface
 }
 
 impl Iterator for EventStream {
@@ -141,8 +260,10 @@ impl Iterator for EventStream {
                 7 => {
                     self.names.clear();
                     self.surfaces.clear();
+                    self.pending_remove_name = None;
                 }
                 3 => {
+                    self.pending_remove_name = None;
                     let name_id = r.u16()? as usize;
                     let x = r.i32()?;
                     let y = r.i32()?;
@@ -151,12 +272,14 @@ impl Iterator for EventStream {
                     let h = r.u8()?;
                     let id = r.u64()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.names.get(name_id), self.surfaces.get(surface_id)) {
+                    let (name, surface) =
+                        resolve(&self.names, &self.surfaces, &mut self.undefined_references, name_id, surface_id);
+                    let event = match (self.current_tick, name, surface) {
                         (Some(tick), Some(name), Some(surface)) => Some(LoggedEvent {
                             tick,
-                            surface: surface.clone(),
+                            surface,
                             event: Event::AddEntity {
-                                name: name.clone(),
+                                name,
                                 x: x as f32 / 10.0,
                                 y: y as f32 / 10.0,
                                 d,
@@ -178,11 +301,16 @@ impl Iterator for EventStream {
                     let y = r.i32()?;
                     let id = r.u64()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.surfaces.get(surface_id)) {
+                    let surface = resolve_surface(&self.surfaces, &mut self.undefined_references, surface_id);
+                    let event = match (self.current_tick, surface) {
                         (Some(tick), Some(surface)) => Some(LoggedEvent {
                             tick,
-                            surface: surface.clone(),
-                            event: Event::RemoveEntity { id: (id != 0).then_some(id), pos: (x as f32 / 10.0, y as f32 / 10.0) },
+                            surface,
+                            event: Event::RemoveEntity {
+                                id: (id != 0).then_some(id),
+                                pos: (x as f32 / 10.0, y as f32 / 10.0),
+                                name: self.pending_remove_name.take(),
+                            },
                         }),
                         _ => None,
                     };
@@ -193,16 +321,17 @@ impl Iterator for EventStream {
                     continue;
                 }
                 5 => {
+                    self.pending_remove_name = None;
                     let name_id = r.u16()? as usize;
                     let x = r.i32()?;
                     let y = r.i32()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.names.get(name_id), self.surfaces.get(surface_id)) {
-                        (Some(tick), Some(name), Some(surface)) => Some(LoggedEvent {
-                            tick,
-                            surface: surface.clone(),
-                            event: Event::AddTile { name: name.clone(), x, y },
-                        }),
+                    let (name, surface) =
+                        resolve(&self.names, &self.surfaces, &mut self.undefined_references, name_id, surface_id);
+                    let event = match (self.current_tick, name, surface) {
+                        (Some(tick), Some(name), Some(surface)) => {
+                            Some(LoggedEvent { tick, surface, event: Event::AddTile { name, x, y } })
+                        }
                         _ => None,
                     };
                     self.pos += r.consumed();
@@ -215,10 +344,9 @@ impl Iterator for EventStream {
                     let x = r.i32()?;
                     let y = r.i32()?;
                     let surface_id = r.u16()? as usize;
-                    let event = match (self.current_tick, self.surfaces.get(surface_id)) {
-                        (Some(tick), Some(surface)) => {
-                            Some(LoggedEvent { tick, surface: surface.clone(), event: Event::RemoveTile { x, y } })
-                        }
+                    let surface = resolve_surface(&self.surfaces, &mut self.undefined_references, surface_id);
+                    let event = match (self.current_tick, surface) {
+                        (Some(tick), Some(surface)) => Some(LoggedEvent { tick, surface, event: Event::RemoveTile { x, y } }),
                         _ => None,
                     };
                     self.pos += r.consumed();
@@ -231,6 +359,17 @@ impl Iterator for EventStream {
                 // so it can be stepped over. A length past the end of the file
                 // falls out as `None` from `skip`, the same treatment every
                 // record gets when the game was killed mid write.
+                // Names what the next removal is for. Read out of its own
+                // length rather than off the stream, so a payload that grows
+                // later is still stepped over exactly.
+                TAG_REMOVE_NAME => {
+                    let len = r.varint()? as usize;
+                    let payload = r.bytes(len)?;
+                    self.pending_remove_name =
+                        ByteReader::new(payload).varint().and_then(|id| self.names.get(id as usize)).cloned();
+                    self.pos += r.consumed();
+                    continue;
+                }
                 t if t >= TAG_EXTENSION_MIN => {
                     let len = r.varint()? as usize;
                     r.skip(len)?;
@@ -240,7 +379,10 @@ impl Iterator for EventStream {
                 // not know can only come from a version whose layout differs,
                 // and `stream_log`'s version check has already refused those.
                 // Reaching here means a damaged file, so stop.
-                _ => return None,
+                _ => {
+                    self.unreadable_tag = true;
+                    return None;
+                }
             }
 
             self.pos += r.consumed();
@@ -256,7 +398,7 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
     File::open(path)?.read_to_end(&mut bytes)?;
 
     if bytes.get(0..4) != Some(&MAGIC[..]) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an event log (bad magic)", path.display())));
+        return headerless(path, bytes);
     }
     match bytes.get(4) {
         Some(&v) if (MIN_SUPPORTED_VERSION..=CURRENT_VERSION).contains(&v) => {}
@@ -272,7 +414,28 @@ pub fn stream_log(path: &Path) -> io::Result<EventStream> {
         None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("{}: truncated event log", path.display()))),
     }
 
-    Ok(EventStream { bytes, pos: 5, names: Vec::new(), surfaces: Vec::new(), current_tick: None, unknown_extensions: 0 })
+    Ok(EventStream::over(bytes, 5))
+}
+
+/// A segment with no header, accepted if it reads as events all the way to the
+/// end and refused otherwise.
+///
+/// These are real and they are not corruption. Deleting a capture cannot reach
+/// the save files that describe it, so a save made before a reset still names
+/// the segment the reset deleted, and loading it appends to a file that is no
+/// longer there. The mod believed the header was written hours ago, so the file
+/// comes back headerless with every record after it intact.
+///
+/// Judged by parsing rather than by guessing: a whole-file walk that never
+/// meets a tag it cannot read is strong evidence, and the alternative is
+/// throwing away somebody's playthrough over five missing bytes.
+fn headerless(path: &Path, bytes: Vec<u8>) -> io::Result<EventStream> {
+    let mut stream = EventStream::over(bytes, 0);
+    if stream.reads_as_events() {
+        stream.headerless = true;
+        return Ok(stream);
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}: not an event log (bad magic)", path.display())))
 }
 
 /// One segment file, plus the half-open tick range replay should take from it.
@@ -295,34 +458,50 @@ pub struct Segment {
 /// Every segment in `dir`, in the order play happened, each bounded at the tick
 /// a later reload superseded it. `dir` is one playthrough's session folder.
 ///
-/// Ordered by mtime rather than the tick in the filename, start tick not being
-/// chronological once a playthrough reloads more than once: a segment is
-/// appended to for exactly as long as it is live.
+/// What survives is the newest segment's ancestor chain, each segment naming
+/// the one its save was made during. A branch nothing descends from is dropped
+/// whole, being play the player walked away from. See `ancestry`.
 ///
-/// Each segment ends where the next created one begins, so `end_tick` is the
-/// smallest start tick among all later segments, computed as a suffix minimum
-/// so a second reload reaching further back also invalidates the first's. That
+/// Which segment is newest comes from mtime rather than the tick in the
+/// filename, start tick not being chronological once a playthrough reloads more
+/// than once: a segment is appended to for exactly as long as it is live. Equal
+/// mtimes fall back to ascending start tick.
+///
+/// Each segment on the chain ends where the next one begins, so `end_tick` is
+/// the smallest start tick among all later segments, computed as a suffix
+/// minimum so a reload reaching further back also invalidates the first's. That
 /// bound is also what keeps the result in ascending tick order.
-///
-/// Equal mtimes fall back to start tick, then rollover sequence, degrading to
-/// stitching in tick order with overlaps trimmed.
 pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
-    let mut found: Vec<(SystemTime, u64, u32, PathBuf)> = std::fs::read_dir(dir)?
+    let mut found: Vec<Found> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
-            let (start_tick, seq) = segment_tick(&path)?;
+            let (start_tick, parent) = segment_tick(&path)?;
             // A segment whose mtime cannot be read sorts oldest, which puts
             // it before everything readable rather than silently last.
             let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-            Some((modified, start_tick, seq, path))
+            Some(Found { modified, start_tick, parent, path })
         })
         .collect();
-    found.sort();
+    found.sort_by_key(|f| (f.modified, f.start_tick));
+
+    // The last segment written is the branch being played, and each segment
+    // names the one its save was made during, so its ancestors are the history
+    // that actually leads here. Everything else is a branch left behind.
+    let chain = match found.last().filter(|tip| tip.parent.is_some()) {
+        Some(tip) => ancestry(&found, tip),
+        // Nothing claims a parent, so this capture predates lineage being
+        // recorded. Fall back to creation order, which is right whenever each
+        // load continued the previous one.
+        None => found.iter().collect(),
+    };
 
     let mut segments: Vec<Segment> =
-        found.into_iter().map(|(_, start_tick, _, path)| Segment { path, start_tick, end_tick: u64::MAX }).collect();
+        chain.into_iter().map(|f| Segment { path: f.path.clone(), start_tick: f.start_tick, end_tick: u64::MAX }).collect();
 
+    // Each is superseded where the next one along the chain begins. A suffix
+    // minimum rather than simply the next start tick, because a chain can step
+    // back on itself: loading a save from earlier in the same branch.
     let mut superseded_at = u64::MAX;
     for segment in segments.iter_mut().rev() {
         segment.end_tick = superseded_at;
@@ -330,6 +509,49 @@ pub fn log_segments(dir: &Path) -> io::Result<Vec<Segment>> {
     }
 
     Ok(segments)
+}
+
+/// One segment file as found on disk, before it is known whether it is part of
+/// the surviving history.
+struct Found {
+    modified: SystemTime,
+    start_tick: u64,
+    /// The segment this one's save was made during, from the filename. `None`
+    /// for the first segment of a capture, and for every segment written
+    /// before the mod recorded it.
+    parent: Option<u64>,
+    path: PathBuf,
+}
+
+/// `tip` and its ancestors, oldest first.
+///
+/// Walking parents rather than trusting creation order is what makes
+/// forward, back, forward come out right: the third load's save was made in
+/// the first branch, so the second branch is not an ancestor and goes, however
+/// recently it was written.
+///
+/// A parent naming a segment that is not there ends the walk, which is what a
+/// capture assembled from pieces looks like. A cycle cannot happen from a
+/// mod that only ever names an older segment, but the visited set makes it
+/// terminate anyway rather than trusting that.
+fn ancestry<'a>(found: &'a [Found], tip: &'a Found) -> Vec<&'a Found> {
+    let mut chain = vec![tip];
+    let mut seen: Vec<u64> = vec![tip.start_tick];
+    let mut at = tip;
+    while let Some(parent) = at.parent {
+        if seen.contains(&parent) {
+            break;
+        }
+        // The most recently written segment with that start tick: loading one
+        // save twice truncates and rewrites in place, so the newest is the one
+        // whose contents survived.
+        let Some(next) = found.iter().rfind(|f| f.start_tick == parent) else { break };
+        seen.push(parent);
+        chain.push(next);
+        at = next;
+    }
+    chain.reverse();
+    chain
 }
 
 /// The exclusive tick bound for each append run inside one segment, given the
@@ -363,21 +585,21 @@ pub fn segment_run_bounds(path: &Path, segment_end: u64) -> io::Result<Vec<u64>>
     Ok(bounds)
 }
 
-/// Parses `events_<tick>.stev` or `events_<tick>_<seq>.stev` into its start
-/// tick and rollover sequence. `None` for anything else, so a stray file is
-/// ignored rather than crashing discovery.
+/// A segment's own start tick, and the segment its save was made during.
+/// `None` for anything that is not a segment file, so a stray file is ignored
+/// rather than crashing discovery.
 ///
-/// `seq` exists because reloading the same save twice resumes at the same tick
-/// both times. Only a tiebreak, mtime staying the primary key since it also
-/// orders segments written before `seq` existed.
-fn segment_tick(path: &Path) -> Option<(u64, u32)> {
+/// `events_<tick>.stev` is a capture's first segment, or one written before
+/// lineage was recorded. `events_<tick>_<parent>.stev` names its parent, which
+/// is what lets a branch left behind be told from the history leading here.
+fn segment_tick(path: &Path) -> Option<(u64, Option<u64>)> {
     if path.extension().and_then(|e| e.to_str()) != Some("stev") {
         return None;
     }
     let rest = path.file_stem()?.to_str()?.strip_prefix("events_")?;
     match rest.split_once('_') {
-        Some((tick, seq)) => Some((tick.parse().ok()?, seq.parse().ok()?)),
-        None => Some((rest.parse().ok()?, 0)),
+        Some((tick, parent)) => Some((tick.parse().ok()?, Some(parent.parse().ok()?))),
+        None => Some((rest.parse().ok()?, None)),
     }
 }
 
@@ -454,7 +676,7 @@ mod tests {
         let logged = stream_log(&path).unwrap().next().unwrap();
 
         assert_eq!(logged.surface, "vulcanus");
-        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: (-3.5, 4.5) });
+        assert_eq!(logged.event, Event::RemoveEntity { id: Some(99), pos: (-3.5, 4.5), name: None });
     }
 
     #[test]
@@ -564,7 +786,7 @@ mod tests {
             w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
                                                                           // Something a later mod version writes and this build has never
                                                                           // heard of, sitting between two records it does understand.
-            w.u8(TAG_EXTENSION_MIN).varint(4).u32(0xDEADBEEF);
+            w.u8(TAG_EXTENSION_MIN + 40).varint(4).u32(0xDEADBEEF);
             w.u8(3).u16(0).i32(15).i32(5).u8(0).u8(1).u8(1).u64(2).u16(0); // AddEntity
         });
 
@@ -576,6 +798,133 @@ mod tests {
         assert_eq!(events.len(), 2, "the record after the extension must still arrive");
         assert_eq!(events[1].event, Event::AddEntity { name: "pipe".to_string(), x: 1.5, y: 0.5, d: 0, w: 1, h: 1, id: Some(2) });
         assert_eq!(stream.unknown_extensions(), 1);
+    }
+
+    /// A segment that lost its header is recovered rather than thrown away.
+    /// Resetting a capture deletes files that saves still name, so loading one
+    /// of those saves appends to a file that is gone and it comes back with
+    /// every record intact and no magic in front.
+    #[test]
+    fn a_segment_with_no_header_is_recovered_if_it_reads_as_events() {
+        let whole = segment(|w| {
+            w.u8(2).u64(10);
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(15).i32(25).u8(0).u8(1).u8(1).u64(1).u16(0);
+            w.u8(3).u16(0).i32(35).i32(45).u8(0).u8(1).u8(1).u64(2).u16(0);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let intact = write_to(dir.path(), "events_0.stev", &whole);
+        let expected: Vec<LoggedEvent> = stream_log(&intact).unwrap().collect();
+        assert_eq!(expected.len(), 2);
+
+        // The same bytes with the five byte header gone, which is exactly what
+        // the mod leaves behind in this case.
+        let beheaded = write_to(dir.path(), "events_1.stev", &whole[5..]);
+        let mut stream = stream_log(&beheaded).expect("a headerless segment must still open");
+        let recovered: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(recovered, expected, "recovered events must match the intact file exactly");
+        assert!(stream.headerless(), "and the recording must be reported as damaged");
+    }
+
+    /// Recovery only stretches so far. Something that is not an event log must
+    /// still be refused, or a replay would be fed nonsense.
+    #[test]
+    fn something_that_is_not_an_event_log_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("junk.stev", b"this is not a capture at all, it is prose".to_vec()),
+            ("empty.stev", Vec::new()),
+            // A plausible first record followed by a tag no version has.
+            ("half.stev", vec![2, 10, 0, 0, 0, 0, 0, 0, 0, 99]),
+        ] {
+            let path = write_to(dir.path(), name, &bytes);
+            assert!(stream_log(&path).is_err(), "{name} must not be accepted as a headerless segment");
+        }
+    }
+
+    /// Records that name a dictionary entry their segment never defined are
+    /// lost, and used to be lost in silence. A capture reset left the mod's
+    /// buffer holding records encoded against the deleted segment's
+    /// dictionary; they were flushed into a fresh segment defining none of
+    /// those names, and a whole playthrough recorded nothing while looking
+    /// like it had simply not been played.
+    #[test]
+    fn records_naming_something_the_segment_never_defined_are_counted() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+                             // No DefineSurface and no DefineName, exactly as the reset bug wrote.
+            w.u8(4).i32(15).i32(25).u64(7).u16(0); // RemoveEntity
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
+            w.u8(5).u16(0).i32(1).i32(2).u16(0); // AddTile
+            w.u8(6).i32(1).i32(2).u16(0); // RemoveTile
+                                          // Then a properly defined pair, which must still come through.
+            w.u8(1).string("nauvis");
+            w.u8(0).string("pipe");
+            w.u8(3).u16(0).i32(35).i32(45).u8(0).u8(1).u8(1).u64(2).u16(0);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let mut stream = stream_log(&path).unwrap();
+        let events: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(events.len(), 1, "only the record whose names were defined survives");
+        assert_eq!(stream.undefined_references(), 4, "and the four that did not are counted, not silent");
+        assert_eq!(stream.unknown_extensions(), 0, "this is damage, not a newer mod");
+    }
+
+    /// A removal that says which of two things at one position was mined. The
+    /// annotation is its own record, so a tool older than it steps over it and
+    /// resolves the removal the way it always did.
+    #[test]
+    fn a_removal_can_name_what_it_is_for() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+            w.u8(1).string("nauvis"); // DefineSurface
+            w.u8(0).string("iron-ore"); // DefineName
+            w.u8(TAG_REMOVE_NAME).varint(1).varint(0); // RemoveName: iron-ore
+            w.u8(4).i32(15).i32(25).u64(0).u16(0); // RemoveEntity
+            w.u8(4).i32(35).i32(45).u64(7).u16(0); // RemoveEntity, unannotated
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let mut stream = stream_log(&path).unwrap();
+        let events: Vec<LoggedEvent> = (&mut stream).collect();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, Event::RemoveEntity { id: None, pos: (1.5, 2.5), name: Some("iron-ore".to_string()) });
+        assert_eq!(
+            events[1].event,
+            Event::RemoveEntity { id: Some(7), pos: (3.5, 4.5), name: None },
+            "the annotation applies to one removal only"
+        );
+        assert_eq!(stream.unknown_extensions(), 0, "a record this build understands is not an unknown one");
+    }
+
+    /// A name written but never used, because the game was killed between the
+    /// two records or an add landed in between, must not attach itself to a
+    /// later removal.
+    #[test]
+    fn a_stale_removal_name_does_not_carry_over() {
+        let bytes = segment(|w| {
+            w.u8(2).u64(10); // SetTick
+            w.u8(1).string("nauvis"); // DefineSurface
+            w.u8(0).string("iron-ore"); // DefineName
+            w.u8(TAG_REMOVE_NAME).varint(1).varint(0); // RemoveName, then no removal
+            w.u8(3).u16(0).i32(5).i32(5).u8(0).u8(1).u8(1).u64(1).u16(0); // AddEntity
+            w.u8(4).i32(35).i32(45).u64(7).u16(0); // RemoveEntity
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_to(dir.path(), "events_0.stev", &bytes);
+        let events: Vec<LoggedEvent> = stream_log(&path).unwrap().collect();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event, Event::RemoveEntity { id: Some(7), pos: (3.5, 4.5), name: None });
     }
 
     /// A segment is append only and can be cut off mid record by the game
@@ -672,23 +1021,87 @@ mod tests {
         assert_eq!(bounds, vec![(0, 500), (1000, 500), (500, u64::MAX)]);
     }
 
-    /// The name the mod gives a segment when a reload resumed at the tick the
-    /// live segment already started at, which the plain `events_<tick>.stev`
-    /// form cannot distinguish from the segment already there.
+    /// Forward, back, forward: the exact sequence that used to merge two
+    /// branches into one factory.
+    ///
+    /// A player builds, loads a save from earlier and builds something else,
+    /// then loads a save made in the *first* branch and carries on. Creation
+    /// order says the middle branch is the newest history, and it is not: the
+    /// last segment's save came from the first branch, so the middle one was
+    /// abandoned however recently it was written.
     #[test]
-    fn a_sequence_suffixed_segment_parses_and_keeps_its_start_tick() {
+    fn a_branch_returned_to_supersedes_the_branch_left_behind() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("events_20000.stev"), MAGIC).unwrap();
-        std::fs::write(dir.path().join("events_20000_1.stev"), MAGIC).unwrap();
-        set_mtime_rank(dir.path(), "events_20000.stev", 0);
-        set_mtime_rank(dir.path(), "events_20000_1.stev", 1);
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        // First branch, then a reload back into it, then a reload that returns
+        // to the first branch and continues from a save made at tick 3000.
+        write("events_1000.stev", 0);
+        write("events_1500_1000.stev", 1);
+        write("events_3000_1000.stev", 2);
 
         let segments = log_segments(dir.path()).unwrap();
         assert_eq!(
             segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(),
-            vec![(20000, 20000), (20000, u64::MAX)],
-            "the first attempt is superseded from the tick the second one restarts at"
+            vec![(1000, 3000), (3000, u64::MAX)],
+            "the abandoned branch is gone, and the first is cut where the one that returned to it begins"
         );
+        assert!(
+            !segments.iter().any(|s| s.start_tick == 1500),
+            "the branch nothing descends from must not be in the history at all"
+        );
+    }
+
+    /// Every load continuing the last one, which is the ordinary case and has
+    /// to keep working now that lineage decides rather than creation order.
+    #[test]
+    fn a_straight_run_of_reloads_keeps_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        write("events_1000.stev", 0);
+        write("events_2000_1000.stev", 1);
+        write("events_3000_2000.stev", 2);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(
+            segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(),
+            vec![(1000, 2000), (2000, 3000), (3000, u64::MAX)],
+            "each is cut where the next begins"
+        );
+    }
+
+    /// A capture written before lineage was recorded has no parents to walk,
+    /// and must still replay the way it always did.
+    #[test]
+    fn a_capture_with_no_lineage_falls_back_to_creation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, rank: u64| {
+            std::fs::write(dir.path().join(name), MAGIC).unwrap();
+            set_mtime_rank(dir.path(), name, rank);
+        };
+        write("events_1000.stev", 0);
+        write("events_2000.stev", 1);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(segments.iter().map(|s| (s.start_tick, s.end_tick)).collect::<Vec<_>>(), vec![(1000, 2000), (2000, u64::MAX)]);
+    }
+
+    /// A parent naming a segment that is not there, which is what deleting
+    /// capture files by hand leaves behind. The walk stops rather than looping
+    /// or dropping everything.
+    #[test]
+    fn a_parent_that_is_missing_ends_the_history_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("events_5000_4000.stev"), MAGIC).unwrap();
+        set_mtime_rank(dir.path(), "events_5000_4000.stev", 0);
+
+        let segments = log_segments(dir.path()).unwrap();
+        assert_eq!(segments.iter().map(|s| s.start_tick).collect::<Vec<_>>(), vec![5000]);
     }
 
     /// A `.stev` whose name is neither form must be ignored rather than

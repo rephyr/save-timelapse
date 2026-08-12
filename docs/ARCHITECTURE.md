@@ -85,11 +85,13 @@ launches it; closing the window does not end a job.
         v
     <staged>/script-output/save-timelapse/frame_<tick>_<surface>.stfr
         |
-        |  CLI collects, orders by save sequence
+        |  CLI collects, orders by the tick in each frame, rewrites as deltas
         v
     frames/ -> renderer -> video or viewer bundle
 
-One save produces one frame. Frame count equals the number of saves supplied.
+One save produces one frame, so frame count equals the number of saves supplied,
+minus any two saves that turn out to be of the same moment. Each save reports the
+whole factory; a final pass keeps only what changed between them.
 
 ## Staging model
 
@@ -522,7 +524,7 @@ reassembles any moment by replaying that log over the baseline.
     <script-output>/save-timelapse/<session>/
         baseline.json                 tick + surfaces the baseline covers
         frame_<tick>_<surface>.stfr   the baseline itself, one per surface
-        events_<start_tick>.stev      append-only, one segment per timeline
+        events_<tick>_<parent>.stev   append-only, one segment per load
         players.jsonl                 optional, sampled player positions
         milestones.jsonl              optional, when each milestone was reached
         prototypes.json               this game's colours and prototype types
@@ -623,7 +625,7 @@ interval.
 
 ### Event format
 
-Also a custom binary format (`<session>/events_<start_tick>.stev`), written
+Also a custom binary format (`<session>/events_<tick>_<parent>.stev`), written
 incrementally as the player plays, so text formatting per construction event
 would be a cost paid during real gameplay.
 
@@ -644,6 +646,7 @@ magic to whatever the last flush wrote.
       tag 5     AddTile           u16 name_id, i32 x, i32 y, u16 surface_id
       tag 6     RemoveTile        i32 x, i32 y, u16 surface_id
       tag 7     ResetDictionaries (no payload, version 2 and later)
+      tag 128   RemoveName        varint len, then varint name_id
       tag >=128 Extension         varint len, then that many bytes
 
 `DefineName`/`DefineSurface` work like the frame format's dictionaries, as two
@@ -665,6 +668,20 @@ iterator reports as end of stream, so a segment from a newer mod stopped the
 replay partway through silently. `EventStream::unknown_extensions` counts what
 was stepped over and `replay::run` sums it across segments.
 
+**A removal can name what it is for.** A position holds at most a deposit and
+the thing standing on it, and a removal carrying only a position resolves to
+whatever is on top, which is the structure. Hand-mining the ore out from under
+a machine therefore took the machine. `RemoveName` (tag 128) names the entity
+the next `RemoveEntity` is for, written immediately before it.
+
+An extension record rather than a field on `RemoveEntity`, the core layout
+being frozen at version 3, so a tool older than the field skips it by its own
+length and resolves the removal exactly as it always did. The mod writes it for
+a resource only: nothing else can be the buried one, and `log_entity` already
+reads the entity's type, so every other removal still reads only what it
+writes. A name the capture never mentioned is a no-op rather than a fallback,
+falling back to the top being the bug this closes.
+
 `id` on `AddEntity`/`RemoveEntity` uses `0` for "no id", Factorio's
 `unit_number` starting at 1. **`RemoveEntity` always carries position, even
 with an id.** An entity present at baseline time has no id in replay's world
@@ -674,19 +691,39 @@ silently no-ops, leaving the entity in the replayed timeline forever. Replay
 tries the id first and falls back to position (see "World state" below), and no
 shape of `RemoveEntity` omits position.
 
-A segment file is resumed across a save reload. Factorio re-runs all of
-`capture.lua`'s top-level code on every load, resetting the in-memory name and
-surface dictionaries to empty while the file on disk keeps every
-`DefineName`/`DefineSurface` written before that point. The writer then hands
-out id 0 again while the reader, assigning ids by encounter order, is already
-past 0, so **every entity and tile logged after a reload decodes as whichever
-name was defined first in that segment.** Nothing about the file looks damaged.
+**A load starts a new segment.** Factorio re-runs all of `capture.lua`'s
+top-level code on every load, which is how the mod knows a load happened at
+all: `storage` rewinds with the save and cannot tell a fresh load from a long
+session.
 
-Event format version 2 fixes this with an explicit `ResetDictionaries` record
-(tag 7, no payload), written when a load resumes a segment already on disk;
-both sides restart their ids from zero there. Version 1 files are still read
-and still carry the bug, the record saying where the reset happened being
-exactly what is missing.
+Resuming the segment a save names was tried and could not be made safe, for two
+reasons. The file may not exist: deleting a capture cannot reach the saves that
+describe it, so loading a save from before a reset appended to a file that was
+gone and recreated it with no header, which a reader could only refuse. And the
+name stopped being true, since a segment named for when it was first created
+went on to hold events from a different branch entirely, while `log_segments`
+bounds abandoned branches using exactly that number.
+
+Starting fresh costs one file per load and makes both hold: every file gets its
+header from whoever created it, and every filename is the tick its records
+really begin at. A header is written rather than appended, so loading the same
+save twice truncates the first attempt, which is a branch the player abandoned
+by loading back to it.
+
+The rewound `storage` is also what makes lineage possible: the
+`segment_start_tick` it carries is the segment the save was written during, and
+the rollover copies it into the new segment's name before overwriting it. See
+"Reloading an earlier save" below for what the reading side does with it.
+
+Version 2 added a `ResetDictionaries` record (tag 7, no payload) for the
+resuming case, where the writer's dictionaries restarted at id 0 while the file
+already held every earlier define, so **every entity logged after a reload
+decoded as whichever name was defined first**. Captures carrying it are still
+read; nothing writes it now.
+
+A segment with no header at all is accepted if it reads as events all the way
+to the end, which recovers recordings damaged by the resuming behaviour before
+it was removed. `Replay::headerless_segments` counts them.
 
 Persisting the dictionary in `storage` would not work, for the same reason the
 mod cannot detect a reload at all (below): `storage` rewinds with the save and
@@ -740,32 +777,41 @@ at or past it are dropped, counted as `Replay::superseded_events` and reported
 rather than warned about: a nonzero count is what a reloaded playthrough looks
 like replaying correctly.
 
-Two things make the bound correct.
+Three things make the bound correct.
 
-Segments are ordered by **mtime, not by the tick in the filename**, start tick
-not being chronological once a playthrough reloads twice. A segment is appended
-to for exactly as long as it is the live one and never touched again after a
-rollover abandons it, so segments finish being written in creation order.
+Each segment **names the segment its save was made during**, as
+`events_<tick>_<parent>.stev`. `storage` rewinds with the save, so a save
+carries the `segment_start_tick` that was live when it was written, and the mod
+copies that into the filename on rollover before overwriting it. This is the
+only lineage a save carries, and it costs no file opens to read, being in the
+name.
 
-A segment ends at the **smallest** start tick among all segments created after
-it, not the next one's, so a second reload reaching further back also
-invalidates part of the first reload's segment. A suffix minimum over the
-creation order expresses that, and also keeps the result in ascending tick
-order despite the mtime sort, since a segment's events all fall below its
-`end_tick`.
+The surviving history is the **newest segment's ancestor chain**, walked parent
+by parent in `event::ancestry`. Anything not on that chain is a branch nobody
+came back to and is dropped whole rather than bounded. Which segment is newest
+still comes from mtime, a segment being appended to for exactly as long as it is
+the live one and never touched again after a rollover abandons it.
 
-Two segments sharing an mtime (a copied capture folder, or a filesystem too
-coarse to separate two rollovers) fall back to ascending start tick, then to
-the rollover sequence in the filename, stitching them together with overlaps
-trimmed.
+A segment on the chain ends at the **smallest** start tick among the segments
+after it, not the next one's, because a chain can step back on itself: loading
+a save from earlier in the same branch. A suffix minimum expresses that, and
+also keeps the result in ascending tick order, since a segment's events all fall
+below its `end_tick`.
+
+A capture recorded before the mod wrote parents has nothing to walk, so
+`log_segments` falls back to creation order and the suffix minimum alone, which
+is what it always did and which is right whenever each load continued the one
+before it. A parent naming a segment that is not there (capture files deleted
+by hand) ends the walk rather than dropping everything, so what survives is the
+run of loads leading back to the gap.
 
 #### Reloading the *same* save twice
 
-Loading the same save again resumes at exactly the tick the live segment
-started at, so nothing distinguishes the second attempt from the first except
-that the ticks jump backwards where it begins. `capture_segment_name` takes a
-rollover sequence so two segments starting at the same tick get different
-filenames (`events_<tick>_<seq>.stev`, the suffix omitted at 0).
+Loading the same save again resumes at exactly the tick the live segment started
+at, from the same parent, so it produces the same filename. `ensure_capture_segment`
+writes the header with `append` false, truncating: a segment starting at a tick
+some earlier attempt also started at, from the same save, is that attempt being
+redone, and what it wrote is exactly what the player has just abandoned.
 
 Captures recorded before that have both attempts in one file, so
 `event::segment_run_bounds` splits a segment into **append runs** wherever its
@@ -780,12 +826,30 @@ separate from `superseded_events` because a segment corrupted by deleting
 corruption produces a header-less file that fails to open outright, counted as
 `skipped_segments`.
 
-A session can legitimately span several segment files, and the mod cannot clean
-up one orphaned by deleting capture files by hand: its next flush recreates the
-file via a plain append with no magic header, under the same session tag.
-`replay::run` treats a segment that fails to open the way it treats a bad
-baseline surface, a warning and a skip, so one broken segment costs only its
-own events.
+A session spans several segment files by design, one per load, and a segment
+that fails to open is treated the way a bad baseline surface is, a warning and a
+skip, so one broken file costs only its own events.
+
+#### Returning to a branch already left
+
+Forward, back, forward is the sequence lineage exists for. A player builds in
+branch A, loads a save from earlier and builds branch B, then loads a save made
+back in A and carries on as C.
+
+Creation order says B is the most recent history, and it is not. C's save was
+made during A, so `ancestry` walks C to A and stops: B is on nobody's chain and
+goes, however recently it was written. A is then cut where C begins, dropping
+only the part of A that C rewound past. What is left is one coherent history,
+which is what superseding is for.
+
+This is decided entirely at read time, from three numbers in two filenames. The
+log is not kept whole to allow it: an abandoned branch's records stay on disk
+because the sandbox cannot delete them, and are ignored rather than replayed.
+
+What still cannot be recovered is history whose segment file is gone, or a save
+made before the mod recorded parents, where the chain has nothing to walk back
+through. A fresh baseline from where the player actually is repairs either in
+one step.
 
 ### Timer handlers share one on_nth_tick per interval
 
@@ -912,6 +976,76 @@ A spurious bump costs a whole redundant file, so `Surface::insert` checks
 whether an add lands on exactly what is already there and leaves the revision
 alone if so. Those are not rare: the baseline smear, a snapshot taken slightly
 after the events describing the same construction, produces them by design.
+
+**A frame carries what changed, not what is standing.** A built frame used to
+be a full snapshot, so on a real Space Age megabase every one of 660 frames
+wrote 863,862 entities and 3,354,339 floor tiles. Across the whole run the
+entity count moved by 0.4% and the tile count by 3.3%: 5.5 GB of which roughly
+96% was the same data written again.
+
+The viewer stores spans, an item plus the frame range it exists over, which is
+the same shape. Writing snapshots to rebuild spans was doing the work twice, and
+paying for it in disk, build time and load time.
+
+So the first frame for a surface is the picture and every one after it is a
+delta: what arrived, and the positions that emptied. `Surface` records which
+positions changed since it last emitted, keys only, and the frame is built by
+asking what is there now: present means it arrived, absent means it left. That
+collapses build-then-mine, mine-then-rebuild and any number of rotations in one
+interval into the single answer the reader needs, without keeping a copy of the
+previous frame to diff against. Frames skipped because a surface was untouched
+lose nothing, the record accumulating until it emits.
+
+Entity and tile removals travel in separate lists, the two being different
+coordinate spaces: an entity sits at a tile's centre.
+
+**Building from saves gets there by comparison instead.** Each save is a
+separate Factorio run reporting everything standing and nothing at all about
+how it got there, so there is no record of what changed to build a delta from.
+`world::delta_between` finds it by comparing two snapshots directly, and
+`write_as_delta_chain` rewrites the exported folder in place once every save
+has been exported. A frame is read before it is written, so the folder shrinks
+as it goes rather than needing room for both forms.
+
+That pass orders by the **tick inside each frame, not by filename**, because a
+chain has to be built in the order it will be replayed and the viewer replays in
+tick order. Filenames cannot carry that order: Factorio's autosaves rotate, so
+`_autosave1` is as likely to be the newest as the oldest, and `ordering_key`
+only guesses from the digits in a name. Two saves of one moment are reduced to
+one here as well. The viewer deduplicates by tick too, but a delta it dropped
+would take every frame after it along with it.
+
+A full frame appearing mid-sequence stays legal and is what a partly converted
+folder looks like: `SpanSet::push_frame` closes whatever the frame does not
+mention, so it reads as a fresh statement of everything standing. That is why a
+failure partway through the pass leaves a timelapse that is larger than intended
+rather than wrong.
+
+**A delta is merged against what is standing, never spliced into it.**
+`SpanBuilder::open` is a sorted vector, so a binary search plus a `Vec::remove`
+or `Vec::insert` per changed item costs `standing * changed`: fine at the 200
+items a frame an ordinary base changes, and unfinishable once one frame changes
+a large share of a large factory. Deleting ten million entities in a single tick
+on a gigabase made loading the result never complete. Both halves are sorted and
+merged in one pass instead, which is the same shape `push_frame` already used.
+
+The failure gave nothing away, being correct code that simply did not return,
+and the viewer's phase label pointed at the wrong function entirely: it was set
+before the work and painted after it, leaving the previous phase's text on
+screen throughout. Phase labels are painted before their work for that reason.
+
+**`SpanBuilder` writes `last` when a span closes, not on every frame it
+survives.** That is what makes a delta cost one pass over the change rather than
+over everything standing, and it made `push_repeats` a single addition instead
+of a walk over ~900k open spans. The equivalence is asserted rather than
+assumed: a sequence built from deltas must produce exactly the spans a sequence
+built from snapshots does, through the real world model and the real wire
+format.
+
+Version 5, and only the CLI writes it. The mod still writes version 3, so
+captures and `format_compatibility.rs` are untouched. Version 4 was a step on
+the way, a frame that omitted an unchanged floor, and deltas subsume it: an
+empty tile delta says the same thing.
 
 **The gap in the numbering is the record.** Files stay named
 `frame_<index>_<surface>.stfr` against a global frame index, so a surface that

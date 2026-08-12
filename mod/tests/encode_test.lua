@@ -175,6 +175,74 @@ do
   check("event_add_entity: a missing id encodes as the 0 sentinel", id_field, encode.u64le(0))
 end
 
+-- Dragging a belt line round a corner makes Factorio rotate the belt already
+-- placed and raises no event, so capture re-logs the tile the drag came from.
+-- Backwards here would re-log the tile ahead, which is the belt just placed,
+-- and fix nothing.
+do
+  -- Factorio's y grows south, so behind a north-facing belt is south of it.
+  local cases = {
+    { name = "north", direction = 0, dx = 0, dy = 1 },
+    { name = "east", direction = 4, dx = -1, dy = 0 },
+    { name = "south", direction = 8, dx = 0, dy = -1 },
+    { name = "west", direction = 12, dx = 1, dy = 0 },
+  }
+  for _, case in pairs(cases) do
+    local dx, dy = encode.step_behind(case.direction)
+    check("step_behind: " .. case.name .. " looks back the way it came", dx .. "," .. dy, case.dx .. "," .. case.dy)
+  end
+
+  -- A belt can only face a cardinal, so the twelve diagonals are not a facing
+  -- to step back from and must not resolve to one.
+  for _, direction in pairs({ 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15 }) do
+    check("step_behind: direction " .. direction .. " is not a belt facing", encode.step_behind(direction), nil)
+  end
+end
+
+do
+  local types = encode.DRAGGABLE_CARRIER_TYPES
+  check("DRAGGABLE_CARRIER_TYPES: contains transport-belt", types["transport-belt"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains underground-belt", types["underground-belt"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains splitter", types["splitter"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains lane-splitter", types["lane-splitter"], true)
+  -- Pipes connect by adjacency rather than by facing, so nothing rotates them
+  -- and looking behind one would be a lookup per pipe placed for nothing.
+  check("DRAGGABLE_CARRIER_TYPES: does not contain pipe", types["pipe"], nil)
+  check("DRAGGABLE_CARRIER_TYPES: does not contain inserter", types["inserter"], nil)
+end
+
+-- Names what the next removal is for, as an extension record so a tool older
+-- than the field steps over it by its own length. Written for a deposit only:
+-- it is the one thing that can sit under something else, and a removal
+-- carrying just a position resolves to whatever stands on top instead.
+do
+  local names = encode.new_dictionary()
+  local record = encode.event_remove_name(names, "iron-ore")
+  local payload = encode.varint(0)
+  local expected = bytes(0) .. encode.str("iron-ore") -- DefineName, first use
+    .. bytes(128) .. encode.varint(#payload) .. payload
+  check("event_remove_name: defines the name, then tag 128 with its own length", record, expected)
+
+  -- Second use shares the dictionary entry, so only the record itself repeats.
+  local again = encode.event_remove_name(names, "iron-ore")
+  check("event_remove_name: a known name costs only the record", again,
+    bytes(128) .. encode.varint(#payload) .. payload)
+end
+
+do
+  -- The length is what an older reader skips by, so it must count the payload
+  -- and nothing else.
+  local names = encode.new_dictionary()
+  for i = 1, 200 do
+    encode.dictionary_id(names, "filler-" .. i, 0)
+  end
+  local record = encode.event_remove_name(names, "iron-ore")
+  local body = record:sub(#(bytes(0) .. encode.str("iron-ore")) + 1)
+  local declared = body:byte(2)
+  check("event_remove_name: a two-byte name id declares length 2", declared, 2)
+  check("event_remove_name: and the record is exactly that long", #body, 2 + declared)
+end
+
 -- Position is sent on removal even when id is available: an entity that
 -- existed when the baseline was taken carries a real unit_number replay never
 -- learned, a snapshot recording no ids, so id alone made every such removal an
@@ -432,6 +500,17 @@ check("capture_segment_basename: no session folder, same naming rule",
   encode.capture_segment_basename(22760790),
   "events_22760790.stev")
 
+-- The reader tells a branch that was left behind from the history leading to
+-- now by walking these parents, so the name has to carry one whenever there is
+-- one to carry.
+check("capture_segment_name: a segment names the one its save was made during",
+  encode.capture_segment_name(0x1a2b3c, 22760790, 22000000),
+  "001a2b3c/events_22760790_22000000.stev")
+
+check("capture_segment_basename: a capture's first segment has no parent",
+  encode.capture_segment_basename(22760790, nil),
+  "events_22760790.stev")
+
 check("player_log_name: lives inside the session's own folder",
   encode.player_log_name(0x1a2b3c),
   "001a2b3c/players.jsonl")
@@ -666,10 +745,35 @@ do
       .. '"kr-advanced-underground-belt":"underground-belt","radar":"radar",'
       .. '"small-worm-turret":"turret","transport-belt":"transport-belt"},'
       .. '"reach":{"kr-advanced-underground-belt":30},'
+      -- Empty for a game with no rails down, and for one whose rail API this
+      -- mod could not read. The desktop side falls back to its own geometry
+      -- for both, so they need not be told apart.
+      .. '"rails":[],'
       -- Named so the desktop side splits a baseline's tiles the way this
       -- capture recorded them, rather than from a list of its own that would
       -- disagree the moment a mod adds a floor.
       .. '"floor":["cerys-refined-concrete"]}'
+  )
+
+  -- Rail geometry is not in any prototype, so what gets written is which
+  -- rails connect to which and the desktop side works the shape out from
+  -- there. Sorted by name then facing, so two runs of one save agree.
+  check(
+    "prototypes_json: rails carry their neighbours, sorted by name then facing",
+    encode.prototypes_json({
+      { n = "curved-rail-b", d = 0, links = { { n = "straight-rail", d = 0, x = 2, y = 0 } } },
+      { n = "curved-rail-a", d = 4, links = {
+        { n = "straight-rail", d = 4, x = -3, y = 0 },
+        { n = "curved-rail-b", d = 4, x = 1.5, y = -2.5 },
+      } },
+      { n = "curved-rail-a", d = 0, links = { { n = "straight-rail", d = 0, x = 0, y = 3 } } },
+    }):match('("rails":%[.*%]),"floor"'),
+    '"rails":['
+      .. '{"n":"curved-rail-a","d":0,"links":[{"n":"straight-rail","d":0,"x":0.0,"y":3.0}]},'
+      .. '{"n":"curved-rail-a","d":4,"links":[{"n":"straight-rail","d":4,"x":-3.0,"y":0.0},'
+      .. '{"n":"curved-rail-b","d":4,"x":1.5,"y":-2.5}]},'
+      .. '{"n":"curved-rail-b","d":0,"links":[{"n":"straight-rail","d":0,"x":2.0,"y":0.0}]}'
+      .. ']'
   )
   prototypes = nil
 end

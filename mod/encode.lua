@@ -431,7 +431,7 @@ function M.frame_end_entities()
   return M.u8(9)
 end
 
--- Live capture event format (events_<start_tick>.stev)
+-- Live capture event format (events_<tick>_<parent>.stev)
 
 function M.event_header()
   return M.EVENT_MAGIC .. M.u8(M.EVENT_VERSION)
@@ -472,6 +472,47 @@ function M.event_add_entity(names, surfaces, surface, name, x, y, direction, id,
     .. M.u8(clamp_u8(h or 1))
     .. M.u64le(id or 0)
     .. M.u16le(surface_id)
+end
+
+--- Types that carry items along a facing, so dragging a line of them can make
+--- the game rotate the one already placed. Kept here rather than in capture.lua
+--- for the same reason as the other type lists: this file has no Factorio
+--- dependency and can be unit tested.
+M.DRAGGABLE_CARRIER_TYPES = {
+  ["transport-belt"] = true,
+  ["underground-belt"] = true,
+  ["splitter"] = true,
+  ["lane-splitter"] = true,
+}
+
+--- One tile step opposite `direction`, which is where the belt a drag came
+--- from sits. Factorio's 16-way direction bytes, so only the four cardinals
+--- have a step; anything else is not a facing a belt can hold.
+function M.step_behind(direction)
+  if direction == 0 then -- north
+    return 0, 1
+  elseif direction == 4 then -- east
+    return -1, 0
+  elseif direction == 8 then -- south
+    return 0, -1
+  elseif direction == 12 then -- west
+    return 1, 0
+  end
+  return nil
+end
+
+--- Names the entity a following removal is for, as an extension record so the
+--- frozen core layout is untouched and an older tool steps over it.
+---
+--- Only ever written for a resource. A position holds at most a deposit and
+--- the thing standing on it, and a removal carrying only a position resolves
+--- to whatever is on top, which is the structure; without this, hand-mining
+--- the ore under a machine took the machine instead. Nothing else can be the
+--- buried one, so nothing else needs saying.
+function M.event_remove_name(names, name)
+  local name_id, define_name = M.dictionary_id(names, name, 0)
+  local payload = M.varint(name_id)
+  return define_name .. M.u8(128) .. M.varint(#payload) .. payload
 end
 
 --- Position is sent even when `id` is available: a baseline entity has no
@@ -541,14 +582,20 @@ function M.baseline_manifest_name(session_id)
   return M.session_dir(session_id) .. "baseline.json"
 end
 
-function M.capture_segment_name(session_id, start_tick)
-  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick)
+function M.capture_segment_name(session_id, start_tick, parent)
+  return M.session_dir(session_id) .. M.capture_segment_basename(start_tick, parent)
 end
 
 --- Split out from `capture_segment_name` so a save with no session_id (one
 --- whose capture state predates session folders) can build the same name
 --- without one. See capture.lua's `capture_segment_path`.
-function M.capture_segment_basename(start_tick)
+--- `parent` is the segment this one's save was made during, which is what tells
+--- a branch that was left behind from the history leading to now. Absent for a
+--- capture's very first segment, there being nothing before it.
+function M.capture_segment_basename(start_tick, parent)
+  if parent then
+    return string.format("events_%d_%d.stev", start_tick, parent)
+  end
   return string.format("events_%d.stev", start_tick)
 end
 
@@ -631,7 +678,26 @@ local REACH_TYPES = {
 --- taking `enemy_map_color`. The two are mutually exclusive per prototype,
 --- `map_color` being what charting uses "if a friendly or enemy color isn't
 --- defined".
-function M.prototypes_json()
+--- Every prototype type that is rail track. Geometry is a property of the
+--- engine rather than of a save, so one sample of each facing answers for
+--- every piece like it.
+M.RAIL_TYPES = {
+  "straight-rail", "curved-rail-a", "curved-rail-b", "half-diagonal-rail",
+  "legacy-straight-rail", "legacy-curved-rail",
+  "elevated-straight-rail", "elevated-curved-rail-a", "elevated-curved-rail-b",
+  "elevated-half-diagonal-rail",
+}
+
+--- Half-tile positions are the finest a rail sits on, so one decimal place is
+--- exact rather than rounded. Written with `%.1f` rather than `%g` so the
+--- output does not change shape between a whole number and a fraction.
+local function rail_offset(value)
+  return string.format("%.1f", value)
+end
+
+--- `rails` is what `export.sample_rail_joints` collected, or nil for a game
+--- with no rails in it. Connectivity rather than geometry: see that function.
+function M.prototypes_json(rails)
   local parts = {}
   local function add(text)
     parts[#parts + 1] = text
@@ -699,7 +765,31 @@ function M.prototypes_json()
   -- splits a baseline's tiles the way this mod recorded them. It kept a copy
   -- of the old list for that, which cannot agree once this side works the
   -- answer out per game. An array, since this says nothing per name.
-  out[#out + 1] = '},"floor":['
+  -- Which rails connect to which, one entry per prototype and facing. An
+  -- array rather than a map: the key would have to be name and facing glued
+  -- together, and every reader would have to take it apart again.
+  -- Sorted so two runs of one save produce one file, `pairs` order over the
+  -- surfaces being unpromised and the desktop side comparing these across
+  -- captures.
+  local rail_list = {}
+  for _, sample in ipairs(rails or {}) do
+    rail_list[#rail_list + 1] = sample
+  end
+  table.sort(rail_list, function(a, b)
+    if a.n ~= b.n then return a.n < b.n end
+    return a.d < b.d
+  end)
+
+  section('},"rails":[', rail_list, function(sample)
+    local links = {}
+    for _, link in ipairs(sample.links) do
+      links[#links + 1] = string.format('{"n":%q,"d":%d,"x":%s,"y":%s}',
+        link.n, link.d, rail_offset(link.x), rail_offset(link.y))
+    end
+    add(string.format('{"n":%q,"d":%d,"links":[%s]}', sample.n, sample.d, table.concat(links, ",")))
+  end)
+
+  out[#out + 1] = '],"floor":['
   local first = #parts
   for _, name in ipairs(M.placed_floor_tiles()) do
     add(string.format('%q', name))

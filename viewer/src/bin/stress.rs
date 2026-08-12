@@ -240,7 +240,15 @@ fn baseline_frame(surface: &str, entities: usize, tiles: usize) -> Frame {
     let tile_side = (tiles as f64).sqrt().ceil().max(1.0) as i32;
     let floor = (0..tiles).map(|i| Tile { n: "concrete".into(), x: i as i32 % tile_side, y: i as i32 / tile_side }).collect();
 
-    Frame { tick: 0, surface: surface.to_string(), count: entities, entities: built, tiles: floor }
+    Frame {
+        tick: 0,
+        surface: surface.to_string(),
+        count: entities,
+        entities: built,
+        tiles: floor,
+        floor_unchanged: false,
+        ..Default::default()
+    }
 }
 
 fn main() {
@@ -298,7 +306,7 @@ fn main() {
             );
             next_id += 1;
         }
-        files += write_all_surfaces(&world, frame as u64 * 3600, &out, frame, &mut revisions).expect("write");
+        files += write_all_surfaces(&mut world, frame as u64 * 3600, &out, frame, &mut revisions).expect("write");
     }
     let write = start.elapsed();
 
@@ -336,7 +344,7 @@ fn main() {
             builder.push(&RenderFrame::from_frame(frame, &mut registry));
         }
         builder.push_repeats(&timeline[filled..]);
-        if let Some(sequence) = builder.finish() {
+        if let Some(sequence) = builder.finish(&registry) {
             spans_total += sequence.span_estimate();
             sequences.push((name, sequence));
         }
