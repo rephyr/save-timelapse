@@ -173,6 +173,37 @@ export from 22 minutes to roughly 5.
 SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
 ```
 
+### Folding a frame that changes most of the factory
+
+`SpanBuilder::open` is everything standing, as a sorted vector. Folding a delta
+in used to binary search it per changed item and splice, and `Vec::remove` and
+`Vec::insert` move everything past the position they touch, so the cost was
+standing multiplied by changed.
+
+That is invisible at what an ordinary base does. The extreme is not: on a real
+4000 hour gigabase, one frame took the factory from **3.7 million buildings to
+500 thousand**, so a single delta carried about 3.2 million removals against a
+list averaging around 2 million entries. Of the order of 3e12 element moves.
+
+| approach | a frame that clears most of the factory |
+|---|---|
+| binary search and splice per item | did not complete, at either scale below |
+| both sides sorted, merged in one pass | 0.25s at a million standing |
+
+The two rows are not the same measurement and cannot be: the splice version has
+no completion time to report. It was abandoned on the real capture, and again on
+the million-entity test below.
+
+The interesting part is what it looked like. Correct code that never returns
+gives no error, no partial output and no progress, so it is indistinguishable
+from a deadlock. It was also being misattributed: the viewer set its phase label
+before the work and painted after it, so the screen named the previous step for
+the whole of it, which pointed diagnosis at the wrong function.
+
+```bash
+cargo test --manifest-path viewer/Cargo.toml a_frame_that_clears_most
+```
+
 ## Measured and rejected
 
 The measurements that changed nothing are worth as much as the ones that did.
