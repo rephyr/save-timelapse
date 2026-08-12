@@ -391,6 +391,47 @@ local function log_event(op, kind, name, x, y, direction, id, w, h, surface)
   end
 end
 
+--- The type list `find_entities_filtered` wants, built once from the same set
+--- `encode` states, so the two cannot drift.
+local draggable_carrier_types = nil
+local function draggable_carrier_type_list()
+  if not draggable_carrier_types then
+    draggable_carrier_types = {}
+    for name in pairs(encode.DRAGGABLE_CARRIER_TYPES) do
+      draggable_carrier_types[#draggable_carrier_types + 1] = name
+    end
+  end
+  return draggable_carrier_types
+end
+
+--- Dragging a belt line around a corner makes Factorio rotate the belt already
+--- placed, and raises no event for it, so the capture kept the facing that belt
+--- went down with and every dragged corner drew straight.
+---
+--- The rotated one is the tile behind the new belt, opposite the way it faces,
+--- so one lookup per belt placed catches it. Re-logging it as an ordinary add
+--- costs the reader nothing when nothing changed: `World::insert` updates an
+--- occupied position in place and skips the revision bump.
+local function relog_belt_behind(surface, pos, direction)
+  local dx, dy = encode.step_behind(direction)
+  if not dx then
+    return
+  end
+
+  local found = surface.find_entities_filtered({
+    position = { x = pos.x + dx, y = pos.y + dy },
+    type = draggable_carrier_type_list(),
+  })[1]
+  if not found then
+    return
+  end
+
+  local back = found.position
+  log_event("+", "e", found.name, back.x, back.y,
+    found.direction, found.unit_number, found.tile_width, found.tile_height,
+    surface.name)
+end
+
 --- Every field read here crosses the Lua/C++ boundary once per property, and
 --- on a busy tick those crossings are most of what capture costs, so a removal
 --- reads only what a removal record holds. Two calls rather than conditionals,
@@ -411,9 +452,15 @@ local function log_entity(op, entity)
     return
   end
 
+  local direction = entity.direction
+  local surface = entity.surface
   log_event(op, "e", entity.name, pos.x, pos.y,
-    entity.direction, entity.unit_number, entity.tile_width, entity.tile_height,
-    entity.surface.name)
+    direction, entity.unit_number, entity.tile_width, entity.tile_height,
+    surface.name)
+
+  if encode.DRAGGABLE_CARRIER_TYPES[entity.type] then
+    relog_belt_behind(surface, pos, direction)
+  end
 end
 
 --- Whether natural ground is being captured at all. Memoized: a startup

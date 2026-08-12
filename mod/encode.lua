@@ -474,6 +474,33 @@ function M.event_add_entity(names, surfaces, surface, name, x, y, direction, id,
     .. M.u16le(surface_id)
 end
 
+--- Types that carry items along a facing, so dragging a line of them can make
+--- the game rotate the one already placed. Kept here rather than in capture.lua
+--- for the same reason as the other type lists: this file has no Factorio
+--- dependency and can be unit tested.
+M.DRAGGABLE_CARRIER_TYPES = {
+  ["transport-belt"] = true,
+  ["underground-belt"] = true,
+  ["splitter"] = true,
+  ["lane-splitter"] = true,
+}
+
+--- One tile step opposite `direction`, which is where the belt a drag came
+--- from sits. Factorio's 16-way direction bytes, so only the four cardinals
+--- have a step; anything else is not a facing a belt can hold.
+function M.step_behind(direction)
+  if direction == 0 then -- north
+    return 0, 1
+  elseif direction == 4 then -- east
+    return -1, 0
+  elseif direction == 8 then -- south
+    return 0, -1
+  elseif direction == 12 then -- west
+    return 1, 0
+  end
+  return nil
+end
+
 --- Names the entity a following removal is for, as an extension record so the
 --- frozen core layout is untouched and an older tool steps over it.
 ---

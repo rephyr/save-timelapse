@@ -175,6 +175,42 @@ do
   check("event_add_entity: a missing id encodes as the 0 sentinel", id_field, encode.u64le(0))
 end
 
+-- Dragging a belt line round a corner makes Factorio rotate the belt already
+-- placed and raises no event, so capture re-logs the tile the drag came from.
+-- Backwards here would re-log the tile ahead, which is the belt just placed,
+-- and fix nothing.
+do
+  -- Factorio's y grows south, so behind a north-facing belt is south of it.
+  local cases = {
+    { name = "north", direction = 0, dx = 0, dy = 1 },
+    { name = "east", direction = 4, dx = -1, dy = 0 },
+    { name = "south", direction = 8, dx = 0, dy = -1 },
+    { name = "west", direction = 12, dx = 1, dy = 0 },
+  }
+  for _, case in pairs(cases) do
+    local dx, dy = encode.step_behind(case.direction)
+    check("step_behind: " .. case.name .. " looks back the way it came", dx .. "," .. dy, case.dx .. "," .. case.dy)
+  end
+
+  -- A belt can only face a cardinal, so the twelve diagonals are not a facing
+  -- to step back from and must not resolve to one.
+  for _, direction in pairs({ 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15 }) do
+    check("step_behind: direction " .. direction .. " is not a belt facing", encode.step_behind(direction), nil)
+  end
+end
+
+do
+  local types = encode.DRAGGABLE_CARRIER_TYPES
+  check("DRAGGABLE_CARRIER_TYPES: contains transport-belt", types["transport-belt"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains underground-belt", types["underground-belt"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains splitter", types["splitter"], true)
+  check("DRAGGABLE_CARRIER_TYPES: contains lane-splitter", types["lane-splitter"], true)
+  -- Pipes connect by adjacency rather than by facing, so nothing rotates them
+  -- and looking behind one would be a lookup per pipe placed for nothing.
+  check("DRAGGABLE_CARRIER_TYPES: does not contain pipe", types["pipe"], nil)
+  check("DRAGGABLE_CARRIER_TYPES: does not contain inserter", types["inserter"], nil)
+end
+
 -- Names what the next removal is for, as an extension record so a tool older
 -- than the field steps over it by its own length. Written for a deposit only:
 -- it is the one thing that can sit under something else, and a removal
