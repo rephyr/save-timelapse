@@ -16,6 +16,36 @@ the answers are properties of how somebody actually played, not of the code.
 Those take the folder from an environment variable so no local path is ever
 committed.
 
+## What they were measured on
+
+    CPU      AMD Ryzen 9 5900X, 12 cores/24 threads
+    RAM      32 GB DDR4-3200
+    GPU      NVIDIA GeForce RTX 4080, 16 GB, 
+    Storage  Samsung 970 EVO Plus 2 TB NVMe 
+    OS       Windows 10 
+
+Stated because three of the numbers below are properties of this machine as
+much as of the code, and reading them without it invites the wrong conclusion.
+
+**Thread count changes the load times.** `ParallelFrameLoad` and the grouping
+passes split across `available_parallelism`, which is 24 here. The 47s to 20s
+load figure is that split plus the `Arc<str>` change together; on four cores the
+parallel half of it is worth proportionally less.
+
+**Disk speed changes what skipping unchanged surfaces is worth.** Not writing
+86% of the files saves more on a slow disk than on this one, so that measurement
+is a floor rather than a typical result.
+
+**The GPU barely matters for the draw-call numbers and matters a lot for
+export.** Draw calls are a CPU submission cost, which is the whole reason
+grouping by type is worth doing, and it would look much the same on weaker
+hardware. Export is the opposite: a 4x supersampled 1080p frame is a 132 MB
+readback, and that is where a slower card would show.
+
+The mod's own cost is the exception. It is measured in Factorio's F4 time usage,
+which is a share of a 60 Hz tick budget rather than wall clock, so it is the one
+figure here that travels between machines reasonably well.
+
 ## Results
 
 ### Frame format: entity runs and delta-encoded positions

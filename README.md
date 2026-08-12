@@ -209,6 +209,7 @@ make test-lua LUA=lua52
 
 Documentation:
 
+- [Requirements](docs/REQUIREMENTS.MD)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Performance](docs/PERFORMANCE.md)
 - [Test fixtures](tests/fixtures/README.md)
