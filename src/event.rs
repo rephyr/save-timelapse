@@ -321,6 +321,7 @@ impl Iterator for EventStream {
                     continue;
                 }
                 5 => {
+                    self.pending_remove_name = None;
                     let name_id = r.u16()? as usize;
                     let x = r.i32()?;
                     let y = r.i32()?;

@@ -477,6 +477,10 @@ fn write_binary_grouped(frame: &FrameOut<'_>) -> Vec<u8> {
         // like any extension so the shape stays uniform, even though it is the
         // absence of a payload that carries the meaning.
         w.u8(TAG_FLOOR_UNCHANGED).varint(0);
+        // Still written, even though no caller pairs an unchanged floor with
+        // tile removals today: dropping them here would be silent, and a
+        // reader that trusts the section would lose floor that really went.
+        write_removed(&mut w, frame.removed_tiles);
         let mut bytes = w.into_vec();
         let trailer = checksum(&bytes);
         bytes.extend_from_slice(&trailer.to_le_bytes());

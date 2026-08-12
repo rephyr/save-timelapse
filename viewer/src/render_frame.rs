@@ -608,8 +608,13 @@ impl SequenceBuilder {
         self.ticks.push(frame.tick);
         // A delta says how many arrived, not how many are standing, so the
         // running total is carried rather than taken from the frame.
+        //
+        // Saturating on the total rather than clamping the removals against
+        // the arrivals: a frame that mines more than it builds is the ordinary
+        // case for a teardown, and clamping made the count stop falling
+        // whenever it happened.
         let standing = match frame.delta {
-            true => self.counts.last().copied().unwrap_or(0) + frame.count - frame.removed_entities.len().min(frame.count),
+            true => (self.counts.last().copied().unwrap_or(0) + frame.count).saturating_sub(frame.removed_entities.len()),
             false => frame.count,
         };
         self.counts.push(standing);
@@ -847,6 +852,41 @@ mod tests {
 
         assert_eq!(frame.count, 9, "the frame holds everything");
         assert_eq!(frame.building_count(&registry), 3, "only what somebody placed is a building");
+    }
+
+    /// The running count a delta carries has to follow what is standing, and
+    /// what is standing goes down as well as up. Clearing a base mines far
+    /// more than it builds, which is exactly where the count used to stick:
+    /// removals were clamped against arrivals, so a frame that added one and
+    /// mined ninety reported no change at all.
+    #[test]
+    fn a_delta_that_mines_more_than_it_builds_still_counts_down() {
+        let mut registry = TypeRegistry::new();
+
+        let standing: Vec<Entity> = (0..100).map(|i| entity("pipe", i as f32 + 0.5, 0.5)).collect();
+        let full =
+            Frame { tick: 0, surface: "nauvis".to_string(), count: standing.len(), entities: standing, ..Default::default() };
+        // Ninety mined and one built, at the tenth-of-a-tile scale removals
+        // are recorded in.
+        let torn_down = Frame {
+            tick: 1,
+            surface: "nauvis".to_string(),
+            count: 1,
+            entities: vec![entity("pipe", 500.5, 0.5)],
+            delta: true,
+            removed_entities: (0..90).map(|i| (i * 10 + 5, 5)).collect(),
+            ..Default::default()
+        };
+
+        let mut builder = FrameSequence::builder();
+        builder.push(&RenderFrame::from_frame(full, &mut registry));
+        builder.push(&RenderFrame::from_frame(torn_down, &mut registry));
+        let mut sequence = builder.finish(&registry).expect("frames");
+
+        sequence.goto(1);
+        let frame = sequence.current();
+        assert_eq!(frame.entities.len(), 11, "eleven really are left");
+        assert_eq!(frame.count, frame.entities.len(), "and the count has to say so");
     }
 
     /// What aggregating the ground is worth, over a real terrain layer rather
