@@ -104,6 +104,12 @@ test:
 #                      catches it only where a test covers that path.
 test-lua: check-mod-syntax
 	$(LUA) mod/tests/encode_test.lua
+	$(LUA) mod/tests/capture_test.lua
+	$(LUA) mod/tests/export_test.lua
+	$(LUA) mod/tests/milestones_test.lua
+	$(LUA) mod/tests/snapshot_test.lua
+	$(LUA) mod/tests/control_test.lua
+	$(LUA) mod/tests/gui_test.lua
 
 # Compiles every shipped Lua file without running it. The unit suite above
 # only dofile()s encode.lua, so a syntax error anywhere else would otherwise
