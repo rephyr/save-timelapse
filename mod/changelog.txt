@@ -1,4 +1,16 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.8.1
+Date: 2026-08-13
+  Features:
+    - The camera in an exported video glides between moves instead of snapping to each frame
+    - Your factory is framed clear of the bottom of the screen
+    - Buildings from any mod are drawn with their own artwork instead of a flat colour
+  Graphics:
+    - New mod thumbnail
+  Bugfixes:
+    - Black lines no longer flicker across an exported video
+
+---------------------------------------------------------------------------------------------------
 Version: 0.8.0
 Date: 2026-08-12
   Features:
@@ -9,7 +21,6 @@ Date: 2026-08-12
     - Player markers can be turned off with P, and the viewer remembers your answer between runs
     - Export an MP4 when you have FFmpeg. It is offered only if FFmpeg is already on your PATH, and it is far smaller than the AVI: measured on real frames, about 15 times. It is also what sharing sites accept, where an AVI often will not upload or preview at all. Nothing changes if you do not have FFmpeg, and nothing asks you to install it: the built-in AVI writer is still there and still needs nothing
   Bugfixes:
-    - Modded buildings are drawn with their own artwork instead of a flat colour. Their icons live inside each mod's zip under names that need not match the building, often as several layers the game tints and composites, so there is nothing to find by guessing and nothing the mod can ask the game for. Factorio is asked to draw every icon once instead, which takes about a minute the first time you build a timelapse with a given set of mods and nothing on later builds. An unmodded playthrough skips it entirely, since nothing it draws is missing from the game you already have
     - Rail looks like rail. Every piece was drawn as a single square on the tile it starts from, but a rail spans two tiles and the pieces sit two apart, so a straight run came out as a dotted line, a diagonal as a staircase, and a corner as scattered blocks. Track is now drawn along the path it actually occupies, including the diagonals and the 1.0 style corners you get on a map built before 2.0. All of that works on recordings you already have, with nothing to reinstall
     - Corners on 2.0 rail need one thing from the mod. Factorio keeps rail shapes inside the engine and will not describe them, and unlike every other piece a corner cannot be worked out by measuring a recording either, since 2.0 splits each one into two halves that meet each other rather than anything of known shape. So the mod now writes down which rails the game says are connected, and the tool works the corner out from that. A recording made before this version keeps square corners until you record with this one
     - A timelapse where a huge part of the factory disappears at once now opens. Clearing ten million entities in a single tick produced a timelapse the viewer would never finish loading: it sat with no progress and no error, because the step that folds a frame's changes in was doing an amount of work that grew with your factory multiplied by how much of it changed at once. It now takes about a quarter of a second. The loading screen also names the step it is really on, having previously kept the last step's label up while it worked
