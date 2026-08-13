@@ -152,6 +152,76 @@ fn stage_mods(staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
     Ok(mods)
 }
 
+/// Factorio's Steam app id, set in the child's environment for the icon dump.
+///
+/// Launching the Steam build directly makes it relaunch itself through Steam,
+/// which drops every argument: `--dump-icon-sprites` silently became "open the
+/// game", exiting 0 after a tenth of a second having written nothing. With this
+/// set the Steam API initialises in place instead. A non-Steam install ignores
+/// it, and nothing under the user's install is touched either way, unlike the
+/// `steam_appid.txt` trick that would otherwise be the fix.
+///
+/// The frame export does not need this. It passes a save to `--benchmark`,
+/// which Steam leaves alone.
+const STEAM_APP_ID: &str = "427520";
+
+/// Every entity prototype's icon, as one PNG per prototype, written into
+/// `into`. Returns how many were kept.
+///
+/// Factorio draws these itself. A mod's art cannot be found by guessing:
+/// `aai-storehouse` draws from `container-1-base.png` plus a separately tinted
+/// mask, so neither the file's name nor how many files there are follows from
+/// the prototype's name. The runtime API will not say either, `LuaEntityPrototype`
+/// having no icon field at all. `--dump-icon-sprites` sidesteps both by
+/// rendering each icon with its layers composited and its tints applied.
+///
+/// Only the entity folder is kept. The dump also writes recipes, technologies,
+/// achievements and a dozen other kinds, which came to 132 MB against the
+/// entity folder's 10 MB on a 71 mod game, and nothing here draws any of them.
+///
+/// These come out as plain squares rather than the mipmap strip the install's
+/// own icon files are, which `icon_source_rect` already handles as a no-op
+/// crop.
+pub fn dump_entity_icons(staged: &Path, into: &Path, config: &ExportConfig) -> io::Result<usize> {
+    let mods = stage_mods(staged, config)?;
+
+    let data = install_data_dir(&config.factorio)
+        .ok_or_else(|| io::Error::other("cannot locate the Factorio data directory from the executable path"))?;
+
+    let config_file = staged.join("config.ini");
+    std::fs::write(&config_file, format!("[path]\nread-data={}\nwrite-data={}\n", data.display(), staged.display()))?;
+
+    let run = Command::new(&config.factorio)
+        .arg("--dump-icon-sprites")
+        .arg("--config")
+        .arg(&config_file)
+        .arg("--mod-directory")
+        .arg(&mods)
+        .arg("--disable-audio")
+        .env("SteamAppId", STEAM_APP_ID)
+        .output()?;
+
+    if !run.status.success() {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let tail: Vec<&str> = stdout.lines().rev().take(3).collect();
+        return Err(io::Error::other(format!("factorio exited with {}: {}", run.status, tail.join(" | "))));
+    }
+
+    let from = staged.join("script-output").join("entity");
+    std::fs::create_dir_all(into)?;
+    let mut kept = 0;
+    for item in std::fs::read_dir(&from)? {
+        let item = item?;
+        let name = item.file_name();
+        if !name.to_string_lossy().ends_with(".png") {
+            continue;
+        }
+        std::fs::copy(item.path(), into.join(&name))?;
+        kept += 1;
+    }
+    Ok(kept)
+}
+
 /// Locate the install's `data` directory from the executable path.
 ///
 /// The usual layout is `<root>/bin/x64/factorio`, but macOS app bundles put the

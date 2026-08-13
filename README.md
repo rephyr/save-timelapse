@@ -58,6 +58,8 @@ Save Timelapse does not carry a list of the things it knows how to draw. It reco
 
 That means an Alien Biomes world keeps its own terrain, a Krastorio2 belt curves at corners, and an ore field from a mod nobody has ever heard of does not pull the camera off your factory. There is nothing to configure, and a mod added partway through a playthrough is picked up the next time you load the save.
 
+Modded buildings are drawn with their own artwork too. A mod's icons cannot be found by guessing, since the file need not be named after the building and is often several layers the game composites, so Factorio is asked to draw them all once per modpack and the result is kept with your timelapse. It takes about a minute the first time you build with a given set of mods and nothing after that, and an unmodded playthrough skips it altogether.
+
 ---
 
 ## Install

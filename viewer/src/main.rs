@@ -673,10 +673,20 @@ fn blit(canvas: &mut Image, source: &Image, at: Vec2) {
 /// Sprites indexed by `TypeId`, so drawing never hashes a name. Best-effort:
 /// this only covers vanilla and Space Age naming, and a missing icon just
 /// means that type keeps its coloured shape.
-async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistry) -> Vec<Option<Sprite>> {
+async fn load_sprites(
+    dumped_icons: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
+    registry: &TypeRegistry,
+) -> Vec<Option<Sprite>> {
     let mut sprites: Vec<Option<Sprite>> = (0..registry.len()).map(|_| None).collect();
-    let Some(data_dir) = data_dir else {
-        return sprites;
+    // The in-world sheets belts and pipes draw from live in the install, so
+    // without one there is nothing to draw those with. Dumped icons are
+    // self-contained, though, so a timelapse carrying them still shows its
+    // factory on a machine that has never had Factorio on it.
+    let data_dir = match (data_dir, dumped_icons) {
+        (Some(dir), _) => dir,
+        (None, Some(_)) => std::path::Path::new(""),
+        (None, None) => return sprites,
     };
 
     let mut last = Instant::now();
@@ -759,7 +769,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
             None
         };
         let sheet = found.as_ref().map(|(_, kind)| *kind);
-        let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(data_dir, name).map(|p| vec![p]));
+        let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(dumped_icons, data_dir, name).map(|p| vec![p]));
 
         // All or nothing: a splitter missing one facing would index past the
         // end at draw time, so the whole type falls back to its icon.
@@ -2167,7 +2177,15 @@ async fn load_everything(args: &Args) -> Loaded {
         Some(dir) => println!("factorio data: {}", dir.display()),
         None => println!("no factorio install found (pass --factorio); sprites unavailable, using colored shapes"),
     }
-    let sprites = load_sprites(data_dir.as_deref(), &registry).await;
+    // Written beside the frames by the game that recorded them, and the only
+    // source that can answer for a modded prototype. Absent for a timelapse
+    // built before icons were dumped, which falls back to the install.
+    let dumped_icons = frames_dir.as_ref().map(|dir| dir.join("icons")).filter(|dir| dir.is_dir());
+    if let Some(dir) = &dumped_icons {
+        let count = std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0);
+        println!("icons from this capture's own game: {count}");
+    }
+    let sprites = load_sprites(dumped_icons.as_deref(), data_dir.as_deref(), &registry).await;
     let with_sprites = sprites.iter().filter(|s| s.is_some()).count();
     println!("{} of {} entity/tile types have sprites", with_sprites, registry.len());
 
