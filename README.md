@@ -197,26 +197,11 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
 - **v0.6:** Video export, improved camera framing, moving entities excluded, ground scanned from a save, better scenery cutoff
 - **v0.7:** Modded games recorded as themselves, Factorio's own belt and pipe artwork, reworked viewer, belt rotations recorded
-
-### v0.8, the beta
-
-- [x] A frame records only what changed, taking a real megabase timelapse from 5.5 GB to 69 MB and a rebuild from 15 minutes to under a minute
-- [x] Ground read once per playthrough instead of once per build
-- [x] MP4 export when FFmpeg is already installed, roughly fifteen times smaller than the AVI and accepted by sharing sites
-- [x] Choose what goes on an exported video: the in-game clock, and a marker showing where you were
-- [x] Recordings survive a reset and a reload, and say so when something could not be read
-- [x] The building count counts buildings
-- [x] Going back to a branch of your playthrough you had left keeps the history you left it with
-- [x] Timelapses built from existing saves compare the saves against each other, and order them by the tick inside each one rather than by filename
-- [x] A frame that clears most of the factory loads. Measured on a 4000 hour gigabase going from 3.7 million buildings to 500 thousand in one frame
-- [x] Rail drawn along the track rather than as a square on each piece's centre tile, so runs and corners are continuous
-- [x] The camera in an exported video glides instead of snapping, and starts moving before the far side of the factory is built rather than jumping to it afterwards
-- [x] The camera leaves the bottom of the frame clear, so the timeline stops sitting on top of the southern edge of your factory
+- **v0.8, the beta:** Incremental frames, 98% smaller timelapses, ground read once per playthrough, MP4 export, video overlays, recording recovery, saves compared against each other, rail drawn along the track
+- **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
 
 ### v1.0
-
 - [ ] Smarter camera auto-follow
-- [ ] Camera keyframes and cinematic controls
 - [ ] Single-binary distribution
 
 ---
