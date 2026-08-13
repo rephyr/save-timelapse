@@ -12,6 +12,12 @@ Already have a factory? Save Timelapse can also reconstruct a timelapse from you
 
 ![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
 
+Here is a full playthrough, recorded and rendered end to end:
+
+[![Factorio Save Timelapse: a playthrough recorded and rendered end to end](https://img.youtube.com/vi/KOBqoYq7GlQ/maxresdefault.jpg)](https://youtu.be/KOBqoYq7GlQ)
+
+Captured by the mod while playing, rendered to video by the viewer. No external video editing software was used at any point.
+
 
 Zoomed in, it draws with Factorio's own artwork, so belts weave and turn, splitters and underground belts read the right way round, and pipe runs join up. 
 
@@ -204,6 +210,8 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - [x] Timelapses built from existing saves compare the saves against each other, and order them by the tick inside each one rather than by filename
 - [x] A frame that clears most of the factory loads. Measured on a 4000 hour gigabase going from 3.7 million buildings to 500 thousand in one frame
 - [x] Rail drawn along the track rather than as a square on each piece's centre tile, so runs and corners are continuous
+- [x] The camera in an exported video glides instead of snapping, and starts moving before the far side of the factory is built rather than jumping to it afterwards
+- [x] The camera leaves the bottom of the frame clear, so the timeline stops sitting on top of the southern edge of your factory
 
 ### v1.0
 

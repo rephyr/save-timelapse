@@ -62,6 +62,22 @@ pub struct GrowingBounds {
     pub half_extent: Vec2,
 }
 
+impl GrowingBounds {
+    /// From the two corners, which is how everything that builds a box has it
+    /// and how `camera_path` smooths one.
+    pub fn from_min_max(min: Vec2, max: Vec2) -> GrowingBounds {
+        GrowingBounds { center: (min + max) / 2.0, half_extent: (max - min) / 2.0 }
+    }
+
+    pub fn min(&self) -> Vec2 {
+        self.center - self.half_extent
+    }
+
+    pub fn max(&self) -> Vec2 {
+        self.center + self.half_extent
+    }
+}
+
 /// Everything in one frame that counts as construction. Filtered per run
 /// rather than per entity, so the test happens tens of times per frame rather
 /// than hundreds of thousands, which is what makes walking twice affordable.
@@ -169,7 +185,7 @@ pub fn growing_bounds_per_frame(frames: &FrameSequence, registry: &TypeRegistry)
                 (None, other) => other,
             };
         }
-        result.push(running.map(|(min, max)| GrowingBounds { center: (min + max) / 2.0, half_extent: (max - min) / 2.0 }));
+        result.push(running.map(|(min, max)| GrowingBounds::from_min_max(min, max)));
     });
     result
 }
