@@ -62,9 +62,11 @@ jobs:
 
       # Through the Makefile rather than calling the interpreter directly, so
       # CI runs what a developer runs. That also picks up `check-mod-syntax`,
-      # which compiles every shipped Lua file: the unit suite only loads
-      # encode.lua, so a syntax error in control.lua or capture.lua would
-      # otherwise reach a player as "Factorio refuses to load the mod".
+      # which compiles every shipped Lua file. The unit suite now loads all of
+      # them, so this is a narrower backstop than it was, but data.lua and
+      # settings.lua run in the data stage and no test loads those: a syntax
+      # error there would otherwise reach a player as "Factorio refuses to
+      # load the mod".
       #
       # Deliberately its own job rather than folded into `cargo test`, whose
       # whole promise is needing nothing beyond the Rust toolchain.

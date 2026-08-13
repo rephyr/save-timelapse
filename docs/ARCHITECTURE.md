@@ -1247,6 +1247,29 @@ On a narrow window the left cluster degrades in tiers rather than overflowing:
 speed pill first, then the step buttons, leaving play alone. Everything dropped
 still has a keyboard equivalent, listed in the `?` panel.
 
+### Framing keeps the bottom of the frame clear
+
+The bar and its activity graph stand in the bottom tenth or so of the window,
+and a base fitted edge to edge puts its southern buildings behind them. So
+`Camera::fit_framed` takes a `Framing` carrying a `bottom_inset` alongside the
+zoom floor and the margin, and applies it twice over: the zoom is fitted to the
+height that remains once the covered strip is taken away, and then the camera
+is pushed south so the box centers in that remainder. Only doing the first
+leaves the base centered and still half behind the bar, merely smaller.
+
+The inset is a share of the frame height rather than a pixel count, so the same
+number frames a 1080p video and the window that previewed it. In the window it
+takes the greater of that share and what the bar's furniture actually covers,
+which is what still clears the bar on a window too short for a tenth of it to.
+An export applies the share alone: it draws no bar, so there is no
+fixed-size furniture to clear, and a pixel count meant for a window would eat a
+quarter of a small video.
+
+All three places that frame the factory take the same `Framing`: auto-follow,
+the one-shot fit button, and the export's smoothed path. An auto-follow that
+disagreed with the export about any of the three numbers would make the window
+a misleading preview of the video.
+
 ### Two ordering constraints in the draw loop
 
 **Surface switches take effect one frame later.** A click on a chip arrives
@@ -1298,7 +1321,7 @@ away and back does not disturb either one's pan and zoom.
 
 ## Exporting a video
 
-    growing bounds ─> camera fit ─> draw offscreen at (w·N, h·N)
+    growing bounds ─> smoothed path ─> camera fit ─> draw offscreen at (w·N, h·N)
                                           │
                           get_texture_data()   RGBA, bottom up
                                           │
@@ -1380,6 +1403,79 @@ Measured on a real 860k entity base, 41 frames at 1080p: 4x supersampling costs
 about 3% more wall clock than 2x, the bottleneck being entity submission rather
 than fill rate or the downsample. The default is 2, a 7680x4320 readback being
 132 MB per frame.
+
+### The camera path is filtered, not simulated
+
+Fitting each frame's growing bounds directly is what made exports snap: the
+tracked box jumps the moment something is built far from everything else, and
+the camera teleports with it. The interactive viewer hides that behind
+`CameraTransition`, which glides over wall-clock seconds, but an export has no
+wall clock. It advances as fast as the disk allows, so the same code produces
+moves of an arbitrary number of output frames.
+
+`viewer/src/camera_path.rs` takes the other route available to something
+running offline: it has every frame's bounds up front, so it filters the whole
+path non-causally rather than simulating a camera that chases it. The camera
+starts easing out **before** the far outpost appears, which is what reads as a
+planned move rather than a reaction.
+
+The filter is three passes of *sliding window extremum, then box blur*, both of
+the same radius, run on the box's two corners rather than on a center and a
+zoom. The extremum pass is what makes it safe to use for framing at all. A
+blurred value is an average over a window, and every entry in that window has
+already taken its extremum over a window that includes the center, so every
+term of the average is at least as far out as the requirement there, and so is
+the average. The smoothed box therefore contains the required box on every
+frame, for any input, and the property composes across passes. A plain blur has
+no such guarantee: it undershoots mid-transition and briefly crops whatever was
+just built, which is the one thing an auto-following camera must not do.
+
+Two consequences worth knowing:
+
+- Moves outward anticipate, moves inward lag. Coming in early is exactly what
+  the extremum pass forbids, so the descent out of the opening establishing
+  shot trails the first entity instead of leading it. Every later move, the
+  box only ever growing, is the anticipating kind.
+- Radius is derived from `--smooth SECS` against the export's own `--fps`, so
+  the pacing is the finished video's rather than this machine's. The default
+  matches `AUTO_FOLLOW_TRANSITION_SECS`, and `--smooth 0` restores the exact
+  per-frame fit.
+
+Boxes are smoothed, not cameras: the aspect ratio only enters at
+`Camera::fit_bounds`, so the path is resolution independent and one could serve
+the interactive window too. The cost of that is a small kink in zoom velocity
+whenever the growing box switches which axis binds the fit, since `fit_bounds`
+takes the `min` of the two. Removing it means padding the box to the output
+aspect before filtering, which would tie the path to one resolution.
+
+### Ground quads overlap by half a pixel
+
+Two tiles that share an edge are drawn as two rects whose edges are equal in
+exact arithmetic and not always in `f32`. `world_to_screen` rounds `center +
+(world - offset) * pixels_per_tile` independently for each tile, so the second
+can start a thousandth of a pixel past where the first ended. Nothing covers a
+pixel whose sample point lands in that crack, and what shows through is the
+clear colour, which is nearly black. Every tile in a column computes the same
+x, so the miss repeats all the way down: a clean black line across the frame.
+
+It is intermittent because the crack has to line up with a sample point, and it
+never happens at a power-of-two zoom, where the multiply is exact. A camera
+that snaps and then sits still shows it rarely; one gliding along a smoothed
+path drifts through the alignments continuously, which is what made it worth
+chasing.
+
+`tiling_quad_size` adds half a pixel to every quad that tiles the plane, so
+neighbours overlap instead of meeting. Half a pixel of the supersampled render
+is a quarter of an output pixel at the default 2x, and the worst crack measured
+across plausible zooms and map coordinates is about a hundredth of one. It is
+one addition per layer rather than per quad, which matters in a loop that runs
+twenty million times on a megabase frame. `camera.rs` carries a test that the
+crack is real on the platform running it, so the bleed cannot be dismissed as
+superstition and removed.
+
+The same function floors a cell at one pixel, which is the other half of the
+job: a quad thinner than a pixel flickers with the sample grid instead of
+cracking against its neighbour.
 
 ### Culling is against the render surface, not the window
 

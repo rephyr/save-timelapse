@@ -8,6 +8,7 @@ mod activity;
 mod avi;
 mod belts;
 mod camera;
+mod camera_path;
 mod chrome;
 mod construction;
 mod draw_calls;
@@ -29,9 +30,10 @@ pub use activity::{activity_heights, analyze_activity, recent_heat, Activity, He
 pub use avi::AviWriter;
 pub use belts::{infer_shapes, infer_underground_ends, sheet_row, BeltShape, Carrier, UndergroundEnd, SHEET_ROWS};
 pub use camera::{
-    entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, Camera, CameraTransition, Timeline,
-    BASE_PIXELS_PER_TILE,
+    entity_cull_half_extents, entity_footprint_size, entity_rotation_radians, tiling_quad_size, Camera, CameraTransition,
+    Framing, Timeline, BASE_PIXELS_PER_TILE,
 };
+pub use camera_path::{smoothing_radius, CameraPath};
 pub use chrome::{draw_key_panel, first_run, Chrome, ChromeState, Click, Ui};
 pub use construction::{growing_bounds_per_frame, GrowingBounds};
 pub use draw_calls::DrawCallCounter;

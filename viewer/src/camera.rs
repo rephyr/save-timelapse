@@ -49,6 +49,15 @@ impl Camera {
         screen_width: f32,
         screen_height: f32,
     ) -> Camera {
+        Self::from_sequence_bounds(Self::sequence_bounds(frames, terrain), screen_width, screen_height)
+    }
+
+    /// The box `fit_sequence` fits to, as min and max corners, for callers
+    /// that want the box itself rather than a camera on it. Split out because
+    /// this walk is O(every entity in every frame): the load path takes the
+    /// box once and derives both the opening camera and the smoothed export
+    /// path from it, rather than walking twice.
+    pub fn sequence_bounds(frames: &crate::render_frame::FrameSequence, terrain: Option<&RenderFrame>) -> Option<(Vec2, Vec2)> {
         let mut bounds: Option<(Vec2, Vec2)> = None;
         let mut take = |point: Vec2| {
             bounds = Some(match bounds {
@@ -76,6 +85,12 @@ impl Camera {
             }
         }
 
+        bounds
+    }
+
+    /// A camera on the box `sequence_bounds` returned, or the default view
+    /// when there was nothing to fit.
+    pub fn from_sequence_bounds(bounds: Option<(Vec2, Vec2)>, screen_width: f32, screen_height: f32) -> Camera {
         match bounds {
             Some((min, max)) => Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN),
             None => Camera { offset: Vec2::ZERO, zoom: 1.0 },
@@ -111,6 +126,25 @@ impl Camera {
         Self::fit_bounds((min + max) / 2.0, max - min, screen_width, screen_height, 1.0, FIT_MARGIN)
     }
 
+    /// Center on a world-space box, fitted the way `framing` asks.
+    ///
+    /// The inset is applied twice over, and both halves are needed: the zoom
+    /// is fitted to the height that is left once the covered strip is taken
+    /// away, and then the camera is pushed down so the box sits centered in
+    /// that strip's *remainder* rather than in the whole frame. Fitting alone
+    /// would leave the box centered and still half behind the scrub bar,
+    /// merely smaller.
+    pub fn fit_framed(center: Vec2, size: Vec2, screen_width: f32, screen_height: f32, framing: Framing) -> Camera {
+        // Never more than most of the frame: an inset that swallowed the whole
+        // height would divide the fit by nothing left, and there is no sane
+        // camera on a frame with no room to put anything.
+        let inset = framing.bottom_inset.clamp(0.0, screen_height * 0.8);
+        let fitted = Self::fit_bounds(center, size, screen_width, screen_height - inset, framing.min_size_tiles, framing.margin);
+        // Down in world terms is up on screen: `offset` is the world point the
+        // middle of the frame shows, so moving it south lifts the base clear.
+        Camera { offset: center + Vec2::new(0.0, inset / (2.0 * fitted.pixels_per_tile())), ..fitted }
+    }
+
     /// Center on a world-space box and pick a zoom that fits.
     ///
     /// `min_size_tiles` floors how tight this zooms: framing one small
@@ -129,6 +163,25 @@ impl Camera {
         let zoom = (screen_width / (size.x * BASE_PIXELS_PER_TILE)).min(screen_height / (size.y * BASE_PIXELS_PER_TILE)) * margin;
         Camera { offset: center, zoom: zoom.clamp(0.01, 50.0) }
     }
+}
+
+/// How a box is framed once something has decided which box to look at.
+///
+/// Carried together rather than passed as three floats because every caller
+/// that frames the factory wants the same three, and an auto-follow that
+/// disagreed with the export about any of them would make the window a
+/// misleading preview of the video.
+#[derive(Clone, Copy)]
+pub struct Framing {
+    /// Floor on how tight to zoom, in tiles. Without it the first 1x1 entity
+    /// of a run fills the screen.
+    pub min_size_tiles: f32,
+    /// How much smaller than edge to edge to fit.
+    pub margin: f32,
+    /// Pixels along the bottom of the frame to keep the box out of, because
+    /// something is drawn over them. The scrub bar and its activity graph in
+    /// the window, the clock overlay in an export.
+    pub bottom_inset: f32,
 }
 
 /// A camera move from wherever it is to a new target over a fixed real-time
@@ -168,6 +221,40 @@ impl CameraTransition {
     pub fn is_finished(&self) -> bool {
         self.elapsed_secs >= self.duration_secs
     }
+}
+
+/// Overlap added to every quad that tiles the plane, in pixels. See
+/// `tiling_quad_size`.
+const SEAM_BLEED: f32 = 0.5;
+
+/// The on-screen size of one cell of a grid that covers the plane: `tiles`
+/// tiles across, plus a sliver so it overlaps its neighbour rather than merely
+/// meeting it.
+///
+/// Without the sliver the ground grows hairlines. Two tiles that share an edge
+/// are drawn as two rects whose edges are equal in exact arithmetic and not
+/// always in `f32`: `world_to_screen` rounds `center + (world - offset) *
+/// pixels_per_tile` independently for each, so the second can start a
+/// thousandth of a pixel past where the first ended. Nothing covers a pixel
+/// whose sample point lands in that crack, and what shows through is the clear
+/// colour, which is nearly black. Both tiles of a column compute the same x,
+/// so the miss is the same all the way down: a clean black line across the
+/// frame, for however long the camera drift keeps the seam where it is. It
+/// comes and goes rather than staying because the crack has to line up with a
+/// sample point, and it never appears at all at a power-of-two zoom, where the
+/// multiply is exact.
+///
+/// Half a pixel is a wide margin over the worst crack measured across
+/// plausible zooms and map coordinates, which is about a hundredth of one, and
+/// it is half a pixel of the *supersampled* render: a quarter of an output
+/// pixel at the default 2x, and less above that. Cheap in the way that matters
+/// here, too, being one addition per layer rather than per quad, in a loop
+/// that runs twenty million times on a megabase frame.
+///
+/// The floor of one pixel is the other half of the same job: a cell thinner
+/// than a pixel would otherwise flicker in and out with the sample grid.
+pub fn tiling_quad_size(pixels_per_tile: f32, tiles: f32) -> f32 {
+    (pixels_per_tile * tiles).max(1.0) + SEAM_BLEED
 }
 
 /// The on-screen size of an entity's footprint, in pixels. Most are 1x1, but
@@ -234,9 +321,14 @@ impl Timeline {
     /// grabbing it, rather than falling through to camera pan.
     pub const HIT_HEIGHT: f32 = 14.0;
 
+    /// How far up from the bottom of the window the bar sits. Named because
+    /// framing has to know how much of the window the bar's furniture spends,
+    /// and reading it off the geometry beats a second copy of the number.
+    pub const FROM_BOTTOM: f32 = 40.0;
+
     pub fn for_screen(screen_width: f32, screen_height: f32) -> Self {
         let width = screen_width * 0.6;
-        Timeline { left: (screen_width - width) / 2.0, width, y: screen_height - 40.0 }
+        Timeline { left: (screen_width - width) / 2.0, width, y: screen_height - Self::FROM_BOTTOM }
     }
 
     /// Where a frame index sits along the bar.
@@ -431,6 +523,72 @@ mod tests {
         assert!((loose.zoom - tight.zoom * 0.5).abs() < 1e-4, "half the margin should mean half the zoom");
     }
 
+    fn framing(bottom_inset: f32) -> Framing {
+        Framing { min_size_tiles: 1.0, margin: 1.0, bottom_inset }
+    }
+
+    /// The whole point: the bottom of the base has to clear the strip the
+    /// scrub bar occupies, not merely be smaller and still behind it.
+    #[test]
+    fn a_bottom_inset_lifts_the_box_clear_of_the_covered_strip() {
+        let (w, h) = (800.0, 600.0);
+        let inset = 120.0;
+        let size = Vec2::splat(40.0);
+        let camera = Camera::fit_framed(Vec2::ZERO, size, w, h, framing(inset));
+        let screen_center = Vec2::new(w / 2.0, h / 2.0);
+
+        let bottom = camera.world_to_screen(size / 2.0, screen_center).y;
+        assert!(bottom <= h - inset + 1e-3, "the base's bottom edge sits at {bottom}, inside the covered strip");
+    }
+
+    /// Lifted, but not so far that it sails off the top: the box should end up
+    /// centered in what is left of the frame.
+    #[test]
+    fn a_bottom_inset_centers_the_box_in_the_room_that_remains() {
+        let (w, h) = (800.0, 600.0);
+        let inset = 120.0;
+        let camera = Camera::fit_framed(Vec2::new(10.0, -5.0), Vec2::splat(40.0), w, h, framing(inset));
+        let screen_center = Vec2::new(w / 2.0, h / 2.0);
+
+        let on_screen = camera.world_to_screen(Vec2::new(10.0, -5.0), screen_center);
+        assert!((on_screen.x - w / 2.0).abs() < 1e-3, "horizontally off center at {}", on_screen.x);
+        assert!(
+            (on_screen.y - (h - inset) / 2.0).abs() < 1e-3,
+            "vertically at {} rather than {}",
+            on_screen.y,
+            (h - inset) / 2.0
+        );
+    }
+
+    #[test]
+    fn a_zero_inset_frames_exactly_as_fit_bounds_does() {
+        let framed = Camera::fit_framed(Vec2::new(3.0, 4.0), Vec2::splat(20.0), 800.0, 600.0, framing(0.0));
+        let plain = Camera::fit_bounds(Vec2::new(3.0, 4.0), Vec2::splat(20.0), 800.0, 600.0, 1.0, 1.0);
+        assert_eq!(framed.offset, plain.offset);
+        assert!((framed.zoom - plain.zoom).abs() < 1e-6);
+    }
+
+    /// A taller box has to zoom out further once part of the frame is spoken
+    /// for, or it would simply be cropped by the strip instead of fitted above
+    /// it.
+    #[test]
+    fn a_bottom_inset_zooms_out_when_height_is_what_binds_the_fit() {
+        let tall = Vec2::new(10.0, 40.0);
+        let without = Camera::fit_framed(Vec2::ZERO, tall, 800.0, 600.0, framing(0.0));
+        let with = Camera::fit_framed(Vec2::ZERO, tall, 800.0, 600.0, framing(150.0));
+        assert!(with.zoom < without.zoom, "{} should be tighter than {}", with.zoom, without.zoom);
+    }
+
+    /// `fit_bounds` divides by the height it is given, so an inset at or past
+    /// the full height would divide by zero or negative and hand back a camera
+    /// with a nonsense zoom.
+    #[test]
+    fn an_absurd_inset_is_clamped_rather_than_dividing_the_frame_away() {
+        let camera = Camera::fit_framed(Vec2::ZERO, Vec2::splat(10.0), 800.0, 600.0, framing(10_000.0));
+        assert!(camera.zoom.is_finite() && camera.zoom > 0.0, "zoom came out {}", camera.zoom);
+        assert!(camera.offset.is_finite());
+    }
+
     #[test]
     fn camera_transition_is_a_no_op_at_zero_elapsed() {
         let start = Camera { offset: Vec2::new(1.0, 2.0), zoom: 1.0 };
@@ -491,6 +649,61 @@ mod tests {
         }
         assert!((result.offset - end.offset).length() < 1e-3);
         assert!((result.zoom - end.zoom).abs() < 1e-3);
+    }
+
+    /// Every camera in the sweep below, so the two tests either side of this
+    /// disagree about nothing but the bleed.
+    fn seam_sweep(mut check: impl FnMut(f32, f32, f32)) {
+        let screen_center = Vec2::new(1920.0, 1080.0);
+        // Powers of two are exact and never crack, so a sweep made only of
+        // round numbers would report a clean bill of health.
+        for zoom in [0.115_625, 0.059_375, 0.540_625, 1.031_25] {
+            let camera = Camera { offset: Vec2::new(-3712.37, 2048.91), zoom };
+            for step in 0..400 {
+                let x = -4000.0 + step as f32 * 19.0;
+                let left = camera.world_to_screen(Vec2::new(x, 0.0), screen_center).x;
+                let right = camera.world_to_screen(Vec2::new(x + 1.0, 0.0), screen_center).x;
+                check(left, right, camera.pixels_per_tile());
+            }
+        }
+    }
+
+    /// Not superstition: this is the arithmetic that opens the crack the
+    /// bleed exists to cover, kept as a test so nobody removes the bleed on
+    /// the grounds that abutting rects obviously abut.
+    #[test]
+    fn abutting_tiles_do_not_always_abut_in_f32() {
+        let mut cracked = 0;
+        seam_sweep(|left, right, pixels_per_tile| {
+            if left + pixels_per_tile < right {
+                cracked += 1;
+            }
+        });
+        assert!(cracked > 0, "no seam cracked, so this platform's f32 does not behave as the bleed assumes");
+    }
+
+    #[test]
+    fn a_tiling_quad_always_reaches_its_neighbour() {
+        seam_sweep(|left, right, pixels_per_tile| {
+            let reach = left + tiling_quad_size(pixels_per_tile, 1.0);
+            assert!(reach >= right, "a tile ending at {reach} leaves a crack before its neighbour at {right}");
+        });
+    }
+
+    /// The overlap has to stay small enough to be invisible: a whole pixel of
+    /// it would move the boundary between two ground colours by a pixel, and
+    /// which one won would depend on draw order rather than on position.
+    #[test]
+    fn the_overlap_is_a_fraction_of_a_pixel() {
+        assert!((tiling_quad_size(32.0, 1.0) - 32.0) < 1.0);
+        assert!((tiling_quad_size(4.0, 8.0) - 32.0) < 1.0);
+    }
+
+    /// A cell thinner than a pixel would otherwise flicker with the sample
+    /// grid, which is the same artifact by another route.
+    #[test]
+    fn a_sub_pixel_tiling_quad_is_still_at_least_a_pixel() {
+        assert!(tiling_quad_size(0.01, 1.0) >= 1.0);
     }
 
     #[test]

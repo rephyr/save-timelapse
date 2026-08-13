@@ -13,11 +13,11 @@ use viewer::{
     activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
     entity_footprint_size, entity_rotation_radians, entity_sheet_path, format_game_time, growing_bounds_per_frame, icon_path,
     icon_source_rect, pipe_piece_path, pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path,
-    splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, underground_source_rect,
-    underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraTransition, Chrome, ChromeState, Click,
-    DrawCallCounter, FrameSequence, GrowingBounds, HeatCell, LoadProgress, LodCell, Mp4Writer, PlayerTrack, ProgressBar,
-    RailSegment, RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd, HEAT_CELL_TILES,
-    LOD_CELL_TILES, PIECES, RAIL_WIDTH_TILES, SHEET_ROWS, SPRITE_TILE_PIXELS,
+    splitter_source_rect, splitter_structure_paths, synthetic_frame, synthetic_tiles, tiling_quad_size, underground_source_rect,
+    underground_structure_path, use_chunk_lod, AviWriter, BeltShape, Camera, CameraPath, CameraTransition, Chrome, ChromeState,
+    Click, DrawCallCounter, FrameSequence, Framing, GrowingBounds, HeatCell, LoadProgress, LodCell, Mp4Writer, PlayerTrack,
+    ProgressBar, RailSegment, RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd,
+    HEAT_CELL_TILES, LOD_CELL_TILES, PIECES, RAIL_WIDTH_TILES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
 
 const ZOOM_STEP: f32 = 1.1;
@@ -33,6 +33,13 @@ const AUTO_FOLLOW_FIT_MARGIN: f32 = 0.92;
 /// A fixed-duration linear glide rather than an exponential approach,
 /// matching TLBE. See `Camera::CameraTransition`.
 const AUTO_FOLLOW_TRANSITION_SECS: f32 = 1.5;
+/// Share of the frame height kept clear along the bottom when following.
+///
+/// The scrub bar, its activity graph and its labels live down there, and a
+/// base fitted edge to edge puts its southern buildings behind them. A share
+/// rather than a pixel count so an export is framed like the window that
+/// previewed it, whatever either one's size.
+const AUTO_FOLLOW_BOTTOM_INSET: f32 = 0.1;
 /// Below this, a sprite is imperceptible and not worth a texture draw over a
 /// flat rect: the zoom-based sprites/shapes split agreed back in the
 /// milestone-1 discussion.
@@ -49,6 +56,11 @@ const BATCH_INDEX_CAPACITY: usize = BATCH_QUAD_CAPACITY * 6;
 /// Oversampling an export uses unless told otherwise. 2 costs four times the
 /// pixels and is where the averaging is clearly visible.
 const DEFAULT_SUPERSAMPLE: u32 = 2;
+
+/// How long an exported camera move takes unless told otherwise. Matches
+/// `AUTO_FOLLOW_TRANSITION_SECS` so a video is paced like browsing the same
+/// capture, even though the two get there by different means.
+const DEFAULT_SMOOTH_SECS: f32 = 1.5;
 
 /// Longest render target edge to ask a GPU for. Past roughly this, drivers
 /// start refusing the allocation, and macroquad reports that as a texture
@@ -88,6 +100,11 @@ struct WorldView {
     /// The whole base's bounding box as of each frame, monotonically
     /// growing, precomputed once at load. See `viewer::growing_bounds_per_frame`.
     growing_bounds: Vec<Option<GrowingBounds>>,
+    /// Everything this surface ever contains, terrain included: the box the
+    /// opening camera is fitted to. Kept because an export smooths its way out
+    /// of it rather than cutting, and rediscovering it means another walk over
+    /// every entity of every frame.
+    opening_bounds: Option<GrowingBounds>,
     /// How much got built in each frame, normalized to 0..1. Precomputed at
     /// load, since recovering it needs a diff between consecutive frames.
     activity: Vec<f32>,
@@ -182,6 +199,10 @@ struct ExportRequest {
     /// entity a pixel lands on wins it outright. This is also what makes full
     /// detail worth asking for in an export.
     supersample: u32,
+    /// Roughly how long the camera takes to complete a move, in seconds of
+    /// finished video. Zero fits every frame's own bounds exactly, which is
+    /// what this used to do and what snapped. See `viewer::camera_path`.
+    smooth_secs: f32,
 }
 
 struct Args {
@@ -200,6 +221,7 @@ fn parse_args() -> Args {
     let mut surface = None;
     let (mut fps, mut video, mut mp4) = (30u32, false, false);
     let (mut overlay_players, mut overlay_clock) = (false, false);
+    let mut smooth_secs = DEFAULT_SMOOTH_SECS;
 
     let mut i = 0;
     while i < args.len() {
@@ -240,6 +262,10 @@ fn parse_args() -> Args {
                 i += 1;
                 supersample = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(supersample);
             }
+            "--smooth" => {
+                i += 1;
+                smooth_secs = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(smooth_secs);
+            }
             "--video" => video = true,
             "--mp4" => mp4 = true,
             "--overlay-players" => overlay_players = true,
@@ -272,6 +298,11 @@ fn parse_args() -> Args {
             // texture sizes past 8192 a side, and a refused target is a black
             // export rather than an error.
             supersample: supersample.clamp(1, 4).min(MAX_RENDER_EDGE / width).min(MAX_RENDER_EDGE / height).max(1),
+            // Capped at ten seconds: past that the filter reaches so far ahead
+            // that the camera is framing a factory that will not exist for
+            // another half minute, which stops looking like anticipation and
+            // starts looking like it is pointed at nothing.
+            smooth_secs: smooth_secs.clamp(0.0, 10.0),
         }
     });
 
@@ -673,10 +704,20 @@ fn blit(canvas: &mut Image, source: &Image, at: Vec2) {
 /// Sprites indexed by `TypeId`, so drawing never hashes a name. Best-effort:
 /// this only covers vanilla and Space Age naming, and a missing icon just
 /// means that type keeps its coloured shape.
-async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistry) -> Vec<Option<Sprite>> {
+async fn load_sprites(
+    dumped_icons: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
+    registry: &TypeRegistry,
+) -> Vec<Option<Sprite>> {
     let mut sprites: Vec<Option<Sprite>> = (0..registry.len()).map(|_| None).collect();
-    let Some(data_dir) = data_dir else {
-        return sprites;
+    // The in-world sheets belts and pipes draw from live in the install, so
+    // without one there is nothing to draw those with. Dumped icons are
+    // self-contained, though, so a timelapse carrying them still shows its
+    // factory on a machine that has never had Factorio on it.
+    let data_dir = match (data_dir, dumped_icons) {
+        (Some(dir), _) => dir,
+        (None, Some(_)) => std::path::Path::new(""),
+        (None, None) => return sprites,
     };
 
     let mut last = Instant::now();
@@ -759,7 +800,7 @@ async fn load_sprites(data_dir: Option<&std::path::Path>, registry: &TypeRegistr
             None
         };
         let sheet = found.as_ref().map(|(_, kind)| *kind);
-        let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(data_dir, name).map(|p| vec![p]));
+        let paths = found.map(|(paths, _)| paths).or_else(|| icon_path(dumped_icons, data_dir, name).map(|p| vec![p]));
 
         // All or nothing: a splitter missing one facing would index past the
         // end at draw time, so the whole type falls back to its icon.
@@ -857,7 +898,7 @@ fn draw_tile_layer(
     registry: &TypeRegistry,
     counter: &mut DrawCallCounter,
 ) {
-    let tile_size = camera.pixels_per_tile().max(1.0);
+    let tile_size = tiling_quad_size(camera.pixels_per_tile(), 1.0);
     for run in tile_runs {
         let color = registry.tile_color(run.type_id);
         let mut drawn = 0;
@@ -890,7 +931,7 @@ fn draw_tile_lod_layer(
     registry: &TypeRegistry,
     counter: &mut DrawCallCounter,
 ) {
-    let chunk_px = camera.pixels_per_tile() * LOD_CELL_TILES as f32;
+    let chunk_px = tiling_quad_size(camera.pixels_per_tile(), LOD_CELL_TILES as f32);
     for run in tile_lod_runs {
         let color = registry.tile_color(run.type_id);
         let mut drawn = 0;
@@ -959,13 +1000,12 @@ fn apply_chrome_click(
         // screen and leaves the camera alone.
         Some(Click::Fit) => {
             if let Some(bounds) = growing_bounds[sequence.index()] {
-                *camera = Camera::fit_bounds(
+                *camera = Camera::fit_framed(
                     bounds.center,
                     bounds.half_extent * 2.0,
                     screen_width(),
                     screen_height(),
-                    AUTO_FOLLOW_MIN_FOCUS_TILES,
-                    AUTO_FOLLOW_FIT_MARGIN,
+                    window_framing(screen_height()),
                 );
                 follow.enabled = false;
                 follow.transition = None;
@@ -1142,6 +1182,40 @@ fn advance_playback(sequence: &mut FrameSequence, state: &mut ViewerState) {
     }
 }
 
+/// How the factory is framed while following it in the window.
+///
+/// The inset is the greater of the share and what the scrub bar's furniture
+/// actually covers. The share is what keeps the window an honest preview of an
+/// export; the pixel floor is what still clears the bar on a window short
+/// enough that a tenth of it would not.
+fn window_framing(screen_height: f32) -> Framing {
+    Framing {
+        min_size_tiles: AUTO_FOLLOW_MIN_FOCUS_TILES,
+        margin: AUTO_FOLLOW_FIT_MARGIN,
+        bottom_inset: (screen_height * AUTO_FOLLOW_BOTTOM_INSET).max(timeline_chrome_height()),
+    }
+}
+
+/// The same, for a frame being exported. No floor: an export draws no scrub
+/// bar, so there is no fixed-size furniture to clear, and a pixel count meant
+/// for a window would eat a quarter of a small video.
+fn export_framing(frame_height: f32) -> Framing {
+    Framing {
+        min_size_tiles: AUTO_FOLLOW_MIN_FOCUS_TILES,
+        margin: AUTO_FOLLOW_FIT_MARGIN,
+        bottom_inset: frame_height * AUTO_FOLLOW_BOTTOM_INSET,
+    }
+}
+
+/// Pixels of the window bottom the scrub bar and its activity graph cover,
+/// off the same numbers that draw them. The labels below the bar and the
+/// playhead time above the graph are left out: they are small, they are text
+/// rather than a solid band, and including them would cost another 40 pixels
+/// of factory to clear something nobody is reading the ground through.
+fn timeline_chrome_height() -> f32 {
+    Timeline::FROM_BOTTOM + ACTIVITY_GAP + ACTIVITY_HEIGHT
+}
+
 /// Advances the auto-follow camera transition toward the growing base's
 /// current bounds, starting a new glide whenever the tracked area grows
 /// past wherever the last one was headed.
@@ -1162,13 +1236,12 @@ fn update_auto_follow(
     if follow.transition.is_none() {
         if let Some(bounds) = growing_bounds[sequence_index] {
             if follow.target_bounds != Some(bounds) {
-                let end = Camera::fit_bounds(
+                let end = Camera::fit_framed(
                     bounds.center,
                     bounds.half_extent * 2.0,
                     screen_width,
                     screen_height,
-                    AUTO_FOLLOW_MIN_FOCUS_TILES,
-                    AUTO_FOLLOW_FIT_MARGIN,
+                    window_framing(screen_height),
                 );
                 follow.transition = Some(CameraTransition::new(*camera, end, AUTO_FOLLOW_TRANSITION_SECS));
                 follow.target_bounds = Some(bounds);
@@ -1240,6 +1313,15 @@ async fn export_frames(
     };
     let screen_center = Vec2::new(w / 2.0, h / 2.0);
 
+    // The whole camera path at once, before a single frame is drawn. An
+    // export knows every frame's bounds up front, so the move to a newly
+    // reached corner of the map can begin before that corner is built rather
+    // than snapping to it after; see `viewer::camera_path`. `fps` is used even
+    // for an image sequence, which has no rate of its own: whatever the frames
+    // are later assembled at is the rate the pacing was meant for.
+    let radius = viewer::smoothing_radius(request.smooth_secs, request.fps);
+    let path = CameraPath::smooth(&world.growing_bounds, world.opening_bounds, radius);
+
     let total = world.sequence.len();
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
     let destination = if request.video { video_path.display().to_string() } else { request.dir.display().to_string() };
@@ -1250,18 +1332,16 @@ async fn export_frames(
     for index in 0..total {
         world.sequence.goto(index);
 
-        // Fitted per frame rather than through `update_auto_follow`, which
-        // glides over wall-clock seconds: an export advances as fast as the
-        // disk allows. Nothing is lost, the bounds growing monotonically.
-        if let Some(bounds) = world.growing_bounds[index] {
-            world.camera = Camera::fit_bounds(
-                bounds.center,
-                bounds.half_extent * 2.0,
-                w,
-                h,
-                AUTO_FOLLOW_MIN_FOCUS_TILES,
-                AUTO_FOLLOW_FIT_MARGIN,
-            );
+        // Read off the precomputed path rather than glided through
+        // `update_auto_follow`, which advances against wall-clock seconds: an
+        // export runs as fast as the disk allows, so its seconds are the
+        // finished video's, not this machine's. Fitted here rather than at
+        // smoothing time because the path holds resolution-independent boxes
+        // and this is where the output size is known. `None` only when there
+        // is nothing on this surface at all, and then the opening camera is
+        // as good an answer as any.
+        if let Some(camera) = path.camera_at(index, w, h, export_framing(h)) {
+            world.camera = camera;
         }
 
         set_camera(&camera);
@@ -1483,7 +1563,7 @@ fn draw_world(
         draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
-        let chunk_px = pixels_per_tile * LOD_CELL_TILES as f32;
+        let chunk_px = tiling_quad_size(pixels_per_tile, LOD_CELL_TILES as f32);
         for run in &frame.entity_lod_runs {
             let color = registry.entity_color(run.type_id);
             let (min, max) = bounds_for(run.type_id);
@@ -2167,7 +2247,15 @@ async fn load_everything(args: &Args) -> Loaded {
         Some(dir) => println!("factorio data: {}", dir.display()),
         None => println!("no factorio install found (pass --factorio); sprites unavailable, using colored shapes"),
     }
-    let sprites = load_sprites(data_dir.as_deref(), &registry).await;
+    // Written beside the frames by the game that recorded them, and the only
+    // source that can answer for a modded prototype. Absent for a timelapse
+    // built before icons were dumped, which falls back to the install.
+    let dumped_icons = frames_dir.as_ref().map(|dir| dir.join("icons")).filter(|dir| dir.is_dir());
+    if let Some(dir) = &dumped_icons {
+        let count = std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0);
+        println!("icons from this capture's own game: {count}");
+    }
+    let sprites = load_sprites(dumped_icons.as_deref(), data_dir.as_deref(), &registry).await;
     let with_sprites = sprites.iter().filter(|s| s.is_some()).count();
     println!("{} of {} entity/tile types have sprites", with_sprites, registry.len());
 
@@ -2176,7 +2264,11 @@ async fn load_everything(args: &Args) -> Loaded {
     let worlds: Vec<WorldView> = loaded
         .into_iter()
         .map(|(name, sequence, terrain)| {
-            let camera = Camera::fit_sequence(&sequence, terrain.as_ref(), screen_width(), screen_height());
+            // The box first, the camera from it: the walk behind it is over
+            // every entity of every frame, and an export wants the box too.
+            let opening = Camera::sequence_bounds(&sequence, terrain.as_ref());
+            let camera = Camera::from_sequence_bounds(opening, screen_width(), screen_height());
+            let opening_bounds = opening.map(|(min, max)| GrowingBounds::from_min_max(min, max));
             let growing_bounds = growing_bounds_per_frame(&sequence, &registry);
             let measured = analyze_activity(&sequence, &registry);
             let activity = activity_heights(&measured.counts);
@@ -2199,6 +2291,7 @@ async fn load_everything(args: &Args) -> Loaded {
                 sequence,
                 camera,
                 growing_bounds,
+                opening_bounds,
                 activity,
                 heat,
                 heat_peak,
@@ -2261,6 +2354,7 @@ async fn run_export(
             overlay_players: request.overlay_players,
             overlay_clock: request.overlay_clock,
             supersample: request.supersample,
+            smooth_secs: request.smooth_secs,
         };
         if let Err(e) = export_frames(&mut worlds[index], registry, sprites, player_track, ui, &this).await {
             eprintln!("export of {name} failed: {e}");
@@ -2349,6 +2443,9 @@ async fn main() {
             sequence,
             camera,
             growing_bounds,
+            // Only the export smooths its way out of the opening box. The
+            // interactive camera starts there and is pulled in by auto-follow.
+            opening_bounds: _,
             activity,
             heat,
             heat_peak,

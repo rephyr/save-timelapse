@@ -1,4 +1,16 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.8.1
+Date: 2026-08-13
+  Features:
+    - The camera in an exported video glides between moves instead of snapping to each frame
+    - Your factory is framed clear of the bottom of the screen
+    - Buildings from any mod are drawn with their own artwork instead of a flat colour
+  Graphics:
+    - New mod thumbnail
+  Bugfixes:
+    - Black lines no longer flicker across an exported video
+
+---------------------------------------------------------------------------------------------------
 Version: 0.8.0
 Date: 2026-08-12
   Features:

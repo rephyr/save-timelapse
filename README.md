@@ -12,6 +12,12 @@ Already have a factory? Save Timelapse can also reconstruct a timelapse from you
 
 ![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
 
+Thirty seconds of an early factory, recorded and rendered end to end:
+
+[![Factorio Save Timelapse: an early factory recorded and rendered end to end](https://img.youtube.com/vi/KOBqoYq7GlQ/maxresdefault.jpg)](https://youtu.be/KOBqoYq7GlQ)
+
+Captured by the mod while playing, rendered to video by the viewer. No external video editing software was used at any point.
+
 
 Zoomed in, it draws with Factorio's own artwork, so belts weave and turn, splitters and underground belts read the right way round, and pipe runs join up. 
 
@@ -57,6 +63,8 @@ If you have autosaves or milestone saves from an existing factory, the companion
 Save Timelapse does not carry a list of the things it knows how to draw. It records what your game says its own prototypes are, so a modded playthrough replays as itself: terrain and buildings take the colours Factorio paints its own map view with, and a modded belt is still a belt, a modded ore patch is still ore, and a modded underground belt still pairs up over its real distance.
 
 That means an Alien Biomes world keeps its own terrain, a Krastorio2 belt curves at corners, and an ore field from a mod nobody has ever heard of does not pull the camera off your factory. There is nothing to configure, and a mod added partway through a playthrough is picked up the next time you load the save.
+
+Modded buildings are drawn with their own artwork too. A mod's icons cannot be found by guessing, since the file need not be named after the building and is often several layers the game composites, so Factorio is asked to draw them all once per modpack and the result is kept with your timelapse. It takes about a minute the first time you build with a given set of mods and nothing after that, and an unmodded playthrough skips it altogether.
 
 ---
 
@@ -189,24 +197,11 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.5:** Stable capture format, save-based milestones, 90% smaller exports, tile reverts, bookmarks, Linux builds
 - **v0.6:** Video export, improved camera framing, moving entities excluded, ground scanned from a save, better scenery cutoff
 - **v0.7:** Modded games recorded as themselves, Factorio's own belt and pipe artwork, reworked viewer, belt rotations recorded
-
-### v0.8, the beta
-
-- [x] A frame records only what changed, taking a real megabase timelapse from 5.5 GB to 69 MB and a rebuild from 15 minutes to under a minute
-- [x] Ground read once per playthrough instead of once per build
-- [x] MP4 export when FFmpeg is already installed, roughly fifteen times smaller than the AVI and accepted by sharing sites
-- [x] Choose what goes on an exported video: the in-game clock, and a marker showing where you were
-- [x] Recordings survive a reset and a reload, and say so when something could not be read
-- [x] The building count counts buildings
-- [x] Going back to a branch of your playthrough you had left keeps the history you left it with
-- [x] Timelapses built from existing saves compare the saves against each other, and order them by the tick inside each one rather than by filename
-- [x] A frame that clears most of the factory loads. Measured on a 4000 hour gigabase going from 3.7 million buildings to 500 thousand in one frame
-- [x] Rail drawn along the track rather than as a square on each piece's centre tile, so runs and corners are continuous
+- **v0.8, the beta:** Incremental frames, 98% smaller timelapses, ground read once per playthrough, MP4 export, video overlays, recording recovery, saves compared against each other, rail drawn along the track
+- **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
 
 ### v1.0
-
 - [ ] Smarter camera auto-follow
-- [ ] Camera keyframes and cinematic controls
 - [ ] Single-binary distribution
 
 ---

@@ -4,17 +4,9 @@ use std::path::{Path, PathBuf};
 
 use macroquad::math::Rect;
 
-/// Vanilla and Space Age icons follow a predictable path under the install's
-/// data directory, keyed by prototype name. No runtime API exposes the real
-/// path and there is no convention for third-party mod icons, so a miss falls
-/// back to a coloured shape rather than erroring.
-pub fn icon_candidates(data_dir: &Path, name: &str) -> Vec<PathBuf> {
-    ["base", "space-age"].iter().map(|group| data_dir.join(group).join("graphics/icons").join(format!("{name}.png"))).collect()
-}
-
-pub fn icon_path(data_dir: &Path, name: &str) -> Option<PathBuf> {
-    icon_candidates(data_dir, name).into_iter().find(|candidate| candidate.exists())
-}
+/// Icon resolution is shared with the CLI, which needs the same answer to
+/// decide whether this game has to be asked to draw its icons at all.
+pub use save_timelapse::icons::{icon_candidates, icon_path};
 
 /// Factorio's in-world sheet for an entity, holding every facing and corner
 /// drawn separately. Same guess and same failure mode as `icon_candidates`.
@@ -178,32 +170,6 @@ pub fn icon_source_rect(width: f32, height: f32) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn icon_path_prefers_the_first_existing_candidate() {
-        let dir = tempfile::tempdir().unwrap();
-        let base_icon_dir = dir.path().join("base").join("graphics/icons");
-        let space_age_icon_dir = dir.path().join("space-age").join("graphics/icons");
-        std::fs::create_dir_all(&base_icon_dir).unwrap();
-        std::fs::create_dir_all(&space_age_icon_dir).unwrap();
-        std::fs::write(base_icon_dir.join("stone-furnace.png"), b"icon").unwrap();
-        std::fs::write(space_age_icon_dir.join("stone-furnace.png"), b"other").unwrap();
-
-        let path = icon_path(dir.path(), "stone-furnace").unwrap();
-        assert_eq!(path, base_icon_dir.join("stone-furnace.png"));
-    }
-
-    #[test]
-    fn icon_candidates_checks_base_then_space_age() {
-        let candidates = icon_candidates(Path::new("/data"), "stone-furnace");
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/data/base/graphics/icons/stone-furnace.png"),
-                PathBuf::from("/data/space-age/graphics/icons/stone-furnace.png"),
-            ]
-        );
-    }
 
     /// Real vanilla/Space Age icon files measured directly: 64+32+16+8=120
     /// wide, 64 tall. The bug this guards against is drawing that whole
