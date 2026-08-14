@@ -182,7 +182,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 - **Only branches recorded by this version can be returned to.** Loading an older save and carrying on tells the recording that the play you left behind was replaced, and it is dropped, which is what keeps the timelapse showing one coherent history rather than several contradicting ones. Come back to a branch you left and the recording follows you, because every save made from 0.8.0 on knows which recording it belongs to. Saves made before that do not, so a branch you left with an older version is gone for good, and so is one whose files you deleted by hand. Recording a fresh baseline from where you are now repairs either.
 
-- **The world is read as it ends up, not as it began.** Ground, ore, trees and cliffs are all scanned once from a single save after the fact, which is what keeps them out of your game entirely. Paving is no longer a hole, since Factorio remembers the ground it covered up and the scan now reads that too, so the grass under concrete you laid at hour three is there from the first frame and the paving arrives on top of it at the tick it went down. What the scan cannot recover is what the game no longer holds anywhere, so a forest cleared before you started recording was never there to find. Clearing during a live capture is recorded as it happens and replays correctly, exhausted ore included. With terrain capture switched off there is deliberately nothing to uncover at all.
+- **The landscape from before your recording is the finished one.** Ground, ore, trees and cliffs are scanned once from a single save after the fact, which is what keeps them out of your game entirely. A forest you cleared before that recording began is in no save it can read and was never written down anywhere else, so it was never there to find. Cleared while recording, it replays as it happened, and so does a patch your drills have mined out. With terrain capture switched off there is deliberately nothing to uncover at all.
 
 ---
 
@@ -199,6 +199,8 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.7:** Modded games recorded as themselves, Factorio's own belt and pipe artwork, reworked viewer, belt rotations recorded
 - **v0.8, the beta:** Incremental frames, 98% smaller timelapses, ground read once per playthrough, MP4 export, video overlays, recording recovery, saves compared against each other, rail drawn along the track
 - **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
+- **v0.8.2:** Scenery scanned from the save rather than bounded to the starting factory, rail corners drawn as curves
+- **v0.8.3:** Ground under paving recovered, exhausted ore patches emptied out, pipes joined to the underground runs they meet
 
 ### v1.0
 - [ ] Smarter camera auto-follow

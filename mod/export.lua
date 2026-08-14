@@ -513,10 +513,10 @@ end
 --- buys three things: no ground cost inside anybody's game, no ground repeated
 --- per frame, and an area chosen knowing how far the factory reached.
 ---
---- What it gives up is ground the game itself no longer holds. Ground under
---- placed floor is recovered (see `ground_under`), so paving laid mid
---- playthrough uncovers rather than leaving a hole, but an ore patch mined out
---- or a forest cleared was gone before the scan ran.
+--- Ground under placed floor comes with it (see `ground_under`), so paving laid
+--- mid playthrough uncovers rather than leaving a hole. Scenery already cleared
+--- by the time this runs is not here and cannot be: it is the baseline and its
+--- removals that carry a patch mined out or a forest felled, not the scan.
 function M.export_terrain(tick, session_id)
   local written, scenery, surfaces = 0, 0, 0
   for _, surface in pairs(game.surfaces) do

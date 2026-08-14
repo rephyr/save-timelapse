@@ -509,9 +509,14 @@ kept nothing under, leaves that position as it was before, which is the hole.
 
 Cheap because it runs nowhere near anybody's game, and it repairs recordings
 already made: ground is offered against a finished capture, so re-scanning fills
-in paving that was already a hole. What it still gives up is ground the game
-itself no longer holds, an ore patch mined out or a forest cleared having gone
-before the scan ran.
+in paving that was already a hole.
+
+Scenery cleared before the scan ran is not its job and never was. A patch mined
+out or a forest felled is carried by the baseline that recorded it standing and
+the removal that took it away, which is why depletion needs an event of its own:
+ore is not mined a removal at a time, so `on_resource_depleted` is the only
+thing that fires when a patch finally empties. What no record anywhere holds is
+scenery already gone before recording began.
 
 The scan writes into the session folder named for the map seed, which is what
 verifies it: a save from a different playthrough lands under a different
