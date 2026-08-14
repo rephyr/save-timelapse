@@ -5,6 +5,7 @@ pub mod build;
 /// The window and its screens, which is what replaces the console menu.
 pub mod gui;
 
+pub mod describe;
 pub mod event;
 pub mod export;
 pub mod frame;
