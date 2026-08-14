@@ -13,8 +13,8 @@
 //! Spans are sorted by type, so materializing a frame emits items already
 //! grouped the way the renderer batches, with nothing to sort per seek.
 
-use crate::registry::TypeId;
-use crate::render_frame::Run;
+use crate::viewer::registry::TypeId;
+use crate::viewer::render_frame::Run;
 
 /// One item present over a contiguous stretch of frames. `last` is exclusive,
 /// and `first == last` cannot happen, a span only being closed after at least
@@ -552,7 +552,7 @@ mod tests {
 #[cfg(test)]
 mod layout {
     use super::*;
-    use crate::render_frame::RenderEntity;
+    use crate::viewer::render_frame::RenderEntity;
 
     /// The trade in bytes, pinned so a field added to either side shows up
     /// here rather than eroding the win. A span carries the type and two frame
@@ -582,8 +582,8 @@ mod layout {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::registry::TypeRegistry;
-    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
+    use crate::viewer::registry::TypeRegistry;
+    use crate::viewer::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
     /// What the span layout costs and saves on a sequence shaped like a real
     /// capture: 400k entities over 150 frames.

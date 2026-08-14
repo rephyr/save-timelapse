@@ -9,11 +9,11 @@
 //! What belongs on screen: an element earns its place by answering where am I,
 //! when am I, or what can I do. "How is the renderer doing" lives behind `F3`.
 
-use save_timelapse::with_thousands;
+use crate::with_thousands;
 
 use macroquad::prelude::*;
 
-use crate::camera::Timeline;
+use crate::viewer::camera::Timeline;
 
 /// Chrome text meant to be read.
 const INK: Color = Color::new(1.0, 1.0, 1.0, 1.0);
@@ -602,7 +602,7 @@ fn draw_pill(rect: Rect, radius: f32, fill: Color, edge: Option<Color>) {
 /// right way round: a panel that reappears is a nuisance, one that never
 /// appears leaves a first-time viewer with nothing but a `?` in the corner.
 pub fn first_run() -> bool {
-    let Some(marker) = save_timelapse::settings::settings_path().map(|p| p.with_file_name("seen-controls")) else {
+    let Some(marker) = crate::settings::settings_path().map(|p| p.with_file_name("seen-controls")) else {
         return false;
     };
     if marker.exists() {

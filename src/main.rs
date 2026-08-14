@@ -4,9 +4,10 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
+use save_timelapse::build;
 use save_timelapse::export;
 use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
@@ -454,80 +455,7 @@ fn mod_source_dir() -> io::Result<PathBuf> {
     ))
 }
 
-/// Where a mode writes its output: beside the running exe, so the result is
-/// easy to find wherever Factorio's user data lives. Falls back to the current
-/// directory only if the exe's path cannot be determined.
-fn output_dir_next_to_exe(name: &str) -> PathBuf {
-    std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
-}
-
-/// Where built timelapses are kept, one subfolder each. A single fixed folder
-/// that every run rebuilt meant reopening yesterday's timelapse was
-/// impossible: the only way to see one was to make it again.
-fn timelapses_root() -> PathBuf {
-    output_dir_next_to_exe("timelapses")
-}
-
-/// Turns a playthrough name or save name into something safe to use as a
-/// folder name, since both come from the user and can hold anything.
-fn as_folder_name(raw: &str) -> String {
-    // Dots are kept, a name like "v1.2 run" being ordinary, and trimmed from
-    // the ends, since "." and ".." name directories.
-    let cleaned: String =
-        raw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        "timelapse".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// One timelapse already built and sitting on disk.
-struct BuiltTimelapse {
-    name: String,
-    path: PathBuf,
-    frames: usize,
-    bytes: u64,
-    modified: SystemTime,
-}
-
-/// Every built timelapse, newest first. Counts frames and weighs the folder,
-/// since which of two somebody wants is usually answered by how big and how
-/// recent it is, neither visible from a name.
-fn list_timelapses() -> Vec<BuiltTimelapse> {
-    list_timelapses_in(&timelapses_root())
-}
-
-/// Split from [`list_timelapses`] only so it can be tested: the real root is
-/// derived from the running executable's own location, which no test can
-/// arrange.
-fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
-    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
-
-    let mut found: Vec<BuiltTimelapse> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let files: Vec<_> = std::fs::read_dir(&path).ok()?.filter_map(Result::ok).collect();
-            let frames = files.iter().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("stfr")).count();
-            // A folder with no frames in it is a half-finished or interrupted
-            // build, not something worth offering to open.
-            if frames == 0 {
-                return None;
-            }
-            let bytes = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some(BuiltTimelapse { name: entry.file_name().to_string_lossy().into_owned(), path, frames, bytes, modified })
-        })
-        .collect();
-
-    found.sort_by_key(|t| std::cmp::Reverse(t.modified));
-    found
-}
-
-fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
+fn ask_timelapse_choice(built: &[build::BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
     println!("\n  Your timelapses:\n");
     for (i, t) in built.iter().enumerate() {
         let age = t.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
@@ -544,23 +472,6 @@ fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<
             _ => println!("\n  Please type a number from 1 to {}.\n", built.len()),
         }
     }
-}
-
-/// `viewer` is a sibling binary rather than a library this crate can call: it
-/// depends on this one, and its `main` is a macroquad event loop. So launching
-/// it means finding the executable cargo built next to this one.
-fn viewer_path() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or_else(|| io::Error::other("could not determine this program's own folder"))?;
-    let candidate = dir.join(format!("viewer{}", std::env::consts::EXE_SUFFIX));
-    if !candidate.exists() {
-        return Err(io::Error::other(format!(
-            "Could not find {} next to this program. Reinstall save-timelapse so both files \
-             end up in the same folder.",
-            candidate.display()
-        )));
-    }
-    Ok(candidate)
 }
 
 /// The surfaces a built timelapse holds, read off its filenames. A
@@ -683,14 +594,14 @@ fn ask_fps(default: u32) -> io::Result<u32> {
 /// Where finished videos and image sequences go: one folder next to the
 /// executable, like `timelapses/`, so "where did it go" has one answer.
 fn videos_root() -> PathBuf {
-    output_dir_next_to_exe("videos")
+    build::output_dir_next_to_exe("videos")
 }
 
 /// Renders a built timelapse to a video file or an image sequence, by running
 /// the viewer rather than reimplementing it: rendering needs a GPU context and
 /// the whole sprite pipeline.
 fn run_export(settings: &mut Settings) -> io::Result<()> {
-    let built = list_timelapses();
+    let built = build::list_timelapses();
     if built.is_empty() {
         println!("\n  You need a timelapse before you can save one as a video.\n  Try option 2 or 3 first.\n");
         return Ok(());
@@ -771,42 +682,24 @@ Show the in-game clock, so the video says how long the factory took?",
     // No extension here: the viewer appends `.avi` or `.mp4` for a video and
     // treats the path as a folder for an image sequence, so the same argument
     // serves both.
-    let target = root.join(as_folder_name(&chosen.name));
-
-    let viewer = viewer_path()?;
-    let mut command = Command::new(&viewer);
-    command
-        .arg(&chosen.path)
-        .arg("--export")
-        .arg(&target)
-        .arg("--width")
-        .arg(size.0.to_string())
-        .arg("--height")
-        .arg(size.1.to_string());
-    if video {
-        command.arg("--video").arg("--fps").arg(fps.to_string());
-        if mp4 {
-            command.arg("--mp4");
-        }
-        if overlay_players {
-            command.arg("--overlay-players");
-        }
-        if overlay_clock {
-            command.arg("--overlay-clock");
-        }
-    }
-    if let Some(name) = &surface {
-        command.arg("--surface").arg(name);
-    }
+    let target = root.join(build::as_folder_name(&chosen.name));
 
     println!("\nRendering. A window opens while this runs; leave it alone until it closes.\n");
-    // `status` rather than `spawn`: every other mode hands off to the viewer
-    // and exits, but an export finishes, and returning to the menu before it
-    // does would leave its progress printing over a fresh prompt.
-    let status = command.status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("the viewer exited with {status} without finishing the export")));
-    }
+    // Blocking: every other mode hands off to the viewer and exits, but an
+    // export finishes, and returning to the menu before it does would leave
+    // its progress printing over a fresh prompt.
+    build::video(&build::VideoRequest {
+        timelapse: chosen.path.clone(),
+        target,
+        width: size.0,
+        height: size.1,
+        surface,
+        video,
+        fps,
+        mp4,
+        overlay_players,
+        overlay_clock,
+    })?;
 
     // Naming the folder, not the file: with "all" there is one file per
     // surface, and with an image sequence there is a folder of them, so the
@@ -875,7 +768,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         [] => format!("playthrough-{:08x}", chosen.session_id),
         surfaces => format!("{} ({:08x})", describe_places(surfaces), chosen.session_id),
     });
-    let out = timelapses_root().join(as_folder_name(&name));
+    let out = build::timelapses_root().join(build::as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -885,77 +778,34 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // `offer_terrain_for_capture` overwrites it afterwards, which is the right
     // precedence, a scan covering the factory's final extent.
     match chosen_surfaces.as_slice() {
-        [name] => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
-        many => replay::write_terrain_of(&replay_state.world, replay_state.baseline.tick, &out, many)?,
+        [one] => println!("\n  Building your timelapse of {}.\n", pretty_place(one)),
+        many if many.len() == surfaces.len() => println!("\n  Building your timelapse.\n"),
+        many => println!("\n  Building your timelapse of {}.\n", describe_places(many)),
     }
 
-    copy_session_sidecars(&chosen.session_dir, &out)?;
-
-    let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
-    let mut written = 0usize;
-    let mut error: Option<io::Error> = None;
-    // Last revision written per surface, carried across the run so
-    // `write_all_surfaces` can skip a surface nothing has touched.
-    let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
-
-    // One place keeps writing frames named for nothing, which is what a
-    // single-surface timelapse has always been on disk and what the viewer
-    // reads as "one world, unnamed". Two or more are named per surface.
-    let emitted = match chosen_surfaces.as_slice() {
-        many if many.len() != 1 => {
-            match many.len() == surfaces.len() {
-                true => println!("\n  Building your timelapse.\n"),
-                false => println!("\n  Building your timelapse of {}.\n", describe_places(many)),
-            }
-            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
-                if error.is_some() {
-                    return;
-                }
-                if let Err(e) = replay::write_surfaces(world, tick, &out, written, &mut surface_revisions, many) {
-                    error = Some(e);
-                    return;
-                }
-                written += 1;
-                if written.is_multiple_of(25) {
-                    print!("\r  {written} frames");
-                    io::stdout().flush().ok();
-                }
-            })?
-        }
-        one => {
-            let name = &one[0];
-            println!("\n  Building your timelapse of {}.\n", pretty_place(name));
-            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
-                if error.is_some() {
-                    return;
-                }
-                // The first frame is the picture; every one after it is what
-                // changed. A real megabase changed by about 200 items a frame
-                // out of 4.2 million, so a snapshot spent 8.8 MB restating what
-                // the reader already had.
-                let frame = match written == 0 {
-                    true => {
-                        world.clear_changes(name);
-                        world.to_frame(name, tick)
-                    }
-                    false => world.to_frame_delta(name, tick),
-                };
-                let path = out.join(format!("frame_{written:04}.stfr"));
-                if let Err(e) = std::fs::write(&path, frame::write_binary(&frame.as_out())) {
-                    error = Some(e);
-                    return;
-                }
-                written += 1;
-                if written.is_multiple_of(25) {
-                    print!("\r  {written} frames");
-                    io::stdout().flush().ok();
-                }
-            })?
+    let plan = build::Plan {
+        surfaces: chosen_surfaces,
+        options: Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES },
+    };
+    // A console reports by overwriting one line, and only every twenty-fifth
+    // frame: the work is fast enough that printing each would spend more time
+    // on the terminal than on the timelapse. Nothing here cancels, there being
+    // nothing to press while this blocks.
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let mut on_frame = |written: usize| {
+        if written.is_multiple_of(25) {
+            print!("\r  {written} frames");
+            io::stdout().flush().ok();
         }
     };
-    if let Some(e) = error {
-        return Err(e);
-    }
+    let built = build::timelapse(
+        &mut replay_state,
+        &chosen.session_dir,
+        &out,
+        &plan,
+        &mut build::Watch { on: &mut on_frame, cancel: &never },
+    )?;
+    let emitted = built.emitted;
     println!(
         "\r  Built {} frames covering {}.",
         with_thousands(emitted as u64),
@@ -1241,7 +1091,7 @@ fn mod_set_stamp(user_mods: &Path) -> String {
 /// depends on the mods rather than on the playthrough: two timelapses from one
 /// modpack share it, and a timelapse folder is deleted and rebuilt every time.
 fn cached_icons(user_mods: &Path) -> PathBuf {
-    output_dir_next_to_exe("icons").join(mod_set_stamp(user_mods))
+    build::output_dir_next_to_exe("icons").join(mod_set_stamp(user_mods))
 }
 
 /// Every entity name the built timelapse actually draws.
@@ -1512,7 +1362,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "from-saves".to_string());
-    let out = timelapses_root().join(as_folder_name(&name));
+    let out = build::timelapses_root().join(build::as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -1526,44 +1376,28 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
         terrain_scan: false,
     };
 
-    let mut done = 0usize;
-    let mut milestone_states: Vec<milestone::State> = Vec::new();
-    let mut exported: Vec<PathBuf> = Vec::new();
-    for (index, save) in chosen.iter().enumerate() {
-        let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
-        io::stdout().flush().ok();
-
-        let staged = workspace.join(format!("stage_{index}"));
-        match export::export_save(save, &staged, &config) {
-            Ok(outcome) => {
-                let target = out.join(format!("frame_{index:04}.stfr"));
-                let primary = &outcome.frames[0];
-                std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
-                exported.push(target.clone());
-                // Appended, not overwritten: each save contributes its own
-                // one-shot sample at its own real tick.
-                if let Some(log) = &outcome.players_log {
-                    let mut combined = std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
-                    combined.write_all(&std::fs::read(log)?)?;
-                }
-                if let Some(state) = outcome.milestones {
-                    milestone_states.push(state);
-                }
-                let kib = target.metadata().map(|m| m.len()).unwrap_or(0) / 1024;
-                println!("ok, {kib} KiB in {:.1}s", outcome.seconds);
-                done += 1;
-            }
-            Err(err) => println!("failed: {err}"),
+    // One line per save, written as it starts and completed as it finishes,
+    // which is what makes a long run readable: the name is on screen while
+    // Factorio is loading it rather than only once it is done.
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let mut on_save = |step: build::SaveStep| match step {
+        build::SaveStep::Started { index, total, label } => {
+            print!("[{:>3}/{total}] {label} ... ", index + 1);
+            io::stdout().flush().ok();
         }
-        let _ = std::fs::remove_dir_all(&staged);
-    }
-    let _ = std::fs::remove_dir_all(&workspace);
-    println!("\n{done} of {} exported to {}", chosen.len(), out.display());
+        build::SaveStep::Exported { bytes, seconds, .. } => println!("ok, {} KiB in {seconds:.1}s", bytes / 1024),
+        build::SaveStep::Failed { error, .. } => println!("failed: {error}"),
+    };
+    let exported = build::from_saves(&chosen, &out, &workspace, &config, &mut build::Watch { on: &mut on_save, cancel: &never })?;
 
-    if done == 0 {
+    let _ = std::fs::remove_dir_all(&workspace);
+    println!("\n{} of {} exported to {}", exported.frames.len(), chosen.len(), out.display());
+
+    if exported.frames.is_empty() {
         return Err(io::Error::other("none of the selected saves exported successfully"));
     }
+    let milestone_states = exported.milestones;
+    let exported = exported.frames;
 
     match write_as_delta_chain(&exported) {
         Ok((before, after)) if after < before => println!(
@@ -1625,12 +1459,11 @@ fn remember(settings: &Settings) {
 /// window somebody keeps open, so blocking would freeze this program behind it,
 /// and detaching is what lets the menu come straight back.
 fn open_viewer(path: &Path) -> io::Result<()> {
-    let viewer = viewer_path()?;
     println!("\n  Opening the viewer.\n");
     // The viewer narrates its loading on stdout and inherits this console, so
     // it would land on top of the menu. Discarding stdout and keeping stderr
     // silences the narration without silencing a viewer that failed.
-    Command::new(&viewer).arg(path).stdout(Stdio::null()).spawn()?;
+    build::viewer_command()?.arg(path).stdout(Stdio::null()).spawn()?;
     Ok(())
 }
 
@@ -1650,7 +1483,7 @@ fn run() -> io::Result<()> {
     }
 
     loop {
-        let built = list_timelapses();
+        let built = build::list_timelapses();
         let outcome = match ask_mode(built.len())? {
             // Straight to the viewer, building nothing. The whole point: a
             // timelapse that already exists should not have to be made again
@@ -1852,7 +1685,7 @@ fn manage(capture_dir: &Path) -> io::Result<()> {
     loop {
         let sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
         let recorded: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
-        let timelapses = list_timelapses();
+        let timelapses = build::list_timelapses();
         let built: u64 = timelapses.iter().map(|t| t.bytes).sum();
         let videos = list_videos();
         let rendered: u64 = videos.iter().map(|v| v.bytes).sum();
@@ -1887,7 +1720,7 @@ fn manage(capture_dir: &Path) -> io::Result<()> {
 /// warning the way [`manage_captures`] has to.
 fn manage_timelapses() -> io::Result<()> {
     loop {
-        let built = list_timelapses();
+        let built = build::list_timelapses();
         if built.is_empty() {
             println!("\n  No timelapses built yet.\n");
             return Ok(());
@@ -2026,21 +1859,6 @@ No log data found in {}.",
     }
 }
 
-/// Copies the plain-JSON sidecar logs a live capture writes into the rendered
-/// output. A straight copy rather than a re-parse, the mod's logs and what the
-/// viewer reads being the same shape by design. Each being absent is normal.
-fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
-    let mut copied = Vec::new();
-    for name in ["players.jsonl", "milestones.jsonl", "prototypes.json"] {
-        let source = session_dir.join(name);
-        if source.exists() {
-            std::fs::copy(&source, out.join(name))?;
-            copied.push(name);
-        }
-    }
-    Ok(copied)
-}
-
 /// A double-clicked console closes the instant the process exits, so an error
 /// message is a flash and nothing else. Waiting for Enter gives somebody who
 /// never typed a command a chance to read it.
@@ -2052,6 +1870,27 @@ fn wait_for_enter() {
 }
 
 fn main() {
+    // The window, in its own process, launched by `build::viewer_command`.
+    // Handled before anything else so the menu's console handling, panic hook
+    // and settings loading never run for a process that is only going to draw.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The window that replaces this menu, still opt in while it is being
+    // built: every flow it does not have yet is one the console still does,
+    // so both have to work at once until the last screen lands.
+    if args.first().is_some_and(|first| first == "--gui") {
+        macroquad::Window::from_config(save_timelapse::gui::window_conf(), save_timelapse::gui::run());
+        return;
+    }
+
+    if args.first().is_some_and(|first| first == build::VIEW_FLAG) {
+        let rest: Vec<String> = args[1..].to_vec();
+        macroquad::Window::from_config(save_timelapse::viewer::app::window_conf(), async move {
+            save_timelapse::viewer::app::run(&rest).await
+        });
+        return;
+    }
+
     // A panic would otherwise skip the pause below: Rust unwinds straight past
     // the `Err` handling and Windows closes the console either way. The hook
     // makes a bug fail the same way a handled error does.
@@ -2082,15 +1921,15 @@ mod tests {
     /// filename, so both can hold anything a filesystem will not.
     #[test]
     fn folder_names_survive_whatever_the_user_called_it() {
-        assert_eq!(as_folder_name("My Megabase"), "My Megabase");
-        assert_eq!(as_folder_name("Nauvis/Run:2"), "Nauvis_Run_2");
-        assert_eq!(as_folder_name("  spaced  "), "spaced");
+        assert_eq!(build::as_folder_name("My Megabase"), "My Megabase");
+        assert_eq!(build::as_folder_name("Nauvis/Run:2"), "Nauvis_Run_2");
+        assert_eq!(build::as_folder_name("  spaced  "), "spaced");
         // Empty or punctuation-only would otherwise produce a folder named
         // "" or ".", one of which cannot be created and the other of which
         // is the parent directory.
-        assert_eq!(as_folder_name(""), "timelapse");
-        assert_eq!(as_folder_name("..."), "timelapse");
-        assert_eq!(as_folder_name("///"), "___");
+        assert_eq!(build::as_folder_name(""), "timelapse");
+        assert_eq!(build::as_folder_name("..."), "timelapse");
+        assert_eq!(build::as_folder_name("///"), "___");
     }
 
     fn built(root: &Path, name: &str, frames: usize) {
@@ -2107,7 +1946,7 @@ mod tests {
         built(root.path(), "alpha", 3);
         built(root.path(), "beta", 7);
 
-        let found = list_timelapses_in(root.path());
+        let found = build::list_timelapses_in(root.path());
         assert_eq!(found.len(), 2);
         let alpha = found.iter().find(|t| t.name == "alpha").expect("alpha listed");
         assert_eq!(alpha.frames, 3);
@@ -2124,7 +1963,7 @@ mod tests {
         std::fs::write(root.path().join("empty").join("players.jsonl"), b"{}").unwrap();
         built(root.path(), "real", 1);
 
-        let found = list_timelapses_in(root.path());
+        let found = build::list_timelapses_in(root.path());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "real");
     }
@@ -2133,7 +1972,7 @@ mod tests {
     #[test]
     fn a_missing_root_lists_nothing_rather_than_failing() {
         let root = tempfile::tempdir().unwrap();
-        assert!(list_timelapses_in(&root.path().join("never-created")).is_empty());
+        assert!(build::list_timelapses_in(&root.path().join("never-created")).is_empty());
     }
 
     #[test]
@@ -2225,7 +2064,7 @@ mod tests {
         )
         .unwrap();
 
-        let copied = copy_session_sidecars(&session, &out).unwrap();
+        let copied = build::copy_sidecars(&session, &out).unwrap();
         assert_eq!(copied, ["players.jsonl", "milestones.jsonl"]);
 
         // Copied verbatim, not re-encoded: the mod's shape and the reader's
@@ -2245,10 +2084,10 @@ mod tests {
         std::fs::create_dir_all(&session).unwrap();
         std::fs::create_dir_all(&out).unwrap();
 
-        assert!(copy_session_sidecars(&session, &out).unwrap().is_empty());
+        assert!(build::copy_sidecars(&session, &out).unwrap().is_empty());
 
         std::fs::write(session.join("milestones.jsonl"), "").unwrap();
-        assert_eq!(copy_session_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
+        assert_eq!(build::copy_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
     }
 
     /// The export menu asks which world to render, and the only record of

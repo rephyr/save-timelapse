@@ -58,20 +58,21 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
 
-      # The two binaries plus mod/, because save-timelapse.exe stages the mod
-      # itself when exporting from saves (see `mod_source_dir`) and looks for
-      # it beside the executable first. Shipping them apart is the one
-      # packaging mistake that makes the from-saves path fail with a message
-      # about a folder the user never knew they needed.
+      # One binary plus mod/, because save-timelapse stages the mod itself
+      # when exporting from saves (see `mod_source_dir`) and looks for it
+      # beside the executable first. Shipping them apart is the one packaging
+      # mistake that makes the from-saves path fail with a message about a
+      # folder the user never knew they needed. The viewer used to be a second
+      # executable here and is now a mode of this one.
       - name: Stage the archive
         shell: bash
         run: |
           staged="save-timelapse-${{ matrix.label }}"
           mkdir -p "$staged"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/release/save-timelapse.exe target/release/viewer.exe "$staged/"
+            cp target/release/save-timelapse.exe "$staged/"
           else
-            cp target/release/save-timelapse target/release/viewer "$staged/"
+            cp target/release/save-timelapse "$staged/"
           fi
           cp -r mod "$staged/mod"
           rm -rf "$staged/mod/tests"

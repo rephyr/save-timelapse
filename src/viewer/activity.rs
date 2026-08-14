@@ -10,18 +10,18 @@
 //! rebuilding on the same spot is activity, this graph showing when the player
 //! was working rather than which positions were ever occupied.
 
-use crate::registry::TypeRegistry;
-use crate::render_frame::FrameSequence;
+use crate::viewer::registry::TypeRegistry;
+use crate::viewer::render_frame::FrameSequence;
 
 /// Entity positions align to a tenth of a tile, the fixed point
-/// `save_timelapse::world::pos_key` keys by. Comparing raw f32s would make a
+/// `crate::world::pos_key` keys by. Comparing raw f32s would make a
 /// position that survived a round trip with a one-ulp difference read as a new
 /// entity.
 ///
 /// Packed into one integer so a frame's positions sort as plain numbers. The
 /// packing only has to be injective; only equality and order are used.
 fn pos_key(x: f32, y: f32) -> u64 {
-    let (x, y) = save_timelapse::world::pos_key(x, y);
+    let (x, y) = crate::world::pos_key(x, y);
     pack(x, y)
 }
 
@@ -259,7 +259,7 @@ pub fn activity_heights(activity: &[usize]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
+    use crate::viewer::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
     /// Builds a frame holding `positions` of one type, which is all this
     /// module looks at.
@@ -518,8 +518,8 @@ mod tests {
     /// while every unit test passed.
     #[test]
     fn real_exported_fixtures_produce_a_readable_graph() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
-        let frames = crate::loading::load_sequence(std::path::Path::new(dir)).unwrap();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames");
+        let frames = crate::viewer::loading::load_sequence(std::path::Path::new(dir)).unwrap();
 
         let mut registry = TypeRegistry::new();
         let render: Vec<RenderFrame> = frames.into_iter().map(|frame| RenderFrame::from_frame(frame, &mut registry)).collect();
@@ -537,8 +537,8 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::registry::TypeRegistry;
-    use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
+    use crate::viewer::registry::TypeRegistry;
+    use crate::viewer::render_frame::{FrameSequence, RenderEntity, RenderFrame, Run};
 
     /// Where the numbers quoted on `analyze_activity` come from. Prints rather
     /// than asserts, a timing threshold being flaky on shared hardware, and
@@ -586,7 +586,7 @@ mod bench {
         let activity = analyze_activity(&sequence, &registry).counts;
         let ours = start.elapsed();
         let start = std::time::Instant::now();
-        let bounds = crate::construction::growing_bounds_per_frame(&sequence, &registry);
+        let bounds = crate::viewer::construction::growing_bounds_per_frame(&sequence, &registry);
         let theirs = start.elapsed();
         println!("BENCH {frames_n} frames, {total} entity-visits");
         println!("BENCH analyze_activity:         {ours:?}");

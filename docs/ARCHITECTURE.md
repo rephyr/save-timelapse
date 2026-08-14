@@ -1175,7 +1175,7 @@ preceding* draw call and starts a new one whenever the bound texture changes
 costs close to one draw call per entity. Untextured rects count as their own
 texture state, so mixing shapes and sprites breaks the batch the same way.
 
-Measured on `tests/fixtures/frames` with `cargo run -p viewer bin drawcalls`,
+Measured on `tests/fixtures/frames` with `cargo run --bin drawcalls`,
 for fully-visible frames:
 
     items    types    export order    grouped    grouped, raised capacity

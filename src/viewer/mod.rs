@@ -1,8 +1,10 @@
 //! Everything that does not touch macroquad's window and input globals, split
-//! out so it is unit testable; `main.rs` is thin glue over this.
+//! out so it is unit testable; `app` is thin glue over this.
 //!
 //! Each module owns its own `#[cfg(test)] mod tests`. Re-exported here so
 //! every name is still reachable as `viewer::Name`.
+
+pub mod app;
 
 mod activity;
 mod avi;

@@ -128,10 +128,10 @@ run:
 	cargo run --release --bin save-timelapse
 
 viewer:
-	cargo run -p viewer --release --bin viewer -- $(FRAMES)
+	cargo run --release --bin save-timelapse -- --view $(FRAMES)
 
 drawcalls:
-	cargo run -p viewer --release --bin drawcalls -- $(FRAMES)
+	cargo run --release --bin drawcalls -- $(FRAMES)
 
 # Development benchmark: run the whole pipeline at megabase scale and compare
 # every number against a saved baseline, to answer "did the change I just made
@@ -149,10 +149,10 @@ drawcalls:
 #
 #   make stress STRESS_ARGS="--surfaces 1 --entities 2000000"
 stress:
-	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS)
+	cargo run -q --release --bin stress -- $(STRESS_ARGS)
 
 stress-save:
-	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS) --save
+	cargo run -q --release --bin stress -- $(STRESS_ARGS) --save
 
 # Fails if mod/ holds a .lua that neither list names, which is exactly how a
 # newly added, required file would otherwise reach a player: control.lua

@@ -19,11 +19,11 @@ pub struct TypeRegistry {
     kinds: Vec<Kind>,
     /// What the running game said its own prototypes are, when the capture
     /// shipped with an answer. Consulted before every built-in table below.
-    prototypes: Option<save_timelapse::prototypes::Prototypes>,
+    prototypes: Option<crate::prototypes::Prototypes>,
     /// Rail geometry worked out from the connectivity the mod recorded, keyed
     /// by prototype and facing. Solved once here rather than per frame, the
     /// answer being a property of the game rather than of a moment.
-    rail_geometry: HashMap<(String, u8), crate::rails::RailSegment>,
+    rail_geometry: HashMap<(String, u8), crate::viewer::rails::RailSegment>,
 }
 
 impl TypeRegistry {
@@ -33,22 +33,22 @@ impl TypeRegistry {
 
     /// Must be set before anything is interned: a name is resolved once, at
     /// intern time, so a description arriving later would apply to nothing.
-    pub fn set_prototypes(&mut self, prototypes: save_timelapse::prototypes::Prototypes) {
+    pub fn set_prototypes(&mut self, prototypes: crate::prototypes::Prototypes) {
         debug_assert!(self.names.is_empty(), "prototypes must be set before interning");
         // Sampled by name, solved by type, so the answer keys the same way
         // `rail_kind` asks for it and one sample answers for every prototype
         // sharing that type.
         let as_kind = |name: &String| prototypes.kind(name).unwrap_or(name).to_string();
-        let samples: Vec<save_timelapse::prototypes::RailSample> = prototypes
+        let samples: Vec<crate::prototypes::RailSample> = prototypes
             .rails
             .iter()
-            .map(|sample| save_timelapse::prototypes::RailSample {
+            .map(|sample| crate::prototypes::RailSample {
                 name: as_kind(&sample.name),
                 direction: sample.direction,
                 links: sample
                     .links
                     .iter()
-                    .map(|link| save_timelapse::prototypes::RailLink {
+                    .map(|link| crate::prototypes::RailLink {
                         name: as_kind(&link.name),
                         direction: link.direction,
                         x: link.x,
@@ -57,7 +57,7 @@ impl TypeRegistry {
                     .collect(),
             })
             .collect();
-        self.rail_geometry = crate::rails::solve(&samples);
+        self.rail_geometry = crate::viewer::rails::solve(&samples);
         self.prototypes = Some(prototypes);
     }
 
@@ -65,9 +65,12 @@ impl TypeRegistry {
     /// this can place. What the capture described comes first, so a modded
     /// rail set answers for itself; the built-in table covers every capture
     /// recorded before the mod described rails at all.
-    pub fn rail_segment(&self, id: TypeId, direction: u8) -> Option<crate::rails::RailSegment> {
+    pub fn rail_segment(&self, id: TypeId, direction: u8) -> Option<crate::viewer::rails::RailSegment> {
         let kind = self.rail_kind(id);
-        self.rail_geometry.get(&(kind.to_string(), direction)).copied().or_else(|| crate::rails::rail_segment(kind, direction))
+        self.rail_geometry
+            .get(&(kind.to_string(), direction))
+            .copied()
+            .or_else(|| crate::viewer::rails::rail_segment(kind, direction))
     }
 
     /// What sort of rail this is: the prototype's own type when the capture
@@ -1275,7 +1278,7 @@ mod tests {
 
     fn typed(pairs: &[(&str, &str)], reach: &[(&str, i32)]) -> TypeRegistry {
         let mut registry = TypeRegistry::new();
-        registry.set_prototypes(save_timelapse::prototypes::Prototypes {
+        registry.set_prototypes(crate::prototypes::Prototypes {
             types: pairs.iter().map(|(n, t)| ((*n).to_string(), (*t).to_string())).collect(),
             reach: reach.iter().map(|(n, r)| ((*n).to_string(), *r)).collect(),
             ..Default::default()
@@ -1306,11 +1309,11 @@ mod tests {
         // And laid out like the vanilla piece it shares a type with, rather
         // than left as a square.
         let minimal = registry.intern("straight-rail-minimal");
-        let vanilla = crate::rails::rail_segment("straight-rail", 2).unwrap();
+        let vanilla = crate::viewer::rails::rail_segment("straight-rail", 2).unwrap();
         assert_eq!(registry.rail_segment(minimal, 2), Some(vanilla));
 
         let modded = registry.intern("kr-fancy-rail");
-        assert_eq!(registry.rail_segment(modded, 4), crate::rails::rail_segment("half-diagonal-rail", 4));
+        assert_eq!(registry.rail_segment(modded, 4), crate::viewer::rails::rail_segment("half-diagonal-rail", 4));
     }
 
     /// A capture that never described its prototypes still recognises the

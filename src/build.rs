@@ -1,0 +1,563 @@
+//! Turning a loaded recording into a timelapse on disk.
+//!
+//! This is the long half of the work and the only part with nothing to ask.
+//! It is split from whatever asked, because the two want different things: a
+//! console prints a line and blocks until it is done, and a window has to keep
+//! drawing, so the work has to be callable from a thread that is not the one
+//! painting.
+//!
+//! What that costs is one callback and one flag, both of which a console front
+//! end can ignore. What it buys is that neither front end owns the writing
+//! rules: which places get named files, when a frame is a picture and when it
+//! is a delta, and what order ground and frames are written in.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
+
+use crate::export::{self, ExportConfig};
+use crate::frame;
+use crate::milestone;
+use crate::replay::{self, Options, Replay};
+
+/// How a caller watches a job and stops one.
+///
+/// `on` is called as each unit of work lands rather than on a schedule: a
+/// small job can finish before any timer would fire, and a caller that wants
+/// less than everything can filter for itself.
+///
+/// `cancel` is checked at the same points, so stopping takes effect within one
+/// unit rather than at the end. Nothing already written is removed: a
+/// cancelled build leaves a shorter timelapse, which is a real thing somebody
+/// may have wanted, rather than nothing at all.
+///
+/// Generic in what gets reported, because the jobs genuinely differ: building
+/// counts frames, and exporting saves has a name and an outcome per save.
+pub struct Watch<'a, P> {
+    pub on: &'a mut dyn FnMut(P),
+    pub cancel: &'a AtomicBool,
+}
+
+impl<P> Watch<'_, P> {
+    fn stopped(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// What to build, decided before any of it starts.
+pub struct Plan {
+    /// Which places to include. Empty means every one the recording has.
+    ///
+    /// Exactly one is the case that changes the output rather than filtering
+    /// it: the frames are named for nothing, which is what a single-surface
+    /// timelapse has always been on disk and what the viewer reads as "one
+    /// world, unnamed".
+    pub surfaces: Vec<String>,
+    pub options: Options,
+}
+
+/// What a finished build did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Built {
+    /// Frames the replay reached, which is what the timeline covers.
+    pub emitted: usize,
+    /// Frames actually written. Lower than `emitted` only if a build stopped.
+    pub written: usize,
+    pub cancelled: bool,
+}
+
+/// Ground, sidecars and frames into `out`, in that order.
+///
+/// Ground first because it is fixed the instant the baseline loads, and
+/// because a later ground scan is meant to overwrite this: the scan covers the
+/// factory's final extent, and this only finds anything at all for a recording
+/// made before ground moved out of the baseline.
+pub fn timelapse(
+    replay: &mut Replay,
+    session_dir: &Path,
+    out: &Path,
+    plan: &Plan,
+    watch: &mut Watch<'_, usize>,
+) -> io::Result<Built> {
+    let tick = replay.baseline.tick;
+    match plan.surfaces.as_slice() {
+        [one] => replay::write_terrain(&replay.world, one, tick, out)?,
+        many => replay::write_terrain_of(&replay.world, tick, out, many)?,
+    }
+    copy_sidecars(session_dir, out)?;
+
+    let mut written = 0usize;
+    let mut failed: Option<io::Error> = None;
+    // Last revision written per surface, carried across the run so a surface
+    // nothing has touched can be skipped.
+    let mut revisions: std::collections::HashMap<String, u64> = Default::default();
+
+    let single = match plan.surfaces.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    };
+
+    let emitted = replay::run(replay, session_dir, &plan.options, |world, tick| {
+        if failed.is_some() || watch.stopped() {
+            return;
+        }
+        let result = match &single {
+            // The first frame is the picture; every one after it is what
+            // changed. A real megabase changed by about 200 items a frame out
+            // of 4.2 million, so a snapshot spent 8.8 MB restating what the
+            // reader already had.
+            Some(name) => {
+                let frame = match written == 0 {
+                    true => {
+                        world.clear_changes(name);
+                        world.to_frame(name, tick)
+                    }
+                    false => world.to_frame_delta(name, tick),
+                };
+                std::fs::write(out.join(format!("frame_{written:04}.stfr")), frame::write_binary(&frame.as_out())).map(|()| 1)
+            }
+            None => replay::write_surfaces(world, tick, out, written, &mut revisions, &plan.surfaces),
+        };
+        match result {
+            Ok(_) => {
+                written += 1;
+                (watch.on)(written);
+            }
+            Err(e) => failed = Some(e),
+        }
+    })?;
+
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    Ok(Built { emitted, written, cancelled: watch.stopped() })
+}
+
+/// The plain-JSON sidecar logs a live capture writes, copied beside the frames.
+///
+/// A straight copy rather than a re-parse, the mod's logs and what the viewer
+/// reads being the same shape by design. Each being absent is normal: a
+/// recording made before a given log existed simply has none.
+pub fn copy_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
+    let mut copied = Vec::new();
+    for name in ["players.jsonl", "milestones.jsonl", "prototypes.json"] {
+        let source = session_dir.join(name);
+        if source.exists() {
+            std::fs::copy(&source, out.join(name))?;
+            copied.push(name);
+        }
+    }
+    Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::capture_with_events;
+
+    /// The arguments a request becomes, as strings, for asserting on.
+    fn args_of(request: &VideoRequest) -> Vec<String> {
+        video_args(request).iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn a_request() -> VideoRequest {
+        VideoRequest {
+            timelapse: PathBuf::from("in"),
+            target: PathBuf::from("out"),
+            width: 1920,
+            height: 1080,
+            surface: None,
+            video: true,
+            fps: 30,
+            mp4: false,
+            overlay_players: false,
+            overlay_clock: false,
+        }
+    }
+
+    /// Every one of these is a decision somebody made in a menu, and a flag
+    /// silently not passed is a render that comes out wrong after minutes
+    /// rather than an error.
+    #[test]
+    fn every_choice_reaches_the_renderer() {
+        let full = VideoRequest {
+            surface: Some("gleba".to_string()),
+            mp4: true,
+            overlay_players: true,
+            overlay_clock: true,
+            fps: 60,
+            ..a_request()
+        };
+        assert_eq!(
+            args_of(&full),
+            [
+                "in",
+                "--export",
+                "out",
+                "--width",
+                "1920",
+                "--height",
+                "1080",
+                "--video",
+                "--fps",
+                "60",
+                "--mp4",
+                "--overlay-players",
+                "--overlay-clock",
+                "--surface",
+                "gleba",
+            ]
+        );
+    }
+
+    /// Frame rate and overlays only mean anything to a video. An image
+    /// sequence is frames on disk for somebody else's editor to time and
+    /// label, and passing a frame rate with them would be a claim about
+    /// timing this cannot make.
+    #[test]
+    fn an_image_sequence_carries_no_frame_rate_or_overlays() {
+        let frames = VideoRequest { video: false, mp4: true, overlay_clock: true, ..a_request() };
+        let args = args_of(&frames);
+        for unwanted in ["--video", "--fps", "--mp4", "--overlay-clock", "--overlay-players"] {
+            assert!(!args.contains(&unwanted.to_string()), "{unwanted} reached an image sequence: {args:?}");
+        }
+    }
+
+    /// No surface is the busiest one, which the renderer picks for itself, so
+    /// the flag has to be absent rather than passed empty.
+    #[test]
+    fn no_chosen_place_passes_no_surface_at_all() {
+        assert!(!args_of(&a_request()).contains(&"--surface".to_string()));
+    }
+
+    /// A build of the fixture capture into a fresh folder, plus the names it
+    /// wrote, sorted so a test can assert on them.
+    fn built(surfaces: &[&str], cancel_after: Option<usize>) -> (Built, Vec<String>, Vec<usize>) {
+        let (_capture, session_dir) = capture_with_events(40);
+        let out = tempfile::tempdir().unwrap();
+        let mut replay = replay::load_baseline(&session_dir.join("baseline.json")).unwrap();
+
+        let plan = Plan {
+            surfaces: surfaces.iter().map(|s| s.to_string()).collect(),
+            options: Options { interval: 10, max_frames: 1000 },
+        };
+
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut on_frame = |written: usize| {
+            seen.push(written);
+            if cancel_after.is_some_and(|at| written >= at) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let result =
+            timelapse(&mut replay, &session_dir, out.path(), &plan, &mut Watch { on: &mut on_frame, cancel: &cancel }).unwrap();
+
+        let mut names: Vec<String> =
+            std::fs::read_dir(out.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        (result, names, seen)
+    }
+
+    /// One place writes frames named for nothing, which is what the viewer
+    /// reads as "one world, unnamed" and what this has always produced.
+    #[test]
+    fn a_single_place_writes_frames_named_for_nothing() {
+        let (result, names, _) = built(&["nauvis"], None);
+        assert!(result.written > 1, "the fixture builds something every tick: {result:?}");
+        assert!(names.contains(&"frame_0000.stfr".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("_nauvis.stfr")), "{names:?}");
+    }
+
+    /// Everything, which is what an empty list means, names each file for its
+    /// surface so more than one world can share a folder.
+    #[test]
+    fn every_place_writes_frames_named_for_their_surface() {
+        let (_, names, _) = built(&[], None);
+        assert!(names.contains(&"frame_0000_nauvis.stfr".to_string()), "{names:?}");
+    }
+
+    /// The count is the running total and arrives once per frame, so a caller
+    /// can print every twenty-fifth or drive a bar without keeping its own.
+    #[test]
+    fn progress_counts_up_once_per_frame() {
+        let (result, _, seen) = built(&["nauvis"], None);
+        assert_eq!(seen.len(), result.written);
+        assert_eq!(seen.first(), Some(&1));
+        assert_eq!(seen.last(), Some(&result.written));
+        assert!(seen.windows(2).all(|w| w[1] == w[0] + 1), "the total must not skip: {seen:?}");
+    }
+
+    /// The whole reason for the flag: a window has to be able to stop a build
+    /// that is going to take minutes, and stopping has to take effect within a
+    /// frame rather than at the end.
+    #[test]
+    fn cancelling_stops_within_a_frame_and_says_so() {
+        let (stopped, _, seen) = built(&["nauvis"], Some(3));
+        assert!(stopped.cancelled);
+        assert_eq!(stopped.written, 3, "one more frame must not slip through: {seen:?}");
+
+        let (whole, _, _) = built(&["nauvis"], None);
+        assert!(!whole.cancelled);
+        assert!(whole.written > stopped.written, "{whole:?} against {stopped:?}");
+    }
+
+    /// What a cancelled build leaves is a shorter timelapse, not nothing: the
+    /// frames already written are correct and somebody may well have wanted
+    /// exactly that.
+    #[test]
+    fn a_cancelled_build_keeps_what_it_already_wrote() {
+        let (result, names, _) = built(&["nauvis"], Some(2));
+        assert_eq!(result.written, 2);
+        assert!(names.contains(&"frame_0000.stfr".to_string()), "{names:?}");
+        assert!(names.contains(&"frame_0001.stfr".to_string()), "{names:?}");
+        assert!(!names.contains(&"frame_0002.stfr".to_string()), "{names:?}");
+    }
+}
+
+/// One save, as an export reports it.
+///
+/// Named rather than counted, because the interesting failure is one save out
+/// of forty refusing while the rest work, and a bare count cannot say which.
+pub enum SaveStep {
+    Started { index: usize, total: usize, label: String },
+    Exported { index: usize, label: String, bytes: u64, seconds: f64 },
+    Failed { index: usize, label: String, error: String },
+}
+
+/// What exporting a set of saves produced.
+#[derive(Debug, Default)]
+pub struct Exported {
+    /// The frame each successful save became, in the order they were given.
+    pub frames: Vec<PathBuf>,
+    /// What each save said about milestones, for `milestone::from_saves`,
+    /// which needs consecutive saves to say when something first became true.
+    pub milestones: Vec<milestone::State>,
+    pub cancelled: bool,
+}
+
+/// Runs Factorio once per save, writing one frame each into `out`.
+///
+/// The slowest thing this tool does by a wide margin: every save is a full
+/// game load, which on a modded megabase is tens of seconds before any of the
+/// export happens. That is the whole reason this reports per save and takes a
+/// cancel flag.
+///
+/// Cancellation is checked between saves, never during one. A running Factorio
+/// is a child process minutes into loading a save, and killing it partway
+/// would leave a staging tree nobody asked for; stopping before the next one
+/// starts is both achievable and what somebody means by "stop".
+///
+/// A save that fails is reported and skipped rather than ending the run. One
+/// unreadable save out of forty should cost that save.
+pub fn from_saves(
+    saves: &[PathBuf],
+    out: &Path,
+    workspace: &Path,
+    config: &ExportConfig,
+    watch: &mut Watch<'_, SaveStep>,
+) -> io::Result<Exported> {
+    let mut result = Exported::default();
+
+    for (index, save) in saves.iter().enumerate() {
+        if watch.stopped() {
+            result.cancelled = true;
+            break;
+        }
+        let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        (watch.on)(SaveStep::Started { index, total: saves.len(), label: label.clone() });
+
+        let staged = workspace.join(format!("stage_{index}"));
+        match export::export_save(save, &staged, config) {
+            Ok(outcome) => {
+                let target = out.join(format!("frame_{index:04}.stfr"));
+                let primary = &outcome.frames[0];
+                std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
+
+                // Appended, not overwritten: each save contributes its own
+                // one-shot sample at its own real tick.
+                if let Some(log) = &outcome.players_log {
+                    let mut combined = std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
+                    std::io::Write::write_all(&mut combined, &std::fs::read(log)?)?;
+                }
+                if let Some(state) = outcome.milestones {
+                    result.milestones.push(state);
+                }
+                let bytes = target.metadata().map(|m| m.len()).unwrap_or(0);
+                result.frames.push(target);
+                (watch.on)(SaveStep::Exported { index, label, bytes, seconds: outcome.seconds });
+            }
+            Err(error) => (watch.on)(SaveStep::Failed { index, label, error: error.to_string() }),
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    Ok(result)
+}
+
+/// Marks a re-execution of this program as the viewer rather than the menu.
+///
+/// Deliberately a flag rather than a bare path argument: a path alone would
+/// have to be told apart from every option a headless build wants, and
+/// guessing wrong means opening a window at somebody who asked for a file.
+pub const VIEW_FLAG: &str = "--view";
+
+/// This program again, told to be the viewer.
+///
+/// The viewer used to be a second executable. It is now a module of this one,
+/// but it still runs in its own process rather than in place, because
+/// macroquad allows a single window per process: opening one from the menu
+/// would mean the menu never comes back, and opening one from a window that
+/// already exists is not possible at all.
+pub fn viewer_command() -> io::Result<std::process::Command> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg(VIEW_FLAG);
+    Ok(command)
+}
+
+/// A video or image sequence to render, decided before any of it starts.
+pub struct VideoRequest {
+    /// The built timelapse to render.
+    pub timelapse: PathBuf,
+    /// Where it goes, without an extension: the renderer appends `.avi` or
+    /// `.mp4` for a video and treats the path as a folder for an image
+    /// sequence, so the same argument serves both.
+    pub target: PathBuf,
+    pub width: u32,
+    pub height: u32,
+    /// One place, `"all"` for one file each, or `None` for the busiest.
+    pub surface: Option<String>,
+    /// A video file rather than a numbered image per frame.
+    pub video: bool,
+    pub fps: u32,
+    pub mp4: bool,
+    pub overlay_players: bool,
+    pub overlay_clock: bool,
+}
+
+/// The arguments `request` becomes, after the `--view` flag.
+///
+/// Split from running it so the translation can be tested: every one of these
+/// is a decision somebody made in a menu, and a flag silently not being passed
+/// is a render that comes out wrong after several minutes rather than an error.
+fn video_args(request: &VideoRequest) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        request.timelapse.clone().into(),
+        "--export".into(),
+        request.target.clone().into(),
+        "--width".into(),
+        request.width.to_string().into(),
+        "--height".into(),
+        request.height.to_string().into(),
+    ];
+    // Frame rate and overlays only mean anything to a video. An image sequence
+    // is frames on disk for somebody else's editor to time and label.
+    if request.video {
+        args.push("--video".into());
+        args.push("--fps".into());
+        args.push(request.fps.to_string().into());
+        if request.mp4 {
+            args.push("--mp4".into());
+        }
+        if request.overlay_players {
+            args.push("--overlay-players".into());
+        }
+        if request.overlay_clock {
+            args.push("--overlay-clock".into());
+        }
+    }
+    if let Some(name) = &request.surface {
+        args.push("--surface".into());
+        args.push(name.clone().into());
+    }
+    args
+}
+
+/// Renders `request`, blocking until the render finishes.
+///
+/// Blocking on purpose, and not reporting either: the renderer opens its own
+/// window and shows the frames as it writes them, so progress is already in
+/// front of whoever asked. What a caller with a window of its own needs is to
+/// run this off the thread doing the painting, which is what makes it a job
+/// rather than something the menu does inline.
+pub fn video(request: &VideoRequest) -> io::Result<()> {
+    let status = viewer_command()?.args(video_args(request)).status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!("the renderer exited with {status} without finishing the export")))
+}
+
+/// Where a mode writes its output: beside the running exe, so the result is
+/// easy to find wherever Factorio's user data lives. Falls back to the current
+/// directory only if the exe's path cannot be determined.
+pub fn output_dir_next_to_exe(name: &str) -> PathBuf {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
+}
+
+/// Where built timelapses are kept, one subfolder each. A single fixed folder
+/// that every run rebuilt meant reopening yesterday's timelapse was
+/// impossible: the only way to see one was to make it again.
+pub fn timelapses_root() -> PathBuf {
+    output_dir_next_to_exe("timelapses")
+}
+
+/// Turns a playthrough name or save name into something safe to use as a
+/// folder name, since both come from the user and can hold anything.
+pub fn as_folder_name(raw: &str) -> String {
+    // Dots are kept, a name like "v1.2 run" being ordinary, and trimmed from
+    // the ends, since "." and ".." name directories.
+    let cleaned: String =
+        raw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "timelapse".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// One timelapse already built and sitting on disk.
+pub struct BuiltTimelapse {
+    pub name: String,
+    pub path: PathBuf,
+    pub frames: usize,
+    pub bytes: u64,
+    pub modified: SystemTime,
+}
+
+/// Every built timelapse, newest first. Counts frames and weighs the folder,
+/// since which of two somebody wants is usually answered by how big and how
+/// recent it is, neither visible from a name.
+pub fn list_timelapses() -> Vec<BuiltTimelapse> {
+    list_timelapses_in(&timelapses_root())
+}
+
+/// Split from [`list_timelapses`] only so it can be tested: the real root is
+/// derived from the running executable's own location, which no test can
+/// arrange.
+pub fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+
+    let mut found: Vec<BuiltTimelapse> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let files: Vec<_> = std::fs::read_dir(&path).ok()?.filter_map(Result::ok).collect();
+            let frames = files.iter().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("stfr")).count();
+            // A folder with no frames in it is a half-finished or interrupted
+            // build, not something worth offering to open.
+            if frames == 0 {
+                return None;
+            }
+            let bytes = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some(BuiltTimelapse { name: entry.file_name().to_string_lossy().into_owned(), path, frames, bytes, modified })
+        })
+        .collect();
+
+    found.sort_by_key(|t| std::cmp::Reverse(t.modified));
+    found
+}

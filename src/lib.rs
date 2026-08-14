@@ -1,6 +1,10 @@
 //! Library half of save-timelapse, so the CLI, the test double and the
 //! integration tests can all share the same code.
 
+pub mod build;
+/// The window and its screens, which is what replaces the console menu.
+pub mod gui;
+
 pub mod event;
 pub mod export;
 pub mod frame;
@@ -18,6 +22,9 @@ pub mod settings;
 pub mod settings_dat;
 #[cfg(test)]
 mod test_support;
+/// The interactive viewer and everything it draws with. Was its own crate
+/// until the two binaries merged.
+pub mod viewer;
 pub mod wire;
 pub mod world;
 

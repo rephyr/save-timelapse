@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::render_frame::RenderEntity;
+use crate::viewer::render_frame::RenderEntity;
 
 /// Factorio's cardinal direction bytes. The raw field is 16-way (22.5 degree
 /// steps) but a belt only ever sits on one of these four.

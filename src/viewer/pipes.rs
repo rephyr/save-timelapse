@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::render_frame::RenderEntity;
+use crate::viewer::render_frame::RenderEntity;
 
 /// One bit per side, in Factorio's direction order.
 pub const NORTH: u8 = 1;
@@ -303,11 +303,11 @@ mod tests {
     /// which is exactly what this file did before.
     #[test]
     fn a_real_capture_has_pipes_meeting_underground_ones() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
-        let frames = crate::loading::load_sequence(std::path::Path::new(dir)).unwrap();
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames");
+        let frames = crate::viewer::loading::load_sequence(std::path::Path::new(dir)).unwrap();
         let frame = frames.into_iter().last().expect("the fixture has frames");
 
-        let mut registry = crate::registry::TypeRegistry::new();
+        let mut registry = crate::viewer::registry::TypeRegistry::new();
         let ids: Vec<_> = frame.entities.iter().map(|e| registry.intern(&e.n)).collect();
         let pipe_flags: Vec<bool> = ids.iter().map(|&id| registry.is_pipe(id)).collect();
         let to_ground_flags: Vec<bool> = ids.iter().map(|&id| registry.is_pipe_to_ground(id)).collect();

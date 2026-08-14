@@ -77,7 +77,7 @@ Save Timelapse has two parts: a desktop companion tool and an optional Factorio 
 You only need the companion tool.
 
 1. Download the latest [release](https://github.com/rephyr/save-timelapse/releases).
-2. Unzip `save-timelapse.exe` and `viewer.exe` into the same folder.
+2. Unzip `save-timelapse.exe` into a folder of its own.
 3. Run `save-timelapse.exe`.
 
 The tool automatically finds your Factorio installation and saves folder and remembers your settings for future runs.
@@ -163,7 +163,7 @@ If you happen to have FFmpeg on your PATH, the tool offers an MP4 as well. It is
 The repository includes real captured frames from a 100-hour Space Age factory.
 
 ```bash
-cargo run -p viewer --release --bin viewer -- tests/fixtures/frames
+cargo run --release --bin save-timelapse -- --view tests/fixtures/frames
 ```
 
 The included capture grows from 240 to 22,971 entities, allowing the renderer to be tested without a Factorio installation.

@@ -113,7 +113,7 @@ Seeking stays cheap despite materialising on demand: 425µs per seek, and a
 full walk of all 150 frames in 67ms.
 
 ```bash
-cargo test --release -p viewer --lib gains -- --ignored --nocapture
+cargo test --release --lib gains -- --ignored --nocapture
 ```
 
 ### Load time
@@ -141,7 +141,7 @@ almost entirely sequentially and allocates nothing per frame once the buffers
 have grown.
 
 ```bash
-cargo test --release -p viewer --lib measure_cost -- --ignored --nocapture
+cargo test --release --lib measure_cost -- --ignored --nocapture
 ```
 
 ### Export: aggregating the ground
@@ -170,7 +170,7 @@ protected are untouched. Total drawing falls about 4.4x, which should take that
 export from 22 minutes to roughly 5.
 
 ```bash
-SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
+SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release --lib measure_terrain_lod -- --ignored --nocapture
 ```
 
 ### Folding a frame that changes most of the factory
