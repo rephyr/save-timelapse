@@ -299,6 +299,22 @@ end
 check_true("the scan writes a description of its own", described ~= nil)
 check_true("with the corner it found in it", described and described:find("curved%-rail%-a") ~= nil)
 
+-- The per-surface cap is why this only ever half worked: the first N rails
+-- found are whichever corner of the map is enumerated first, so orientations
+-- used anywhere else were never sampled.
+local asked_with = nil
+local capped = fake.surface("nauvis", { corner, joined })
+capped.find_entities_filtered = function(filter)
+  asked_with = filter
+  return { corner, joined }
+end
+_G.game.surfaces = { nauvis = capped }
+
+export.sample_rail_joints(3000)
+check("a live sample stays capped", asked_with.limit, 3000)
+export.write_prototypes(0x1234, true)
+check("the scan asks for every rail there is", asked_with.limit, nil)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

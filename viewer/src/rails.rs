@@ -55,6 +55,16 @@ impl RailSegment {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         RailSegment { length: (dx * dx + dy * dy).sqrt(), rotation: dy.atan2(dx), offset: ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0) }
     }
+
+    /// The same piece rotated about its own position by `radians`.
+    fn turned(&self, radians: f32) -> RailSegment {
+        let (sin, cos) = radians.sin_cos();
+        RailSegment {
+            length: self.length,
+            rotation: self.rotation + radians,
+            offset: (self.offset.0 * cos - self.offset.1 * sin, self.offset.0 * sin + self.offset.1 * cos),
+        }
+    }
 }
 
 /// How wide to draw track, in tiles. Narrower than the two rails really span,
@@ -124,9 +134,40 @@ pub fn rail_segment(name: &str, direction: u8) -> Option<RailSegment> {
             let turn = |(x, y): (f32, f32)| if flip { (-x, -y) } else { (x, y) };
             return Some(RailSegment::between(turn(a), turn(b)));
         }
+        // 2.0's corner, half a quarter turn each. Measured off a real capture's
+        // connectivity: the facings a quarter turn apart agreed exactly, and
+        // every facing of one prototype is that same piece turned, 16 facings
+        // to a full turn.
+        //
+        // Built in rather than left to `solve` so a corner draws as a corner
+        // with no capture, no scan and nothing asked of anybody. A modded rail
+        // still goes through the sampler.
+        "curved-rail-a" | "elevated-curved-rail-a" => {
+            return Some(match direction % 4 {
+                0 => turned_curve((0.0, 2.0), (-1.0, -3.0), 0, direction),
+                _ => turned_curve((0.0, 2.0), (2.0, -2.5), 2, direction),
+            });
+        }
+        "curved-rail-b" | "elevated-curved-rail-b" => {
+            return Some(match direction % 4 {
+                0 => turned_curve((1.0, 2.0), (-2.0, -2.0), 0, direction),
+                _ => turned_curve((2.0, -2.0), (0.0, 2.5), 2, direction),
+            });
+        }
         _ => return None,
     };
     Some(RailSegment { length: (dx * dx + dy * dy).sqrt(), rotation: dy.atan2(dx), offset: (0.0, 0.0) })
+}
+
+/// A curve measured at `base`, turned to `direction`.
+///
+/// Two shapes per prototype, not one turned eight ways: the facings that meet
+/// cardinal track and the ones that meet diagonal track are different pieces,
+/// which is why the two families have different lengths. Within a family the
+/// facings are quarter turns and agree exactly.
+fn turned_curve(a: (f32, f32), b: (f32, f32), base: u8, direction: u8) -> RailSegment {
+    let steps = (direction as f32) - (base as f32);
+    RailSegment::between(a, b).turned(steps * std::f32::consts::TAU / 16.0)
 }
 
 /// Two joints closer than this are one joint. Rails sit on half-tile
@@ -184,7 +225,39 @@ pub fn solve(samples: &[save_timelapse::prototypes::RailSample]) -> HashMap<(Str
     }
 
     pair_up_the_rest(samples, &mut known);
+    complete_by_quarter_turns(samples, &mut known);
     known
+}
+
+/// A rail facing is the same piece a quarter turn round, so one solved facing
+/// settles the three at right angles to it.
+///
+/// Without this a curve whose only neighbours are other unsolved curves never
+/// resolves and draws square, which on a real capture was 6 of 22 facings. Only
+/// multiples of four directions: measured against solved pairs, those agree to
+/// 0.0 degrees, while 45 degree steps do not, so they are a different shape and
+/// not this function's to guess.
+fn complete_by_quarter_turns(samples: &[save_timelapse::prototypes::RailSample], known: &mut HashMap<(String, u8), RailSegment>) {
+    // A solved run of no length draws as nothing, so it is not a solution.
+    known.retain(|_, segment| segment.length > SAME_JOINT);
+
+    let mut wanted: Vec<(String, u8)> = samples.iter().map(|s| (s.name.clone(), s.direction)).collect();
+    wanted.sort();
+    wanted.dedup();
+
+    for (name, direction) in wanted {
+        if known.contains_key(&(name.clone(), direction)) {
+            continue;
+        }
+        let quarter = std::f32::consts::TAU / 4.0;
+        let turns = [4u8, 8, 12].into_iter().find_map(|step| {
+            let from = (direction + step) % 16;
+            known.get(&(name.clone(), from)).map(|segment| (*segment, 16 - step))
+        });
+        if let Some((segment, step)) = turns {
+            known.insert((name, direction), segment.turned(step as f32 / 4.0 * quarter));
+        }
+    }
 }
 
 /// The joints a piece can work out from neighbours already known.
@@ -366,9 +439,9 @@ mod tests {
     /// between those two points, which is nothing like the square it was.
     #[test]
     fn a_curve_takes_its_shape_from_the_rails_it_connects_to() {
-        let solved = solve(&[sample("curved-rail-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("straight-rail", 4, -3.0, 0.0)])]);
+        let solved = solve(&[sample("kr-curve-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("straight-rail", 4, -3.0, 0.0)])]);
 
-        let curve = solved.get(&("curved-rail-a".to_string(), 0)).expect("solved from its neighbours");
+        let curve = solved.get(&("kr-curve-a".to_string(), 0)).expect("solved from its neighbours");
         let mut ends = curve.ends();
         ends.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert!((ends[0].0 - -2.0).abs() < 1e-4 && (ends[0].1 - 0.0).abs() < 1e-4, "got {ends:?}");
@@ -382,13 +455,13 @@ mod tests {
     #[test]
     fn a_curve_attached_to_another_curve_resolves_on_a_later_round() {
         let solved = solve(&[
-            sample("curved-rail-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("straight-rail", 4, -3.0, 0.0)]),
+            sample("kr-curve-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("straight-rail", 4, -3.0, 0.0)]),
             // Sits two tiles right and two up from the first curve, so the
             // first curve's (0,2) end is at (-2,0) in this one's frame.
-            sample("curved-rail-b", 0, &[("curved-rail-a", 0, -2.0, 2.0), ("straight-rail", 4, 3.0, 0.0)]),
+            sample("kr-curve-b", 0, &[("kr-curve-a", 0, -2.0, 2.0), ("straight-rail", 4, 3.0, 0.0)]),
         ]);
 
-        let twin = solved.get(&("curved-rail-b".to_string(), 0)).expect("resolved once its neighbour was");
+        let twin = solved.get(&("kr-curve-b".to_string(), 0)).expect("resolved once its neighbour was");
         assert!(twin.length > 0.0);
     }
 
@@ -398,7 +471,7 @@ mod tests {
     #[test]
     fn a_junction_does_not_shorten_the_piece_it_sits_on() {
         let solved = solve(&[sample(
-            "curved-rail-a",
+            "kr-curve-a",
             0,
             &[
                 ("straight-rail", 0, 0.0, 3.0),
@@ -409,7 +482,7 @@ mod tests {
             ],
         )]);
 
-        let curve = solved.get(&("curved-rail-a".to_string(), 0)).expect("still solved");
+        let curve = solved.get(&("kr-curve-a".to_string(), 0)).expect("still solved");
         assert!((curve.length - 8.0f32.sqrt()).abs() < 1e-4, "spans the outermost pair, got {}", curve.length);
     }
 
@@ -419,17 +492,17 @@ mod tests {
     /// rounds it ran, and no amount of recorded connectivity would have
     /// helped.
     ///
-    /// Measured off a real map: `curved-rail-a` facing 0 meets a vertical
+    /// Measured off a real map: `kr-curve-a` facing 0 meets a vertical
     /// straight three tiles above it, which puts that joint at (0,2).
     #[test]
     fn a_corner_of_two_halves_resolves_even_though_neither_half_can_alone() {
         let solved = solve(&[
-            sample("curved-rail-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("curved-rail-b", 0, -2.0, -5.0)]),
-            sample("curved-rail-b", 0, &[("curved-rail-a", 0, 2.0, 5.0), ("straight-rail", 4, -3.0, -2.0)]),
+            sample("kr-curve-a", 0, &[("straight-rail", 0, 0.0, 3.0), ("kr-curve-b", 0, -2.0, -5.0)]),
+            sample("kr-curve-b", 0, &[("kr-curve-a", 0, 2.0, 5.0), ("straight-rail", 4, -3.0, -2.0)]),
         ]);
 
-        let first = solved.get(&("curved-rail-a".to_string(), 0)).expect("the half touching a straight");
-        let second = solved.get(&("curved-rail-b".to_string(), 0)).expect("the half touching the first");
+        let first = solved.get(&("kr-curve-a".to_string(), 0)).expect("the half touching a straight");
+        let second = solved.get(&("kr-curve-b".to_string(), 0)).expect("the half touching the first");
         assert!(first.length > 0.0 && second.length > 0.0);
 
         // They have to meet: the first's far end and the second's far end are
@@ -446,15 +519,15 @@ mod tests {
     /// the pairing pass cannot invent geometry out of a dead end.
     #[test]
     fn one_anchor_and_nothing_to_pair_with_stays_unknown() {
-        let solved = solve(&[sample("curved-rail-a", 0, &[("straight-rail", 0, 0.0, 3.0)])]);
-        assert!(!solved.contains_key(&("curved-rail-a".to_string(), 0)));
+        let solved = solve(&[sample("kr-curve-a", 0, &[("straight-rail", 0, 0.0, 3.0)])]);
+        assert!(!solved.contains_key(&("kr-curve-a".to_string(), 0)));
     }
 
     /// Nothing to work from is left alone rather than guessed at.
     #[test]
     fn a_piece_with_one_joint_stays_unknown() {
-        let solved = solve(&[sample("curved-rail-a", 0, &[("straight-rail", 0, 0.0, 3.0)])]);
-        assert!(!solved.contains_key(&("curved-rail-a".to_string(), 0)));
+        let solved = solve(&[sample("kr-curve-a", 0, &[("straight-rail", 0, 0.0, 3.0)])]);
+        assert!(!solved.contains_key(&("kr-curve-a".to_string(), 0)));
     }
 
     /// A capture whose mod never described rails, which is every capture made
@@ -534,12 +607,67 @@ mod tests {
         }
     }
 
-    /// Curves are deliberately absent, and a caller has to keep working when
-    /// this says nothing rather than assume every rail has an answer.
     #[test]
-    fn a_curve_has_no_segment_yet() {
-        assert_eq!(rail_segment("curved-rail-a", 0), None);
-        assert_eq!(rail_segment("curved-rail-b", 4), None);
+    fn something_that_is_not_rail_has_no_segment() {
         assert_eq!(rail_segment("transport-belt", 0), None);
+    }
+
+    /// The measurements the built-in curves come from, so a change to the
+    /// tables has to disagree with a real capture out loud.
+    #[test]
+    fn a_curve_matches_what_a_real_capture_measured() {
+        type Measured = (&'static str, u8, [(f32, f32); 2]);
+        let cases: [Measured; 6] = [
+            ("curved-rail-a", 0, [(0.0, 2.0), (-1.0, -3.0)]),
+            ("curved-rail-a", 4, [(-2.0, 0.0), (3.0, -1.0)]),
+            ("curved-rail-a", 2, [(0.0, 2.0), (2.0, -2.5)]),
+            ("curved-rail-b", 0, [(1.0, 2.0), (-2.0, -2.0)]),
+            ("curved-rail-b", 12, [(2.0, -1.0), (-2.0, 2.0)]),
+            ("curved-rail-b", 14, [(-2.0, -2.0), (2.5, 0.0)]),
+        ];
+        for (name, direction, want) in cases {
+            let got = rail_segment(name, direction).expect("every rail facing has a shape").ends();
+            let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3;
+            let matched = (near(got[0], want[0]) && near(got[1], want[1])) || (near(got[0], want[1]) && near(got[1], want[0]));
+            assert!(matched, "{name} d{direction}: got {got:?}, measured {want:?}");
+        }
+    }
+
+    /// The two families are different pieces, not one turned eight ways, which
+    /// is why forcing a 45 degree rotation put endpoints off the half-tile grid.
+    #[test]
+    fn the_two_curve_families_have_their_own_lengths() {
+        let cardinal = rail_segment("curved-rail-a", 4).unwrap().length;
+        let diagonal = rail_segment("curved-rail-a", 6).unwrap().length;
+        assert!((cardinal - 26f32.sqrt()).abs() < 1e-3, "cardinal facings span root 26, got {cardinal}");
+        assert!((diagonal - cardinal).abs() > 0.1, "the diagonal family is a different piece, got {diagonal}");
+    }
+
+    /// On a real capture 6 of 22 facings never resolved, because a curve whose
+    /// only neighbours are other unsolved curves has nothing to stand on. Every
+    /// one of them was a quarter turn from a facing that had.
+    #[test]
+    fn a_facing_that_cannot_resolve_is_a_quarter_turn_from_one_that_can() {
+        let samples = vec![
+            sample("curved-rail-a", 4, &[("straight-rail", 4, 3.0, 0.0), ("straight-rail", 0, -2.0, -3.0)]),
+            // Attached only to a curve that never resolves either, which is
+            // the shape the real capture got stuck on.
+            sample("curved-rail-a", 0, &[("curved-rail-b", 2, 2.0, 5.0)]),
+        ];
+        let solved = solve(&samples);
+
+        let anchored = solved.get(&("curved-rail-a".to_string(), 4)).expect("the anchored facing");
+        let turned = solved.get(&("curved-rail-a".to_string(), 0)).expect("the facing a quarter turn from it");
+        assert!((turned.length - anchored.length).abs() < 1e-4, "a turn does not change the length");
+        let quarter = std::f32::consts::TAU / 4.0;
+        let apart = (turned.rotation - anchored.rotation).rem_euclid(quarter);
+        assert!(apart < 1e-3 || (quarter - apart) < 1e-3, "rotated by {}, not a quarter turn", apart.to_degrees());
+    }
+
+    /// A run of no length draws as nothing, which is not better than a square.
+    #[test]
+    fn a_degenerate_solution_is_not_kept() {
+        let samples = vec![sample("kr-curve-a", 4, &[("straight-rail", 4, 3.0, 0.0), ("straight-rail", 4, 3.0, 0.0)])];
+        assert!(!solve(&samples).contains_key(&("kr-curve-a".to_string(), 4)));
     }
 }

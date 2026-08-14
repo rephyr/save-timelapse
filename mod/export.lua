@@ -576,9 +576,12 @@ end
 --- otherwise pass for the shape of every piece like it.
 local RAIL_SAMPLES_PER_FACING = 3
 
---- A ceiling on how many rails are looked at per surface. Every facing of
---- every prototype turns up within a few hundred pieces of track, and a
---- megabase has hundreds of thousands.
+--- A ceiling on how many rails are looked at per surface during play, where
+--- this costs somebody's frame rate.
+---
+--- Not a representative sample: the first N found are whichever corner of the
+--- map is enumerated first, so orientations used anywhere else go unrecorded
+--- and draw as squares. The unattended scan passes no limit for that reason.
 local RAIL_SCAN_LIMIT = 3000
 
 --- Which rails connect to which, for each rail prototype and facing.
@@ -596,7 +599,9 @@ local RAIL_SCAN_LIMIT = 3000
 ---
 --- Positions are relative to the piece being described, that being the whole
 --- point: the answer is the same everywhere on the map.
-function M.sample_rail_joints()
+--- `limit` caps how many rails are looked at per surface; nil looks at all of
+--- them, which only the unattended scan can afford.
+function M.sample_rail_joints(limit)
   -- Asked for by name, not by type. `find_entities_filtered` raises on a type
   -- this game does not have, and one bad entry takes the whole call with it,
   -- which is what an empty rail section turned out to mean. Building the list
@@ -625,7 +630,7 @@ function M.sample_rail_joints()
   for _, surface in pairs(game.surfaces) do
     -- Per surface, so one that refuses to be scanned costs only itself.
     local ok, rails = pcall(function()
-      return surface.find_entities_filtered({ name = names, limit = RAIL_SCAN_LIMIT })
+      return surface.find_entities_filtered({ name = names, limit = limit })
     end)
     if not ok then
       log("[save-timelapse] rail scan failed on " .. surface.name .. ": " .. tostring(rails))
@@ -691,10 +696,18 @@ end
 --- rail API differs from this one still gets everything else described. An
 --- empty list is what a capture made before this existed also looks like, and
 --- the desktop side already has to handle that.
-function M.write_prototypes(session_id)
+--- `exhaustive` drops the per-surface rail cap, for callers not running inside
+--- somebody's game.
+function M.write_prototypes(session_id, exhaustive)
   pcall(function()
     local rails = {}
-    local ok, sampled = pcall(M.sample_rail_joints)
+    -- Not `exhaustive and nil or RAIL_SCAN_LIMIT`: `and nil` always falls
+    -- through to the `or`, so that reads as capped whatever is asked for.
+    local limit = RAIL_SCAN_LIMIT
+    if exhaustive then
+      limit = nil
+    end
+    local ok, sampled = pcall(M.sample_rail_joints, limit)
     if ok and sampled then
       rails = sampled
     end
@@ -834,7 +847,7 @@ function M.run_pending_tick_work(tick, session_id_fn)
     -- For the rails: they are sampled from placed track, and live capture
     -- samples once at the baseline, so a game with no track down yet gets
     -- square corners forever. This save has the finished factory in it.
-    M.write_prototypes(session_id)
+    M.write_prototypes(session_id, true)
     log(string.format(
       "[save-timelapse] terrain scan wrote %d tiles and %d scenery entities across %d surface(s)",
       tiles, scenery, surfaces))
