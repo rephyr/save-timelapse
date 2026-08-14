@@ -162,12 +162,39 @@ function M.paths()
 end
 
 --- A surface with just enough on it to be found and named.
+---
+--- `find_entities_filtered` honours `type` and nothing else. The terrain scan
+--- asks for scenery types over an area it computed from the player's own
+--- entities, so a fake that returned everything to both queries could not tell
+--- the two apart, and a test of what the scan picks up would pass on a scan
+--- that picked up the wrong things. `force` and `area` stay ignored: no fake
+--- entity has a force, and every test that cares about bounds asserts on the
+--- bounds directly.
 function M.surface(name, entities)
   return {
     name = name,
     valid = true,
     index = 1,
-    find_entities_filtered = function() return entities or {} end,
+    find_entities_filtered = function(filter)
+      local all = entities or {}
+      local wanted = filter and filter.type
+      if not wanted then
+        return all
+      end
+      if type(wanted) == "string" then
+        wanted = { wanted }
+      end
+      local allowed, kept = {}, {}
+      for _, t in ipairs(wanted) do
+        allowed[t] = true
+      end
+      for _, entity in ipairs(all) do
+        if allowed[entity.type] then
+          kept[#kept + 1] = entity
+        end
+      end
+      return kept
+    end,
     find_tiles_filtered = function() return {} end,
     get_tile = function() return { name = "grass-1", valid = true } end,
   }

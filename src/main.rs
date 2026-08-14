@@ -1099,6 +1099,20 @@ fn offer_terrain_for_capture(
     // Read once per playthrough. A rebuild otherwise launches Factorio again
     // to be told the same ground, which is now most of what a rebuild costs.
     let cached = cached_terrain(user_dir, session_id);
+    // Ground read before the scan collected scenery is worse than no ground at
+    // all here: it would be reused forever, and the ore, trees and cliffs it
+    // does not carry are exactly what the scan now exists to supply. Discarding
+    // it costs one Factorio run, once, on captures that have been missing their
+    // scenery all along.
+    //
+    // One file answering yes settles it for the playthrough. Nauvis always has
+    // something growing on it, so the case this gets wrong is a capture made
+    // only of scenery-free surfaces, which rescans rather than reuses: the safe
+    // way round.
+    let cached = match cached.iter().any(|p| frame::read_has_entities(p).unwrap_or(false)) {
+        true => cached,
+        false => Vec::new(),
+    };
     println!();
     let wanted = ask_yes_no(
         match cached.is_empty() {

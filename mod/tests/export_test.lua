@@ -223,6 +223,46 @@ check_true("and is named in the log", (function()
   return false
 end)())
 
+-- The terrain scan's scenery pass ---------------------------------------------
+--
+-- The bug this exists for: the in-game pass bounds ore, trees and cliffs by the
+-- factory's bounding box at the moment it runs, which for a live capture is the
+-- baseline. A patch reached in hour ten was never inside any box, so it was
+-- never recorded, and no later frame could rescue it. This pass runs against
+-- the finished save instead, so it repairs recordings already made.
+
+fake.reset(100)
+export = load_export()
+local ore = fake.entity({ name = "coal", type = "resource", x = 900, y = 900 })
+local tree = fake.entity({ name = "tree-01", type = "tree", x = -400, y = 120 })
+local drill = fake.entity({ name = "electric-mining-drill", type = "mining-drill", x = 0, y = 0 })
+_G.game.surfaces = { nauvis = fake.surface("nauvis", { drill, ore, tree }) }
+
+local tiles, surfaces, scenery = export.export_terrain(1, nil)
+check("the scan reports the scenery it wrote", scenery, 2)
+check("and still reports its surface, though the fake has no tiles to give", surfaces, 1)
+check("tiles are counted separately from scenery", tiles, 0)
+
+-- Joined rather than read from `written_to`, which keeps one write: a terrain
+-- file is appended in pieces (header, scenery runs, the marker, tiles, then the
+-- checksum), and the names live in whichever piece first mentioned them.
+local function file_bytes(path)
+  local parts = {}
+  for _, write in ipairs(fake.written) do
+    if write.path == path then
+      parts[#parts + 1] = write.data
+    end
+  end
+  return table.concat(parts)
+end
+
+local terrain_file = file_bytes("save-timelapse/terrain_nauvis.stfr")
+check_true("ore far outside the baseline's box is in the file", terrain_file:find("coal", 1, true) ~= nil)
+check_true("so are trees", terrain_file:find("tree-01", 1, true) ~= nil)
+-- Scenery goes in the entity section; what the player built belongs to the
+-- frames, which carry when each piece went down.
+check("what the player built is not duplicated into it", terrain_file:find("electric-mining-drill", 1, true), nil)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

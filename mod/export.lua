@@ -314,15 +314,81 @@ local function export_surface(surface, tick, session_id)
 end
 
 --- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
---- with an empty entity section and nothing but tiles after it. Placed floor
---- is excluded, the frames already carrying it with the history of when each
---- piece went down.
+--- What the scan writes into a terrain file's entity section: the map's own
+--- furniture, as opposed to anything a player placed.
+---
+--- Fixed rather than read from the startup settings that gate the in-game
+--- scenery pass. Those settings exist to keep a live baseline from freezing
+--- somebody's game, and this pass runs unattended against a save after the
+--- playthrough, where that cost does not exist. Reading them here would also
+--- mean the scan obeys whatever the *tool* set for its own run, which is off,
+--- and it would scan nothing.
+local SCAN_SCENERY_TYPES = { "resource", "tree", "cliff", "plant", "unit-spawner" }
+
+--- Writes `SCAN_SCENERY_TYPES` over `area` as entity runs, returning the
+--- running checksum and how many were written.
+---
+--- This is the whole reason the scan exists in the form it does. The in-game
+--- pass bounds scenery by the factory's bounding box at the moment it runs,
+--- and for a live capture that moment is the baseline, so an ore patch reached
+--- in hour ten was never inside any box and was never recorded. This one runs
+--- against the finished save, where the box is the factory's final extent, so
+--- it sees everything the playthrough ever reached. It repairs recordings
+--- already made, which a fix to the in-game pass cannot do.
+local function write_scenery(path, dict, surface, area, checksum)
+  local order, groups, pending_count, written = {}, {}, 0, 0
+
+  local function flush()
+    if pending_count == 0 then
+      return
+    end
+    local parts = {}
+    for i = 1, #order do
+      local name = order[i]
+      local group = groups[name]
+      parts[i] = encode.frame_entity_run(dict, name, group.w, group.h, group.xs, group.ys, group.ds, group.n)
+    end
+    checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
+    order, groups, pending_count = {}, {}, 0
+  end
+
+  for _, entity in pairs(surface.find_entities_filtered({ area = area, type = SCAN_SCENERY_TYPES })) do
+    if entity.valid then
+      local pos = entity.position
+      local group = groups[entity.name]
+      if not group then
+        group = { w = entity.tile_width, h = entity.tile_height, n = 0, xs = {}, ys = {}, ds = {} }
+        groups[entity.name] = group
+        order[#order + 1] = entity.name
+      end
+      local k = group.n + 1
+      group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
+      written = written + 1
+      pending_count = pending_count + 1
+
+      -- Same reason the tile loop below flushes: one write_file per entity
+      -- would make a megabase's ore field cost syscalls rather than entities.
+      if pending_count >= FLUSH_EVERY then
+        flush()
+      end
+    end
+  end
+
+  flush()
+  return { checksum = checksum, written = written }
+end
+
+--- with the scenery of `SCAN_SCENERY_TYPES` in its entity section and natural
+--- ground after it. Placed floor is excluded, the frames already carrying it
+--- with the history of when each piece went down.
 local function export_terrain_to(tick, session_id, surface, area)
   local path = M.EXPORT_DIR .. encode.terrain_name(session_id, surface.name)
   local dict = encode.new_dictionary()
 
   local checksum = encode.checksum_init()
   checksum = M.checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
+  local scenery = write_scenery(path, dict, surface, area, checksum)
+  checksum = scenery.checksum
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
   local order, groups, pending_count, written = {}, {}, 0, 0
@@ -365,7 +431,7 @@ local function export_terrain_to(tick, session_id, surface, area)
 
   flush()
   M.safe_write_file(path, encode.u32le(checksum), true)
-  return written
+  return written, scenery.written
 end
 
 --- The area a surface's ground should cover: a margin around everything the
@@ -401,20 +467,24 @@ end
 --- that is not placed floor, so water landfilled at hour three reads as
 --- landfill at hour ten.
 function M.export_terrain(tick, session_id)
-  local written, surfaces = 0, 0
+  local written, scenery, surfaces = 0, 0, 0
   for _, surface in pairs(game.surfaces) do
     if M.is_inhabited(surface) then
       local area = terrain_area_for(surface)
       if area then
-        local count = export_terrain_to(tick, session_id, surface, area)
-        if count > 0 then
+        local count, scenery_count = export_terrain_to(tick, session_id, surface, area)
+        -- Counted as written when either half found something: a surface can
+        -- be all ore and cliffs over ground the game never generated a tile
+        -- for, and one that is all ground is the ordinary case.
+        if count > 0 or scenery_count > 0 then
           written = written + count
+          scenery = scenery + scenery_count
           surfaces = surfaces + 1
         end
       end
     end
   end
-  return written, surfaces
+  return written, surfaces, scenery
 end
 
 --- A surface is worth exporting if it is nauvis or the player built on it.
@@ -770,8 +840,10 @@ function M.run_pending_tick_work(tick, session_id_fn)
     -- Asked for only now, and only if a scan is actually due: it reads
     -- nauvis's map settings, which is not work to repeat on every tick of
     -- every game just so this call site can read tidily.
-    local tiles, surfaces = M.export_terrain(tick, session_id_fn and session_id_fn() or nil)
-    log(string.format("[save-timelapse] terrain scan wrote %d tiles across %d surface(s)", tiles, surfaces))
+    local tiles, surfaces, scenery = M.export_terrain(tick, session_id_fn and session_id_fn() or nil)
+    log(string.format(
+      "[save-timelapse] terrain scan wrote %d tiles and %d scenery entities across %d surface(s)",
+      tiles, scenery, surfaces))
     terrain_scan_pending = false
   end
 end
