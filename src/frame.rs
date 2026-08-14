@@ -327,6 +327,39 @@ pub fn read_header(path: &std::path::Path) -> io::Result<(u64, String)> {
     Ok((tick, surface))
 }
 
+/// Whether a frame file's entity section holds anything.
+///
+/// A bounded prefix, not a parse: the caller is deciding whether to read a
+/// megabase's ground at all.
+pub fn read_has_entities(path: &std::path::Path) -> io::Result<bool> {
+    use std::io::Read;
+
+    let mut prefix = [0u8; 512];
+    let read = {
+        let mut file = std::fs::File::open(path)?;
+        let mut filled = 0;
+        loop {
+            match file.read(&mut prefix[filled..])? {
+                0 => break filled,
+                n => filled += n,
+            }
+            if filled == prefix.len() {
+                break filled;
+            }
+        }
+    };
+
+    let mut r = ByteReader::new(&prefix[..read]);
+    r.magic(MAGIC).ok_or_else(|| invalid(format!("{}: not a frame file (bad magic)", path.display())))?;
+    let version = r.u8().ok_or_else(truncated)?;
+    if !(MIN_SUPPORTED_VERSION..=CURRENT_VERSION).contains(&version) {
+        return Err(invalid(format!("{}: unsupported frame format version {version}", path.display())));
+    }
+    r.u64().ok_or_else(truncated)?;
+    r.string().ok_or_else(truncated)?;
+    Ok(r.tag().ok_or_else(truncated)? != TAG_END_ENTITIES)
+}
+
 pub fn read_binary(bytes: &[u8]) -> io::Result<Frame> {
     // Magic + version + at least an empty trailer: anything shorter cannot
     // possibly be a complete file, whatever else is wrong with it.
@@ -1189,6 +1222,27 @@ mod tests {
         let frame = read_binary(&write_binary(&out)).unwrap();
         assert_eq!(frame.entities.len(), 1);
         assert!(frame.tiles.is_empty());
+    }
+
+    /// Ground cached before the terrain scan collected scenery has an empty
+    /// entity section, and reusing it forever is what would leave a repaired
+    /// capture still missing its ore. Getting this backwards either rescans
+    /// every rebuild or never rescans at all, so both answers are pinned.
+    #[test]
+    fn read_has_entities_tells_scanned_scenery_from_ground_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let tiles = vec![crate::frame::Tile { n: "grass-1".into(), x: 0, y: 0 }];
+
+        let bare = FrameOut { tick: 1, surface: "nauvis", entities: &[], tiles: &tiles, ..Default::default() };
+        let bare_path = dir.path().join("terrain_bare.stfr");
+        std::fs::write(&bare_path, write_binary(&bare)).unwrap();
+        assert!(!read_has_entities(&bare_path).unwrap(), "ground with no scenery");
+
+        let scenery = vec![entity("coal", 900.0, 900.0, 0, 1, 1)];
+        let scanned = FrameOut { tick: 1, surface: "nauvis", entities: &scenery, tiles: &tiles, ..Default::default() };
+        let scanned_path = dir.path().join("terrain_scanned.stfr");
+        std::fs::write(&scanned_path, write_binary(&scanned)).unwrap();
+        assert!(read_has_entities(&scanned_path).unwrap(), "ground with scenery in it");
     }
 }
 

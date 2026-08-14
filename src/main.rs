@@ -1099,6 +1099,14 @@ fn offer_terrain_for_capture(
     // Read once per playthrough. A rebuild otherwise launches Factorio again
     // to be told the same ground, which is now most of what a rebuild costs.
     let cached = cached_terrain(user_dir, session_id);
+    // Ground cached before the scan collected scenery would be reused forever,
+    // leaving out the scenery this exists to supply. One file answering yes
+    // settles it; a capture with no scenery anywhere rescans, which is the safe
+    // way to be wrong.
+    let cached = match cached.iter().any(|p| frame::read_has_entities(p).unwrap_or(false)) {
+        true => cached,
+        false => Vec::new(),
+    };
     println!();
     let wanted = ask_yes_no(
         match cached.is_empty() {
@@ -1312,6 +1320,30 @@ fn add_icons(out: &Path, config: &export::ExportConfig) -> bool {
     copied > 0
 }
 
+/// Copies the rail shapes a scan sampled into a timelapse's description.
+///
+/// Only `rails`, and only where there are none: the scan ran later than the
+/// capture and its frames were written against the capture's own answers.
+/// Edited as JSON so unknown keys survive.
+fn adopt_scanned_rails(scanned: &Path, description: &Path) -> io::Result<bool> {
+    let has_rails = |value: &serde_json::Value| value.get("rails").and_then(|r| r.as_array()).is_some_and(|r| !r.is_empty());
+
+    let scanned: serde_json::Value = serde_json::from_slice(&std::fs::read(scanned)?)?;
+    if !has_rails(&scanned) {
+        return Ok(false);
+    }
+    let mut current: serde_json::Value = serde_json::from_slice(&std::fs::read(description)?)?;
+    if has_rails(&current) {
+        return Ok(false);
+    }
+    let Some(object) = current.as_object_mut() else {
+        return Ok(false);
+    };
+    object.insert("rails".to_string(), scanned["rails"].clone());
+    std::fs::write(description, serde_json::to_vec(&current)?)?;
+    Ok(true)
+}
+
 fn add_terrain(
     save: &Path,
     out: &Path,
@@ -1354,6 +1386,14 @@ fn add_terrain(
                     }
                 }
                 println!("{copied} surface(s) of ground in {:.1}s", scan.seconds);
+
+                if let Some(described) = &scan.prototypes {
+                    match adopt_scanned_rails(described, &out.join("prototypes.json")) {
+                        Ok(true) => println!("  Rail corners recovered from that save."),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("warning: could not read rail shapes from the scan: {e}"),
+                    }
+                }
 
                 // The one failure this cannot prevent and can always see:
                 // Factorio generates chunks as somebody goes, so playing past
@@ -2405,5 +2445,43 @@ mod tests {
     fn parse_save_selection_filter_with_no_matches_is_empty() {
         let s = saves(&["a.zip"]);
         assert!(parse_save_selection("zzz", &s).is_empty());
+    }
+
+    fn write_json(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn scanned_rails_fill_in_a_description_that_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanned = write_json(dir.path(), "scanned.json", r#"{"rails":[{"n":"curved-rail-a"}]}"#);
+        let current = write_json(dir.path(), "prototypes.json", r#"{"rails":[],"types":{"a":"b"}}"#);
+
+        assert!(adopt_scanned_rails(&scanned, &current).unwrap());
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&current).unwrap()).unwrap();
+        assert_eq!(after["rails"].as_array().unwrap().len(), 1);
+        // The capture's own answers are what its frames were written against.
+        assert_eq!(after["types"]["a"], "b");
+    }
+
+    #[test]
+    fn a_description_that_already_has_rails_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanned = write_json(dir.path(), "scanned.json", r#"{"rails":[{"n":"new"}]}"#);
+        let current = write_json(dir.path(), "prototypes.json", r#"{"rails":[{"n":"old"}]}"#);
+
+        assert!(!adopt_scanned_rails(&scanned, &current).unwrap());
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&current).unwrap()).unwrap();
+        assert_eq!(after["rails"][0]["n"], "old");
+    }
+
+    #[test]
+    fn a_scan_that_sampled_no_rails_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanned = write_json(dir.path(), "scanned.json", r#"{"rails":[]}"#);
+        let current = write_json(dir.path(), "prototypes.json", r#"{"rails":[]}"#);
+        assert!(!adopt_scanned_rails(&scanned, &current).unwrap());
     }
 }

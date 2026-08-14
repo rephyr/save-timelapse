@@ -1,4 +1,11 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.8.2
+Date: 2026-08-14
+  Bugfixes:
+    - Ore, trees and cliffs beyond the area your factory covered when you started recording are no longer missing. Rebuild an existing timelapse to get them back
+    - Rail corners are drawn as curves instead of squares
+
+---------------------------------------------------------------------------------------------------
 Version: 0.8.1
 Date: 2026-08-13
   Features:

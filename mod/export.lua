@@ -314,15 +314,71 @@ local function export_surface(surface, tick, session_id)
 end
 
 --- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
---- with an empty entity section and nothing but tiles after it. Placed floor
---- is excluded, the frames already carrying it with the history of when each
---- piece went down.
+--- Fixed rather than read from the settings gating the in-game pass: those
+--- exist to keep a live baseline cheap, and the tool sets them off for its own
+--- runs, so reading them here would scan nothing.
+local SCAN_SCENERY_TYPES = { "resource", "tree", "cliff", "plant", "unit-spawner" }
+
+--- Scenery over `area`, as entity runs.
+---
+--- The in-game pass bounds this by the factory's box at the moment it runs,
+--- which for a live capture is the baseline, so anything reached later was
+--- never recorded. Scanning the finished save also repairs captures already
+--- made.
+local function write_scenery(path, dict, surface, area, checksum)
+  local order, groups, pending_count, written = {}, {}, 0, 0
+
+  local function flush()
+    if pending_count == 0 then
+      return
+    end
+    local parts = {}
+    for i = 1, #order do
+      local name = order[i]
+      local group = groups[name]
+      parts[i] = encode.frame_entity_run(dict, name, group.w, group.h, group.xs, group.ys, group.ds, group.n)
+    end
+    checksum = M.checksummed_write(path, table.concat(parts), true, checksum)
+    order, groups, pending_count = {}, {}, 0
+  end
+
+  for _, entity in pairs(surface.find_entities_filtered({ area = area, type = SCAN_SCENERY_TYPES })) do
+    if entity.valid then
+      local pos = entity.position
+      local group = groups[entity.name]
+      if not group then
+        group = { w = entity.tile_width, h = entity.tile_height, n = 0, xs = {}, ys = {}, ds = {} }
+        groups[entity.name] = group
+        order[#order + 1] = entity.name
+      end
+      local k = group.n + 1
+      group.n, group.xs[k], group.ys[k], group.ds[k] = k, pos.x, pos.y, entity.direction
+      written = written + 1
+      pending_count = pending_count + 1
+
+      -- Flushed like the tiles below: one write per entity would cost
+      -- syscalls rather than entities.
+      if pending_count >= FLUSH_EVERY then
+        flush()
+      end
+    end
+  end
+
+  flush()
+  return { checksum = checksum, written = written }
+end
+
+--- with the scenery of `SCAN_SCENERY_TYPES` in its entity section and natural
+--- ground after it. Placed floor is excluded, the frames already carrying it
+--- with the history of when each piece went down.
 local function export_terrain_to(tick, session_id, surface, area)
   local path = M.EXPORT_DIR .. encode.terrain_name(session_id, surface.name)
   local dict = encode.new_dictionary()
 
   local checksum = encode.checksum_init()
   checksum = M.checksummed_write(path, encode.frame_header(tick, surface.name), false, checksum)
+  local scenery = write_scenery(path, dict, surface, area, checksum)
+  checksum = scenery.checksum
   checksum = M.checksummed_write(path, encode.frame_end_entities(), true, checksum)
 
   local order, groups, pending_count, written = {}, {}, 0, 0
@@ -365,7 +421,7 @@ local function export_terrain_to(tick, session_id, surface, area)
 
   flush()
   M.safe_write_file(path, encode.u32le(checksum), true)
-  return written
+  return written, scenery.written
 end
 
 --- The area a surface's ground should cover: a margin around everything the
@@ -401,20 +457,23 @@ end
 --- that is not placed floor, so water landfilled at hour three reads as
 --- landfill at hour ten.
 function M.export_terrain(tick, session_id)
-  local written, surfaces = 0, 0
+  local written, scenery, surfaces = 0, 0, 0
   for _, surface in pairs(game.surfaces) do
     if M.is_inhabited(surface) then
       local area = terrain_area_for(surface)
       if area then
-        local count = export_terrain_to(tick, session_id, surface, area)
-        if count > 0 then
+        local count, scenery_count = export_terrain_to(tick, session_id, surface, area)
+        -- Either half counts: a surface can be all ore over ungenerated
+        -- ground.
+        if count > 0 or scenery_count > 0 then
           written = written + count
+          scenery = scenery + scenery_count
           surfaces = surfaces + 1
         end
       end
     end
   end
-  return written, surfaces
+  return written, surfaces, scenery
 end
 
 --- A surface is worth exporting if it is nauvis or the player built on it.
@@ -517,9 +576,12 @@ end
 --- otherwise pass for the shape of every piece like it.
 local RAIL_SAMPLES_PER_FACING = 3
 
---- A ceiling on how many rails are looked at per surface. Every facing of
---- every prototype turns up within a few hundred pieces of track, and a
---- megabase has hundreds of thousands.
+--- A ceiling on how many rails are looked at per surface during play, where
+--- this costs somebody's frame rate.
+---
+--- Not a representative sample: the first N found are whichever corner of the
+--- map is enumerated first, so orientations used anywhere else go unrecorded
+--- and draw as squares. The unattended scan passes no limit for that reason.
 local RAIL_SCAN_LIMIT = 3000
 
 --- Which rails connect to which, for each rail prototype and facing.
@@ -537,7 +599,9 @@ local RAIL_SCAN_LIMIT = 3000
 ---
 --- Positions are relative to the piece being described, that being the whole
 --- point: the answer is the same everywhere on the map.
-function M.sample_rail_joints()
+--- `limit` caps how many rails are looked at per surface; nil looks at all of
+--- them, which only the unattended scan can afford.
+function M.sample_rail_joints(limit)
   -- Asked for by name, not by type. `find_entities_filtered` raises on a type
   -- this game does not have, and one bad entry takes the whole call with it,
   -- which is what an empty rail section turned out to mean. Building the list
@@ -566,7 +630,7 @@ function M.sample_rail_joints()
   for _, surface in pairs(game.surfaces) do
     -- Per surface, so one that refuses to be scanned costs only itself.
     local ok, rails = pcall(function()
-      return surface.find_entities_filtered({ name = names, limit = RAIL_SCAN_LIMIT })
+      return surface.find_entities_filtered({ name = names, limit = limit })
     end)
     if not ok then
       log("[save-timelapse] rail scan failed on " .. surface.name .. ": " .. tostring(rails))
@@ -632,10 +696,18 @@ end
 --- rail API differs from this one still gets everything else described. An
 --- empty list is what a capture made before this existed also looks like, and
 --- the desktop side already has to handle that.
-function M.write_prototypes(session_id)
+--- `exhaustive` drops the per-surface rail cap, for callers not running inside
+--- somebody's game.
+function M.write_prototypes(session_id, exhaustive)
   pcall(function()
     local rails = {}
-    local ok, sampled = pcall(M.sample_rail_joints)
+    -- Not `exhaustive and nil or RAIL_SCAN_LIMIT`: `and nil` always falls
+    -- through to the `or`, so that reads as capped whatever is asked for.
+    local limit = RAIL_SCAN_LIMIT
+    if exhaustive then
+      limit = nil
+    end
+    local ok, sampled = pcall(M.sample_rail_joints, limit)
     if ok and sampled then
       rails = sampled
     end
@@ -770,8 +842,15 @@ function M.run_pending_tick_work(tick, session_id_fn)
     -- Asked for only now, and only if a scan is actually due: it reads
     -- nauvis's map settings, which is not work to repeat on every tick of
     -- every game just so this call site can read tidily.
-    local tiles, surfaces = M.export_terrain(tick, session_id_fn and session_id_fn() or nil)
-    log(string.format("[save-timelapse] terrain scan wrote %d tiles across %d surface(s)", tiles, surfaces))
+    local session_id = session_id_fn and session_id_fn() or nil
+    local tiles, surfaces, scenery = M.export_terrain(tick, session_id)
+    -- For the rails: they are sampled from placed track, and live capture
+    -- samples once at the baseline, so a game with no track down yet gets
+    -- square corners forever. This save has the finished factory in it.
+    M.write_prototypes(session_id, true)
+    log(string.format(
+      "[save-timelapse] terrain scan wrote %d tiles and %d scenery entities across %d surface(s)",
+      tiles, scenery, surfaces))
     terrain_scan_pending = false
   end
 end

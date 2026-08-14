@@ -344,6 +344,9 @@ pub struct TerrainScan {
     /// quietly laying a stranger's landscape under somebody's factory.
     pub session_id: u32,
     pub files: Vec<PathBuf>,
+    /// The description the scan wrote, carried back only for its rail shapes:
+    /// a capture whose baseline predates its first rail has none.
+    pub prototypes: Option<PathBuf>,
     pub seconds: f64,
     /// The game tick the scanned save was at, which is the one thing that can
     /// make a scan wrong while succeeding: ground exists only in chunks the
@@ -367,7 +370,7 @@ pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Re
 
     // One session folder per playthrough, and a scan only ever loads one
     // save, so anything else here would mean a stale staging directory.
-    let mut found: Option<(u32, Vec<PathBuf>)> = None;
+    let mut found: Option<(u32, Vec<PathBuf>, Option<PathBuf>)> = None;
     for entry in std::fs::read_dir(&written_to)?.filter_map(Result::ok) {
         let path = entry.path();
         if !path.is_dir() {
@@ -383,11 +386,12 @@ pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Re
             .collect();
         files.sort();
         if !files.is_empty() {
-            found = Some((session_id, files));
+            let described = path.join("prototypes.json");
+            found = Some((session_id, files, described.is_file().then_some(described)));
         }
     }
 
-    let (session_id, files) = found.ok_or_else(|| {
+    let (session_id, files, prototypes) = found.ok_or_else(|| {
         io::Error::other(
             "the scan produced no ground. Either nothing on this save is owned \
              by the player force, or the mod did not run: the scan trigger must \
@@ -400,5 +404,5 @@ pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Re
     // save: the header carries the tick the export ran at.
     let tick = files.first().and_then(|p| crate::frame::read_header(p).ok()).map(|(tick, _)| tick).unwrap_or(0);
 
-    Ok(TerrainScan { session_id, files, seconds: started.elapsed().as_secs_f64(), tick })
+    Ok(TerrainScan { session_id, files, prototypes, seconds: started.elapsed().as_secs_f64(), tick })
 }

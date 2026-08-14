@@ -1512,7 +1512,6 @@ fn draw_world(
             draw_construction_heat(cells, peak, index, camera, screen_center);
         }
     };
-    let pixels_per_tile = camera.pixels_per_tile();
     let (view_min, view_max) = view_bounds(camera, screen_center);
 
     // Scenery is culled against the ground as well as the screen, so trees
@@ -1539,19 +1538,44 @@ fn draw_world(
     // stair-stepping where two ground types meet, at a scale supersampling is
     // already averaging away.
     if let Some(terrain) = terrain {
+        // Scenery rides in the terrain file's entity section. Same detail
+        // switch as its tiles, and for the same reason: an ore field across a
+        // megabase is millions of quads of background.
         match detail.terrain {
-            true => draw_tile_lod_layer(
-                &terrain.tile_lod,
-                &terrain.tile_lod_runs,
-                camera,
-                screen_center,
-                view_min,
-                view_max,
-                registry,
-                counter,
-            ),
+            true => {
+                draw_tile_lod_layer(
+                    &terrain.tile_lod,
+                    &terrain.tile_lod_runs,
+                    camera,
+                    screen_center,
+                    view_min,
+                    view_max,
+                    registry,
+                    counter,
+                );
+                draw_entity_lod_layer(
+                    &terrain.entity_lod,
+                    &terrain.entity_lod_runs,
+                    camera,
+                    screen_center,
+                    registry,
+                    &bounds_for,
+                    counter,
+                );
+            }
             false => {
-                draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter)
+                draw_tile_layer(&terrain.tiles, &terrain.tile_runs, camera, screen_center, view_min, view_max, registry, counter);
+                draw_entity_layer(
+                    &terrain.entities,
+                    &terrain.entity_runs,
+                    camera,
+                    screen_center,
+                    registry,
+                    sprites,
+                    use_sprites,
+                    &bounds_for,
+                    counter,
+                );
             }
         }
     }
@@ -1563,26 +1587,7 @@ fn draw_world(
         draw_tile_lod_layer(&frame.tile_lod, &frame.tile_lod_runs, camera, screen_center, view_min, view_max, registry, counter);
         paint_heat(camera);
 
-        let chunk_px = tiling_quad_size(pixels_per_tile, LOD_CELL_TILES as f32);
-        for run in &frame.entity_lod_runs {
-            let color = registry.entity_color(run.type_id);
-            let (min, max) = bounds_for(run.type_id);
-            let mut drawn = 0;
-            for cell in &frame.entity_lod[run.range()] {
-                let origin = cell.world_origin();
-                if origin.x + (LOD_CELL_TILES as f32) < min.x
-                    || origin.x > max.x
-                    || origin.y + (LOD_CELL_TILES as f32) < min.y
-                    || origin.y > max.y
-                {
-                    continue;
-                }
-                let screen = camera.world_to_screen(origin, screen_center);
-                draw_lod_cell(screen, chunk_px, color);
-                drawn += 1;
-            }
-            counter.quads(None, drawn);
-        }
+        draw_entity_lod_layer(&frame.entity_lod, &frame.entity_lod_runs, camera, screen_center, registry, &bounds_for, counter);
     } else {
         // This frame's floor, then buildings, matching how paving over grass
         // looks in game. Iterating runs keeps the batch intact, sprite and
@@ -1599,54 +1604,119 @@ fn draw_world(
         // mentioned first. With both present on the tile (see `Surface::under`)
         // that showed as ore flickering over the factory. Two filtered passes
         // rather than a sorted copy, this loop allocating nothing per frame.
-        let ore = frame.entity_runs.iter().filter(|run| registry.is_resource(run.type_id));
-        let built = frame.entity_runs.iter().filter(|run| !registry.is_resource(run.type_id));
-        for run in ore.chain(built) {
-            let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
-            let color = registry.entity_color(run.type_id);
-            let rotation_allowed = registry.is_rotation_allowed(run.type_id);
-            // Per run rather than per entity: which prototype this is fixes
-            // whether it is track, and only the facing varies below.
-            let track = registry.is_rail_track(run.type_id);
-            let (min, max) = bounds_for(run.type_id);
-            let mut drawn = 0;
-            for entity in &frame.entities[run.range()] {
-                let (w, h) = (entity.w as u32, entity.h as u32);
-                let segment = track.then(|| registry.rail_segment(run.type_id, entity.d)).flatten();
-                // A rail reaches well past the tile it is recorded on, up to
-                // half of a half diagonal's four tiles, so culling it on its
-                // 1x1 footprint would drop track that is still on screen.
-                let half = match segment {
-                    Some(segment) => Vec2::splat(segment.length / 2.0),
-                    None => entity_cull_half_extents(w, h, entity.d, rotation_allowed),
-                };
-                if entity.x + half.x < min.x
-                    || entity.x - half.x > max.x
-                    || entity.y + half.y < min.y
-                    || entity.y - half.y > max.y
-                {
-                    continue;
-                }
-                let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
-                // Track is drawn as a coloured segment, so it takes the plain
-                // rectangle path even where an icon did load for it.
-                let sprite = segment.is_none().then_some(sprite).flatten();
-                let art = match (segment, sprite) {
-                    (Some(segment), _) => EntityArt::rail(segment),
-                    (None, Some(sprite)) => entity_source(sprite, entity, rotation_allowed),
-                    (None, None) => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
-                };
-                // A frame that knows its own size in tiles is drawn at that
-                // size; everything else still fills its footprint.
-                let size = match art.tiles {
-                    Some(tiles) => tiles * pixels_per_tile,
-                    None => entity_footprint_size(pixels_per_tile, w, h),
-                };
-                draw_entity(screen + art.offset * pixels_per_tile, size, color, sprite, &art);
-                drawn += 1;
+        draw_entity_layer(
+            &frame.entities,
+            &frame.entity_runs,
+            camera,
+            screen_center,
+            registry,
+            sprites,
+            use_sprites,
+            &bounds_for,
+            counter,
+        );
+    }
+}
+
+/// Entities, run by run. Shared with the terrain layer's scenery, so a tree
+/// looks the same whichever file it arrived in.
+#[allow(clippy::too_many_arguments)]
+fn draw_entity_layer(
+    entities: &[RenderEntity],
+    entity_runs: &[Run],
+    camera: &Camera,
+    screen_center: Vec2,
+    registry: &TypeRegistry,
+    sprites: &[Option<Sprite>],
+    use_sprites: bool,
+    bounds_for: &impl Fn(TypeId) -> (Vec2, Vec2),
+    counter: &mut DrawCallCounter,
+) {
+    let pixels_per_tile = camera.pixels_per_tile();
+    // Ore before anything standing on it, for the same reason floor goes
+    // down before buildings.
+    //
+    // Stated here because nothing else states it: runs arrive in type
+    // order, which is intern order, which is whichever name a capture
+    // mentioned first. With both present on the tile (see `Surface::under`)
+    // that showed as ore flickering over the factory. Two filtered passes
+    // rather than a sorted copy, this loop allocating nothing per frame.
+    let ore = entity_runs.iter().filter(|run| registry.is_resource(run.type_id));
+    let built = entity_runs.iter().filter(|run| !registry.is_resource(run.type_id));
+    for run in ore.chain(built) {
+        let sprite = if use_sprites { sprites[run.type_id as usize].as_ref() } else { None };
+        let color = registry.entity_color(run.type_id);
+        let rotation_allowed = registry.is_rotation_allowed(run.type_id);
+        // Per run rather than per entity: which prototype this is fixes
+        // whether it is track, and only the facing varies below.
+        let track = registry.is_rail_track(run.type_id);
+        let (min, max) = bounds_for(run.type_id);
+        let mut drawn = 0;
+        for entity in &entities[run.range()] {
+            let (w, h) = (entity.w as u32, entity.h as u32);
+            let segment = track.then(|| registry.rail_segment(run.type_id, entity.d)).flatten();
+            // A rail reaches well past the tile it is recorded on, up to
+            // half of a half diagonal's four tiles, so culling it on its
+            // 1x1 footprint would drop track that is still on screen.
+            let half = match segment {
+                Some(segment) => Vec2::splat(segment.length / 2.0),
+                None => entity_cull_half_extents(w, h, entity.d, rotation_allowed),
+            };
+            if entity.x + half.x < min.x || entity.x - half.x > max.x || entity.y + half.y < min.y || entity.y - half.y > max.y {
+                continue;
             }
-            counter.quads(sprite.map(|_| run.type_id), drawn);
+            let screen = camera.world_to_screen(Vec2::new(entity.x, entity.y), screen_center);
+            // Track is drawn as a coloured segment, so it takes the plain
+            // rectangle path even where an icon did load for it.
+            let sprite = segment.is_none().then_some(sprite).flatten();
+            let art = match (segment, sprite) {
+                (Some(segment), _) => EntityArt::rail(segment),
+                (None, Some(sprite)) => entity_source(sprite, entity, rotation_allowed),
+                (None, None) => EntityArt::plain(Rect::default(), entity_rotation_radians(w, h, entity.d, rotation_allowed)),
+            };
+            // A frame that knows its own size in tiles is drawn at that
+            // size; everything else still fills its footprint.
+            let size = match art.tiles {
+                Some(tiles) => tiles * pixels_per_tile,
+                None => entity_footprint_size(pixels_per_tile, w, h),
+            };
+            draw_entity(screen + art.offset * pixels_per_tile, size, color, sprite, &art);
+            drawn += 1;
         }
+        counter.quads(sprite.map(|_| run.type_id), drawn);
+    }
+}
+
+/// The chunk-LOD counterpart of `draw_entity_layer`, one flat quad per cell.
+#[allow(clippy::too_many_arguments)]
+fn draw_entity_lod_layer(
+    entity_lod: &[LodCell],
+    entity_lod_runs: &[Run],
+    camera: &Camera,
+    screen_center: Vec2,
+    registry: &TypeRegistry,
+    bounds_for: &impl Fn(TypeId) -> (Vec2, Vec2),
+    counter: &mut DrawCallCounter,
+) {
+    let chunk_px = tiling_quad_size(camera.pixels_per_tile(), LOD_CELL_TILES as f32);
+    for run in entity_lod_runs {
+        let color = registry.entity_color(run.type_id);
+        let (min, max) = bounds_for(run.type_id);
+        let mut drawn = 0;
+        for cell in &entity_lod[run.range()] {
+            let origin = cell.world_origin();
+            if origin.x + (LOD_CELL_TILES as f32) < min.x
+                || origin.x > max.x
+                || origin.y + (LOD_CELL_TILES as f32) < min.y
+                || origin.y > max.y
+            {
+                continue;
+            }
+            let screen = camera.world_to_screen(origin, screen_center);
+            draw_lod_cell(screen, chunk_px, color);
+            drawn += 1;
+        }
+        counter.quads(None, drawn);
     }
 }
 
