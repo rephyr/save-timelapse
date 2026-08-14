@@ -12,9 +12,9 @@ Already have a factory? Save Timelapse can also reconstruct a timelapse from you
 
 ![Interactive Factorio timelapse viewer replaying a megabase](assets/overview.gif)
 
-Thirty seconds of an early factory, recorded and rendered end to end:
+A factory recorded and rendered end to end. Click to watch:
 
-[![Factorio Save Timelapse: an early factory recorded and rendered end to end](https://img.youtube.com/vi/KOBqoYq7GlQ/maxresdefault.jpg)](https://youtu.be/KOBqoYq7GlQ)
+[![Factorio Save Timelapse: a factory recorded and rendered end to end](https://img.youtube.com/vi/CCscPpznCfo/maxresdefault.jpg)](https://youtu.be/CCscPpznCfo)
 
 Captured by the mod while playing, rendered to video by the viewer. No external video editing software was used at any point.
 
