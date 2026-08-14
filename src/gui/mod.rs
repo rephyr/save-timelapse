@@ -58,6 +58,16 @@ enum Screen {
     /// Which recording to build. Loaded when the screen opens, since it reads
     /// the disk and the answer changes as somebody plays.
     Recordings(Vec<Recording>),
+    /// Reading a baseline, which on a megabase is tens of seconds. Its own
+    /// phase rather than the first part of the build, because the places to
+    /// choose between are not known until it finishes, and doing it here means
+    /// the build does not read the same file twice.
+    Opening(Opening),
+    /// Which places to include. Multi select: rows toggle, and the row under
+    /// them starts the build with whatever is ticked.
+    Places(Choosing),
+    /// How often to take a picture, as presets rather than a number to type.
+    Interval(Choosing),
     /// A build in flight, or the sentence it ended with. The window keeps
     /// drawing throughout, which is the whole reason the work is on a thread.
     Building(Running),
@@ -66,6 +76,7 @@ enum Screen {
 }
 
 /// A recording the build screen can offer.
+#[derive(Clone)]
 struct Recording {
     label: String,
     note: String,
@@ -74,11 +85,55 @@ struct Recording {
     name: String,
 }
 
+/// A baseline being read on its own thread.
+struct Opening {
+    loaded: Receiver<Result<Box<Loaded>, String>>,
+    what: String,
+    /// Carried through the wait, because the screens after it need the name
+    /// and the folder and this is the only thing that outlives the choice.
+    recording: Recording,
+}
+
+/// A recording read and ready to build, with the answers gathered so far.
+struct Loaded {
+    replay: replay::Replay,
+    surfaces: Vec<String>,
+}
+
+/// A loaded recording part way through being configured.
+struct Choosing {
+    loaded: Box<Loaded>,
+    recording: Recording,
+    /// One per surface, in the same order.
+    picked: Vec<bool>,
+}
+
+impl Choosing {
+    fn chosen_surfaces(&self) -> Vec<String> {
+        chosen_of(&self.loaded.surfaces, &self.picked)
+    }
+}
+
+/// The ticked names, in the order they were offered.
+///
+/// Order matters rather than being incidental: these go to the writer, which
+/// treats exactly one place differently from several. A free function because
+/// the answer is a property of two lists and nothing else, which is also what
+/// lets it be tested without a loaded recording behind it.
+fn chosen_of(surfaces: &[String], picked: &[bool]) -> Vec<String> {
+    surfaces.iter().zip(picked).filter(|(_, picked)| **picked).map(|(name, _)| name.clone()).collect()
+}
+
+/// The intervals offered, in seconds of game time per frame.
+///
+/// Presets rather than a number to type, for the same reason every list here
+/// is numbered: this is a trade between smoothness and file size that four
+/// points cover, and a free number invites answers nobody wants to sit through.
+const INTERVALS: [(u64, &str); 4] =
+    [(10, "Every 10 seconds"), (30, "Every 30 seconds"), (60, "Every minute"), (300, "Every 5 minutes")];
+
 /// What a build says to the window while it runs.
 enum Update {
-    /// Reading the baseline, which on a megabase is tens of seconds with
-    /// nothing else to report.
-    Loading,
     Frames(usize),
     /// The sentence to show when it is over, whether it worked or not.
     Ended(String),
@@ -102,7 +157,6 @@ impl Running {
     fn drain(&mut self) -> Option<String> {
         loop {
             match self.updates.try_recv() {
-                Ok(Update::Loading) => self.frames = None,
                 Ok(Update::Frames(count)) => self.frames = Some(count),
                 Ok(Update::Ended(message)) => return Some(message),
                 // Disconnected without a word means the thread died. Saying so
@@ -169,6 +223,27 @@ impl App {
                 rows.push(Choice::new("Back", ""));
                 rows
             }
+            // Nothing to choose while a file is being read, but the row is
+            // there so the screen has the same shape as every other one.
+            Screen::Opening(_) => vec![Choice::new("Cancel", "")],
+            Screen::Places(choosing) => {
+                let mut rows: Vec<Choice> = choosing
+                    .loaded
+                    .surfaces
+                    .iter()
+                    .zip(&choosing.picked)
+                    .map(|(name, picked)| Choice::new(&describe::pretty_place(name), if *picked { "included" } else { "" }))
+                    .collect();
+                let picked = choosing.picked.iter().filter(|p| **p).count();
+                rows.push(Choice::new("Continue", format!("{picked} of {}", choosing.picked.len())));
+                rows.push(Choice::new("Back", ""));
+                rows
+            }
+            Screen::Interval(_) => {
+                let mut rows: Vec<Choice> = INTERVALS.iter().map(|(_, label)| Choice::new(label, "")).collect();
+                rows.push(Choice::new("Back", ""));
+                rows
+            }
             // One row, and it stops the build rather than leaving the screen:
             // walking away from work that is still running is how somebody
             // ends up with a half written timelapse and no idea why.
@@ -182,6 +257,9 @@ impl App {
             Screen::Menu => "Save Timelapse",
             Screen::Watch => "Watch a timelapse",
             Screen::Recordings(_) => "Build from a recording",
+            Screen::Opening(opening) => &opening.what,
+            Screen::Places(_) => "Which places?",
+            Screen::Interval(_) => "How often a picture?",
             Screen::Building(running) => &running.what,
             Screen::Done(_) => "Done",
             Screen::Soon(what) => what,
@@ -220,7 +298,37 @@ impl App {
                 None => self.screen = Screen::Menu,
             },
             Screen::Recordings(found) => match found.get(index) {
-                Some(chosen) => self.screen = Screen::Building(start_build(chosen)),
+                Some(chosen) => self.screen = Screen::Opening(start_opening(chosen)),
+                None => self.screen = Screen::Menu,
+            },
+            // Nothing to cancel cleanly part way through a file read, so this
+            // drops the thread's answer rather than pretending to stop it.
+            Screen::Opening(_) => self.screen = Screen::Menu,
+            Screen::Places(choosing) => {
+                let places = choosing.picked.len();
+                match index {
+                    // A place toggles. Nothing confirms until the row below,
+                    // so a mistaken tap costs one more tap rather than a build.
+                    at if at < places => choosing.picked[at] = !choosing.picked[at],
+                    // Continue, unless nothing is ticked: a build of nowhere
+                    // would spend minutes producing an empty folder.
+                    at if at == places && choosing.picked.iter().any(|p| *p) => {
+                        let Screen::Places(choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                            unreachable!("just matched")
+                        };
+                        self.screen = Screen::Interval(choosing);
+                    }
+                    at if at == places => {}
+                    _ => self.screen = Screen::Menu,
+                }
+            }
+            Screen::Interval(_) => match INTERVALS.get(index) {
+                Some(&(seconds, _)) => {
+                    let Screen::Interval(choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                        unreachable!("just matched")
+                    };
+                    self.screen = Screen::Building(start_build(choosing, seconds));
+                }
                 None => self.screen = Screen::Menu,
             },
             // The flag, not the screen: the thread notices within a frame and
@@ -238,7 +346,25 @@ impl App {
             if let Some(message) = running.drain() {
                 self.screen = Screen::Done(message);
             }
+            return;
         }
+
+        let Screen::Opening(opening) = &mut self.screen else { return };
+        let answer = match opening.loaded.try_recv() {
+            Ok(answer) => answer,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("Reading that recording stopped unexpectedly.".to_string()),
+        };
+        let Screen::Opening(opening) = std::mem::replace(&mut self.screen, Screen::Menu) else { unreachable!("just matched") };
+        self.screen = match answer {
+            // Everywhere ticked to begin with: the common answer is all of
+            // them, and starting from nothing means every build needs work
+            // before it can start.
+            Ok(loaded) => {
+                Screen::Places(Choosing { picked: vec![true; loaded.surfaces.len()], loaded, recording: opening.recording })
+            }
+            Err(message) => Screen::Done(message),
+        };
     }
 
     fn draw(&self, column: &Column, choices: &[Choice], hovered: Option<usize>) {
@@ -261,10 +387,22 @@ impl App {
             let baseline = row.text_baseline(LABEL_SIZE);
             self.ui.text(&choice.label, row.x + 18.0, baseline, LABEL_SIZE, if lit { ACCENT } else { TEXT });
 
+            // A ticked place gets an edge as well as a word, so which rows are
+            // in is readable at a glance rather than by reading every note.
+            if choice.note == "included" {
+                draw_rectangle(row.x, row.y, 3.0, row.height, ACCENT);
+            }
+
             if !choice.note.is_empty() {
                 let note_width = self.ui.width(&choice.note, NOTE_SIZE);
                 self.ui.text(&choice.note, row.x + row.width - 18.0 - note_width, baseline, NOTE_SIZE, TEXT_DIM);
             }
+        }
+
+        if let Screen::Opening(_) = &self.screen {
+            let line = "Reading it. This takes a while on a big factory.";
+            let width = self.ui.width(line, NOTE_SIZE);
+            self.ui.text(line, (screen_width() - width) / 2.0, column.top - 30.0, NOTE_SIZE, TEXT_DIM);
         }
 
         if let Screen::Building(running) = &self.screen {
@@ -316,56 +454,80 @@ fn recordings() -> Vec<Recording> {
         .collect()
 }
 
+/// Reads a recording's baseline on its own thread.
+///
+/// Its own phase because it is slow enough to need a screen of its own, and
+/// because what it produces is what the next two screens ask about: the places
+/// to choose between are the ones this finds.
+fn start_opening(chosen: &Recording) -> Opening {
+    let (send, loaded) = channel();
+    let baseline_path = chosen.baseline_path.clone();
+    let session_dir = chosen.session_dir.clone();
+
+    std::thread::spawn(move || {
+        let answer = match replay::load_baseline(&baseline_path) {
+            Ok(replay) => match replay::discover_surfaces(&session_dir, &replay) {
+                Ok(surfaces) => Ok(Box::new(Loaded { replay, surfaces })),
+                Err(e) => Err(format!("Could not tell where this recording has been: {e}")),
+            },
+            Err(e) => Err(format!("Could not read that recording: {e}")),
+        };
+        let _ = send.send(answer);
+    });
+
+    Opening { loaded, what: format!("Reading {}", chosen.label), recording: chosen.clone() }
+}
+
 /// Starts a build on its own thread and hands back the two ends the window
 /// needs: what it says, and how to stop it.
 ///
-/// Every place, at the default interval. Choosing those is two more screens,
-/// and a build that runs with sensible answers is worth more than one that
-/// cannot start until they exist.
-fn start_build(chosen: &Recording) -> Running {
+/// Takes the recording it was given rather than reading it again: the baseline
+/// is already in hand from the screen before, and on a megabase reading it
+/// twice is the slowest thing here done for nothing.
+fn start_build(choosing: Choosing, seconds: u64) -> Running {
     let (send, updates) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
 
-    let out = build::timelapses_root().join(build::as_folder_name(&chosen.name));
-    let baseline_path = chosen.baseline_path.clone();
-    let session_dir = chosen.session_dir.clone();
+    let surfaces = choosing.chosen_surfaces();
+    let out = build::timelapses_root().join(build::as_folder_name(&choosing.recording.name));
+    let session_dir = choosing.recording.session_dir.clone();
+    let what = format!("Building {}", choosing.recording.label);
+    let mut replay = choosing.loaded.replay;
     let flag = Arc::clone(&cancel);
 
     std::thread::spawn(move || {
-        let _ = send.send(Update::Loading);
-        let ended = build_on_thread(&baseline_path, &session_dir, &out, &flag, &send);
+        let ended = build_on_thread(&mut replay, &session_dir, &out, surfaces, seconds, &flag, &send);
         let _ = send.send(Update::Ended(ended));
     });
 
-    Running { updates, cancel, what: format!("Building {}", chosen.label), frames: None }
+    Running { updates, cancel, what, frames: None }
 }
 
 /// The build itself, as one function returning the sentence to show. Split out
-/// so the thread body is three lines and every failure has somewhere to go.
+/// so the thread body is two lines and every failure has somewhere to go.
+#[allow(clippy::too_many_arguments)]
 fn build_on_thread(
-    baseline_path: &std::path::Path,
+    replay: &mut replay::Replay,
     session_dir: &std::path::Path,
     out: &std::path::Path,
+    surfaces: Vec<String>,
+    seconds: u64,
     cancel: &AtomicBool,
     send: &std::sync::mpsc::Sender<Update>,
 ) -> String {
-    let mut replay = match replay::load_baseline(baseline_path) {
-        Ok(loaded) => loaded,
-        Err(e) => return format!("Could not read that recording: {e}"),
-    };
     let _ = std::fs::remove_dir_all(out);
     if let Err(e) = std::fs::create_dir_all(out) {
         return format!("Could not make a folder for it: {e}");
     }
 
     let plan = build::Plan {
-        surfaces: Vec::new(),
-        options: replay::Options { interval: 60 * crate::viewer::TICKS_PER_SECOND, max_frames: 20_000 },
+        surfaces,
+        options: replay::Options { interval: seconds * crate::viewer::TICKS_PER_SECOND, max_frames: 20_000 },
     };
     let mut on_frame = |written: usize| {
         let _ = send.send(Update::Frames(written));
     };
-    match build::timelapse(&mut replay, session_dir, out, &plan, &mut build::Watch { on: &mut on_frame, cancel }) {
+    match build::timelapse(replay, session_dir, out, &plan, &mut build::Watch { on: &mut on_frame, cancel }) {
         Ok(built) if built.cancelled => format!("Stopped after {} frames. What was written is usable.", built.written),
         Ok(built) => format!("Built {} frames in {}", built.written, out.display()),
         Err(e) => format!("The build failed: {e}"),
@@ -454,12 +616,14 @@ mod tests {
         assert_eq!(job.frames, Some(500));
     }
 
+    /// A build that has not written anything yet shows no count at all. Zero
+    /// would claim work that has not started, and the screen says "Starting"
+    /// instead.
     #[test]
-    fn loading_shows_no_count_until_the_first_frame_lands() {
+    fn nothing_is_counted_until_the_first_frame_lands() {
         let (mut job, send) = running();
-        send.send(Update::Loading).unwrap();
-        job.drain();
-        assert_eq!(job.frames, None, "a count of zero would claim work that has not started");
+        assert_eq!(job.drain(), None);
+        assert_eq!(job.frames, None);
 
         send.send(Update::Frames(1)).unwrap();
         job.drain();
@@ -483,6 +647,41 @@ mod tests {
         drop(send);
         let ended = job.drain().expect("a disconnected build must not sit there forever");
         assert!(ended.contains("unexpectedly"), "{ended}");
+    }
+
+    fn places(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The common answer is all of them, so a build needs no work before it
+    /// can start.
+    #[test]
+    fn every_place_starts_ticked() {
+        let surfaces = places(&["nauvis", "vulcanus"]);
+        assert_eq!(chosen_of(&surfaces, &vec![true; surfaces.len()]), ["nauvis", "vulcanus"]);
+    }
+
+    /// Order matters: the chosen names go to the writer, which treats exactly
+    /// one place differently from several.
+    #[test]
+    fn unticking_leaves_the_rest_in_their_original_order() {
+        let surfaces = places(&["nauvis", "vulcanus", "gleba"]);
+        assert_eq!(chosen_of(&surfaces, &[true, false, true]), ["nauvis", "gleba"]);
+        assert_eq!(chosen_of(&surfaces, &[false, false, true]), ["gleba"]);
+    }
+
+    #[test]
+    fn unticking_everything_chooses_nothing() {
+        assert!(chosen_of(&places(&["nauvis", "vulcanus"]), &[false, false]).is_empty());
+    }
+
+    /// Four points cover the trade between smoothness and file size, and each
+    /// has to say what it means in game time rather than in ticks.
+    #[test]
+    fn the_intervals_offered_are_ordered_and_distinct() {
+        let seconds: Vec<u64> = INTERVALS.iter().map(|(s, _)| *s).collect();
+        assert!(seconds.windows(2).all(|w| w[0] < w[1]), "{seconds:?}");
+        assert!(INTERVALS.iter().all(|(_, label)| !label.is_empty()));
     }
 
     /// Stopping raises the flag and nothing else: the thread notices within a
