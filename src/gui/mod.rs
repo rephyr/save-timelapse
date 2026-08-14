@@ -72,7 +72,113 @@ enum Screen {
     /// drawing throughout, which is the whole reason the work is on a thread.
     Building(Running),
     Done(String),
+    /// Which saves to build from, newest first. Multi select, like places.
+    Saves(SavePick),
+    /// Whether to read the ground, which costs one more Factorio run.
+    Ground(SavePick),
+    /// Which timelapse to render, then how. Each step is a list, so the
+    /// answers accumulate in one place rather than in a screen each.
+    Render(Render),
+    /// The three things this program leaves on disk. Split by how recoverable
+    /// each is, the same split the console menu makes.
+    Manage,
+    Listing(Listing),
+    /// Nothing is deleted without this. A list where a click removes something
+    /// is a list where a mis-click does.
+    Confirm(Confirm),
     Soon(&'static str),
+}
+
+/// A video being set up. `step` is which question is on screen.
+struct Render {
+    built: Vec<build::BuiltTimelapse>,
+    step: RenderStep,
+    chosen: Option<usize>,
+    size: (u32, u32),
+    fps: u32,
+    video: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RenderStep {
+    Which,
+    Size,
+    Rate,
+    Kind,
+}
+
+/// The sizes offered, largest last so going up reads as a direction.
+const SIZES: [(u32, u32, &str); 4] =
+    [(1920, 1080, "1080p"), (1280, 720, "720p, smallest and fastest"), (2560, 1440, "1440p"), (3840, 2160, "4K")];
+
+/// Frame rates, as what they are for rather than as numbers alone.
+const RATES: [(u32, &str); 3] = [(30, "30 per second"), (60, "60 per second, smoothest"), (24, "24 per second, filmic")];
+
+/// The saves offered and which are ticked.
+struct SavePick {
+    saves: Vec<std::path::PathBuf>,
+    labels: Vec<String>,
+    notes: Vec<String>,
+    picked: Vec<bool>,
+    ground: bool,
+}
+
+impl SavePick {
+    fn chosen(&self) -> Vec<std::path::PathBuf> {
+        self.saves.iter().zip(&self.picked).filter(|(_, p)| **p).map(|(save, _)| save.clone()).collect()
+    }
+}
+
+/// Which of the three is being looked through, and what it holds.
+struct Listing {
+    kind: Kind,
+    rows: Vec<Deletable>,
+}
+
+/// What a row in a listing is, which decides what deleting it costs.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// A playthrough's recorded history, and the only copy of it.
+    LogData,
+    Timelapse,
+    Video,
+}
+
+impl Kind {
+    fn title(self) -> &'static str {
+        match self {
+            Kind::LogData => "Log data",
+            Kind::Timelapse => "Built timelapses",
+            Kind::Video => "Videos",
+        }
+    }
+
+    /// What losing one costs, said before anything is deleted rather than
+    /// after. Only the first cannot be undone by rebuilding.
+    fn warning(self) -> &'static str {
+        match self {
+            Kind::LogData => {
+                "The only copy of that playthrough's history. It cannot be recovered from your saves, \
+                 because Factorio keeps no record of when anything was built."
+            }
+            Kind::Timelapse => "You can build it again from the log data.",
+            Kind::Video => "You can save it again from the timelapse.",
+        }
+    }
+}
+
+/// One thing a listing offers to delete.
+struct Deletable {
+    label: String,
+    note: String,
+    path: std::path::PathBuf,
+}
+
+/// A delete waiting to be agreed to.
+struct Confirm {
+    kind: Kind,
+    label: String,
+    path: std::path::PathBuf,
 }
 
 /// A recording the build screen can offer.
@@ -248,6 +354,63 @@ impl App {
             // walking away from work that is still running is how somebody
             // ends up with a half written timelapse and no idea why.
             Screen::Building(_) => vec![Choice::new("Stop", "")],
+            Screen::Saves(pick) => {
+                let mut rows: Vec<Choice> = pick
+                    .labels
+                    .iter()
+                    .zip(&pick.notes)
+                    .zip(&pick.picked)
+                    .map(|((label, note), picked)| {
+                        Choice::new(label, if *picked { "included".to_string() } else { note.clone() })
+                    })
+                    .collect();
+                let picked = pick.picked.iter().filter(|p| **p).count();
+                rows.push(Choice::new("Continue", format!("{picked} chosen")));
+                rows.push(Choice::new("Back", ""));
+                rows
+            }
+            Screen::Ground(pick) => vec![
+                Choice::new("Yes, read the ground", if pick.ground { "chosen" } else { "" }),
+                Choice::new("No, just the factory", ""),
+                Choice::new("Back", ""),
+            ],
+            Screen::Render(render) => match render.step {
+                RenderStep::Which => {
+                    let mut rows: Vec<Choice> =
+                        render.built.iter().map(|t| Choice::new(&t.name, format!("{} frames", t.frames))).collect();
+                    rows.push(Choice::new("Back", ""));
+                    rows
+                }
+                RenderStep::Size => {
+                    let mut rows: Vec<Choice> = SIZES.iter().map(|(_, _, label)| Choice::new(label, "")).collect();
+                    rows.push(Choice::new("Back", ""));
+                    rows
+                }
+                RenderStep::Rate => {
+                    let mut rows: Vec<Choice> = RATES.iter().map(|(_, label)| Choice::new(label, "")).collect();
+                    rows.push(Choice::new("Back", ""));
+                    rows
+                }
+                RenderStep::Kind => vec![
+                    Choice::new("One video file", ""),
+                    Choice::new("A picture per frame", "for editing"),
+                    Choice::new("Back", ""),
+                ],
+            },
+            Screen::Manage => vec![
+                Choice::new(Kind::LogData.title(), summary(Kind::LogData)),
+                Choice::new(Kind::Timelapse.title(), summary(Kind::Timelapse)),
+                Choice::new(Kind::Video.title(), summary(Kind::Video)),
+                Choice::new("Back", ""),
+            ],
+            Screen::Listing(listing) => {
+                let mut rows: Vec<Choice> = listing.rows.iter().map(|row| Choice::new(&row.label, row.note.clone())).collect();
+                rows.push(Choice::new("Back", ""));
+                rows
+            }
+            // Delete second, so the row under the pointer when this screen
+            // opens is the harmless one.
+            Screen::Confirm(_) => vec![Choice::new("Keep it", ""), Choice::new("Delete", "")],
             Screen::Done(_) | Screen::Soon(_) => vec![Choice::new("Back", "")],
         }
     }
@@ -262,6 +425,17 @@ impl App {
             Screen::Interval(_) => "How often a picture?",
             Screen::Building(running) => &running.what,
             Screen::Done(_) => "Done",
+            Screen::Render(render) => match render.step {
+                RenderStep::Which => "Which timelapse?",
+                RenderStep::Size => "How big?",
+                RenderStep::Rate => "How smooth?",
+                RenderStep::Kind => "A video, or the frames?",
+            },
+            Screen::Saves(_) => "Which saves?",
+            Screen::Ground(_) => "Include the ground?",
+            Screen::Manage => "Manage",
+            Screen::Listing(listing) => listing.kind.title(),
+            Screen::Confirm(confirm) => &confirm.label,
             Screen::Soon(what) => what,
         }
     }
@@ -281,9 +455,26 @@ impl App {
                         found => Screen::Recordings(found),
                     }
                 }
-                2 => self.screen = Screen::Soon("Build one from save files"),
-                3 => self.screen = Screen::Soon("Save one as a video"),
-                4 => self.screen = Screen::Soon("Manage"),
+                2 => {
+                    self.screen = match save_pick() {
+                        Some(pick) => Screen::Saves(pick),
+                        None => Screen::Done("No Factorio saves found.".to_string()),
+                    }
+                }
+                3 => {
+                    self.screen = match build::list_timelapses() {
+                        built if built.is_empty() => Screen::Done("Build a timelapse first.".to_string()),
+                        built => Screen::Render(Render {
+                            built,
+                            step: RenderStep::Which,
+                            chosen: None,
+                            size: (1920, 1080),
+                            fps: 30,
+                            video: true,
+                        }),
+                    }
+                }
+                4 => self.screen = Screen::Manage,
                 _ => self.quit = true,
             },
             Screen::Watch => match self.timelapses.get(index) {
@@ -335,6 +526,88 @@ impl App {
             // reports what it managed, and the window waits for that rather
             // than pretending it already stopped.
             Screen::Building(running) => running.stop(),
+            Screen::Render(render) => match render.step {
+                RenderStep::Which if index < render.built.len() => {
+                    render.chosen = Some(index);
+                    render.step = RenderStep::Size;
+                }
+                RenderStep::Size if index < SIZES.len() => {
+                    let (width, height, _) = SIZES[index];
+                    render.size = (width, height);
+                    render.step = RenderStep::Rate;
+                }
+                RenderStep::Rate if index < RATES.len() => {
+                    render.fps = RATES[index].0;
+                    render.step = RenderStep::Kind;
+                }
+                RenderStep::Kind if index < 2 => {
+                    render.video = index == 0;
+                    let Screen::Render(render) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                        unreachable!("just matched")
+                    };
+                    self.screen = Screen::Building(start_render(render));
+                }
+                // Back, from wherever: one step at a time rather than out to
+                // the menu, so changing one answer does not lose the others.
+                RenderStep::Which => self.screen = Screen::Menu,
+                RenderStep::Size => render.step = RenderStep::Which,
+                RenderStep::Rate => render.step = RenderStep::Size,
+                RenderStep::Kind => render.step = RenderStep::Rate,
+            },
+            Screen::Saves(pick) => {
+                let count = pick.saves.len();
+                match index {
+                    at if at < count => pick.picked[at] = !pick.picked[at],
+                    at if at == count && pick.picked.iter().any(|p| *p) => {
+                        let Screen::Saves(pick) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                            unreachable!("just matched")
+                        };
+                        self.screen = Screen::Ground(pick);
+                    }
+                    at if at == count => {}
+                    _ => self.screen = Screen::Menu,
+                }
+            }
+            Screen::Ground(_) => {
+                let Screen::Ground(mut pick) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                    unreachable!("just matched")
+                };
+                self.screen = match index {
+                    0 | 1 => {
+                        pick.ground = index == 0;
+                        Screen::Building(start_from_saves(pick))
+                    }
+                    _ => Screen::Menu,
+                };
+            }
+            Screen::Manage => {
+                self.screen = match index {
+                    0 => open_listing(Kind::LogData),
+                    1 => open_listing(Kind::Timelapse),
+                    2 => open_listing(Kind::Video),
+                    _ => Screen::Menu,
+                }
+            }
+            Screen::Listing(listing) => match listing.rows.get(index) {
+                Some(row) => {
+                    self.screen = Screen::Confirm(Confirm {
+                        kind: listing.kind,
+                        label: format!("Delete {}?", row.label),
+                        path: row.path.clone(),
+                    })
+                }
+                None => self.screen = Screen::Manage,
+            },
+            Screen::Confirm(confirm) => {
+                let kind = confirm.kind;
+                self.screen = match index {
+                    1 => match build::delete_path(&confirm.path) {
+                        Ok(()) => open_listing(kind),
+                        Err(e) => Screen::Done(format!("Could not delete it: {e}")),
+                    },
+                    _ => open_listing(kind),
+                };
+            }
             Screen::Done(_) | Screen::Soon(_) => self.screen = Screen::Menu,
         }
     }
@@ -399,6 +672,23 @@ impl App {
             }
         }
 
+        if let Screen::Confirm(confirm) = &self.screen {
+            let warning = confirm.kind.warning();
+            let width = self.ui.width(warning, NOTE_SIZE);
+            // Wrapped by hand only when it has to be: one line reads better,
+            // and the long warning is the one that never fits.
+            match width < column.width * 1.6 {
+                true => self.ui.text(warning, (screen_width() - width) / 2.0, column.top - 30.0, NOTE_SIZE, TEXT_DIM),
+                false => {
+                    for (line, part) in wrapped(warning, 64).iter().enumerate() {
+                        let width = self.ui.width(part, NOTE_SIZE);
+                        let y = column.top - 52.0 + line as f32 * 20.0;
+                        self.ui.text(part, (screen_width() - width) / 2.0, y, NOTE_SIZE, TEXT_DIM);
+                    }
+                }
+            }
+        }
+
         if let Screen::Opening(_) = &self.screen {
             let line = "Reading it. This takes a while on a big factory.";
             let width = self.ui.width(line, NOTE_SIZE);
@@ -430,14 +720,223 @@ impl App {
     }
 }
 
-/// Every recording, newest first, described the way a row wants it.
-fn recordings() -> Vec<Recording> {
-    let Some(user_dir) = crate::locate::factorio_user_dir() else { return Vec::new() };
-    let capture = user_dir.join("script-output").join("save-timelapse");
+/// Renders a video on its own thread.
+///
+/// Reports nothing while it runs, because the renderer opens its own window
+/// and shows the frames as it writes them. What the thread buys is a menu that
+/// still answers while that happens.
+fn start_render(render: Render) -> Running {
+    let (send, updates) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let chosen = &render.built[render.chosen.expect("a timelapse was chosen to get here")];
+    let what = format!("Rendering {}", chosen.name);
+    let request = build::VideoRequest {
+        timelapse: chosen.path.clone(),
+        target: build::videos_root().join(build::as_folder_name(&chosen.name)),
+        width: render.size.0,
+        height: render.size.1,
+        // The busiest place. Choosing between them is one more step, and the
+        // answer for a single-world timelapse is the only one there is.
+        surface: None,
+        video: render.video,
+        fps: render.fps,
+        // Only when FFmpeg is already installed: an MP4 is smaller and is what
+        // sharing sites accept, and nothing here asks anybody to go and get it.
+        mp4: render.video && crate::ffmpeg_available(),
+        overlay_players: false,
+        overlay_clock: render.video,
+    };
+
+    std::thread::spawn(move || {
+        let ended = match std::fs::create_dir_all(request.target.parent().unwrap_or(&request.target))
+            .and_then(|()| build::video(&request))
+        {
+            Ok(()) => format!("Saved to {}", request.target.display()),
+            Err(e) => format!("The render failed: {e}"),
+        };
+        let _ = send.send(Update::Ended(ended));
+    });
+
+    Running { updates, cancel, what, frames: None }
+}
+
+/// The saves this machine has, newest first, with nothing ticked.
+///
+/// Nothing rather than everything, unlike the places picker: every save is a
+/// full Factorio run, so a build of all forty is an hour somebody did not ask
+/// for. Places cost nothing extra to include.
+fn save_pick() -> Option<SavePick> {
+    let user_dir = crate::locate::factorio_user_dir()?;
     let now = std::time::SystemTime::now();
 
-    replay::discover_sessions(&capture)
-        .unwrap_or_default()
+    let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(user_dir.join("saves"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
+        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+
+    let labels = found.iter().map(|(_, path)| path.file_stem().unwrap_or_default().to_string_lossy().into_owned()).collect();
+    let notes =
+        found.iter().map(|(modified, _)| describe::describe_age(now.duration_since(*modified).unwrap_or_default())).collect();
+    let picked = vec![false; found.len()];
+    let saves = found.into_iter().map(|(_, path)| path).collect();
+
+    Some(SavePick { saves, labels, notes, picked, ground: false })
+}
+
+/// Builds from the chosen saves on its own thread.
+///
+/// The order matters and is not the order they were ticked: a timelapse runs
+/// forwards, so the saves go in oldest first however the list showed them.
+fn start_from_saves(pick: SavePick) -> Running {
+    let (send, updates) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    let mut saves = pick.chosen();
+    saves.reverse();
+    let ground = pick.ground;
+    let flag = Arc::clone(&cancel);
+    let what = format!("Building from {} saves", saves.len());
+
+    std::thread::spawn(move || {
+        let ended = from_saves_on_thread(&saves, ground, &flag, &send);
+        let _ = send.send(Update::Ended(ended));
+    });
+
+    Running { updates, cancel, what, frames: None }
+}
+
+/// The from-saves build, as one function returning the sentence to show.
+fn from_saves_on_thread(
+    saves: &[std::path::PathBuf],
+    ground: bool,
+    cancel: &AtomicBool,
+    send: &std::sync::mpsc::Sender<Update>,
+) -> String {
+    let Some(factorio) = crate::locate::locate_factorio() else {
+        return "Could not find factorio.exe. Build from a recording instead, or start the console menu once to point it at your install.".to_string();
+    };
+    let Some(user_dir) = crate::locate::factorio_user_dir() else {
+        return "Could not find your Factorio folder.".to_string();
+    };
+    let Ok(mod_source) = build::mod_source_dir() else {
+        return "Could not find the mod folder that has to sit beside this program.".to_string();
+    };
+
+    let config = crate::export::ExportConfig {
+        factorio,
+        user_mods: user_dir.join("mods"),
+        mod_source,
+        include_resources: false,
+        capture_terrain: ground,
+        terrain_scan: false,
+    };
+
+    let name = saves.last().and_then(|s| s.file_stem()).map(|s| s.to_string_lossy().into_owned());
+    let out = build::timelapses_root().join(build::as_folder_name(&name.unwrap_or_else(|| "timelapse".to_string())));
+    let _ = std::fs::remove_dir_all(&out);
+    if let Err(e) = std::fs::create_dir_all(&out) {
+        return format!("Could not make a folder for it: {e}");
+    }
+    let workspace = std::env::temp_dir().join(format!("save-timelapse-gui-{}", std::process::id()));
+
+    // Counted rather than named: the row shows a running total the same way a
+    // build from a recording does, and the saves have names too long for it.
+    let mut done = 0usize;
+    let mut on_save = |step: build::SaveStep| {
+        if let build::SaveStep::Exported { .. } = step {
+            done += 1;
+            let _ = send.send(Update::Frames(done));
+        }
+    };
+    let exported = match build::from_saves(saves, &out, &workspace, &config, &mut build::Watch { on: &mut on_save, cancel }) {
+        Ok(exported) => exported,
+        Err(e) => return format!("The build failed: {e}"),
+    };
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    if exported.frames.is_empty() {
+        return "None of those saves could be exported.".to_string();
+    }
+    // Best effort from here: a timelapse that exists beats one abandoned for a
+    // step that only makes it smaller or prettier.
+    let _ = build::write_as_delta_chain(&exported.frames);
+    let milestones = crate::milestone::from_saves(exported.milestones);
+    if !milestones.is_empty() {
+        let _ = crate::milestone::write_jsonl(&out.join("milestones.jsonl"), &milestones);
+    }
+
+    let stopped = if exported.cancelled { "Stopped. " } else { "" };
+    format!("{stopped}Built {} frames in {}", exported.frames.len(), out.display())
+}
+
+/// How much of one kind there is, for the row that opens it.
+fn summary(kind: Kind) -> String {
+    let rows = deletables(kind);
+    let bytes: u64 = rows.iter().map(|row| build::size_on_disk(&row.path)).sum();
+    format!("{}, {}", rows.len(), describe::describe_size(bytes))
+}
+
+fn open_listing(kind: Kind) -> Screen {
+    Screen::Listing(Listing { kind, rows: deletables(kind) })
+}
+
+/// What one kind holds, newest first.
+///
+/// All three read the disk each time rather than being cached: deleting one
+/// changes the answer, and so does playing the game in the background.
+fn deletables(kind: Kind) -> Vec<Deletable> {
+    match kind {
+        Kind::LogData => sessions()
+            .into_iter()
+            .map(|session| {
+                let places = describe::describe_places(&session.baseline.surfaces);
+                Deletable {
+                    label: session.label().unwrap_or_else(|| places.clone()),
+                    note: describe::describe_size(session.size_on_disk()),
+                    path: session.session_dir,
+                }
+            })
+            .collect(),
+        Kind::Timelapse => build::list_timelapses()
+            .into_iter()
+            .map(|built| Deletable {
+                label: built.name,
+                note: format!("{} frames, {}", built.frames, describe::describe_size(built.bytes)),
+                path: built.path,
+            })
+            .collect(),
+        Kind::Video => build::list_videos()
+            .into_iter()
+            .map(|video| {
+                let age = video.modified.elapsed().map(describe::describe_age).unwrap_or_else(|_| "unknown".to_string());
+                Deletable {
+                    label: video.name,
+                    note: format!("{}, {age}", describe::describe_size(video.bytes)),
+                    path: video.path,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Every recording this machine has, or none if Factorio cannot be found.
+fn sessions() -> Vec<replay::Session> {
+    let Some(user_dir) = crate::locate::factorio_user_dir() else { return Vec::new() };
+    replay::discover_sessions(&user_dir.join("script-output").join("save-timelapse")).unwrap_or_default()
+}
+
+/// Every recording, newest first, described the way a row wants it.
+fn recordings() -> Vec<Recording> {
+    let now = std::time::SystemTime::now();
+    sessions()
         .into_iter()
         .map(|session| {
             let places = describe::describe_places(&session.baseline.surfaces);
@@ -544,6 +1043,25 @@ fn list_timelapses() -> Vec<Built> {
         .into_iter()
         .map(|found| Built { name: found.name, path: found.path, note: format!("{} frames", found.frames) })
         .collect()
+}
+
+/// Splits `text` into lines of at most `columns` characters, breaking at
+/// spaces. Crude on purpose: the only long text here is one warning, and a
+/// real wrapper would need the font to measure against.
+fn wrapped(text: &str, columns: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("seeded with one");
+        if !line.is_empty() && line.len() + 1 + word.len() > columns {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
 }
 
 pub fn window_conf() -> macroquad::conf::Conf {
@@ -682,6 +1200,78 @@ mod tests {
         let seconds: Vec<u64> = INTERVALS.iter().map(|(s, _)| *s).collect();
         assert!(seconds.windows(2).all(|w| w[0] < w[1]), "{seconds:?}");
         assert!(INTERVALS.iter().all(|(_, label)| !label.is_empty()));
+    }
+
+    fn save_pick_of(saves: &[&str], picked: &[bool]) -> SavePick {
+        SavePick {
+            saves: saves.iter().map(std::path::PathBuf::from).collect(),
+            labels: saves.iter().map(|s| s.to_string()).collect(),
+            notes: vec![String::new(); saves.len()],
+            picked: picked.to_vec(),
+            ground: false,
+        }
+    }
+
+    /// Nothing ticked to begin with, unlike places: every save is a full
+    /// Factorio run, so a build of all forty is an hour nobody asked for.
+    #[test]
+    fn saves_start_unticked_and_keep_their_order() {
+        let pick = save_pick_of(&["c.zip", "b.zip", "a.zip"], &[false, true, true]);
+        assert_eq!(pick.chosen(), [std::path::PathBuf::from("b.zip"), std::path::PathBuf::from("a.zip")]);
+        assert!(save_pick_of(&["a.zip"], &[false]).chosen().is_empty());
+    }
+
+    /// The list shows newest first, but a timelapse runs forwards, so what
+    /// reaches the exporter has to be reversed. Getting this backwards builds
+    /// a factory that shrinks.
+    #[test]
+    fn the_chosen_saves_are_reversed_into_playing_order() {
+        let mut order = save_pick_of(&["newest.zip", "middle.zip", "oldest.zip"], &[true, true, true]).chosen();
+        order.reverse();
+        let names: Vec<String> = order.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(names, ["oldest.zip", "middle.zip", "newest.zip"]);
+    }
+
+    /// Every step has to be reachable and every option say what it means.
+    #[test]
+    fn the_render_steps_offer_something_at_each_one() {
+        assert!(SIZES.iter().all(|(w, h, label)| *w > 0 && *h > 0 && !label.is_empty()));
+        assert!(RATES.iter().all(|(fps, label)| *fps > 0 && !label.is_empty()));
+        assert_eq!(SIZES[0].0, 1920, "the recommended size leads");
+        assert_eq!(RATES[0].0, 30, "and the recommended rate");
+    }
+
+    /// Deleting log data is the one thing here that cannot be undone, so it
+    /// says so rather than sharing a sentence with the two that can.
+    #[test]
+    fn only_log_data_warns_that_it_cannot_be_recovered() {
+        assert!(Kind::LogData.warning().contains("cannot be recovered"));
+        assert!(Kind::Timelapse.warning().contains("build it again"));
+        assert!(Kind::Video.warning().contains("save it again"));
+    }
+
+    #[test]
+    fn every_kind_is_named_for_what_it_holds() {
+        for kind in [Kind::LogData, Kind::Timelapse, Kind::Video] {
+            assert!(!kind.title().is_empty());
+            assert!(!kind.warning().is_empty());
+        }
+    }
+
+    #[test]
+    fn wrapping_breaks_at_spaces_and_keeps_every_word() {
+        let text = "the only copy of that playthrough's history and nothing else";
+        let lines = wrapped(text, 20);
+        assert!(lines.iter().all(|line| line.len() <= 20), "{lines:?}");
+        assert_eq!(lines.join(" "), text, "no word may be lost or split");
+    }
+
+    /// A word longer than the limit goes on its own line rather than looping
+    /// forever looking for a break that is not there.
+    #[test]
+    fn a_word_longer_than_the_line_still_terminates() {
+        let lines = wrapped("short verylongwordthatcannotfit end", 10);
+        assert_eq!(lines, ["short", "verylongwordthatcannotfit", "end"]);
     }
 
     /// Stopping raises the flag and nothing else: the thread notices within a

@@ -16,7 +16,6 @@ use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 use save_timelapse::settings::Settings;
 use save_timelapse::with_thousands;
-use save_timelapse::world;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -328,52 +327,6 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
 /// chain has to be built in the order it will be replayed and the viewer
 /// replays in tick order. Filenames cannot carry that: Factorio's autosaves
 /// rotate, so `_autosave1` is as likely to be the newest as the oldest, and
-/// `ordering_key` can only guess from the digits in a name.
-///
-/// Two saves of one moment are dropped to one here rather than at load. The
-/// viewer deduplicates by tick too, but a delta it dropped would take every
-/// frame after it along with it.
-fn write_as_delta_chain(frames: &[PathBuf]) -> io::Result<(u64, u64)> {
-    let size = |path: &PathBuf| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let before: u64 = frames.iter().map(size).sum();
-
-    let mut ordered: Vec<(u64, &PathBuf)> = Vec::new();
-    for path in frames {
-        match frame::read_header(path) {
-            Ok((tick, _)) => ordered.push((tick, path)),
-            // Unreadable here means unreadable to the viewer as well, so it is
-            // removed rather than left to reset the sequence at load.
-            Err(_) => drop(std::fs::remove_file(path)),
-        }
-    }
-    ordered.sort_by_key(|&(tick, _)| tick);
-
-    let mut chain: Vec<&PathBuf> = Vec::new();
-    let mut last_tick: Option<u64> = None;
-    for (tick, path) in ordered {
-        match last_tick == Some(tick) {
-            true => drop(std::fs::remove_file(path)),
-            false => {
-                chain.push(path);
-                last_tick = Some(tick);
-            }
-        }
-    }
-
-    let mut previous: Option<frame::Frame> = None;
-    for path in &chain {
-        let current = frame::read_binary(&std::fs::read(path)?)?;
-        // Read before it is written, so rewriting in place is safe: the folder
-        // shrinks as it goes rather than needing room for both forms at once.
-        if let Some(prev) = &previous {
-            std::fs::write(path, frame::write_binary(&world::delta_between(prev, &current).as_out()))?;
-        }
-        previous = Some(current);
-    }
-
-    Ok((before, chain.iter().copied().map(size).sum()))
-}
-
 /// Saves are usually numbered, so order by that number rather than
 /// lexicographically, which would place "base10" before "base2".
 fn ordering_key(path: &Path) -> (u64, String) {
@@ -411,30 +364,6 @@ fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
         .filter(|path| path.file_name().and_then(|n| n.to_str()).is_some_and(|name| name.to_lowercase().contains(&needle)))
         .cloned()
         .collect()
-}
-
-/// The Lua mod's source. Tried next to this program first (how it travels
-/// once distributed), then the compile-time project root (running straight out
-/// of target/release), then the current folder.
-fn mod_source_dir() -> io::Result<PathBuf> {
-    let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
-    if let Some(dir) = &exe_sibling {
-        if dir.is_dir() {
-            return Ok(dir.clone());
-        }
-    }
-    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod");
-    if manifest_candidate.is_dir() {
-        return Ok(manifest_candidate);
-    }
-    let cwd_candidate = PathBuf::from("mod");
-    if cwd_candidate.is_dir() {
-        return Ok(cwd_candidate);
-    }
-    Err(io::Error::other(
-        "Could not find the mod/ folder needed to export from saves. It should sit next to \
-         this program (or in the current folder, if running from source).",
-    ))
 }
 
 fn ask_timelapse_choice(built: &[build::BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
@@ -573,12 +502,6 @@ fn ask_fps(default: u32) -> io::Result<u32> {
     }
 }
 
-/// Where finished videos and image sequences go: one folder next to the
-/// executable, like `timelapses/`, so "where did it go" has one answer.
-fn videos_root() -> PathBuf {
-    build::output_dir_next_to_exe("videos")
-}
-
 /// Renders a built timelapse to a video file or an image sequence, by running
 /// the viewer rather than reimplementing it: rendering needs a GPU context and
 /// the whole sprite pipeline.
@@ -659,7 +582,7 @@ Show the in-game clock, so the video says how long the factory took?",
     settings.export_fps = Some(fps);
     remember(settings);
 
-    let root = videos_root();
+    let root = build::videos_root();
     std::fs::create_dir_all(&root)?;
     // No extension here: the viewer appends `.avi` or `.mp4` for a video and
     // treats the path as a folder for an image sequence, so the same argument
@@ -875,7 +798,7 @@ fn add_icons_for_capture(settings: &mut Settings, user_dir: &Path, out: &Path) {
     let Some(factorio) = settings.factorio_exe.clone().or_else(locate_factorio) else {
         return;
     };
-    let Ok(mod_source) = mod_source_dir() else {
+    let Ok(mod_source) = build::mod_source_dir() else {
         return;
     };
     let config = export::ExportConfig {
@@ -995,7 +918,7 @@ fn offer_terrain_for_capture(
     let config = export::ExportConfig {
         factorio,
         user_mods: user_dir.join("mods"),
-        mod_source: mod_source_dir()?,
+        mod_source: build::mod_source_dir()?,
         include_resources: false,
         capture_terrain: true,
         terrain_scan: true,
@@ -1352,7 +1275,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     let config = export::ExportConfig {
         factorio,
         user_mods,
-        mod_source: mod_source_dir()?,
+        mod_source: build::mod_source_dir()?,
         include_resources: false,
         capture_terrain,
         terrain_scan: false,
@@ -1381,7 +1304,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     let milestone_states = exported.milestones;
     let exported = exported.frames;
 
-    match write_as_delta_chain(&exported) {
+    match build::write_as_delta_chain(&exported) {
         Ok((before, after)) if after < before => println!(
             "  frames reduced from {} MiB to {} MiB, each one keeping only what changed",
             before / (1024 * 1024),
@@ -1514,62 +1437,6 @@ fn run() -> io::Result<()> {
 /// The capture management screen: name a playthrough, see what each costs on
 /// disk, delete ones finished with. Deleting is offered here because the
 /// in-game reset only removes the playthrough currently loaded.
-/// One rendered video or image sequence in `videos/`. The viewer writes a file
-/// for a video and a folder of numbered frames for a sequence, so both shapes
-/// are listed the same way and weighed the same way.
-struct BuiltVideo {
-    name: String,
-    path: PathBuf,
-    bytes: u64,
-    modified: SystemTime,
-}
-
-/// Bytes under `path`, whether it is one file or a folder of frames. Best
-/// effort: anything unreadable counts as nothing rather than failing a listing
-/// somebody is only trying to read.
-fn size_on_disk(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::metadata(path) else { return 0 };
-    if meta.is_file() {
-        return meta.len();
-    }
-    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
-    entries.filter_map(Result::ok).map(|entry| size_on_disk(&entry.path())).sum()
-}
-
-fn list_videos() -> Vec<BuiltVideo> {
-    list_videos_in(&videos_root())
-}
-
-/// Split from [`list_videos`] for the same reason as [`list_timelapses_in`]:
-/// the real root is derived from the running executable's own location.
-fn list_videos_in(root: &Path) -> Vec<BuiltVideo> {
-    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
-    let mut found: Vec<BuiltVideo> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some(BuiltVideo {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                bytes: size_on_disk(&path),
-                path,
-                modified,
-            })
-        })
-        .collect();
-    found.sort_by_key(|v| std::cmp::Reverse(v.modified));
-    found
-}
-
-/// Deletes `path`, file or folder, so a video and an image sequence are the
-/// same operation to the caller.
-fn delete_path(path: &Path) -> io::Result<()> {
-    match std::fs::metadata(path)?.is_dir() {
-        true => std::fs::remove_dir_all(path),
-        false => std::fs::remove_file(path),
-    }
-}
-
 /// The three things this tool leaves on disk, split by what losing one costs.
 ///
 /// The log data is a playthrough's recorded history and the only copy of it: it
@@ -1584,7 +1451,7 @@ fn manage(capture_dir: &Path) -> io::Result<()> {
         let recorded: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
         let timelapses = build::list_timelapses();
         let built: u64 = timelapses.iter().map(|t| t.bytes).sum();
-        let videos = list_videos();
+        let videos = build::list_videos();
         let rendered: u64 = videos.iter().map(|v| v.bytes).sum();
 
         let input = prompt(&format!(
@@ -1643,7 +1510,7 @@ fn manage_timelapses() -> io::Result<()> {
 /// was rendered from is still there.
 fn manage_videos() -> io::Result<()> {
     loop {
-        let videos = list_videos();
+        let videos = build::list_videos();
         if videos.is_empty() {
             println!("\n  No videos saved yet.\n");
             return Ok(());
@@ -1667,7 +1534,7 @@ fn manage_videos() -> io::Result<()> {
         let chosen = &videos[index];
         let question = format!("Delete \"{}\"? You can save it again from the timelapse", chosen.name);
         if ask_yes_no(&question, false)? {
-            match delete_path(&chosen.path) {
+            match build::delete_path(&chosen.path) {
                 Ok(()) => println!("Deleted."),
                 Err(e) => println!("Could not delete it: {e}"),
             }
@@ -1912,7 +1779,7 @@ mod tests {
         std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
         std::fs::write(sequence.join("frame_0001.png"), b"pretend frame").unwrap();
 
-        let found = list_videos_in(root.path());
+        let found = build::list_videos_in(root.path());
         assert_eq!(found.len(), 2);
         let beta = found.iter().find(|v| v.name == "beta").expect("the sequence is listed");
         assert_eq!(beta.bytes, b"pretend frame".len() as u64 * 2, "a folder weighs what is inside it");
@@ -1921,7 +1788,7 @@ mod tests {
     #[test]
     fn no_videos_yet_lists_nothing_rather_than_failing() {
         let root = tempfile::tempdir().unwrap();
-        assert!(list_videos_in(&root.path().join("never-created")).is_empty());
+        assert!(build::list_videos_in(&root.path().join("never-created")).is_empty());
     }
 
     /// Deleting a video has to work on both shapes, since which one it is
@@ -1934,9 +1801,9 @@ mod tests {
         std::fs::create_dir_all(&sequence).unwrap();
         std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
 
-        delete_path(&root.path().join("alpha.avi")).unwrap();
-        delete_path(&sequence).unwrap();
-        assert!(list_videos_in(root.path()).is_empty());
+        build::delete_path(&root.path().join("alpha.avi")).unwrap();
+        build::delete_path(&sequence).unwrap();
+        assert!(build::list_videos_in(root.path()).is_empty());
     }
 
     /// Both sidecars a live capture writes have to land next to the frames,
@@ -2237,7 +2104,7 @@ mod tests {
             })
             .collect();
 
-        write_as_delta_chain(&paths).unwrap();
+        build::write_as_delta_chain(&paths).unwrap();
 
         let full: Vec<u64> = paths
             .iter()
@@ -2274,7 +2141,7 @@ mod tests {
             })
             .collect();
 
-        write_as_delta_chain(&paths).unwrap();
+        build::write_as_delta_chain(&paths).unwrap();
 
         let left: Vec<&std::path::PathBuf> = paths.iter().filter(|p| p.exists()).collect();
         assert_eq!(left.len(), 2, "the repeated moment is gone");
@@ -2295,7 +2162,7 @@ mod tests {
             })
             .collect();
 
-        let (before, after) = write_as_delta_chain(&paths).unwrap();
+        let (before, after) = build::write_as_delta_chain(&paths).unwrap();
         assert!(after * 4 < before, "five copies of one factory became one copy and four near-empty frames: {before} to {after}");
     }
 

@@ -561,3 +561,128 @@ pub fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
     found.sort_by_key(|t| std::cmp::Reverse(t.modified));
     found
 }
+
+/// Where finished videos and image sequences go: one folder next to the
+/// executable, like `timelapses/`, so "where did it go" has one answer.
+pub fn videos_root() -> PathBuf {
+    output_dir_next_to_exe("videos")
+}
+
+/// One rendered video or image sequence in `videos/`. The viewer writes a file
+/// for a video and a folder of numbered frames for a sequence, so both shapes
+/// are listed the same way and weighed the same way.
+pub struct BuiltVideo {
+    pub name: String,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub modified: SystemTime,
+}
+
+/// Bytes under `path`, whether it is one file or a folder of frames. Best
+/// effort: anything unreadable counts as nothing rather than failing a listing
+/// somebody is only trying to read.
+pub fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else { return 0 };
+    if meta.is_file() {
+        return meta.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    entries.filter_map(Result::ok).map(|entry| size_on_disk(&entry.path())).sum()
+}
+
+pub fn list_videos() -> Vec<BuiltVideo> {
+    list_videos_in(&videos_root())
+}
+
+/// Split from [`list_videos`] for the same reason as [`list_timelapses_in`]:
+/// the real root is derived from the running executable's own location.
+pub fn list_videos_in(root: &Path) -> Vec<BuiltVideo> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut found: Vec<BuiltVideo> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some(BuiltVideo {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                bytes: size_on_disk(&path),
+                path,
+                modified,
+            })
+        })
+        .collect();
+    found.sort_by_key(|v| std::cmp::Reverse(v.modified));
+    found
+}
+
+/// Deletes `path`, file or folder, so a video and an image sequence are the
+/// same operation to the caller.
+pub fn delete_path(path: &Path) -> io::Result<()> {
+    match std::fs::metadata(path)?.is_dir() {
+        true => std::fs::remove_dir_all(path),
+        false => std::fs::remove_file(path),
+    }
+}
+
+/// frame after it along with it.
+pub fn write_as_delta_chain(frames: &[PathBuf]) -> io::Result<(u64, u64)> {
+    let size = |path: &PathBuf| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let before: u64 = frames.iter().map(size).sum();
+
+    let mut ordered: Vec<(u64, &PathBuf)> = Vec::new();
+    for path in frames {
+        match frame::read_header(path) {
+            Ok((tick, _)) => ordered.push((tick, path)),
+            // Unreadable here means unreadable to the viewer as well, so it is
+            // removed rather than left to reset the sequence at load.
+            Err(_) => drop(std::fs::remove_file(path)),
+        }
+    }
+    ordered.sort_by_key(|&(tick, _)| tick);
+
+    let mut chain: Vec<&PathBuf> = Vec::new();
+    let mut last_tick: Option<u64> = None;
+    for (tick, path) in ordered {
+        match last_tick == Some(tick) {
+            true => drop(std::fs::remove_file(path)),
+            false => {
+                chain.push(path);
+                last_tick = Some(tick);
+            }
+        }
+    }
+
+    let mut previous: Option<frame::Frame> = None;
+    for path in &chain {
+        let current = frame::read_binary(&std::fs::read(path)?)?;
+        // Read before it is written, so rewriting in place is safe: the folder
+        // shrinks as it goes rather than needing room for both forms at once.
+        if let Some(prev) = &previous {
+            std::fs::write(path, frame::write_binary(&crate::world::delta_between(prev, &current).as_out()))?;
+        }
+        previous = Some(current);
+    }
+
+    Ok((before, chain.iter().copied().map(size).sum()))
+}
+/// of target/release), then the current folder.
+pub fn mod_source_dir() -> io::Result<PathBuf> {
+    let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
+    if let Some(dir) = &exe_sibling {
+        if dir.is_dir() {
+            return Ok(dir.clone());
+        }
+    }
+    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod");
+    if manifest_candidate.is_dir() {
+        return Ok(manifest_candidate);
+    }
+    let cwd_candidate = PathBuf::from("mod");
+    if cwd_candidate.is_dir() {
+        return Ok(cwd_candidate);
+    }
+    Err(io::Error::other(
+        "Could not find the mod/ folder needed to export from saves. It should sit next to \
+         this program (or in the current folder, if running from source).",
+    ))
+}
