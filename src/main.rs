@@ -111,7 +111,7 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
              \x20   2  Build one from what you recorded while playing\n\
              \x20   3  Build one from your save files\n\
              \x20   4  Save one as a video file\n\
-             \x20   5  Manage your recordings\n\
+             \x20   5  Manage log data, timelapses and videos\n\
              \x20   6  Quit\n\n\
              \x20 Type a number:"
         ))?;
@@ -196,13 +196,6 @@ fn locate_factorio_exe_interactive(settings: &mut Settings) -> io::Result<PathBu
     }
 }
 
-/// Empty input is the caller's job to treat as "every surface"; this only
-/// ever gets asked about a genuine name, matched case-insensitively so
-/// "Nauvis" and "nauvis" aren't different answers.
-fn find_surface<'a>(input: &str, surfaces: &'a [String]) -> Option<&'a str> {
-    surfaces.iter().find(|s| s.eq_ignore_ascii_case(input)).map(String::as_str)
-}
-
 /// `None` for anything that is not a recognized yes/no word, including empty
 /// input: whether blank means yes is the caller's business.
 fn parse_yes_no(input: &str) -> Option<bool> {
@@ -252,21 +245,27 @@ fn ask_frame_seconds(default: u64) -> io::Result<u64> {
     }
 }
 
-fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
+/// Which places to build, as their real surface names. Never empty: Enter
+/// means all of them.
+///
+/// Numbered rather than typed, like every other list here. Names are the one
+/// thing a player has no reason to know: the places they recognise are called
+/// `nauvis` and `platform-5` underneath, and a capture across four planets and
+/// three platforms is a lot to spell correctly.
+fn ask_surface_choice(surfaces: &[String]) -> io::Result<Vec<String>> {
+    println!("\n  Which places should the timelapse include?\n");
+    for (i, surface) in surfaces.iter().enumerate() {
+        println!("  {}  {}", i + 1, pretty_place(surface));
+    }
     loop {
-        let input = prompt(&format!(
-            "  Include everywhere you have been, or just one place?\n  \
-             You have been to: {}\n\n  \
-             Press Enter for all of them, or type one name:",
-            surfaces.iter().map(|s| pretty_place(s)).collect::<Vec<_>>().join(", ")
-        ))?;
-        if input.is_empty() {
-            return Ok(None);
+        let input = prompt("\n  Type numbers separated by spaces, or press Enter for all of them:")?;
+        if input.trim().is_empty() {
+            return Ok(surfaces.to_vec());
         }
-        if let Some(found) = find_surface(&input, surfaces) {
-            return Ok(Some(found.to_string()));
+        match parse_index_list(&input, surfaces.len()) {
+            Some(chosen) => return Ok(chosen.into_iter().map(|i| surfaces[i].clone()).collect()),
+            None => println!("\n  Please type numbers from 1 to {}, separated by spaces.\n", surfaces.len()),
         }
-        println!("\n  There is no \"{input}\" in that list. Try again.\n");
     }
 }
 
@@ -296,6 +295,23 @@ fn parse_session_index(input: &str, count: usize) -> Option<usize> {
     let one_based: usize = input.trim().parse().ok()?;
     let index = one_based.checked_sub(1)?;
     (index < count).then_some(index)
+}
+
+/// Every index in a list like "1 3 4", "1,3,4" or "1, 3 4".
+///
+/// All or nothing: one bad entry rejects the whole line rather than quietly
+/// selecting the part that parsed, because a typo in a list of places to build
+/// would otherwise be discovered only after the build. Repeats collapse and
+/// order is kept as typed.
+fn parse_index_list(input: &str, count: usize) -> Option<Vec<usize>> {
+    let mut chosen: Vec<usize> = Vec::new();
+    for token in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|token| !token.is_empty()) {
+        let index = parse_session_index(token, count)?;
+        if !chosen.contains(&index) {
+            chosen.push(index);
+        }
+    }
+    (!chosen.is_empty()).then_some(chosen)
 }
 
 /// Only reached when more than one playthrough has capture data waiting.
@@ -576,23 +592,25 @@ fn surfaces_in(dir: &Path) -> Vec<String> {
 /// what Enter gives. `Some("all")` is passed straight through, since the
 /// viewer already understands it as every surface.
 fn ask_export_surface(surfaces: &[String]) -> io::Result<Option<String>> {
+    println!("\n  This timelapse has more than one world in it.\n");
+    for (i, surface) in surfaces.iter().enumerate() {
+        println!("  {}  {}", i + 1, pretty_place(surface));
+    }
+    // Last and numbered like the rest, rather than a word to type: it is one
+    // more thing this list can produce, not a different kind of answer.
+    let every = surfaces.len() + 1;
+    println!("  {every}  One video for each of them");
+
     loop {
-        let input = prompt(&format!(
-            "\nThis timelapse has more than one world in it.\n\
-             Surfaces: {}\n\
-             Enter a name, \"all\" for one file each, or press Enter for the busiest one:",
-            surfaces.join(", ")
-        ))?;
-        if input.is_empty() {
+        let input = prompt("\n  Type a number, or press Enter for the busiest one:")?;
+        if input.trim().is_empty() {
             return Ok(None);
         }
-        if input.eq_ignore_ascii_case("all") {
-            return Ok(Some("all".to_string()));
+        match parse_session_index(&input, every) {
+            Some(index) if index + 1 == every => return Ok(Some("all".to_string())),
+            Some(index) => return Ok(Some(surfaces[index].clone())),
+            None => println!("\n  Please type a number from 1 to {every}.\n"),
         }
-        if let Some(found) = find_surface(&input, surfaces) {
-            return Ok(Some(found.to_string()));
-        }
-        println!("\"{input}\" doesn't match any surface listed above. Try again.");
     }
 }
 
@@ -839,7 +857,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
     println!("{}\n", describe_places(&surfaces));
 
-    let chosen_surface = ask_surface_choice(&surfaces)?;
+    let chosen_surfaces = ask_surface_choice(&surfaces)?;
     let frame_seconds = ask_frame_seconds(settings.frame_seconds.unwrap_or(DEFAULT_FRAME_SECONDS))?;
 
     // Saved before the export, so an answer survives a build that fails.
@@ -866,9 +884,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // recorded before ground moved into its own scan. Kept first because
     // `offer_terrain_for_capture` overwrites it afterwards, which is the right
     // precedence, a scan covering the factory's final extent.
-    match &chosen_surface {
-        None => replay::write_all_terrain(&replay_state.world, replay_state.baseline.tick, &out)?,
-        Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
+    match chosen_surfaces.as_slice() {
+        [name] => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
+        many => replay::write_terrain_of(&replay_state.world, replay_state.baseline.tick, &out, many)?,
     }
 
     copy_session_sidecars(&chosen.session_dir, &out)?;
@@ -880,14 +898,20 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // `write_all_surfaces` can skip a surface nothing has touched.
     let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
 
-    let emitted = match &chosen_surface {
-        None => {
-            println!("\n  Building your timelapse.\n");
+    // One place keeps writing frames named for nothing, which is what a
+    // single-surface timelapse has always been on disk and what the viewer
+    // reads as "one world, unnamed". Two or more are named per surface.
+    let emitted = match chosen_surfaces.as_slice() {
+        many if many.len() != 1 => {
+            match many.len() == surfaces.len() {
+                true => println!("\n  Building your timelapse.\n"),
+                false => println!("\n  Building your timelapse of {}.\n", describe_places(many)),
+            }
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
                     return;
                 }
-                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
+                if let Err(e) = replay::write_surfaces(world, tick, &out, written, &mut surface_revisions, many) {
                     error = Some(e);
                     return;
                 }
@@ -898,7 +922,8 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
                 }
             })?
         }
-        Some(name) => {
+        one => {
+            let name = &one[0];
             println!("\n  Building your timelapse of {}.\n", pretty_place(name));
             replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
                 if error.is_some() {
@@ -1656,7 +1681,7 @@ fn run() -> io::Result<()> {
                 // asking, and it is worth keeping even though nothing was
                 // built.
                 remember(&settings);
-                manage_captures(&dir.join("script-output").join("save-timelapse"))
+                manage(&dir.join("script-output").join("save-timelapse"))
             }),
             Mode::Quit => return Ok(()),
         };
@@ -1759,13 +1784,176 @@ fn describe_session_with_size(session: &replay::Session, now: SystemTime) -> Str
 /// The capture management screen: name a playthrough, see what each costs on
 /// disk, delete ones finished with. Deleting is offered here because the
 /// in-game reset only removes the playthrough currently loaded.
+/// One rendered video or image sequence in `videos/`. The viewer writes a file
+/// for a video and a folder of numbered frames for a sequence, so both shapes
+/// are listed the same way and weighed the same way.
+struct BuiltVideo {
+    name: String,
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+/// Bytes under `path`, whether it is one file or a folder of frames. Best
+/// effort: anything unreadable counts as nothing rather than failing a listing
+/// somebody is only trying to read.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else { return 0 };
+    if meta.is_file() {
+        return meta.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    entries.filter_map(Result::ok).map(|entry| size_on_disk(&entry.path())).sum()
+}
+
+fn list_videos() -> Vec<BuiltVideo> {
+    list_videos_in(&videos_root())
+}
+
+/// Split from [`list_videos`] for the same reason as [`list_timelapses_in`]:
+/// the real root is derived from the running executable's own location.
+fn list_videos_in(root: &Path) -> Vec<BuiltVideo> {
+    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut found: Vec<BuiltVideo> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some(BuiltVideo {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                bytes: size_on_disk(&path),
+                path,
+                modified,
+            })
+        })
+        .collect();
+    found.sort_by_key(|v| std::cmp::Reverse(v.modified));
+    found
+}
+
+/// Deletes `path`, file or folder, so a video and an image sequence are the
+/// same operation to the caller.
+fn delete_path(path: &Path) -> io::Result<()> {
+    match std::fs::metadata(path)?.is_dir() {
+        true => std::fs::remove_dir_all(path),
+        false => std::fs::remove_file(path),
+    }
+}
+
+/// The three things this tool leaves on disk, split by what losing one costs.
+///
+/// The log data is a playthrough's recorded history and the only copy of it: it
+/// cannot be got back from a save, because Factorio keeps no record of when
+/// anything was built. A timelapse and a video are both made from that log, so
+/// deleting either is giving up disk space and a rebuild, not the history.
+/// Putting all three on one screen with one delete made the recoverable and the
+/// irreversible look alike.
+fn manage(capture_dir: &Path) -> io::Result<()> {
+    loop {
+        let sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
+        let recorded: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
+        let timelapses = list_timelapses();
+        let built: u64 = timelapses.iter().map(|t| t.bytes).sum();
+        let videos = list_videos();
+        let rendered: u64 = videos.iter().map(|v| v.bytes).sum();
+
+        let input = prompt(&format!(
+            "\n  What would you like to manage?\n\n\
+             \x20   1  Log data            {:>3}, {}\n\
+             \x20   2  Built timelapses    {:>3}, {}\n\
+             \x20   3  Videos              {:>3}, {}\n\
+             \x20   4  Back\n\n\
+             \x20 Type a number:",
+            sessions.len(),
+            describe_size(recorded),
+            timelapses.len(),
+            describe_size(built),
+            videos.len(),
+            describe_size(rendered),
+        ))?;
+
+        match input.trim() {
+            "1" => manage_captures(capture_dir)?,
+            "2" => manage_timelapses()?,
+            "3" => manage_videos()?,
+            "4" | "" => return Ok(()),
+            _ => println!("\n  Please type a number from 1 to 4.\n"),
+        }
+    }
+}
+
+/// Built timelapses. Deleting one costs the time to build it again and nothing
+/// else, which is why this asks once and says so rather than spelling out a
+/// warning the way [`manage_captures`] has to.
+fn manage_timelapses() -> io::Result<()> {
+    loop {
+        let built = list_timelapses();
+        if built.is_empty() {
+            println!("\n  No timelapses built yet.\n");
+            return Ok(());
+        }
+
+        let Some(index) = ask_timelapse_choice(&built, "Which would you like to delete?")? else {
+            return Ok(());
+        };
+        let chosen = &built[index];
+        let question = format!("Delete \"{}\"? You can build it again from the log data", chosen.name);
+        if ask_yes_no(&question, false)? {
+            match std::fs::remove_dir_all(&chosen.path) {
+                Ok(()) => println!("Deleted."),
+                Err(e) => println!("Could not delete it: {e}"),
+            }
+        } else {
+            println!("Left alone.");
+        }
+    }
+}
+
+/// Videos and image sequences. Cheapest of the three to lose: the timelapse it
+/// was rendered from is still there.
+fn manage_videos() -> io::Result<()> {
+    loop {
+        let videos = list_videos();
+        if videos.is_empty() {
+            println!("\n  No videos saved yet.\n");
+            return Ok(());
+        }
+
+        println!("\n  Your videos:\n");
+        for (i, video) in videos.iter().enumerate() {
+            let age = video.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
+            println!("  {}  {}", i + 1, video.name);
+            println!("     {}, saved {age}\n", describe_size(video.bytes));
+        }
+
+        let input = prompt("  Type a number to delete one, or press Enter to go back:")?;
+        if input.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(index) = parse_session_index(&input, videos.len()) else {
+            println!("\n  Please type a number from 1 to {}.\n", videos.len());
+            continue;
+        };
+        let chosen = &videos[index];
+        let question = format!("Delete \"{}\"? You can save it again from the timelapse", chosen.name);
+        if ask_yes_no(&question, false)? {
+            match delete_path(&chosen.path) {
+                Ok(()) => println!("Deleted."),
+                Err(e) => println!("Could not delete it: {e}"),
+            }
+        } else {
+            println!("Left alone.");
+        }
+    }
+}
+
 fn manage_captures(capture_dir: &Path) -> io::Result<()> {
     loop {
         let mut sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
         if sessions.is_empty() {
             println!(
                 "
-No captures found in {}.",
+No log data found in {}.",
                 capture_dir.display()
             );
             return Ok(());
@@ -1773,25 +1961,32 @@ No captures found in {}.",
 
         let now = SystemTime::now();
         let total: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
-        println!("\n  {} recordings, {} in total:\n", sessions.len(), describe_size(total));
+        println!("\n  Log data from {} playthroughs, {} in total:\n", sessions.len(), describe_size(total));
         for (i, session) in sessions.iter().enumerate() {
             println!("  {}  {}\n", i + 1, describe_session_with_size(session, now));
         }
 
         let action = prompt(
-            "  Type a number to rename one, or \"d\" and a number to delete one.\n\
-             \x20 Press Enter to go back:",
+            "  1  Rename one\n\
+             \x20 2  Delete one permanently\n\n\
+             \x20 Type a number, or press Enter to go back:",
         )?;
         let action = action.trim().to_string();
         if action.is_empty() {
             return Ok(());
         }
+        if action != "1" && action != "2" {
+            println!("\n  Please type 1 or 2, or press Enter to go back.\n");
+            continue;
+        }
 
-        if let Some(rest) = action.strip_prefix('d') {
-            let Some(index) = parse_session_index(rest, sessions.len()) else {
-                println!("Please enter \"d\" followed by a number between 1 and {}.", sessions.len());
-                continue;
-            };
+        let which = prompt(&format!("  Which one? Type a number from 1 to {}:", sessions.len()))?;
+        let Some(index) = parse_session_index(&which, sessions.len()) else {
+            println!("\n  Please type a number from 1 to {}.\n", sessions.len());
+            continue;
+        };
+
+        if action == "2" {
             // Named in the question rather than just numbered: a number is
             // easy to mistype, and this cannot be undone.
             let session = sessions.remove(index);
@@ -1820,10 +2015,6 @@ No captures found in {}.",
             continue;
         }
 
-        let Some(index) = parse_session_index(&action, sessions.len()) else {
-            println!("Please enter a number between 1 and {}, or \"d <number>\" to delete.", sessions.len());
-            continue;
-        };
         let current = sessions[index].label().unwrap_or_default();
         let hint = if current.is_empty() {
             "Enter a name for this capture (or press Enter to leave it unnamed):".to_string()
@@ -1943,6 +2134,73 @@ mod tests {
     fn a_missing_root_lists_nothing_rather_than_failing() {
         let root = tempfile::tempdir().unwrap();
         assert!(list_timelapses_in(&root.path().join("never-created")).is_empty());
+    }
+
+    #[test]
+    fn a_list_of_numbers_can_be_separated_by_spaces_or_commas() {
+        assert_eq!(parse_index_list("1 3", 4), Some(vec![0, 2]));
+        assert_eq!(parse_index_list("1,3", 4), Some(vec![0, 2]));
+        assert_eq!(parse_index_list("  2 ,3,  1 ", 4), Some(vec![1, 2, 0]));
+    }
+
+    /// One bad entry rejects the line. Selecting the part that parsed would
+    /// mean a typo silently builds a different set of places than was asked
+    /// for, and the build is long enough that nobody would catch it.
+    #[test]
+    fn one_bad_entry_rejects_the_whole_list() {
+        assert_eq!(parse_index_list("1 9", 4), None);
+        assert_eq!(parse_index_list("1 nauvis", 4), None);
+        assert_eq!(parse_index_list("0", 4), None, "the list is 1 based");
+        assert_eq!(parse_index_list("", 4), None, "blank is the caller's business, not a selection");
+    }
+
+    /// Typing the same place twice is a slip, not a request for two copies of
+    /// it, and the writer would key both to one surface anyway.
+    #[test]
+    fn repeats_collapse_and_order_is_kept_as_typed() {
+        assert_eq!(parse_index_list("3 1 3", 3), Some(vec![2, 0]));
+    }
+
+    fn rendered(root: &Path, name: &str, bytes: &[u8]) {
+        std::fs::write(root.join(name), bytes).unwrap();
+    }
+
+    /// The viewer writes one file for a video and a folder of numbered frames
+    /// for an image sequence, so both have to be listed and weighed.
+    #[test]
+    fn videos_and_image_sequences_are_both_listed() {
+        let root = tempfile::tempdir().unwrap();
+        rendered(root.path(), "alpha.mp4", b"pretend video");
+        let sequence = root.path().join("beta");
+        std::fs::create_dir_all(&sequence).unwrap();
+        std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
+        std::fs::write(sequence.join("frame_0001.png"), b"pretend frame").unwrap();
+
+        let found = list_videos_in(root.path());
+        assert_eq!(found.len(), 2);
+        let beta = found.iter().find(|v| v.name == "beta").expect("the sequence is listed");
+        assert_eq!(beta.bytes, b"pretend frame".len() as u64 * 2, "a folder weighs what is inside it");
+    }
+
+    #[test]
+    fn no_videos_yet_lists_nothing_rather_than_failing() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(list_videos_in(&root.path().join("never-created")).is_empty());
+    }
+
+    /// Deleting a video has to work on both shapes, since which one it is
+    /// depends on an answer given at export time.
+    #[test]
+    fn deleting_covers_a_file_and_a_folder_alike() {
+        let root = tempfile::tempdir().unwrap();
+        rendered(root.path(), "alpha.avi", b"pretend video");
+        let sequence = root.path().join("beta");
+        std::fs::create_dir_all(&sequence).unwrap();
+        std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
+
+        delete_path(&root.path().join("alpha.avi")).unwrap();
+        delete_path(&sequence).unwrap();
+        assert!(list_videos_in(root.path()).is_empty());
     }
 
     /// Both sidecars a live capture writes have to land next to the frames,
@@ -2391,18 +2649,6 @@ mod tests {
         let mut saves = vec![PathBuf::from("zzz.zip"), PathBuf::from("aaa.zip")];
         saves.sort_by_key(|p| ordering_key(p));
         assert_eq!(saves, vec![PathBuf::from("aaa.zip"), PathBuf::from("zzz.zip")]);
-    }
-
-    #[test]
-    fn find_surface_matches_case_insensitively() {
-        let surfaces = vec!["nauvis".to_string(), "vulcanus".to_string()];
-        assert_eq!(find_surface("Vulcanus", &surfaces), Some("vulcanus"));
-    }
-
-    #[test]
-    fn find_surface_returns_none_for_no_match() {
-        let surfaces = vec!["nauvis".to_string()];
-        assert_eq!(find_surface("fulgora", &surfaces), None);
     }
 
     fn saves(names: &[&str]) -> Vec<PathBuf> {
