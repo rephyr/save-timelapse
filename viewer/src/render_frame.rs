@@ -389,7 +389,8 @@ impl RenderFrame {
         // which sides join onto them. Nothing is both a pipe and a belt, so
         // the three meanings never collide on one entity.
         let pipe_flags: Vec<bool> = entity_ids.iter().map(|&id| registry.is_pipe(id)).collect();
-        crate::pipes::infer_connections(&mut entities, &pipe_flags);
+        let to_ground_flags: Vec<bool> = entity_ids.iter().map(|&id| registry.is_pipe_to_ground(id)).collect();
+        crate::pipes::infer_connections(&mut entities, &pipe_flags, &to_ground_flags);
 
         let tile_ids: Vec<TypeId> = frame.tiles.iter().map(|t| registry.intern(&t.n)).collect();
         let tiles: Vec<RenderTile> = frame.tiles.iter().map(|t| RenderTile { x: t.x, y: t.y }).collect();

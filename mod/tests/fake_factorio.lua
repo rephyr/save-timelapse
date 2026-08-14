@@ -163,14 +163,14 @@ end
 
 --- A surface with just enough on it to be found and named.
 ---
---- `find_entities_filtered` honours `type` and nothing else. The terrain scan
---- asks for scenery types over an area it computed from the player's own
---- entities, so a fake that returned everything to both queries could not tell
---- the two apart, and a test of what the scan picks up would pass on a scan
---- that picked up the wrong things. `force` and `area` stay ignored: no fake
---- entity has a force, and every test that cares about bounds asserts on the
---- bounds directly.
-function M.surface(name, entities)
+--- `find_entities_filtered` honours `type` and nothing else, and
+--- `find_tiles_filtered` honours `name`. The terrain scan asks for scenery
+--- types over an area it computed from the player's own entities, so a fake
+--- that returned everything to both queries could not tell the two apart, and a
+--- test of what the scan picks up would pass on a scan that picked up the wrong
+--- things. `force` and `area` stay ignored: no fake entity has a force, and
+--- every test that cares about bounds asserts on the bounds directly.
+function M.surface(name, entities, tiles)
   return {
     name = name,
     valid = true,
@@ -195,8 +195,39 @@ function M.surface(name, entities)
       end
       return kept
     end,
-    find_tiles_filtered = function() return {} end,
+    find_tiles_filtered = function(filter)
+      local all = tiles or {}
+      local wanted = filter and filter.name
+      if not wanted then
+        return all
+      end
+      if type(wanted) == "string" then
+        wanted = { wanted }
+      end
+      local allowed, kept = {}, {}
+      for _, n in ipairs(wanted) do
+        allowed[n] = true
+      end
+      for _, tile in ipairs(all) do
+        if allowed[tile.name] then
+          kept[#kept + 1] = tile
+        end
+      end
+      return kept
+    end,
     get_tile = function() return { name = "grass-1", valid = true } end,
+  }
+end
+
+--- One tile as a scan reads it. `hidden` is the ground Factorio kept under
+--- placed floor, and `deep` the layer under that.
+function M.tile(fields)
+  return {
+    valid = true,
+    name = fields.name,
+    position = { x = fields.x or 0, y = fields.y or 0 },
+    hidden_tile = fields.hidden,
+    double_hidden_tile = fields.deep,
   }
 end
 

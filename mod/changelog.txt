@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.8.3
+Date: 2026-08-14
+  Graphics:
+    - Pipe runs that dive underground join up on screen instead of stopping dead. A pipe meeting an underground pipe is drawn connected to it, the same as one meeting another pipe. On the test capture this joined up a quarter again as many pipe ends as before
+  Bugfixes:
+    - The ground under paving you laid partway through a playthrough is no longer missing. Concrete placed at hour three used to leave a hole where it would later go, because ground is read from a finished save that already has concrete there. Factorio remembers what paving covered up, so that is read too and the grass is there from the first frame. Rebuild an existing timelapse's ground to fix one already made
+
+---------------------------------------------------------------------------------------------------
 Version: 0.8.2
 Date: 2026-08-14
   Bugfixes:

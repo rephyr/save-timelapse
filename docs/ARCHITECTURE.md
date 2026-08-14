@@ -493,10 +493,25 @@ standing on nothing beyond that first box. Topping it up as the base grows
 would need the covered area tracked in `storage`, a threshold to batch on, ring
 geometry so each top-up writes only what is new, and a stall when one fires.
 
-**What it gives up is ground since built over.** The query asks for everything
-that is not placed floor, so water landfilled at hour three reads as landfill
-at hour ten and its water is never recorded: replayed from the beginning, that
-lake is a hole until the tick the landfill was laid.
+**Ground under placed floor is recovered rather than skipped.** The scan reads
+the finished save, where concrete laid at hour three is already concrete, and
+writing only what is not floor left every paved position with nothing under it:
+replayed from the beginning a paved area was a hole until the tick the concrete
+went down, rather than the grass it was laid on. Factorio keeps the covered tile
+so that mining floor gives the ground back, and keeps a second layer for floor
+over landfill, so `ground_under` asks for the deeper of the two and writes that.
+The floor itself still stays out, the frames carrying when each piece went down.
+
+Both reads are probed once rather than per tile: an API build without the
+property raises rather than answering nil, and a `pcall` per tile would cost
+more than the read it guards. A build that cannot answer, or paving the game
+kept nothing under, leaves that position as it was before, which is the hole.
+
+Cheap because it runs nowhere near anybody's game, and it repairs recordings
+already made: ground is offered against a finished capture, so re-scanning fills
+in paving that was already a hole. What it still gives up is ground the game
+itself no longer holds, an ore patch mined out or a forest cleared having gone
+before the scan ran.
 
 The scan writes into the session folder named for the map seed, which is what
 verifies it: a save from a different playthrough lands under a different
