@@ -6,6 +6,6 @@
   "contact": "",
   "homepage": "",
   "factorio_version": "2.0",
-  "description": "The factory must grow. Unlike your files.\n\nBeta: the recording format is frozen, so a capture keeps working as the tool updates. Still young, so expect the occasional bug. Records your factory as you build it, then replays the whole thing in an interactive viewer you can pan, zoom and scrub through, or export as a video. It takes one snapshot and logs only what changes after that, so it stays cheap enough to leave running on a megabase. The companion tool can also build a timelapse from save files you already have, no mod needed.",
+  "description": "The factory must grow. Unlike your files.\n\nBeta: the recording format is frozen, so a capture keeps working as the tool updates. Still young, so expect the occasional bug. Records your factory as you build it, then replays the whole thing in an interactive viewer you can pan, zoom and scrub through, or export as a video. It takes one snapshot and logs only what changes after that, so it stays cheap enough to leave running on a megabase. The ground your factory stands on, with its ore, trees and cliffs, is read from one of your saves once the timelapse is built, so it costs nothing while you play. The companion tool can also build a timelapse from save files you already have, no mod needed.",
   "dependencies": ["base >= 2.0.0"]
 }
