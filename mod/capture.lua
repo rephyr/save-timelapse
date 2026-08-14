@@ -611,6 +611,17 @@ capture_handler("on_space_platform_mined_tile", function(e) log_tile_change("-",
 -- Without it a modded construction aid places entities capture never sees.
 capture_handler("script_raised_revive", function(e) log_entity("+", e.entity) end)
 
+-- An ore patch is not mined away a removal at a time. The resource entity
+-- stays put while its amount falls and the game destroys it on reaching zero,
+-- raising none of the removal events above, so without this every patch a
+-- factory ever ate sits there full for the rest of the timelapse.
+--
+-- `log_entity` reads the entity, so this relies on the event arriving before
+-- the game destroys it. Its validity check is what makes the other reading
+-- cost the one removal rather than raise. Infinite resources never deplete and
+-- so never reach here, which is correct: they are still there.
+capture_handler("on_resource_depleted", function(e) log_entity("-", e.entity) end)
+
 --- The periodic flush body, run from control.lua's timer multiplexer. Calls
 --- `ensure_capture_segment` directly because a save that starts with capture
 --- already on may reach here before anything is built.
