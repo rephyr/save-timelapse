@@ -1538,16 +1538,9 @@ fn draw_world(
     // stair-stepping where two ground types meet, at a scale supersampling is
     // already averaging away.
     if let Some(terrain) = terrain {
-        // Scenery rides in the terrain file's entity section: ore, trees,
-        // cliffs and nests, scanned across the whole factory once from a
-        // finished save. The in-game pass could only ever see the box the
-        // factory occupied at the moment it ran, which for a live capture is
-        // the baseline, so anything reached later was never recorded at all.
-        //
-        // Drawn on the same detail switch its tiles use, and for the same
-        // reason: this is background, and an ore field across a megabase is
-        // millions of quads that nobody can pick out individually at the zoom
-        // where the switch flips.
+        // Scenery rides in the terrain file's entity section. Same detail
+        // switch as its tiles, and for the same reason: an ore field across a
+        // megabase is millions of quads of background.
         match detail.terrain {
             true => {
                 draw_tile_lod_layer(
@@ -1625,12 +1618,8 @@ fn draw_world(
     }
 }
 
-/// Entities, run by run, in whatever detail the zoom and the sprites allow.
-///
-/// Shared by the frame's own entities and the terrain layer's scenery, which
-/// differ only in where they came from: both are runs over a slice, both want
-/// ore under everything, and drawing the second any other way would give a
-/// tree a different look depending on which file it arrived in.
+/// Entities, run by run. Shared with the terrain layer's scenery, so a tree
+/// looks the same whichever file it arrived in.
 #[allow(clippy::too_many_arguments)]
 fn draw_entity_layer(
     entities: &[RenderEntity],

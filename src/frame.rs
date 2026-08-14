@@ -327,14 +327,10 @@ pub fn read_header(path: &std::path::Path) -> io::Result<(u64, String)> {
     Ok((tick, surface))
 }
 
-/// Whether a frame file's entity section holds anything, from the same
-/// bounded prefix `read_header` reads rather than a full parse.
+/// Whether a frame file's entity section holds anything.
 ///
-/// The entity section sits directly after the header and ends with its own
-/// tag, so an empty one puts that tag first and the answer is three reads in.
-/// A full parse would answer the same question by materializing every tile of
-/// a megabase's ground, which is exactly what the caller is trying to avoid
-/// deciding whether to do.
+/// A bounded prefix, not a parse: the caller is deciding whether to read a
+/// megabase's ground at all.
 pub fn read_has_entities(path: &std::path::Path) -> io::Result<bool> {
     use std::io::Read;
 

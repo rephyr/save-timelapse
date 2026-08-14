@@ -314,27 +314,17 @@ local function export_surface(surface, tick, session_id)
 end
 
 --- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
---- What the scan writes into a terrain file's entity section: the map's own
---- furniture, as opposed to anything a player placed.
----
---- Fixed rather than read from the startup settings that gate the in-game
---- scenery pass. Those settings exist to keep a live baseline from freezing
---- somebody's game, and this pass runs unattended against a save after the
---- playthrough, where that cost does not exist. Reading them here would also
---- mean the scan obeys whatever the *tool* set for its own run, which is off,
---- and it would scan nothing.
+--- Fixed rather than read from the settings gating the in-game pass: those
+--- exist to keep a live baseline cheap, and the tool sets them off for its own
+--- runs, so reading them here would scan nothing.
 local SCAN_SCENERY_TYPES = { "resource", "tree", "cliff", "plant", "unit-spawner" }
 
---- Writes `SCAN_SCENERY_TYPES` over `area` as entity runs, returning the
---- running checksum and how many were written.
+--- Scenery over `area`, as entity runs.
 ---
---- This is the whole reason the scan exists in the form it does. The in-game
---- pass bounds scenery by the factory's bounding box at the moment it runs,
---- and for a live capture that moment is the baseline, so an ore patch reached
---- in hour ten was never inside any box and was never recorded. This one runs
---- against the finished save, where the box is the factory's final extent, so
---- it sees everything the playthrough ever reached. It repairs recordings
---- already made, which a fix to the in-game pass cannot do.
+--- The in-game pass bounds this by the factory's box at the moment it runs,
+--- which for a live capture is the baseline, so anything reached later was
+--- never recorded. Scanning the finished save also repairs captures already
+--- made.
 local function write_scenery(path, dict, surface, area, checksum)
   local order, groups, pending_count, written = {}, {}, 0, 0
 
@@ -366,8 +356,8 @@ local function write_scenery(path, dict, surface, area, checksum)
       written = written + 1
       pending_count = pending_count + 1
 
-      -- Same reason the tile loop below flushes: one write_file per entity
-      -- would make a megabase's ore field cost syscalls rather than entities.
+      -- Flushed like the tiles below: one write per entity would cost
+      -- syscalls rather than entities.
       if pending_count >= FLUSH_EVERY then
         flush()
       end
@@ -473,9 +463,8 @@ function M.export_terrain(tick, session_id)
       local area = terrain_area_for(surface)
       if area then
         local count, scenery_count = export_terrain_to(tick, session_id, surface, area)
-        -- Counted as written when either half found something: a surface can
-        -- be all ore and cliffs over ground the game never generated a tile
-        -- for, and one that is all ground is the ordinary case.
+        -- Either half counts: a surface can be all ore over ungenerated
+        -- ground.
         if count > 0 or scenery_count > 0 then
           written = written + count
           scenery = scenery + scenery_count
@@ -840,7 +829,12 @@ function M.run_pending_tick_work(tick, session_id_fn)
     -- Asked for only now, and only if a scan is actually due: it reads
     -- nauvis's map settings, which is not work to repeat on every tick of
     -- every game just so this call site can read tidily.
-    local tiles, surfaces, scenery = M.export_terrain(tick, session_id_fn and session_id_fn() or nil)
+    local session_id = session_id_fn and session_id_fn() or nil
+    local tiles, surfaces, scenery = M.export_terrain(tick, session_id)
+    -- For the rails: they are sampled from placed track, and live capture
+    -- samples once at the baseline, so a game with no track down yet gets
+    -- square corners forever. This save has the finished factory in it.
+    M.write_prototypes(session_id)
     log(string.format(
       "[save-timelapse] terrain scan wrote %d tiles and %d scenery entities across %d surface(s)",
       tiles, scenery, surfaces))

@@ -263,6 +263,42 @@ check_true("so are trees", terrain_file:find("tree-01", 1, true) ~= nil)
 -- frames, which carry when each piece went down.
 check("what the player built is not duplicated into it", terrain_file:find("electric-mining-drill", 1, true), nil)
 
+-- The scan describes the game again, for the rails ---------------------------
+--
+-- Rail corner shapes cannot be recovered from a recording, so they are sampled
+-- from track that is actually placed. Live capture samples once, at the
+-- baseline, and a playthrough with no track down yet samples nothing and never
+-- looks again unless the modpack changes, so every corner built afterwards
+-- draws as a square. The scanned save has the finished factory in it.
+
+fake.reset(100)
+_G.settings.startup["save-timelapse-terrain-scan"] = { value = true }
+export = load_export()
+_G.prototypes.entity = {
+  ["straight-rail"] = { type = "straight-rail" },
+  ["curved-rail-a"] = { type = "curved-rail-a" },
+}
+local joined = fake.entity({ name = "straight-rail", type = "straight-rail", x = 10, y = 23 })
+local corner = fake.entity({
+  name = "curved-rail-a",
+  type = "curved-rail-a",
+  x = 10,
+  y = 20,
+  connections = { ["0:0"] = joined },
+})
+_G.game.surfaces = { nauvis = fake.surface("nauvis", { corner, joined }) }
+
+export.run_pending_tick_work(5, function() return 0x1234 end)
+
+local described = nil
+for _, write in ipairs(fake.written) do
+  if write.path:find("prototypes.json", 1, true) then
+    described = write.data
+  end
+end
+check_true("the scan writes a description of its own", described ~= nil)
+check_true("with the corner it found in it", described and described:find("curved%-rail%-a") ~= nil)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)
