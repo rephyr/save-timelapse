@@ -6,7 +6,7 @@
 
 [package]
 name = "save-timelapse"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 description = "Build a timelapse of a Factorio factory from existing save files"
 license = "MIT"

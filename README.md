@@ -80,6 +80,20 @@ You only need the companion tool.
 2. Unzip `save-timelapse.exe` into a folder of its own.
 3. Run `save-timelapse.exe`.
 
+One file, and the viewer is part of it. There is nothing to keep beside it except the `mod` folder it unzips with, which it needs to read your saves.
+
+### Prefer a window?
+
+Run it with `--gui` and you get one instead of the text menu:
+
+```bash
+save-timelapse --gui
+```
+
+Everything the menu does is there: watching a timelapse, building one from a recording or from your saves, saving a video, and managing what is on disk. It opens your timelapse the moment it has built it, rather than sending you back to pick it.
+
+It is opt in for this release while it gets some use. The text menu is unchanged and still what you get by double-clicking.
+
 The tool automatically finds your Factorio installation and saves folder and remembers your settings for future runs.
 
 It asks whether to include the natural ground, meaning the grass, water and trees around your factory. It looks considerably better with it. The ground is read in one extra pass over your most recent save rather than recorded into every frame, so it costs one more Factorio run and very little size.
@@ -204,11 +218,11 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.8, the beta:** Incremental frames, 98% smaller timelapses, ground read once per playthrough, MP4 export, video overlays, recording recovery, saves compared against each other, rail drawn along the track
 - **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
 - **v0.8.2:** Scenery scanned from the save rather than bounded to the starting factory, rail corners drawn as curves
-- **v0.8.3:** Ground under paving recovered, exhausted ore patches emptied out, pipes joined to the underground runs they meet
+- **v0.9:** One binary instead of two, a window alongside the text menu, biter expansion and nest clearing recorded, ground under paving recovered, exhausted ore emptied out, pipes joined to underground runs
 
 ### v1.0
 - [ ] Smarter camera auto-follow
-- [ ] Single-binary distribution
+- [ ] The window as the default, rather than behind `--gui`
 
 ---
 
