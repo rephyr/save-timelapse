@@ -1572,8 +1572,11 @@ pub fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
             window_title: "Save Timelapse".to_string(),
-            window_width: 960,
-            window_height: 720,
+            // The same size the viewer opens at, so clicking a timelapse does
+            // not resize the world. Comfortably inside a 1440p or 1080p
+            // screen, and the lists scroll on anything smaller.
+            window_width: 1280,
+            window_height: 800,
             high_dpi: true,
             ..Default::default()
         },
