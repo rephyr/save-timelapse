@@ -29,11 +29,26 @@ const ROW_EDGE: Color = Color::new(1.0, 1.0, 1.0, 0.10);
 const TEXT: Color = Color::new(0.94, 0.94, 0.96, 1.0);
 const TEXT_DIM: Color = Color::new(0.94, 0.94, 0.96, 0.55);
 const ACCENT: Color = Color::new(0.45, 0.75, 1.0, 1.0);
+/// The way out of a screen. Warm rather than the blue everything else uses, so
+/// Back and Quit are found by colour instead of by reading every row.
+const LEAVE: Color = Color::new(0.98, 0.72, 0.42, 1.0);
+const LEAVE_ROW: Color = Color::new(0.98, 0.72, 0.42, 0.07);
+const LEAVE_ROW_HOVER: Color = Color::new(0.98, 0.72, 0.42, 0.18);
 
 const ROW_HEIGHT: f32 = 46.0;
 const LABEL_SIZE: f32 = 20.0;
 const NOTE_SIZE: f32 = 16.0;
 const TITLE_SIZE: f32 = 34.0;
+/// The name, bigger than a screen's own title: it is the one piece of the
+/// window that is the same on every screen, so it carries the identity.
+const NAME_SIZE: f32 = 44.0;
+
+/// A cool light pink for the name, with a deeper one under it for depth and a
+/// wide faint one for the glow. Three shades of one colour rather than three
+/// colours, so it reads as lit rather than as decorated.
+const NAME: Color = Color::new(1.0, 0.72, 0.86, 1.0);
+const NAME_DEEP: Color = Color::new(0.72, 0.36, 0.58, 0.85);
+const NAME_GLOW: Color = Color::new(1.0, 0.60, 0.82, 0.10);
 
 /// One choice in a column: what it says, and the quieter thing it says on the
 /// right. The note is where a count goes, so a row can carry "3 ready" without
@@ -41,11 +56,21 @@ const TITLE_SIZE: f32 = 34.0;
 struct Choice {
     label: String,
     note: String,
+    /// The way out: Back, Quit, and keeping something rather than deleting it.
+    ///
+    /// Marked rather than recognised from the label, so a row that says
+    /// something else can still be the exit and a row that happens to say
+    /// "Back" cannot become one by accident.
+    leave: bool,
 }
 
 impl Choice {
     fn new(label: &str, note: impl Into<String>) -> Choice {
-        Choice { label: label.to_string(), note: note.into() }
+        Choice { label: label.to_string(), note: note.into(), leave: false }
+    }
+
+    fn leaving(label: &str) -> Choice {
+        Choice { leave: true, ..Choice::new(label, "") }
     }
 }
 
@@ -68,6 +93,11 @@ enum Screen {
     Places(Choosing),
     /// How often to take a picture, as presets rather than a number to type.
     Interval(Choosing),
+    /// Whether to read the grass, water and trees under the factory.
+    CaptureGround(Choosing),
+    /// Which save to read it from. Ground only exists where a save had already
+    /// been, so a later save can only ever cover more of the factory.
+    GroundSave(Choosing),
     /// A build in flight, or the sentence it ended with. The window keeps
     /// drawing throughout, which is the whole reason the work is on a thread.
     Building(Running),
@@ -94,17 +124,31 @@ struct Render {
     built: Vec<build::BuiltTimelapse>,
     step: RenderStep,
     chosen: Option<usize>,
+    /// The places this timelapse holds, empty for one unnamed world.
+    surfaces: Vec<String>,
+    /// One place, `"all"` for a file each, or `None` for the busiest.
+    surface: Option<String>,
     size: (u32, u32),
     fps: u32,
     video: bool,
+    clock: bool,
+    players: bool,
+    /// Whether this timelapse knows where anybody was. Only a live capture
+    /// does, so offering the marker otherwise is offering nothing.
+    has_players: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum RenderStep {
     Which,
+    /// Skipped for a timelapse with one world in it, there being no choice.
+    Place,
     Size,
     Rate,
     Kind,
+    /// Skipped for an image sequence: overlays are burnt into a video, and a
+    /// folder of frames is for somebody else's editor to label.
+    Overlays,
 }
 
 /// The sizes offered, largest last so going up reads as a direction.
@@ -186,6 +230,9 @@ struct Confirm {
 struct Recording {
     label: String,
     note: String,
+    /// Which playthrough this is, which is what ties ground to it: a scan of a
+    /// save from another game lands under a different id and is refused.
+    session_id: u32,
     session_dir: std::path::PathBuf,
     baseline_path: std::path::PathBuf,
     name: String,
@@ -212,6 +259,17 @@ struct Choosing {
     recording: Recording,
     /// One per surface, in the same order.
     picked: Vec<bool>,
+    seconds: u64,
+    /// Where the ground comes from, or `None` for a build without it.
+    ground: Option<GroundFrom>,
+}
+
+/// How the ground for this build is going to be got.
+#[derive(Clone)]
+enum GroundFrom {
+    /// Already read for this playthrough, so it costs a file copy.
+    Cache(Vec<std::path::PathBuf>),
+    Save(std::path::PathBuf),
 }
 
 impl Choosing {
@@ -251,6 +309,12 @@ struct Running {
     cancel: Arc<AtomicBool>,
     what: String,
     frames: Option<usize>,
+    /// Whether this job counts anything. A render does not: the window it
+    /// opens shows its own progress, and a second count here would be a
+    /// number nobody can check.
+    counts: bool,
+    /// What to say while it has nothing to count.
+    waiting: String,
 }
 
 impl Running {
@@ -285,6 +349,9 @@ pub struct App {
     screen: Screen,
     /// Rebuilt when a screen opens rather than every frame: it reads the disk.
     timelapses: Vec<crate::gui::Built>,
+    /// How far the current screen is scrolled. Reset whenever the screen
+    /// changes, so opening a short list does not land part way down it.
+    scroll: f32,
     quit: bool,
 }
 
@@ -298,7 +365,7 @@ pub struct Built {
 
 impl Default for App {
     fn default() -> App {
-        App { ui: Ui::new(), screen: Screen::Menu, timelapses: Vec::new(), quit: false }
+        App { ui: Ui::new(), screen: Screen::Menu, timelapses: Vec::new(), scroll: 0.0, quit: false }
     }
 }
 
@@ -316,22 +383,22 @@ impl App {
                     Choice::new("Build one from save files", ""),
                     Choice::new("Save one as a video", ""),
                     Choice::new("Manage", ""),
-                    Choice::new("Quit", ""),
+                    Choice::leaving("Quit"),
                 ]
             }
             Screen::Watch => {
                 let mut rows: Vec<Choice> = self.timelapses.iter().map(|t| Choice::new(&t.name, t.note.clone())).collect();
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             Screen::Recordings(found) => {
                 let mut rows: Vec<Choice> = found.iter().map(|r| Choice::new(&r.label, r.note.clone())).collect();
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             // Nothing to choose while a file is being read, but the row is
             // there so the screen has the same shape as every other one.
-            Screen::Opening(_) => vec![Choice::new("Cancel", "")],
+            Screen::Opening(_) => vec![Choice::leaving("Cancel")],
             Screen::Places(choosing) => {
                 let mut rows: Vec<Choice> = choosing
                     .loaded
@@ -342,18 +409,37 @@ impl App {
                     .collect();
                 let picked = choosing.picked.iter().filter(|p| **p).count();
                 rows.push(Choice::new("Continue", format!("{picked} of {}", choosing.picked.len())));
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             Screen::Interval(_) => {
                 let mut rows: Vec<Choice> = INTERVALS.iter().map(|(_, label)| Choice::new(label, "")).collect();
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
+                rows
+            }
+            Screen::CaptureGround(choosing) => {
+                let cached = !cached_for(&choosing.recording).is_empty();
+                vec![
+                    Choice::new(
+                        "Yes, add the ground",
+                        // Said on the row, because it changes the answer: a
+                        // rescan is one more Factorio run and a reuse is not.
+                        if cached { "already read, instant" } else { "one more Factorio run" },
+                    ),
+                    Choice::new("No, just the factory", ""),
+                    Choice::leaving("Back"),
+                ]
+            }
+            Screen::GroundSave(_) => {
+                let mut rows: Vec<Choice> =
+                    saves_newest_first().into_iter().map(|(label, note, _)| Choice::new(&label, note)).collect();
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             // One row, and it stops the build rather than leaving the screen:
             // walking away from work that is still running is how somebody
             // ends up with a half written timelapse and no idea why.
-            Screen::Building(_) => vec![Choice::new("Stop", "")],
+            Screen::Building(_) => vec![Choice::leaving("Stop")],
             Screen::Saves(pick) => {
                 let mut rows: Vec<Choice> = pick
                     .labels
@@ -366,52 +452,69 @@ impl App {
                     .collect();
                 let picked = pick.picked.iter().filter(|p| **p).count();
                 rows.push(Choice::new("Continue", format!("{picked} chosen")));
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             Screen::Ground(pick) => vec![
                 Choice::new("Yes, read the ground", if pick.ground { "chosen" } else { "" }),
                 Choice::new("No, just the factory", ""),
-                Choice::new("Back", ""),
+                Choice::leaving("Back"),
             ],
             Screen::Render(render) => match render.step {
                 RenderStep::Which => {
                     let mut rows: Vec<Choice> =
                         render.built.iter().map(|t| Choice::new(&t.name, format!("{} frames", t.frames))).collect();
-                    rows.push(Choice::new("Back", ""));
+                    rows.push(Choice::leaving("Back"));
                     rows
                 }
                 RenderStep::Size => {
                     let mut rows: Vec<Choice> = SIZES.iter().map(|(_, _, label)| Choice::new(label, "")).collect();
-                    rows.push(Choice::new("Back", ""));
+                    rows.push(Choice::leaving("Back"));
                     rows
                 }
                 RenderStep::Rate => {
                     let mut rows: Vec<Choice> = RATES.iter().map(|(_, label)| Choice::new(label, "")).collect();
-                    rows.push(Choice::new("Back", ""));
+                    rows.push(Choice::leaving("Back"));
                     rows
                 }
                 RenderStep::Kind => vec![
                     Choice::new("One video file", ""),
                     Choice::new("A picture per frame", "for editing"),
-                    Choice::new("Back", ""),
+                    Choice::leaving("Back"),
                 ],
+                RenderStep::Place => {
+                    let mut rows: Vec<Choice> =
+                        render.surfaces.iter().map(|name| Choice::new(&describe::pretty_place(name), "")).collect();
+                    rows.push(Choice::new("One video for each", ""));
+                    rows.push(Choice::leaving("Back"));
+                    rows
+                }
+                RenderStep::Overlays => {
+                    let on = |yes: bool| if yes { "on" } else { "off" };
+                    let mut rows = vec![Choice::new("In-game clock", on(render.clock))];
+                    if render.has_players {
+                        rows.push(Choice::new("Where you were", on(render.players)));
+                    }
+                    rows.push(Choice::new("Render", ""));
+                    rows.push(Choice::leaving("Back"));
+                    rows
+                }
             },
             Screen::Manage => vec![
                 Choice::new(Kind::LogData.title(), summary(Kind::LogData)),
                 Choice::new(Kind::Timelapse.title(), summary(Kind::Timelapse)),
                 Choice::new(Kind::Video.title(), summary(Kind::Video)),
-                Choice::new("Back", ""),
+                Choice::leaving("Back"),
             ],
             Screen::Listing(listing) => {
                 let mut rows: Vec<Choice> = listing.rows.iter().map(|row| Choice::new(&row.label, row.note.clone())).collect();
-                rows.push(Choice::new("Back", ""));
+                rows.push(Choice::leaving("Back"));
                 rows
             }
             // Delete second, so the row under the pointer when this screen
             // opens is the harmless one.
-            Screen::Confirm(_) => vec![Choice::new("Keep it", ""), Choice::new("Delete", "")],
-            Screen::Done(_) | Screen::Soon(_) => vec![Choice::new("Back", "")],
+            Screen::Confirm(_) => vec![Choice::leaving("Keep it"), Choice::new("Delete", "")],
+            Screen::Done(_) | Screen::Soon(_) => vec![Choice::leaving("Back")],
         }
     }
 
@@ -423,13 +526,17 @@ impl App {
             Screen::Opening(opening) => &opening.what,
             Screen::Places(_) => "Which places?",
             Screen::Interval(_) => "How often a picture?",
+            Screen::CaptureGround(_) => "Add the ground?",
+            Screen::GroundSave(_) => "Read the ground from which save?",
             Screen::Building(running) => &running.what,
             Screen::Done(_) => "Done",
             Screen::Render(render) => match render.step {
                 RenderStep::Which => "Which timelapse?",
                 RenderStep::Size => "How big?",
                 RenderStep::Rate => "How smooth?",
+                RenderStep::Place => "Which place?",
                 RenderStep::Kind => "A video, or the frames?",
+                RenderStep::Overlays => "Anything on top?",
             },
             Screen::Saves(_) => "Which saves?",
             Screen::Ground(_) => "Include the ground?",
@@ -468,9 +575,16 @@ impl App {
                             built,
                             step: RenderStep::Which,
                             chosen: None,
+                            surfaces: Vec::new(),
+                            surface: None,
                             size: (1920, 1080),
                             fps: 30,
                             video: true,
+                            // The clock is what most timelapses want, so it is
+                            // on and the marker is not.
+                            clock: true,
+                            players: false,
+                            has_players: false,
                         }),
                     }
                 }
@@ -513,15 +627,49 @@ impl App {
                     _ => self.screen = Screen::Menu,
                 }
             }
-            Screen::Interval(_) => match INTERVALS.get(index) {
-                Some(&(seconds, _)) => {
-                    let Screen::Interval(choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
-                        unreachable!("just matched")
-                    };
-                    self.screen = Screen::Building(start_build(choosing, seconds));
-                }
-                None => self.screen = Screen::Menu,
-            },
+            Screen::Interval(_) => {
+                let Screen::Interval(mut choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                    unreachable!("just matched")
+                };
+                self.screen = match INTERVALS.get(index) {
+                    Some(&(seconds, _)) => {
+                        choosing.seconds = seconds;
+                        Screen::CaptureGround(choosing)
+                    }
+                    None => Screen::Menu,
+                };
+            }
+            Screen::CaptureGround(_) => {
+                let Screen::CaptureGround(mut choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                    unreachable!("just matched")
+                };
+                self.screen = match index {
+                    // Already read means there is nothing to ask: the save it
+                    // came from stopped mattering once the ground was kept.
+                    0 => match cached_for(&choosing.recording) {
+                        cached if cached.is_empty() => Screen::GroundSave(choosing),
+                        cached => {
+                            choosing.ground = Some(GroundFrom::Cache(cached));
+                            Screen::Building(start_build(choosing))
+                        }
+                    },
+                    1 => Screen::Building(start_build(choosing)),
+                    _ => Screen::Menu,
+                };
+            }
+            Screen::GroundSave(_) => {
+                let Screen::GroundSave(mut choosing) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                    unreachable!("just matched")
+                };
+                let saves = saves_newest_first();
+                self.screen = match saves.get(index) {
+                    Some((_, _, path)) => {
+                        choosing.ground = Some(GroundFrom::Save(path.clone()));
+                        Screen::Building(start_build(choosing))
+                    }
+                    None => Screen::Menu,
+                };
+            }
             // The flag, not the screen: the thread notices within a frame and
             // reports what it managed, and the window waits for that rather
             // than pretending it already stopped.
@@ -529,6 +677,25 @@ impl App {
             Screen::Render(render) => match render.step {
                 RenderStep::Which if index < render.built.len() => {
                     render.chosen = Some(index);
+                    let chosen = &render.built[index];
+                    render.surfaces = build::surfaces_in(&chosen.path);
+                    // Only a live capture records where anybody was, and the
+                    // marker means nothing without it.
+                    render.has_players = chosen.path.join("players.jsonl").is_file();
+                    // One world has no choice to offer, and the viewer picking
+                    // the busiest of one is picking that one.
+                    render.step = match render.surfaces.len() > 1 {
+                        true => RenderStep::Place,
+                        false => RenderStep::Size,
+                    };
+                }
+                RenderStep::Place if index <= render.surfaces.len() => {
+                    render.surface = match render.surfaces.get(index) {
+                        Some(name) => Some(name.clone()),
+                        // The row past the places is "one video for each",
+                        // which the renderer already understands by name.
+                        None => Some("all".to_string()),
+                    };
                     render.step = RenderStep::Size;
                 }
                 RenderStep::Size if index < SIZES.len() => {
@@ -542,15 +709,44 @@ impl App {
                 }
                 RenderStep::Kind if index < 2 => {
                     render.video = index == 0;
-                    let Screen::Render(render) = std::mem::replace(&mut self.screen, Screen::Menu) else {
-                        unreachable!("just matched")
-                    };
-                    self.screen = Screen::Building(start_render(render));
+                    match render.video {
+                        true => render.step = RenderStep::Overlays,
+                        false => {
+                            let Screen::Render(render) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                                unreachable!("just matched")
+                            };
+                            self.screen = Screen::Building(start_render(render));
+                        }
+                    }
+                }
+                RenderStep::Overlays => {
+                    // The rows shift when there is no player log, so they are
+                    // counted rather than numbered: clock, then the marker if
+                    // it is offered, then render, then back.
+                    let marker = render.has_players.then_some(1);
+                    let render_row = 1 + marker.map_or(0, |_| 1);
+                    match index {
+                        0 => render.clock = !render.clock,
+                        at if Some(at) == marker => render.players = !render.players,
+                        at if at == render_row => {
+                            let Screen::Render(render) = std::mem::replace(&mut self.screen, Screen::Menu) else {
+                                unreachable!("just matched")
+                            };
+                            self.screen = Screen::Building(start_render(render));
+                        }
+                        _ => render.step = RenderStep::Kind,
+                    }
                 }
                 // Back, from wherever: one step at a time rather than out to
                 // the menu, so changing one answer does not lose the others.
                 RenderStep::Which => self.screen = Screen::Menu,
-                RenderStep::Size => render.step = RenderStep::Which,
+                RenderStep::Place => render.step = RenderStep::Which,
+                RenderStep::Size => {
+                    render.step = match render.surfaces.len() > 1 {
+                        true => RenderStep::Place,
+                        false => RenderStep::Which,
+                    }
+                }
                 RenderStep::Rate => render.step = RenderStep::Size,
                 RenderStep::Kind => render.step = RenderStep::Rate,
             },
@@ -633,11 +829,51 @@ impl App {
             // Everywhere ticked to begin with: the common answer is all of
             // them, and starting from nothing means every build needs work
             // before it can start.
-            Ok(loaded) => {
-                Screen::Places(Choosing { picked: vec![true; loaded.surfaces.len()], loaded, recording: opening.recording })
-            }
+            Ok(loaded) => Screen::Places(Choosing {
+                picked: vec![true; loaded.surfaces.len()],
+                loaded,
+                recording: opening.recording,
+                seconds: 60,
+                ground: None,
+            }),
             Err(message) => Screen::Done(message),
         };
+    }
+
+    /// The program's name, drawn as the one thing here that is not a list.
+    ///
+    /// Weight comes from redrawing rather than from a bold font, because the
+    /// font is whatever the system had and there is no promise of a bold cut
+    /// of it. Three passes: a wide faint glow, a deeper shade offset down for
+    /// depth, then the face thickened horizontally, which is what a real bold
+    /// mostly is.
+    fn draw_name(&self, center_x: f32, baseline: f32) {
+        let name = "Save Timelapse";
+        let width = self.ui.width(name, NAME_SIZE);
+        let left = center_x - width / 2.0;
+
+        // Eight directions rather than four, because offset copies of a glyph
+        // are not a blur: with only the axes the halo comes out as a cross
+        // rather than as light around the letters.
+        for ring in [3.0f32, 6.0] {
+            let diagonal = ring * std::f32::consts::FRAC_1_SQRT_2;
+            for (dx, dy) in [
+                (-ring, 0.0),
+                (ring, 0.0),
+                (0.0, -ring),
+                (0.0, ring),
+                (-diagonal, -diagonal),
+                (diagonal, -diagonal),
+                (-diagonal, diagonal),
+                (diagonal, diagonal),
+            ] {
+                self.ui.text(name, left + dx, baseline + dy, NAME_SIZE, NAME_GLOW);
+            }
+        }
+        self.ui.text(name, left, baseline + 2.0, NAME_SIZE, NAME_DEEP);
+        for weight in [0.0, 0.6, 1.2] {
+            self.ui.text(name, left + weight, baseline, NAME_SIZE, NAME);
+        }
     }
 
     fn draw(&self, column: &Column, choices: &[Choice], hovered: Option<usize>) {
@@ -647,18 +883,37 @@ impl App {
         // The logo goes here. Until there is one, the name carries the header
         // on its own rather than a placeholder box standing in for artwork
         // nobody has drawn yet.
-        let title = self.title();
-        let width = self.ui.width(title, TITLE_SIZE);
-        self.ui.text(title, center_x - width / 2.0, center_y + TITLE_SIZE / 2.0, TITLE_SIZE, TEXT);
+        match self.screen {
+            Screen::Menu => self.draw_name(center_x, center_y + NAME_SIZE / 2.0),
+            _ => {
+                let title = self.title();
+                let width = self.ui.width(title, TITLE_SIZE);
+                self.ui.text(title, center_x - width / 2.0, center_y + TITLE_SIZE / 2.0, TITLE_SIZE, TEXT);
+            }
+        }
 
         for (index, choice) in choices.iter().enumerate() {
+            if !column.visible(index) {
+                continue;
+            }
             let row = column.row(index);
             let lit = hovered == Some(index);
-            draw_rectangle(row.x, row.y, row.width, row.height, if lit { ROW_HOVER } else { ROW });
+            let fill = match (choice.leave, lit) {
+                (true, true) => LEAVE_ROW_HOVER,
+                (true, false) => LEAVE_ROW,
+                (false, true) => ROW_HOVER,
+                (false, false) => ROW,
+            };
+            draw_rectangle(row.x, row.y, row.width, row.height, fill);
             draw_rectangle_lines(row.x, row.y, row.width, row.height, 1.0, ROW_EDGE);
 
             let baseline = row.text_baseline(LABEL_SIZE);
-            self.ui.text(&choice.label, row.x + 18.0, baseline, LABEL_SIZE, if lit { ACCENT } else { TEXT });
+            let label = match (choice.leave, lit) {
+                (true, _) => LEAVE,
+                (false, true) => ACCENT,
+                (false, false) => TEXT,
+            };
+            self.ui.text(&choice.label, row.x + 18.0, baseline, LABEL_SIZE, label);
 
             // A ticked place gets an edge as well as a word, so which rows are
             // in is readable at a glance rather than by reading every note.
@@ -670,6 +925,20 @@ impl App {
                 let note_width = self.ui.width(&choice.note, NOTE_SIZE);
                 self.ui.text(&choice.note, row.x + row.width - 18.0 - note_width, baseline, NOTE_SIZE, TEXT_DIM);
             }
+        }
+
+        // A list that scrolls says so, otherwise the rows below the fold are
+        // as unreachable as they were before scrolling existed.
+        if column.max_scroll > 0.0 {
+            let track_x = column.x + column.width + 8.0;
+            let track_top = column.view_top;
+            let track_height = column.view_bottom - column.view_top;
+            draw_rectangle(track_x, track_top, 4.0, track_height, ROW);
+
+            let shown = track_height / (track_height + column.max_scroll);
+            let thumb = (track_height * shown).max(24.0);
+            let at = track_top + (track_height - thumb) * (column.scroll / column.max_scroll);
+            draw_rectangle(track_x, at, 4.0, thumb, ROW_HOVER);
         }
 
         if let Screen::Confirm(confirm) = &self.screen {
@@ -696,13 +965,31 @@ impl App {
         }
 
         if let Screen::Building(running) = &self.screen {
-            let line = match running.frames {
-                None => "Reading the recording...".to_string(),
-                Some(0) => "Starting...".to_string(),
-                Some(count) => format!("{} frames", crate::with_thousands(count as u64)),
+            let line = match (running.counts, running.frames) {
+                (false, _) => running.waiting.clone(),
+                (true, None) => "Starting...".to_string(),
+                (true, Some(count)) => format!("{} frames", crate::with_thousands(count as u64)),
             };
             let width = self.ui.width(&line, LABEL_SIZE);
-            self.ui.text(&line, (screen_width() - width) / 2.0, column.top - 30.0, LABEL_SIZE, ACCENT);
+            self.ui.text(&line, (screen_width() - width) / 2.0, column.top - 54.0, LABEL_SIZE, ACCENT);
+
+            // A bar with nothing to measure against, because none of these
+            // know their total until they are over: a recording's frame count
+            // depends on how long it was played, and a render's window shows
+            // its own. It says "still going" rather than "this far along",
+            // which is the honest amount to claim.
+            let bar = layout::Rect { x: column.x, y: column.top - 36.0, width: column.width, height: 6.0 };
+            draw_rectangle(bar.x, bar.y, bar.width, bar.height, ROW);
+            let sweep = (get_time() as f32 * 0.6).fract();
+            let lit = bar.width * 0.25;
+            // Wrapped rather than bounced, so it reads as movement in one
+            // direction rather than as something stuck.
+            let at = bar.x + (bar.width + lit) * sweep - lit;
+            let from = at.max(bar.x);
+            let to = (at + lit).min(bar.x + bar.width);
+            if to > from {
+                draw_rectangle(from, bar.y, to - from, bar.height, ACCENT);
+            }
         }
 
         if let Screen::Done(message) = &self.screen {
@@ -717,6 +1004,76 @@ impl App {
                 self.ui.text(message, (screen_width() - width) / 2.0, column.top - 24.0, NOTE_SIZE, TEXT_DIM);
             }
         }
+    }
+}
+
+/// Ground already read for this playthrough, if any.
+fn cached_for(recording: &Recording) -> Vec<std::path::PathBuf> {
+    let Some(user_dir) = crate::locate::factorio_user_dir() else { return Vec::new() };
+    build::cached_ground(&user_dir, recording.session_id)
+}
+
+/// The saves this machine has, newest first, as label, age and path.
+///
+/// Newest first because ground only exists where a save had already been, so a
+/// later save can only ever cover more of the factory.
+fn saves_newest_first() -> Vec<(String, String, std::path::PathBuf)> {
+    let Some(user_dir) = crate::locate::factorio_user_dir() else { return Vec::new() };
+    let now = std::time::SystemTime::now();
+
+    let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(user_dir.join("saves"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("zip"))
+        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
+        .collect();
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+
+    found
+        .into_iter()
+        .map(|(modified, path)| {
+            let label = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let age = describe::describe_age(now.duration_since(modified).unwrap_or_default());
+            (label, age, path)
+        })
+        .collect()
+}
+
+/// Puts the ground beside the frames, however it was chosen.
+fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32) -> String {
+    let cached = match from {
+        GroundFrom::Cache(cached) => {
+            return match build::reuse_ground(&cached, out) {
+                0 => "The ground already read for this playthrough could not be copied.".to_string(),
+                _ => "Reused the ground already read for this playthrough.".to_string(),
+            }
+        }
+        GroundFrom::Save(save) => save,
+    };
+
+    let Some(factorio) = crate::locate::locate_factorio() else {
+        return "Could not find factorio.exe, so the ground was not read.".to_string();
+    };
+    let Some(user_dir) = crate::locate::factorio_user_dir() else {
+        return "Could not find your Factorio folder, so the ground was not read.".to_string();
+    };
+    let Ok(mod_source) = build::mod_source_dir() else {
+        return "Could not find the mod folder, so the ground was not read.".to_string();
+    };
+
+    let config = crate::export::ExportConfig {
+        factorio,
+        user_mods: user_dir.join("mods"),
+        mod_source,
+        include_resources: false,
+        capture_terrain: true,
+        terrain_scan: true,
+    };
+    match build::scan_ground(&cached, out, &config, Some(session_id)) {
+        Ok(surfaces) => format!("Ground added for {surfaces} place(s)."),
+        Err(message) => message,
     }
 }
 
@@ -736,16 +1093,14 @@ fn start_render(render: Render) -> Running {
         target: build::videos_root().join(build::as_folder_name(&chosen.name)),
         width: render.size.0,
         height: render.size.1,
-        // The busiest place. Choosing between them is one more step, and the
-        // answer for a single-world timelapse is the only one there is.
-        surface: None,
+        surface: render.surface.clone(),
         video: render.video,
         fps: render.fps,
         // Only when FFmpeg is already installed: an MP4 is smaller and is what
         // sharing sites accept, and nothing here asks anybody to go and get it.
         mp4: render.video && crate::ffmpeg_available(),
-        overlay_players: false,
-        overlay_clock: render.video,
+        overlay_players: render.video && render.players,
+        overlay_clock: render.video && render.clock,
     };
 
     std::thread::spawn(move || {
@@ -758,7 +1113,9 @@ fn start_render(render: Render) -> Running {
         let _ = send.send(Update::Ended(ended));
     });
 
-    Running { updates, cancel, what, frames: None }
+    // A render counts nothing here: the window it opens shows its own frames,
+    // and a second count would be a number nobody can check against it.
+    Running { updates, cancel, what, frames: None, counts: false, waiting: "Rendering in its own window...".to_string() }
 }
 
 /// The saves this machine has, newest first, with nothing ticked.
@@ -810,7 +1167,7 @@ fn start_from_saves(pick: SavePick) -> Running {
         let _ = send.send(Update::Ended(ended));
     });
 
-    Running { updates, cancel, what, frames: None }
+    Running { updates, cancel, what, frames: None, counts: true, waiting: "Starting Factorio...".to_string() }
 }
 
 /// The from-saves build, as one function returning the sentence to show.
@@ -943,7 +1300,8 @@ fn recordings() -> Vec<Recording> {
             let label = session.label().unwrap_or_else(|| places.clone());
             let age = describe::describe_age(now.duration_since(session.last_modified).unwrap_or_default());
             Recording {
-                note: format!("{}, {age}", describe::describe_play_time(session.baseline.tick)),
+                session_id: session.session_id,
+                note: format!("{}, {age}", describe::describe_play_time(session.played_tick())),
                 name: session.label().unwrap_or_else(|| format!("{places} ({:08x})", session.session_id)),
                 label,
                 session_dir: session.session_dir,
@@ -983,7 +1341,7 @@ fn start_opening(chosen: &Recording) -> Opening {
 /// Takes the recording it was given rather than reading it again: the baseline
 /// is already in hand from the screen before, and on a megabase reading it
 /// twice is the slowest thing here done for nothing.
-fn start_build(choosing: Choosing, seconds: u64) -> Running {
+fn start_build(choosing: Choosing) -> Running {
     let (send, updates) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -991,15 +1349,30 @@ fn start_build(choosing: Choosing, seconds: u64) -> Running {
     let out = build::timelapses_root().join(build::as_folder_name(&choosing.recording.name));
     let session_dir = choosing.recording.session_dir.clone();
     let what = format!("Building {}", choosing.recording.label);
+    let seconds = choosing.seconds;
+    let ground = choosing.ground.clone();
+    let session_id = choosing.recording.session_id;
     let mut replay = choosing.loaded.replay;
     let flag = Arc::clone(&cancel);
 
     std::thread::spawn(move || {
-        let ended = build_on_thread(&mut replay, &session_dir, &out, surfaces, seconds, &flag, &send);
+        let built = build_on_thread(&mut replay, &session_dir, &out, surfaces, seconds, &flag, &send);
+        // Ground last, and only if the frames worked: it is the slow half, and
+        // there is nothing to lay it under otherwise.
+        let ended = match ground {
+            Some(from) if !built.starts_with("The build failed") && !built.starts_with("Could not") => {
+                format!(
+                    "{built}
+{}",
+                    add_ground(from, &out, session_id)
+                )
+            }
+            _ => built,
+        };
         let _ = send.send(Update::Ended(ended));
     });
 
-    Running { updates, cancel, what, frames: None }
+    Running { updates, cancel, what, frames: None, counts: true, waiting: "Reading the recording...".to_string() }
 }
 
 /// The build itself, as one function returning the sentence to show. Split out
@@ -1082,13 +1455,27 @@ pub async fn run() {
 
     while !app.quit {
         let choices = app.choices();
-        let column = Column::centered(screen_width(), screen_height(), choices.len(), ROW_HEIGHT);
+        let column = Column::centered(screen_width(), screen_height(), choices.len(), ROW_HEIGHT, app.scroll);
+        // Clamped back from what the column worked out, so a wheel spun past
+        // the end does not keep counting up invisibly and then need spinning
+        // all the way back.
+        app.scroll = column.scroll;
+
+        let (_, wheel) = mouse_wheel();
+        if wheel != 0.0 && column.max_scroll > 0.0 {
+            app.scroll = (app.scroll - wheel * ROW_HEIGHT).clamp(0.0, column.max_scroll);
+        }
+
         let (mouse_x, mouse_y) = mouse_position();
         let hovered = column.hit(mouse_x, mouse_y);
 
         if is_mouse_button_pressed(MouseButton::Left) {
             if let Some(index) = hovered {
+                let was = std::mem::discriminant(&app.screen);
                 app.choose(index);
+                if was != std::mem::discriminant(&app.screen) {
+                    app.scroll = 0.0;
+                }
             }
         }
         // Escape goes back one level, and out of the menu entirely, so the
@@ -1098,6 +1485,7 @@ pub async fn run() {
                 Screen::Menu => app.quit = true,
                 _ => app.screen = Screen::Menu,
             }
+            app.scroll = 0.0;
         }
 
         app.poll();
@@ -1116,8 +1504,14 @@ mod tests {
     /// window, and none of this needs either.
     fn running() -> (Running, Sender<Update>) {
         let (send, updates) = channel();
-        let running =
-            Running { updates, cancel: Arc::new(AtomicBool::new(false)), what: "Building nauvis".to_string(), frames: None };
+        let running = Running {
+            updates,
+            cancel: Arc::new(AtomicBool::new(false)),
+            what: "Building nauvis".to_string(),
+            frames: None,
+            counts: true,
+            waiting: "Reading the recording...".to_string(),
+        };
         (running, send)
     }
 
@@ -1239,6 +1633,87 @@ mod tests {
         assert!(RATES.iter().all(|(fps, label)| *fps > 0 && !label.is_empty()));
         assert_eq!(SIZES[0].0, 1920, "the recommended size leads");
         assert_eq!(RATES[0].0, 30, "and the recommended rate");
+    }
+
+    /// Ground read once for a playthrough is reused, so a rebuild does not
+    /// launch Factorio to be told the same thing. The screen has to say which
+    /// it will be, because one is instant and the other is a game load.
+    #[test]
+    fn cached_ground_is_only_reused_when_it_holds_scenery() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("script-output").join("save-timelapse").join("0000002a");
+        std::fs::create_dir_all(&session).unwrap();
+
+        let bare = crate::frame::FrameOut { tick: 0, surface: "nauvis", ..Default::default() };
+        std::fs::write(session.join("terrain_nauvis.stfr"), crate::frame::write_binary(&bare)).unwrap();
+        assert!(
+            build::cached_ground(dir.path(), 42).is_empty(),
+            "ground read before the scan collected scenery must not be reused forever"
+        );
+
+        let trees = vec![crate::frame::Entity { n: "tree-01".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }];
+        let scanned = crate::frame::FrameOut { tick: 0, surface: "nauvis", entities: &trees, ..Default::default() };
+        std::fs::write(session.join("terrain_nauvis.stfr"), crate::frame::write_binary(&scanned)).unwrap();
+        assert_eq!(build::cached_ground(dir.path(), 42).len(), 1);
+    }
+
+    fn a_render(video: bool, has_players: bool) -> Render {
+        Render {
+            built: Vec::new(),
+            step: RenderStep::Overlays,
+            chosen: Some(0),
+            surfaces: Vec::new(),
+            surface: None,
+            size: (1920, 1080),
+            fps: 30,
+            video,
+            clock: true,
+            players: false,
+            has_players,
+        }
+    }
+
+    /// The overlay rows shift when there is no player log, so which row does
+    /// what is counted rather than numbered. Getting it wrong renders with the
+    /// opposite of what was asked, several minutes later.
+    #[test]
+    fn the_render_row_moves_when_the_marker_is_not_offered() {
+        // Clock, marker, render, back.
+        let with_marker = a_render(true, true);
+        assert_eq!(with_marker.has_players.then_some(1), Some(1));
+
+        // Clock, render, back: the marker's row is gone, not merely disabled.
+        let without = a_render(true, false);
+        assert_eq!(without.has_players.then_some(1), None);
+    }
+
+    /// Most timelapses want the clock and do not want the marker, so that is
+    /// where the toggles start.
+    #[test]
+    fn the_clock_starts_on_and_the_marker_off() {
+        let render = a_render(true, true);
+        assert!(render.clock);
+        assert!(!render.players);
+    }
+
+    /// Overlays are burnt into a video. A folder of frames is for somebody
+    /// else's editor to label, so neither flag may reach one.
+    #[test]
+    fn an_image_sequence_carries_neither_overlay() {
+        let mut frames = a_render(false, true);
+        frames.clock = true;
+        frames.players = true;
+        assert!(!(frames.video && frames.clock));
+        assert!(!(frames.video && frames.players));
+    }
+
+    /// Every screen has a way out and it has to be the one that stands out,
+    /// since that is the whole point of colouring it differently.
+    #[test]
+    fn the_way_out_is_marked_rather_than_recognised_from_its_label() {
+        assert!(Choice::leaving("Back").leave);
+        assert!(!Choice::new("Back to the future", "").leave, "a label is not what makes a row an exit");
+        assert!(!Choice::new("Continue", "3 of 4").leave);
     }
 
     /// Deleting log data is the one thing here that cannot be undone, so it

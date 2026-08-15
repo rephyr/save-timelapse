@@ -103,7 +103,7 @@ pub fn describe_session(session: &replay::Session, now: SystemTime) -> String {
     // Older captures wrote only a total, which counts the trees and ore a
     // capture keeps for context alongside what somebody built.
     let buildings = session.baseline.buildings.unwrap_or(session.baseline.entities);
-    let scale = format!("{} buildings, {}", with_thousands(buildings as u64), describe_play_time(session.baseline.tick));
+    let scale = format!("{} buildings, {}", with_thousands(buildings as u64), describe_play_time(session.played_tick()));
     match session.label() {
         Some(name) => format!("{name}  ({places})\n     {scale}, last played {age}"),
         None => format!("{places}\n     {scale}, last played {age}"),

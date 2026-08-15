@@ -329,6 +329,15 @@ fn draw_loading(progress: &LoadProgress) {
     }
 }
 
+/// The export's own progress, in the window that would otherwise stay black.
+///
+/// Drawn after `set_default_camera`, which is what hands painting back from
+/// the render target every frame is composed into.
+fn draw_export_progress(done: usize, total: usize, destination: &str) {
+    let progress = LoadProgress { phase: "rendering", detail: destination.to_string(), done, total };
+    draw_loading(&progress);
+}
+
 /// Draw the bar and yield to the window, but only if enough time has passed
 /// since the last redraw, so a fast load doesn't pay a vsync wait per item.
 async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: bool) {
@@ -1401,6 +1410,11 @@ async fn export_frames(
             print!("\r  {}/{total}", index + 1);
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
+        // Every frame is drawn into the render target and read straight back
+        // out, so nothing was ever painted into the window itself: an export
+        // sat there black for however long it took. The bar is the same one a
+        // load draws, because it is the same question being asked.
+        draw_export_progress(index + 1, total, &destination);
         // Hands the frame to the driver. Without it the whole export happens
         // inside one displayed frame and the window sits unresponsive until
         // it finishes.

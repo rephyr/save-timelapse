@@ -150,6 +150,29 @@ pub struct Session {
 }
 
 impl Session {
+    /// How far this playthrough has actually got, in game ticks.
+    ///
+    /// Not `baseline.tick`, which is when recording *started*: on a capture
+    /// turned on at hour twelve that reads as twelve hours no matter how long
+    /// somebody has played since, and on one turned on at the beginning it
+    /// reads as nothing forever. What a picker wants is where the recording
+    /// has reached.
+    ///
+    /// Read from the newest segment on the chain, which is the stretch being
+    /// played now. One file per session rather than all of them: the ones
+    /// before it are older by construction.
+    pub fn played_tick(&self) -> u64 {
+        let newest = crate::event::log_segments(&self.session_dir).ok().and_then(|segments| segments.last().cloned());
+        let Some(segment) = newest else { return self.baseline.tick };
+
+        // The filename's own tick is the floor, and costs nothing. Reading the
+        // segment can only raise it, and a segment that will not open leaves
+        // the floor standing rather than losing the answer entirely.
+        let from_name = segment.start_tick.max(self.baseline.tick);
+        let Ok(stream) = crate::event::stream_log(&segment.path) else { return from_name };
+        stream.map(|logged| logged.tick).max().unwrap_or(0).max(from_name)
+    }
+
     /// A name the user gave this playthrough, as a `label.txt` in the session
     /// folder so it travels with the capture: copied elsewhere it keeps its
     /// name, deleted it takes it along. Unreadable or empty is unset.

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use crate::export::{self, ExportConfig};
+use crate::export::{self, ExportConfig, MOD_NAME};
 use crate::frame;
 use crate::milestone;
 use crate::replay::{self, Options, Replay};
@@ -685,4 +685,104 @@ pub fn mod_source_dir() -> io::Result<PathBuf> {
         "Could not find the mod/ folder needed to export from saves. It should sit next to \
          this program (or in the current folder, if running from source).",
     ))
+}
+
+/// Ground already read for this playthrough, newest first.
+///
+/// Kept beside the capture rather than only in the timelapse, which is deleted
+/// and rebuilt every time. Natural ground does not change, so reading it again
+/// means launching Factorio to be told the same thing, which on a megabase is
+/// most of what a rebuild costs.
+///
+/// Ground cached before the scan collected scenery would be reused forever,
+/// leaving out the trees and ore this exists to supply, so a set where no file
+/// holds an entity counts as nothing cached. A capture with no scenery
+/// anywhere rescans, which is the safe way to be wrong.
+pub fn cached_ground(user_dir: &Path, session_id: u32) -> Vec<PathBuf> {
+    let dir = user_dir.join("script-output").join(MOD_NAME).join(format!("{session_id:08x}"));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("terrain_") && n.ends_with(".stfr")))
+        .collect();
+    found.sort();
+
+    match found.iter().any(|p| crate::frame::read_has_entities(p).unwrap_or(false)) {
+        true => found,
+        false => Vec::new(),
+    }
+}
+
+/// Copies cached ground beside the frames. Returns how many files landed.
+pub fn reuse_ground(cached: &[PathBuf], out: &Path) -> usize {
+    cached.iter().filter(|file| file.file_name().is_some_and(|name| std::fs::copy(file, out.join(name)).is_ok())).count()
+}
+
+/// Reads one save's ground and puts it beside the frames, keeping a copy for
+/// next time.
+///
+/// `expect_session` is the playthrough the frames belong to. A save from a
+/// different game lands under a different session id and is refused rather
+/// than laying an unrelated landscape under somebody's factory; `None` skips
+/// that check, which is right for the from-saves path where the saves *are*
+/// the playthrough.
+pub fn scan_ground(save: &Path, out: &Path, config: &ExportConfig, expect_session: Option<u32>) -> Result<usize, String> {
+    let staged = std::env::temp_dir().join(format!("{MOD_NAME}-ground-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+
+    let scanned = crate::export::scan_terrain(save, &staged, config);
+    let copied = match scanned {
+        Err(e) => Err(format!("Could not read the ground: {e}")),
+        Ok(scan) => match expect_session {
+            Some(want) if want != scan.session_id => {
+                Err("That save is from a different playthrough, so its ground would not match.".to_string())
+            }
+            _ => {
+                let keep = crate::locate::locate_factorio()
+                    .map(|dir| dir.join("script-output").join(MOD_NAME).join(format!("{:08x}", scan.session_id)))
+                    .filter(|dir| dir.is_dir());
+                let mut copied = 0usize;
+                for file in &scan.files {
+                    let Some(name) = file.file_name() else { continue };
+                    if std::fs::copy(file, out.join(name)).is_ok() {
+                        copied += 1;
+                    }
+                    if let Some(dir) = &keep {
+                        let _ = std::fs::copy(file, dir.join(name));
+                    }
+                }
+                Ok(copied)
+            }
+        },
+    };
+
+    let _ = std::fs::remove_dir_all(&staged);
+    copied
+}
+
+/// The surfaces a built timelapse holds, read off its filenames. A
+/// single-surface build writes `frame_0000.stfr` with no name in it, so an
+/// empty result means "one surface, unnamed" rather than "none". Split at the
+/// first underscore after the index, so a name containing one survives.
+pub fn surfaces_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_string();
+            // Terrain files are named per surface too, so counting both would
+            // list a name twice. Terrain alone is not a surface anyone can
+            // export.
+            let rest = stem.strip_prefix("frame_")?;
+            let (_index, surface) = rest.split_once('_')?;
+            (!surface.is_empty()).then(|| surface.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }

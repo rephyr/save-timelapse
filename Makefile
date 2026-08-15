@@ -56,14 +56,15 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls stress stress-save check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run run-console viewer drawcalls stress stress-save check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
 	@echo "  build        cargo build --release --workspace"
 	@echo "  test         cargo test --workspace"
 	@echo "  test-lua     run mod/tests/encode_test.lua (needs Lua 5.2 on PATH, see LUA)"
-	@echo "  run          save-timelapse: interactive, asks what to do and opens the viewer"
+	@echo "  run          save-timelapse: the window"
+	@echo "  run-console  save-timelapse: the console menu"
 	@echo "  viewer       open the interactive viewer on FRAMES"
 	@echo "  drawcalls    headless draw-call report on FRAMES"
 	@echo "  stress       benchmark the whole pipeline against the saved baseline"
@@ -125,6 +126,12 @@ check-mod-syntax:
 	done
 
 run:
+	cargo run --release --bin save-timelapse -- --gui
+
+# The console menu, which is still what a release runs by default and still
+# the only one that offers every option. Kept as its own target so a change to
+# one front end can be tried against the other without editing this file.
+run-console:
 	cargo run --release --bin save-timelapse
 
 viewer:

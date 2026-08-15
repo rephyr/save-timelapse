@@ -385,31 +385,7 @@ fn ask_timelapse_choice(built: &[build::BuiltTimelapse], question: &str) -> io::
     }
 }
 
-/// The surfaces a built timelapse holds, read off its filenames. A
-/// single-surface build writes `frame_0000.stfr` with no name in it, so an
-/// empty result means "one surface, unnamed" rather than "none". Split at the
-/// first underscore after the index, so a name containing one survives.
-fn surfaces_in(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
-        .filter_map(|p| {
-            let stem = p.file_stem()?.to_str()?.to_string();
-            // Terrain files are named per surface too, so counting both would
-            // list a name twice. Terrain alone is not a surface anyone can
-            // export.
-            let rest = stem.strip_prefix("frame_")?;
-            let (_index, surface) = rest.split_once('_')?;
-            (!surface.is_empty()).then(|| surface.to_string())
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
+/// viewer already understands it as every surface.
 /// `None` means "let the viewer pick", which is its busiest surface, and is
 /// what Enter gives. `Some("all")` is passed straight through, since the
 /// viewer already understands it as every surface.
@@ -517,7 +493,7 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
     };
     let chosen = &built[index];
 
-    let surfaces = surfaces_in(&chosen.path);
+    let surfaces = build::surfaces_in(&chosen.path);
     let surface = if surfaces.len() > 1 { ask_export_surface(&surfaces)? } else { None };
 
     // Asked as a question about the output rather than as a format choice:
@@ -1862,7 +1838,7 @@ mod tests {
         for name in ["frame_0000_nauvis.stfr", "frame_0001_nauvis.stfr", "frame_0000_vulcanus.stfr", "terrain_nauvis.stfr"] {
             std::fs::write(root.path().join(name), b"x").unwrap();
         }
-        assert_eq!(surfaces_in(root.path()), vec!["nauvis", "vulcanus"]);
+        assert_eq!(build::surfaces_in(root.path()), vec!["nauvis", "vulcanus"]);
     }
 
     /// A single-surface build writes untagged filenames, so there is no name
@@ -1872,7 +1848,7 @@ mod tests {
     fn an_untagged_single_surface_build_lists_no_surfaces() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("frame_0000.stfr"), b"x").unwrap();
-        assert!(surfaces_in(root.path()).is_empty());
+        assert!(build::surfaces_in(root.path()).is_empty());
     }
 
     /// Space platforms are named by the player, so a surface name can hold
@@ -1881,7 +1857,7 @@ mod tests {
     fn a_surface_name_containing_an_underscore_survives() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("frame_0003_my_platform.stfr"), b"x").unwrap();
-        assert_eq!(surfaces_in(root.path()), vec!["my_platform"]);
+        assert_eq!(build::surfaces_in(root.path()), vec!["my_platform"]);
     }
 
     #[test]
