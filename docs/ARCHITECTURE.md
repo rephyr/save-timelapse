@@ -511,6 +511,34 @@ Cheap because it runs nowhere near anybody's game, and it repairs recordings
 already made: ground is offered against a finished capture, so re-scanning fills
 in paving that was already a hole.
 
+**Nests come from the scan and from nowhere else**, and the scan cannot say
+when one arrived. Biters expand, so a nest built at hour ten is in the scanned
+save and gets laid down from the first frame, contradicting the
+`on_biter_base_built` event that says when it really turned up.
+
+Leaving them out was tried and was worse. A live baseline only sees chunks the
+game had generated when recording started, and Factorio keeps nests out of the
+starting area, so a capture begun at the beginning has none at all: measured on
+a real one, 2,109 entities and not a single spawner. Without the scan the
+timelapse had no nests until biters expanded into view.
+
+So the scan keeps every nest, and `build::drop_nests_that_arrived_later` takes
+back the ones it has no business dating: any whose position the log names in an
+`AddEntity`, which for a nest can only be `on_biter_base_built`. Those are left
+to the event, which knows the tick. Applied to reused ground as well as a fresh
+scan, since the cache holds the scan as it came and what the recording has to
+say about it grows every time somebody plays on.
+
+Only nests. Everything else in that layer is trees, ore and cliffs, none of
+which a playthrough builds, and matching a factory's own adds against the ground
+would be millions of positions to no purpose.
+
+What is still wrong is a nest nobody built and nobody cleared, standing in a
+part of the map that was not generated when recording started. Nothing knows
+when it came into view, because revealing a chunk raises no event this records.
+Watching `on_chunk_generated` would close it, at the cost of a query per chunk
+during play and only for recordings made afterwards.
+
 Scenery cleared before the scan ran is not its job and never was. A patch mined
 out or a forest felled is carried by the baseline that recorded it standing and
 the removal that took it away, which is why depletion needs an event of its own:

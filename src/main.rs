@@ -884,6 +884,10 @@ fn offer_terrain_for_capture(
             cached.iter().filter(|file| file.file_name().is_some_and(|name| std::fs::copy(file, out.join(name)).is_ok())).count();
         if copied > 0 {
             println!("  Reused the ground already read for this playthrough.");
+            // Applied to the reused copy as well as a fresh scan: the cache
+            // holds the scan as it came, and what the recording has to say
+            // about it grows every time somebody plays on.
+            report_dated_nests(out, &user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}")));
             return Ok(());
         }
     }
@@ -900,7 +904,22 @@ fn offer_terrain_for_capture(
         terrain_scan: true,
     };
     add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
+    report_dated_nests(out, &user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}")));
     Ok(())
+}
+
+/// Hands the ground back to the recording for the one thing a scan cannot
+/// date: a nest the biters built while somebody was playing.
+///
+/// Said out loud when it finds any, because "your nests appeared at the right
+/// time" is not visible in a built timelapse until somebody scrubs to the hour
+/// it happened.
+fn report_dated_nests(out: &Path, session_dir: &Path) {
+    match build::drop_nests_that_arrived_later(out, session_dir) {
+        Ok(0) => {}
+        Ok(n) => println!("  {n} nest(s) the biters built are timed from the recording rather than shown from the start."),
+        Err(e) => eprintln!("warning: could not date the nests against the recording ({e}); they will show from the start"),
+    }
 }
 
 /// Where a scan's ground is kept for next time: this playthrough's own capture

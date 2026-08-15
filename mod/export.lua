@@ -316,6 +316,15 @@ end
 --- Fixed rather than read from the settings gating the in-game pass: those
 --- exist to keep a live baseline cheap, and the tool sets them off for its own
 --- runs, so reading them here would scan nothing.
+---
+--- Nests are in here despite expanding during a playthrough, which this pass
+--- cannot represent: it reads one save and its result is drawn for the whole
+--- replay, so a nest built at hour ten is laid down from the first frame.
+--- Leaving them out was tried and was worse. A live baseline only sees chunks
+--- the game had generated when recording started, and Factorio keeps nests out
+--- of the starting area, so on a capture begun at the beginning the baseline
+--- holds none at all: measured on a real one, 2,109 entities and not a single
+--- spawner. Without this the timelapse has no nests until biters expand.
 local SCAN_SCENERY_TYPES = { "resource", "tree", "cliff", "plant", "unit-spawner" }
 
 --- Scenery over `area`, as entity runs.

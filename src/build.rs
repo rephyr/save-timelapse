@@ -80,6 +80,10 @@ pub fn timelapse(
     plan: &Plan,
     watch: &mut Watch<'_, usize>,
 ) -> io::Result<Built> {
+    // Before anything is written, so the nests somebody cleared stand in the
+    // first frame like everything else that was there at the start.
+    let _ = restore_cleared_nests(replay, session_dir);
+
     let tick = replay.baseline.tick;
     match plan.surfaces.as_slice() {
         [one] => replay::write_terrain(&replay.world, one, tick, out)?,
@@ -785,4 +789,287 @@ pub fn surfaces_in(dir: &Path) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The type a nest is, which is what the scan cannot date and the log can.
+const NEST: &str = "unit-spawner";
+
+/// Puts back every nest the recording cleared, so clearing one can be watched.
+///
+/// The ground scan reads a finished save, so a nest somebody cleared at hour
+/// five is not in it and never appears at all: the clearing, which is most of
+/// what fighting biters looks like in a timelapse, is invisible. The log knows
+/// it happened, because a removal names a nest, and a removal naming something
+/// the recording never added is proof it was standing there before any of this
+/// began.
+///
+/// So each one goes into the world at the baseline, and the removal that named
+/// it takes it away again at the tick it fired. Nothing else changes: the
+/// replay does the rest by itself.
+///
+/// Only nests. A tree or a rock cleared has the same shape of problem and no
+/// name in its removal to work from, and giving every removal a name would put
+/// one on the millions a factory generates.
+pub fn restore_cleared_nests(replay: &mut Replay, session_dir: &Path) -> io::Result<usize> {
+    let described = crate::prototypes::read(session_dir);
+    let is_nest = |name: &str| match &described {
+        Some(p) => p.kind(name) == Some(NEST),
+        None => name.contains("spawner"),
+    };
+
+    // Everything the log ever added, so a nest built by expansion and then
+    // cleared is not put back at the start as well: the event already places
+    // that one at the tick it was built.
+    let mut added: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    let mut cleared: Vec<(String, f32, f32)> = Vec::new();
+
+    for segment in crate::event::log_segments(session_dir)? {
+        let Ok(stream) = crate::event::stream_log(&segment.path) else { continue };
+        for logged in stream {
+            match &logged.event {
+                crate::event::Event::AddEntity { x, y, .. } => {
+                    added.insert(at(*x, *y));
+                }
+                crate::event::Event::RemoveEntity { pos, name: Some(name), .. } if is_nest(name) => {
+                    cleared.push((name.clone(), pos.0, pos.1));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut put_back = 0usize;
+    for (name, x, y) in cleared {
+        if added.contains(&at(x, y)) {
+            continue;
+        }
+        let (w, h) = described.as_ref().map_or((1, 1), |p| p.size_of(&name));
+        // No id: a nest rebuilt from a removal has no history, exactly like one
+        // that came from a baseline, and position is what resolves both.
+        replay.world.apply(None, &crate::event::Event::AddEntity { name, x, y, d: 0, w, h, id: None });
+        put_back += 1;
+    }
+    Ok(put_back)
+}
+
+/// One position, at the tenth of a tile the format stores, so a nest read from
+/// a save and the same nest named by an event compare equal.
+fn at(x: f32, y: f32) -> (i32, i32) {
+    ((x * 10.0).round() as i32, (y * 10.0).round() as i32)
+}
+
+/// Drops from `out`'s ground layer every nest the recording says turned up
+/// after it started.
+///
+/// The scan reads one finished save and cannot say when anything in it
+/// appeared, so a nest the biters built at hour ten was laid down from the
+/// first frame. The recording knows: `on_biter_base_built` names it at the
+/// tick it was built. Taking those out of the static layer leaves the event to
+/// put each one down when it actually arrived, and leaves every nest that was
+/// always there exactly where it was.
+///
+/// Scanning the earliest save instead does not work and was measured: Factorio
+/// generates the map as somebody explores, so an early save has almost no
+/// nests in it and nothing ever adds the rest, revealing a chunk raising no
+/// event this records.
+///
+/// Best effort by design. A log that cannot be read, or a ground file that
+/// cannot be rewritten, leaves the ground as the scan produced it, which is
+/// the behaviour this replaces rather than a failure.
+pub fn drop_nests_that_arrived_later(out: &Path, session_dir: &Path) -> io::Result<usize> {
+    let described = crate::prototypes::read(session_dir);
+    let is_nest = |name: &str| match &described {
+        Some(p) => p.kind(name) == Some(NEST),
+        // A recording that never described its prototypes, which is every one
+        // made before the mod started saying. The name is all there is.
+        None => name.contains("spawner"),
+    };
+
+    let mut arrived: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    for segment in crate::event::log_segments(session_dir)? {
+        let Ok(stream) = crate::event::stream_log(&segment.path) else { continue };
+        for logged in stream {
+            if let crate::event::Event::AddEntity { name, x, y, .. } = &logged.event {
+                if is_nest(name) {
+                    arrived.insert(at(*x, *y));
+                }
+            }
+        }
+    }
+    if arrived.is_empty() {
+        return Ok(0);
+    }
+
+    let mut dropped = 0usize;
+    for entry in std::fs::read_dir(out)?.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_ground =
+            path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("terrain_") && n.ends_with(".stfr"));
+        if !is_ground {
+            continue;
+        }
+        let Ok(mut ground) = std::fs::read(&path).and_then(|bytes| frame::read_binary(&bytes)) else { continue };
+
+        let before = ground.entities.len();
+        ground.entities.retain(|e| !(is_nest(&e.n) && arrived.contains(&at(e.x, e.y))));
+        if ground.entities.len() == before {
+            continue;
+        }
+        ground.count = ground.entities.len();
+        if std::fs::write(&path, frame::write_binary(&ground.as_out())).is_ok() {
+            dropped += before - ground.entities.len();
+        }
+    }
+    Ok(dropped)
+}
+
+#[cfg(test)]
+mod ground_tests {
+    use super::*;
+    use crate::test_support::{capture_building, capture_with_events};
+
+    /// A ground file holding two nests, one of which the log will claim.
+    fn ground_with_nests(out: &Path, positions: &[(f32, f32)]) {
+        let entities: Vec<frame::Entity> =
+            positions.iter().map(|&(x, y)| frame::Entity { n: "biter-spawner".into(), x, y, d: 0, w: 3, h: 3 }).collect();
+        let tiles = vec![frame::Tile { n: "grass-1".into(), x: 0, y: 0 }];
+        let out_frame = frame::FrameOut { tick: 0, surface: "nauvis", entities: &entities, tiles: &tiles, ..Default::default() };
+        std::fs::write(out.join("terrain_nauvis.stfr"), frame::write_binary(&out_frame)).unwrap();
+    }
+
+    fn nests_left(out: &Path) -> Vec<(f32, f32)> {
+        let bytes = std::fs::read(out.join("terrain_nauvis.stfr")).unwrap();
+        frame::read_binary(&bytes).unwrap().entities.iter().map(|e| (e.x, e.y)).collect()
+    }
+
+    /// The whole point: a nest the recording says was built stops being part
+    /// of the landscape, so the event that built it decides when it appears.
+    /// One that was always there is untouched.
+    #[test]
+    fn a_nest_the_log_built_is_dropped_and_the_rest_stay() {
+        // The fixture writes tenths of a tile, so its one build at tick 1
+        // lands at 1.0, 1.0.
+        let (_capture, session_dir) = capture_building(1, "biter-spawner");
+        let out = tempfile::tempdir().unwrap();
+        ground_with_nests(out.path(), &[(1.0, 1.0), (500.0, 500.0)]);
+
+        assert_eq!(drop_nests_that_arrived_later(out.path(), &session_dir).unwrap(), 1);
+        assert_eq!(
+            nests_left(out.path()),
+            [(500.0, 500.0)],
+            "the one the biters built goes, so its event decides when it appears; the one that was              always there stays"
+        );
+    }
+
+    /// Only nests. Everything else in the ground layer is trees, ore and
+    /// cliffs, none of which a playthrough builds, and a factory's own adds
+    /// run to millions.
+    #[test]
+    fn something_else_the_log_built_takes_no_nest_with_it() {
+        let (_capture, session_dir) = capture_building(1, "pipe");
+        let out = tempfile::tempdir().unwrap();
+        ground_with_nests(out.path(), &[(1.0, 1.0), (500.0, 500.0)]);
+
+        assert_eq!(drop_nests_that_arrived_later(out.path(), &session_dir).unwrap(), 0);
+        assert_eq!(nests_left(out.path()).len(), 2, "a pipe built where a nest stands is not that nest arriving");
+    }
+
+    /// A recording with nothing built leaves the ground exactly as scanned,
+    /// which is what every from-saves build and every quiet playthrough gets.
+    #[test]
+    fn a_recording_that_built_no_nests_changes_nothing() {
+        let (_capture, session_dir) = capture_with_events(0);
+        let out = tempfile::tempdir().unwrap();
+        ground_with_nests(out.path(), &[(10.0, 10.0), (500.0, 500.0)]);
+
+        assert_eq!(drop_nests_that_arrived_later(out.path(), &session_dir).unwrap(), 0);
+        assert_eq!(nests_left(out.path()).len(), 2);
+    }
+
+    /// A capture whose log clears a nest that nothing ever built. That is what
+    /// a player finding a nest and destroying it looks like from the outside.
+    fn capture_clearing_a_nest(at_tick: u64) -> (tempfile::TempDir, PathBuf) {
+        use crate::wire::ByteWriter;
+        let (dir, session_dir) = capture_building(0, "biter-spawner");
+
+        let mut w = ByteWriter::new();
+        w.magic(b"STE1").u8(1);
+        w.u8(0).string("biter-spawner");
+        w.u8(1).string("nauvis");
+        w.u8(2).u64(at_tick);
+        // A named removal: tag 128 says the next removal is for that name.
+        w.u8(128).varint(1).varint(0);
+        w.u8(4).i32(3000).i32(4000).u64(0).u16(0);
+        std::fs::write(session_dir.join("events_0.stev"), w.into_vec()).unwrap();
+
+        (dir, session_dir)
+    }
+
+    /// The whole point: a nest cleared during a playthrough is in no save the
+    /// scan can read, so without this it never appears and the clearing cannot
+    /// be watched.
+    #[test]
+    fn a_nest_the_recording_cleared_is_put_back_at_the_start() {
+        let (_capture, session_dir) = capture_clearing_a_nest(50);
+        let mut replay = replay::load_baseline(&session_dir.join("baseline.json")).unwrap();
+
+        assert_eq!(restore_cleared_nests(&mut replay, &session_dir).unwrap(), 1);
+        let frame = replay.world.to_frame("nauvis", 0);
+        assert!(
+            frame.entities.iter().any(|e| &*e.n == "biter-spawner" && e.x == 300.0 && e.y == 400.0),
+            "it has to stand in the first frame: {:?}",
+            frame.entities
+        );
+    }
+
+    /// And it goes away again when the log says it did, which is the half that
+    /// makes putting it back worth anything.
+    #[test]
+    fn and_the_removal_takes_it_away_again_at_its_own_tick() {
+        let (_capture, session_dir) = capture_clearing_a_nest(50);
+        let out = tempfile::tempdir().unwrap();
+        let mut replay = replay::load_baseline(&session_dir.join("baseline.json")).unwrap();
+
+        let plan = Plan { surfaces: vec!["nauvis".to_string()], options: Options { interval: 10, max_frames: 100 } };
+        let mut ignored = |_: usize| {};
+        let cancel = AtomicBool::new(false);
+        timelapse(&mut replay, &session_dir, out.path(), &plan, &mut Watch { on: &mut ignored, cancel: &cancel }).unwrap();
+
+        assert!(
+            !replay.world.to_frame("nauvis", 100).entities.iter().any(|e| &*e.n == "biter-spawner"),
+            "the nest must be gone once the clearing has replayed"
+        );
+    }
+
+    /// A nest the biters built and somebody then cleared is already placed by
+    /// its own event, so putting it back at the start would show it before the
+    /// biters made it.
+    #[test]
+    fn a_nest_that_was_built_first_is_not_put_back_as_well() {
+        let (_capture, session_dir) = capture_building(1, "biter-spawner");
+        let mut replay = replay::load_baseline(&session_dir.join("baseline.json")).unwrap();
+        assert_eq!(restore_cleared_nests(&mut replay, &session_dir).unwrap(), 0, "nothing was cleared here");
+    }
+
+    /// Positions are matched at the tenth of a tile the format stores, so a
+    /// nest read from a save and the same nest named by an event compare
+    /// equal rather than missing each other by rounding.
+    #[test]
+    fn positions_match_at_the_precision_the_format_keeps() {
+        assert_eq!(at(10.0, 10.0), (100, 100));
+        assert_eq!(at(10.05, -3.5), (101, -35), "a tenth apart is a different place");
+        assert_eq!(at(10.04, 10.0), at(10.04, 10.0));
+    }
+
+    /// A session folder with no log at all is a from-saves build, and leaves
+    /// the ground alone rather than failing the ground step.
+    #[test]
+    fn no_recording_leaves_the_ground_alone() {
+        let empty = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        ground_with_nests(out.path(), &[(10.0, 10.0)]);
+
+        assert_eq!(drop_nests_that_arrived_later(out.path(), empty.path()).unwrap(), 0);
+        assert_eq!(nests_left(out.path()).len(), 1);
+    }
 }

@@ -26,6 +26,13 @@ pub struct Prototypes {
     /// How far an underground belt or pipe reaches, in tiles. Only the two
     /// types that have one appear here.
     pub reach: HashMap<String, i32>,
+    /// How many tiles each prototype covers. Only what is not 1x1 is written,
+    /// so absent means one tile.
+    ///
+    /// Every record carrying a position carries its footprint too, except a
+    /// removal, and a removal is where something cleared before the ground was
+    /// ever scanned has to be rebuilt from nothing but its name.
+    pub size: HashMap<String, (u32, u32)>,
     /// Which tiles this capture treated as placed floor rather than generated
     /// ground, the split `world.rs` has to reproduce. Empty falls back there.
     pub floor: HashSet<String>,
@@ -67,6 +74,11 @@ impl Prototypes {
             && self.rails.is_empty()
     }
 
+    /// `name`'s footprint, one tile when it says nothing.
+    pub fn size_of(&self, name: &str) -> (u32, u32) {
+        self.size.get(name).copied().unwrap_or((1, 1))
+    }
+
     pub fn kind(&self, name: &str) -> Option<&str> {
         self.types.get(name).map(String::as_str)
     }
@@ -102,6 +114,10 @@ pub fn read(dir: &Path) -> Option<Prototypes> {
         entities: section(&root, "entities", rgb),
         types: section(&root, "types", |value| Some(value.as_str()?.to_string())),
         reach: section(&root, "reach", |value| i32::try_from(value.as_i64()?).ok()),
+        size: section(&root, "size", |value| {
+            let (w, h) = value.as_str()?.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        }),
         floor: names(&root, "floor"),
         rails: rail_samples(&root),
     };

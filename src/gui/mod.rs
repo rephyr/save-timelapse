@@ -957,6 +957,13 @@ impl App {
             }
         }
 
+        // Everything a screen says about itself hangs off the title's own
+        // baseline rather than off the column. Measured from the column, a
+        // status line and a 34 pixel title were five pixels apart and drew
+        // over each other; measured from the title, they cannot.
+        let under_title = center_y + TITLE_SIZE / 2.0 + 28.0;
+        let next_line = 18.0;
+
         for (index, choice) in choices.iter().enumerate() {
             if !column.visible(index) {
                 continue;
@@ -1017,11 +1024,11 @@ impl App {
             // Wrapped by hand only when it has to be: one line reads better,
             // and the long warning is the one that never fits.
             match width < column.width * 1.6 {
-                true => self.ui.text(warning, (screen_width() - width) / 2.0, column.top - 30.0, NOTE_SIZE, TEXT_DIM),
+                true => self.ui.text(warning, (screen_width() - width) / 2.0, under_title, NOTE_SIZE, TEXT_DIM),
                 false => {
                     for (line, part) in wrapped(warning, 64).iter().enumerate() {
                         let width = self.ui.width(part, NOTE_SIZE);
-                        let y = column.top - 52.0 + line as f32 * 20.0;
+                        let y = under_title + line as f32 * next_line;
                         self.ui.text(part, (screen_width() - width) / 2.0, y, NOTE_SIZE, TEXT_DIM);
                     }
                 }
@@ -1031,7 +1038,7 @@ impl App {
         if let Screen::Opening(_) = &self.screen {
             let line = "Reading it. This takes a while on a big factory.";
             let width = self.ui.width(line, NOTE_SIZE);
-            self.ui.text(line, (screen_width() - width) / 2.0, column.top - 30.0, NOTE_SIZE, TEXT_DIM);
+            self.ui.text(line, (screen_width() - width) / 2.0, under_title, NOTE_SIZE, TEXT_DIM);
         }
 
         if let Screen::Building(running) = &self.screen {
@@ -1041,14 +1048,14 @@ impl App {
                 (true, Some(count)) => format!("{} frames", crate::with_thousands(count as u64)),
             };
             let width = self.ui.width(&line, LABEL_SIZE);
-            self.ui.text(&line, (screen_width() - width) / 2.0, column.top - 54.0, LABEL_SIZE, ACCENT);
+            self.ui.text(&line, (screen_width() - width) / 2.0, under_title, LABEL_SIZE, ACCENT);
 
             // A bar with nothing to measure against, because none of these
             // know their total until they are over: a recording's frame count
             // depends on how long it was played, and a render's window shows
             // its own. It says "still going" rather than "this far along",
             // which is the honest amount to claim.
-            let bar = layout::Rect { x: column.x, y: column.top - 36.0, width: column.width, height: 6.0 };
+            let bar = layout::Rect { x: column.x, y: under_title + 10.0, width: column.width, height: 6.0 };
             draw_rectangle(bar.x, bar.y, bar.width, bar.height, ROW);
             let sweep = (get_time() as f32 * 0.6).fract();
             let lit = bar.width * 0.25;
@@ -1064,14 +1071,14 @@ impl App {
 
         if let Screen::Done(message) = &self.screen {
             let width = self.ui.width(message, NOTE_SIZE);
-            self.ui.text(message, (screen_width() - width) / 2.0, column.top - 30.0, NOTE_SIZE, TEXT_DIM);
+            self.ui.text(message, (screen_width() - width) / 2.0, under_title, NOTE_SIZE, TEXT_DIM);
         }
 
         if let Screen::Watch = self.screen {
             if self.timelapses.is_empty() {
                 let message = "Nothing built yet.";
                 let width = self.ui.width(message, NOTE_SIZE);
-                self.ui.text(message, (screen_width() - width) / 2.0, column.top - 24.0, NOTE_SIZE, TEXT_DIM);
+                self.ui.text(message, (screen_width() - width) / 2.0, under_title, NOTE_SIZE, TEXT_DIM);
             }
         }
     }
@@ -1112,13 +1119,19 @@ fn saves_newest_first() -> Vec<(String, String, std::path::PathBuf)> {
 }
 
 /// Puts the ground beside the frames, however it was chosen.
-fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32) -> String {
+fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32, session_dir: &std::path::Path) -> String {
     let cached = match from {
         GroundFrom::Cache(cached) => {
             return match build::reuse_ground(&cached, out) {
                 0 => "The ground already read for this playthrough could not be copied.".to_string(),
-                _ => "Reused the ground already read for this playthrough.".to_string(),
-            }
+                _ => {
+                    // Applied to the reused copy as well as a fresh scan: the
+                    // cache holds the scan as it came, and what the recording
+                    // has to say about it grows every time somebody plays on.
+                    let _ = build::drop_nests_that_arrived_later(out, session_dir);
+                    "Reused the ground already read for this playthrough.".to_string()
+                }
+            };
         }
         GroundFrom::Save(save) => save,
     };
@@ -1142,7 +1155,13 @@ fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32) -> Strin
         terrain_scan: true,
     };
     match build::scan_ground(&cached, out, &config, Some(session_id)) {
-        Ok(surfaces) => format!("Ground added for {surfaces} place(s)."),
+        Ok(surfaces) => {
+            // The scan cannot date what it found, and the recording can. Only
+            // nests need it: nothing else in there is built during a
+            // playthrough.
+            let _ = build::drop_nests_that_arrived_later(out, session_dir);
+            format!("Ground added for {surfaces} place(s).")
+        }
         Err(message) => message,
     }
 }
@@ -1434,7 +1453,7 @@ fn start_build(choosing: Choosing) -> Running {
                 format!(
                     "{built}
 {}",
-                    add_ground(from, &out, session_id)
+                    add_ground(from, &out, session_id, &session_dir)
                 )
             }
             _ => built,

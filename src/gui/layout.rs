@@ -39,8 +39,10 @@ const COLUMN_SHARE: f32 = 0.44;
 const COLUMN_MIN: f32 = 320.0;
 const COLUMN_MAX: f32 = 620.0;
 
-/// Space above the column, for the logo and the name.
-const HEADER_HEIGHT: f32 = 132.0;
+/// Space above the column, for the logo and the name, and under them for the
+/// line a screen says about itself: what a build is up to, or what deleting
+/// something costs. Sized for the title plus two lines under it.
+const HEADER_HEIGHT: f32 = 150.0;
 
 /// What the header shrinks to when the choices need the room. Enough for the
 /// screen's own title, which is the part that says where you are.
@@ -278,6 +280,25 @@ mod tests {
         assert!(!column.visible(0), "{column:?}");
         let first = column.row(0);
         assert_eq!(column.hit(first.x + 10.0, first.y + first.height / 2.0), None);
+    }
+
+    /// The bug this exists for: the title and the line a screen says about
+    /// itself were placed from different anchors, five pixels apart, and drew
+    /// over each other. The header has to hold a title and two lines under it.
+    #[test]
+    fn the_header_has_room_for_a_title_and_two_lines_under_it() {
+        let column = Column::centered(1280.0, 900.0, 5, 44.0, 0.0);
+        let (_, center_y) = column.header_center(1280.0);
+
+        // What `App::draw` does: the title on the header's centre line, then
+        // the status underneath it.
+        let title_baseline = center_y + 34.0 / 2.0;
+        let under_title = title_baseline + 28.0;
+        let second_line = under_title + 18.0;
+
+        assert!(title_baseline - 34.0 > center_y - HEADER_HEIGHT / 2.0, "the title fits in the header");
+        assert!(under_title > title_baseline, "the status sits below the title");
+        assert!(second_line < column.top, "and a second line still clears the first row: {second_line} vs {}", column.top);
     }
 
     #[test]

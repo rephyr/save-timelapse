@@ -10,6 +10,12 @@ use std::time::SystemTime;
 /// Returns the session folder. Its parent is the capture directory, and its
 /// baseline manifest is `baseline.json` inside it.
 pub fn capture_with_events(ticks: u64) -> (tempfile::TempDir, PathBuf) {
+    capture_building(ticks, "pipe")
+}
+
+/// The same, with a say in what gets built: a log that builds nests is what a
+/// biter expanding looks like, and nothing else can stand in for it.
+pub fn capture_building(ticks: u64, what: &str) -> (tempfile::TempDir, PathBuf) {
     use crate::frame;
     use crate::wire::ByteWriter;
 
@@ -28,7 +34,7 @@ pub fn capture_with_events(ticks: u64) -> (tempfile::TempDir, PathBuf) {
     // a fixture: the reader is what is under test.
     let mut w = ByteWriter::new();
     w.magic(b"STE1").u8(1);
-    w.u8(0).string("pipe");
+    w.u8(0).string(what);
     w.u8(1).string("nauvis");
     for tick in 1..=ticks {
         w.u8(2).u64(tick);

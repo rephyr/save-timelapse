@@ -3,6 +3,9 @@ Version: 0.8.3
 Date: 2026-08-14
   Graphics:
     - Pipe runs that dive underground join up on screen instead of stopping dead. A pipe meeting an underground pipe is drawn connected to it, the same as one meeting another pipe. On the test capture this joined up a quarter again as many pipe ends as before
+  Features:
+    - Biters expanding is recorded, so a nest they build appears when they built it rather than whenever a later snapshot happened to notice it
+    - Clearing a nest can be watched. A nest you destroy is not in the save the ground is read from, so it never appeared at all and the fight was invisible; the recording now says one was there and takes it away at the moment you cleared it. Recordings already under way pick this up for nests cleared from here on, earlier ones having nothing written down to work from
   Bugfixes:
     - Ore patches your factory has eaten now empty out as they are mined instead of sitting there full for the whole timelapse. Ore is not mined away a piece at a time, so nothing the recording listened for ever fired: a patch stayed exactly as it started while the drills on top of it kept working
     - The ground under paving you laid partway through a playthrough is no longer missing. Concrete placed at hour three used to leave a hole where it would later go, because ground is read from a finished save that already has concrete there. Factorio remembers what paving covered up, so that is read too and the grass is there from the first frame. Rebuild an existing timelapse's ground to fix one already made
