@@ -3,7 +3,7 @@ Version: 0.9.0
 Date: 2026-08-15
   Major Features:
     - One program instead of two. The viewer is part of it now, so there is a single file to download and nothing to keep together
-    - A window, if you would rather not use the text menu. Run it with --gui and it does everything the menu does. Opt in for this release while it gets some use
+    - A window. Running the tool now opens one instead of a text menu, and it does everything the menu did. The text menu is still there behind --console, and each offers the other
   Features:
     - Build several places at once, rather than one or all of them
     - Every menu is picked by number, with nothing left to spell
