@@ -18,8 +18,8 @@
 
 use macroquad::math::Vec2;
 
-use crate::camera::{Camera, Framing};
-use crate::construction::GrowingBounds;
+use crate::viewer::camera::{Camera, Framing};
+use crate::viewer::construction::GrowingBounds;
 
 /// How many extremum-then-blur passes make up the filter. One box blur has a
 /// corner in its velocity; chaining three approximates a Gaussian closely

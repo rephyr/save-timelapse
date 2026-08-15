@@ -1,4 +1,4 @@
-//! Discovering, reading, and grouping raw `save_timelapse::frame::Frame`
+//! Discovering, reading, and grouping raw `crate::frame::Frame`
 //! data from disk (or synthesizing it for load testing). Everything here
 //! stays at that level, never touching `TypeRegistry`/`RenderFrame`.
 
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
-use save_timelapse::frame::{Entity, Frame, Tile};
+use crate::frame::{Entity, Frame, Tile};
 
 /// Grid of fabricated entities, cycling through a handful of type names, for
 /// load-testing at counts the real fixtures don't reach.
@@ -105,7 +105,7 @@ pub fn load_frame(path: &Path) -> Option<Frame> {
             return None;
         }
     };
-    match save_timelapse::frame::read_binary(&bytes) {
+    match crate::frame::read_binary(&bytes) {
         Ok(frame) => Some(frame),
         Err(e) => {
             eprintln!("warning: skipping invalid frame {}: {}", path.display(), e);
@@ -277,7 +277,7 @@ pub fn group_paths_by_surface(paths: Vec<PathBuf>) -> Vec<(String, Vec<(u64, Pat
 
     let mut by_surface: HashMap<String, Vec<Candidate>> = HashMap::new();
     for path in paths {
-        match save_timelapse::frame::read_header(&path) {
+        match crate::frame::read_header(&path) {
             Ok((tick, surface)) => {
                 let size = path.metadata().map(|m| m.len()).unwrap_or(0);
                 by_surface.entry(surface).or_default().push((tick, size, path));
@@ -357,7 +357,7 @@ mod tests {
     /// tests that only care about tick/surface ordering, not real content.
     fn write_stub_frame(dir: &Path, name: &str, tick: u64, surface: &str, entity_count: usize) {
         let entities = synthetic_frame(entity_count).entities;
-        let out = save_timelapse::frame::FrameOut {
+        let out = crate::frame::FrameOut {
             tick,
             surface,
             entities: &entities,
@@ -365,7 +365,7 @@ mod tests {
             floor_unchanged: false,
             ..Default::default()
         };
-        std::fs::write(dir.join(name), save_timelapse::frame::write_binary(&out)).unwrap();
+        std::fs::write(dir.join(name), crate::frame::write_binary(&out)).unwrap();
     }
 
     /// Polls `load` to completion without a real render loop to yield
@@ -385,7 +385,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let valid = dir.path().join("frame_0000.stfr");
         let invalid = dir.path().join("frame_0001.stfr");
-        let bytes = save_timelapse::frame::write_binary(&save_timelapse::frame::FrameOut {
+        let bytes = crate::frame::write_binary(&crate::frame::FrameOut {
             tick: 0,
             surface: "nauvis",
             entities: &[],
@@ -462,7 +462,7 @@ mod tests {
     /// among the paths" rather than only ever testing uniform, tiny ones.
     #[test]
     fn parallel_load_matches_sequential_loading_on_the_real_fixtures() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames");
         let paths = frame_paths(Path::new(dir)).unwrap();
 
         let sequential: Vec<u64> = paths.iter().filter_map(|p| load_frame(p)).map(|f| f.tick).collect();
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn grouping_paths_by_header_matches_grouping_parsed_frames() {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames"));
         let paths = frame_paths(dir).unwrap();
 
         let by_header = group_paths_by_surface(paths.clone());
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn load_sequence_loads_the_real_fixtures_in_order() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames");
         let frames = load_sequence(Path::new(dir)).unwrap();
         assert_eq!(frames.len(), 5);
         let ticks: Vec<u64> = frames.iter().map(|f| f.tick).collect();

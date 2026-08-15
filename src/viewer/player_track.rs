@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use save_timelapse::player_log::PlayerSample;
+use crate::player_log::PlayerSample;
 
 /// Where every tracked player was, as of whatever tick is displayed. Built once
 /// at load; a linear scan per lookup is plenty, sample counts being tiny next

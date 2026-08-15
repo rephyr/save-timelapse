@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use save_timelapse::frame::Frame;
-use viewer::{DrawCallCounter, ParallelFrameLoad, RenderFrame, TypeId, TypeRegistry};
+use save_timelapse::viewer::{DrawCallCounter, ParallelFrameLoad, RenderFrame, TypeId, TypeRegistry};
 
 /// macroquad's defaults (`conf::Conf`): 5,000 indices at 6 per quad.
 const DEFAULT_INDEX_CAPACITY: usize = 5_000;
@@ -50,16 +50,16 @@ fn parsed_bytes(frame: &Frame) -> usize {
 }
 
 fn grouped_bytes(frame: &RenderFrame) -> usize {
-    frame.entities.len() * std::mem::size_of::<viewer::RenderEntity>()
-        + frame.tiles.len() * std::mem::size_of::<viewer::RenderTile>()
-        + (frame.entity_runs.len() + frame.tile_runs.len()) * std::mem::size_of::<viewer::Run>()
+    frame.entities.len() * std::mem::size_of::<save_timelapse::viewer::RenderEntity>()
+        + frame.tiles.len() * std::mem::size_of::<save_timelapse::viewer::RenderTile>()
+        + (frame.entity_runs.len() + frame.tile_runs.len()) * std::mem::size_of::<save_timelapse::viewer::Run>()
 }
 
 /// The real fixtures top out at 23k entities, where most per-type runs still
 /// fit in one default-capacity draw call. `--synthetic N` reaches the scale
 /// where the raised capacity is what actually matters.
 fn synthetic_report(count: usize) {
-    let frame = viewer::synthetic_frame(count);
+    let frame = save_timelapse::viewer::synthetic_frame(count);
     let mut registry = TypeRegistry::new();
     let rendered = RenderFrame::from_frame(frame, &mut registry);
     let order: Vec<Option<TypeId>> =
@@ -77,7 +77,7 @@ fn main() {
         return;
     }
 
-    let path = args.first().map(String::as_str).unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames"));
+    let path = args.first().map(String::as_str).unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames"));
 
     // Loaded once, in parallel: this used to also call load_sequence just to
     // fail fast on an empty/invalid directory, then reload and reparse every
@@ -85,7 +85,7 @@ fn main() {
     // load serves both (the total count for the summary at the bottom and
     // the per-frame detail here) without parsing gigabytes of real capture
     // data twice.
-    let paths = viewer::frame_paths(Path::new(path)).unwrap_or_default();
+    let paths = save_timelapse::viewer::frame_paths(Path::new(path)).unwrap_or_default();
     let frames = block_on_load(ParallelFrameLoad::start(paths));
     if frames.is_empty() {
         eprintln!("error: no valid frame files found in {path}");

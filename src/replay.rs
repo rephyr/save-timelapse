@@ -150,6 +150,29 @@ pub struct Session {
 }
 
 impl Session {
+    /// How far this playthrough has actually got, in game ticks.
+    ///
+    /// Not `baseline.tick`, which is when recording *started*: on a capture
+    /// turned on at hour twelve that reads as twelve hours no matter how long
+    /// somebody has played since, and on one turned on at the beginning it
+    /// reads as nothing forever. What a picker wants is where the recording
+    /// has reached.
+    ///
+    /// Read from the newest segment on the chain, which is the stretch being
+    /// played now. One file per session rather than all of them: the ones
+    /// before it are older by construction.
+    pub fn played_tick(&self) -> u64 {
+        let newest = crate::event::log_segments(&self.session_dir).ok().and_then(|segments| segments.last().cloned());
+        let Some(segment) = newest else { return self.baseline.tick };
+
+        // The filename's own tick is the floor, and costs nothing. Reading the
+        // segment can only raise it, and a segment that will not open leaves
+        // the floor standing rather than losing the answer entirely.
+        let from_name = segment.start_tick.max(self.baseline.tick);
+        let Ok(stream) = crate::event::stream_log(&segment.path) else { return from_name };
+        stream.map(|logged| logged.tick).max().unwrap_or(0).max(from_name)
+    }
+
     /// A name the user gave this playthrough, as a `label.txt` in the session
     /// folder so it travels with the capture: copied elsewhere it keeps its
     /// name, deleted it takes it along. Unreadable or empty is unset.
@@ -610,12 +633,30 @@ pub fn write_all_surfaces(
     index: usize,
     written: &mut std::collections::HashMap<String, u64>,
 ) -> io::Result<usize> {
+    write_surfaces(world, tick, out, index, written, &[])
+}
+
+/// [`write_all_surfaces`] restricted to `only`, which is how a build covering
+/// some of a capture's places rather than all of them is written. An empty
+/// `only` means every surface, so the unfiltered call is the same code path
+/// rather than a second one that could drift from it.
+pub fn write_surfaces(
+    world: &mut World,
+    tick: u64,
+    out: &Path,
+    index: usize,
+    written: &mut std::collections::HashMap<String, u64>,
+    only: &[String],
+) -> io::Result<usize> {
     let mut files = 0;
     // Owned up front: the loop needs the world mutably to drain each surface's
     // change record, which a borrow of its name list would forbid.
     let names: Vec<String> = world.surface_names().into_iter().map(str::to_string).collect();
     for surface in &names {
         let surface = surface.as_str();
+        if !only.is_empty() && !only.iter().any(|wanted| wanted == surface) {
+            continue;
+        }
         let revision = match world.surface(surface) {
             Some(s) => s.revision(),
             None => continue,
@@ -667,7 +708,16 @@ pub fn write_terrain(world: &World, surface_name: &str, tick: u64, out: &Path) -
 
 /// `write_terrain` for every surface `world` has.
 pub fn write_all_terrain(world: &World, tick: u64, out: &Path) -> io::Result<()> {
+    write_terrain_of(world, tick, out, &[])
+}
+
+/// [`write_all_terrain`] restricted to `only`, empty meaning all of them, so a
+/// build of two places out of nine does not lay down the other seven's ground.
+pub fn write_terrain_of(world: &World, tick: u64, out: &Path, only: &[String]) -> io::Result<()> {
     for surface in world.surface_names() {
+        if !only.is_empty() && !only.iter().any(|wanted| wanted == surface) {
+            continue;
+        }
         write_terrain(world, surface, tick, out)?;
     }
     Ok(())
@@ -1649,6 +1699,55 @@ mod tests {
         let written: Vec<String> =
             fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(written, vec!["frame_0007_nauvis.stfr"], "the empty vulcanus surface must not get a file");
+    }
+
+    /// Building two places out of nine writes those two. The filter is the
+    /// whole of what a chosen subset means downstream, so a surface left out
+    /// must produce no file at all rather than an empty one.
+    #[test]
+    fn write_surfaces_writes_only_the_places_asked_for() {
+        let baseline = |surface: &str| crate::frame::Frame {
+            tick: 100,
+            surface: surface.to_string(),
+            entities: vec![crate::frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }],
+            count: 1,
+            tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
+        };
+
+        let mut world = crate::world::World::new();
+        for surface in ["nauvis", "vulcanus", "gleba"] {
+            world.load_baseline(&baseline(surface));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let only = vec!["nauvis".to_string(), "gleba".to_string()];
+        write_surfaces(&mut world, 100, dir.path(), 0, &mut Default::default(), &only).unwrap();
+
+        let mut written: Vec<String> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        written.sort();
+        assert_eq!(written, vec!["frame_0000_gleba.stfr", "frame_0000_nauvis.stfr"]);
+    }
+
+    /// An empty filter is every surface, so the unfiltered call and a filter
+    /// naming everything cannot drift apart.
+    #[test]
+    fn an_empty_filter_means_every_surface() {
+        let mut world = crate::world::World::new();
+        world.load_baseline(&crate::frame::Frame {
+            tick: 100,
+            surface: "nauvis".to_string(),
+            entities: vec![crate::frame::Entity { n: "pipe".into(), x: 0.5, y: 0.5, d: 0, w: 1, h: 1 }],
+            count: 1,
+            tiles: Vec::new(),
+            floor_unchanged: false,
+            ..Default::default()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(write_surfaces(&mut world, 100, dir.path(), 0, &mut Default::default(), &[]).unwrap(), 1);
     }
 
     /// The saving itself: on a real nine-surface capture 93% of the bytes were

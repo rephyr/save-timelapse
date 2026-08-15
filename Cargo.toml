@@ -1,9 +1,12 @@
+# No members: the viewer used to be its own crate, and merging it in is what
+# makes this one binary. It cannot be a dependency, since it needs this
+# package's own library and Cargo refuses the cycle, so it lives in
+# `src/viewer/` instead.
 [workspace]
-members = ["viewer"]
 
 [package]
 name = "save-timelapse"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 description = "Build a timelapse of a Factorio factory from existing save files"
 license = "MIT"
@@ -22,12 +25,28 @@ path = "src/main.rs"
 name = "fake-factorio"
 path = "src/bin/fake_factorio.rs"
 
+# Development tools, not shipped. `stress` is the pipeline benchmark and
+# `drawcalls` the headless render profiler; both came with the viewer and are
+# worth keeping runnable.
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"
+
+[[bin]]
+name = "drawcalls"
+path = "src/bin/drawcalls.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+macroquad = "0.4"
+image = { version = "0.24.9", default-features = false, features = ["jpeg"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Only to prove the embedded display face is one macroquad can rasterise; it
+# reaches fontdue through macroquad at runtime.
+fontdue = "0.9"
 
 [profile.release]
 opt-level = 3

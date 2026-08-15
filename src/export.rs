@@ -361,8 +361,10 @@ pub struct TerrainScan {
 /// separately keeps it out of every frame and out of the live baseline, and
 /// lets the area be chosen knowing how far the factory eventually reached.
 ///
-/// The trade is ground since built over: water landfilled at hour three reads
-/// as landfill at hour ten, so replaying from the start shows a hole there.
+/// Ground since built over comes back with it: Factorio keeps what paving
+/// covered, so the scan reads that rather than leaving the position empty until
+/// the tick the concrete went down. What the scan alone cannot see is scenery
+/// already gone by then, which the baseline and its removals carry instead.
 pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<TerrainScan> {
     let started = Instant::now();
     let scan = ExportConfig { terrain_scan: true, ..config.clone() };

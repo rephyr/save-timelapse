@@ -1,7 +1,7 @@
 //! H.264 in MP4, by piping raw frames to FFmpeg when the user happens to have
 //! it.
 //!
-//! The built-in [`crate::avi`] writer exists so the tool needs nothing
+//! The built-in [`crate::viewer::avi`] writer exists so the tool needs nothing
 //! installed, and it stays the default for exactly that reason. What it cannot
 //! be is small or widely postable: MJPEG stores every frame whole, and a
 //! timelapse is mostly the same picture over and over, which is the one thing
@@ -113,7 +113,7 @@ mod tests {
     /// reason this path is optional. CI has no FFmpeg, so this is a local
     /// check rather than a gate.
     fn ffmpeg_or_skip() -> bool {
-        if save_timelapse::ffmpeg_available() {
+        if crate::ffmpeg_available() {
             return true;
         }
         eprintln!("skipping: ffmpeg is not on PATH");

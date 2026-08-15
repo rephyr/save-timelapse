@@ -1,12 +1,24 @@
 //! save-timelapse: one interactive tool, no flags to learn. Asks what you want
 //! to do, asks whatever it could not auto-detect, then opens the viewer on the
 //! result.
+//!
+//! A window by default, and a text menu behind `--console` for anyone who
+//! prefers one or is driving it from a terminal. Each offers the other, so
+//! neither is reachable only by knowing a flag.
+
+// Windows only, and ignored everywhere else. Without it a console-subsystem
+// binary opens a black console box behind the window on every double-click,
+// which is most of what makes an app feel unfinished. The cost is that the
+// text menu has to find a console for itself; see `ensure_console`.
+#![windows_subsystem = "windows"]
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::process::Stdio;
+use std::time::SystemTime;
 
+use save_timelapse::build;
+use save_timelapse::describe;
 use save_timelapse::export;
 use save_timelapse::frame;
 use save_timelapse::locate::{factorio_user_dir, locate_factorio};
@@ -14,7 +26,6 @@ use save_timelapse::milestone;
 use save_timelapse::replay::{self, Options};
 use save_timelapse::settings::Settings;
 use save_timelapse::with_thousands;
-use save_timelapse::world;
 
 /// Default game time per frame during live-capture replay, asked about
 /// interactively so a longer playthrough can trade a larger export for
@@ -46,6 +57,7 @@ enum Mode {
     FromSaves,
     ExportVideo,
     ManageCaptures,
+    OpenWindow,
     Quit,
 }
 
@@ -111,8 +123,9 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
              \x20   2  Build one from what you recorded while playing\n\
              \x20   3  Build one from your save files\n\
              \x20   4  Save one as a video file\n\
-             \x20   5  Manage your recordings\n\
-             \x20   6  Quit\n\n\
+             \x20   5  Manage log data, timelapses and videos\n\
+             \x20   6  Use the window instead\n\
+             \x20   7  Quit\n\n\
              \x20 Type a number:"
         ))?;
         match input.as_str() {
@@ -121,11 +134,16 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
             "3" => return Ok(Mode::FromSaves),
             "4" => return Ok(Mode::ExportVideo),
             "5" => return Ok(Mode::ManageCaptures),
+            // The only way anybody finds the window. It takes a flag to open,
+            // and a flag has to come from a terminal or a shortcut, neither of
+            // which somebody who double-clicked an exe has. This menu is what
+            // they do have.
+            "6" => return Ok(Mode::OpenWindow),
             // Bare Enter still leaves, both because it is what long-time users
             // already press and because it is what leaves every screen below
             // this one, so it should keep meaning "back" one level up.
-            "6" | "q" | "Q" | "" => return Ok(Mode::Quit),
-            _ => println!("\n  Please type a number from 1 to 6.\n"),
+            "7" | "q" | "Q" | "" => return Ok(Mode::Quit),
+            _ => println!("\n  Please type a number from 1 to 7.\n"),
         }
     }
 }
@@ -196,13 +214,6 @@ fn locate_factorio_exe_interactive(settings: &mut Settings) -> io::Result<PathBu
     }
 }
 
-/// Empty input is the caller's job to treat as "every surface"; this only
-/// ever gets asked about a genuine name, matched case-insensitively so
-/// "Nauvis" and "nauvis" aren't different answers.
-fn find_surface<'a>(input: &str, surfaces: &'a [String]) -> Option<&'a str> {
-    surfaces.iter().find(|s| s.eq_ignore_ascii_case(input)).map(String::as_str)
-}
-
 /// `None` for anything that is not a recognized yes/no word, including empty
 /// input: whether blank means yes is the caller's business.
 fn parse_yes_no(input: &str) -> Option<bool> {
@@ -252,41 +263,28 @@ fn ask_frame_seconds(default: u64) -> io::Result<u64> {
     }
 }
 
-fn ask_surface_choice(surfaces: &[String]) -> io::Result<Option<String>> {
+/// Which places to build, as their real surface names. Never empty: Enter
+/// means all of them.
+///
+/// Numbered rather than typed, like every other list here. Names are the one
+/// thing a player has no reason to know: the places they recognise are called
+/// `nauvis` and `platform-5` underneath, and a capture across four planets and
+/// three platforms is a lot to spell correctly.
+fn ask_surface_choice(surfaces: &[String]) -> io::Result<Vec<String>> {
+    println!("\n  Which places should the timelapse include?\n");
+    for (i, surface) in surfaces.iter().enumerate() {
+        println!("  {}  {}", i + 1, describe::pretty_place(surface));
+    }
     loop {
-        let input = prompt(&format!(
-            "  Include everywhere you have been, or just one place?\n  \
-             You have been to: {}\n\n  \
-             Press Enter for all of them, or type one name:",
-            surfaces.iter().map(|s| pretty_place(s)).collect::<Vec<_>>().join(", ")
-        ))?;
-        if input.is_empty() {
-            return Ok(None);
+        let input = prompt("\n  Type numbers separated by spaces, or press Enter for all of them:")?;
+        if input.trim().is_empty() {
+            return Ok(surfaces.to_vec());
         }
-        if let Some(found) = find_surface(&input, surfaces) {
-            return Ok(Some(found.to_string()));
+        match parse_index_list(&input, surfaces.len()) {
+            Some(chosen) => return Ok(chosen.into_iter().map(|i| surfaces[i].clone()).collect()),
+            None => println!("\n  Please type numbers from 1 to {}, separated by spaces.\n", surfaces.len()),
         }
-        println!("\n  There is no \"{input}\" in that list. Try again.\n");
     }
-}
-
-/// A coarse "how long ago" label, good enough to recognise your own
-/// playthrough in a list. Factorio gives mods no way to read a save name.
-fn describe_age(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs();
-    if secs < 60 {
-        return "just now".to_string();
-    }
-    if secs < 3600 {
-        let minutes = secs / 60;
-        return format!("{minutes} minute{} ago", if minutes == 1 { "" } else { "s" });
-    }
-    if secs < 86400 {
-        let hours = secs / 3600;
-        return format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" });
-    }
-    let days = secs / 86400;
-    format!("{days} day{} ago", if days == 1 { "" } else { "s" })
 }
 
 /// 1-based `input` as an index into a list of `count` items. `None` for
@@ -298,6 +296,23 @@ fn parse_session_index(input: &str, count: usize) -> Option<usize> {
     (index < count).then_some(index)
 }
 
+/// Every index in a list like "1 3 4", "1,3,4" or "1, 3 4".
+///
+/// All or nothing: one bad entry rejects the whole line rather than quietly
+/// selecting the part that parsed, because a typo in a list of places to build
+/// would otherwise be discovered only after the build. Repeats collapse and
+/// order is kept as typed.
+fn parse_index_list(input: &str, count: usize) -> Option<Vec<usize>> {
+    let mut chosen: Vec<usize> = Vec::new();
+    for token in input.split(|c: char| c == ',' || c.is_whitespace()).filter(|token| !token.is_empty()) {
+        let index = parse_session_index(token, count)?;
+        if !chosen.contains(&index) {
+            chosen.push(index);
+        }
+    }
+    (!chosen.is_empty()).then_some(chosen)
+}
+
 /// Only reached when more than one playthrough has capture data waiting.
 /// Always picks exactly one rather than offering "all": combining them would
 /// jump between different bases in one timelapse.
@@ -305,7 +320,7 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
     println!("\n  You have {} recordings:\n", sessions.len());
     let now = SystemTime::now();
     for (i, session) in sessions.iter().enumerate() {
-        println!("  {}  {}\n", i + 1, describe_session(session, now));
+        println!("  {}  {}\n", i + 1, describe::describe_session(session, now));
     }
     loop {
         let input = prompt("  Which one? Type a number:")?;
@@ -329,52 +344,6 @@ fn ask_session_choice(sessions: &[replay::Session]) -> io::Result<usize> {
 /// chain has to be built in the order it will be replayed and the viewer
 /// replays in tick order. Filenames cannot carry that: Factorio's autosaves
 /// rotate, so `_autosave1` is as likely to be the newest as the oldest, and
-/// `ordering_key` can only guess from the digits in a name.
-///
-/// Two saves of one moment are dropped to one here rather than at load. The
-/// viewer deduplicates by tick too, but a delta it dropped would take every
-/// frame after it along with it.
-fn write_as_delta_chain(frames: &[PathBuf]) -> io::Result<(u64, u64)> {
-    let size = |path: &PathBuf| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let before: u64 = frames.iter().map(size).sum();
-
-    let mut ordered: Vec<(u64, &PathBuf)> = Vec::new();
-    for path in frames {
-        match frame::read_header(path) {
-            Ok((tick, _)) => ordered.push((tick, path)),
-            // Unreadable here means unreadable to the viewer as well, so it is
-            // removed rather than left to reset the sequence at load.
-            Err(_) => drop(std::fs::remove_file(path)),
-        }
-    }
-    ordered.sort_by_key(|&(tick, _)| tick);
-
-    let mut chain: Vec<&PathBuf> = Vec::new();
-    let mut last_tick: Option<u64> = None;
-    for (tick, path) in ordered {
-        match last_tick == Some(tick) {
-            true => drop(std::fs::remove_file(path)),
-            false => {
-                chain.push(path);
-                last_tick = Some(tick);
-            }
-        }
-    }
-
-    let mut previous: Option<frame::Frame> = None;
-    for path in &chain {
-        let current = frame::read_binary(&std::fs::read(path)?)?;
-        // Read before it is written, so rewriting in place is safe: the folder
-        // shrinks as it goes rather than needing room for both forms at once.
-        if let Some(prev) = &previous {
-            std::fs::write(path, frame::write_binary(&world::delta_between(prev, &current).as_out()))?;
-        }
-        previous = Some(current);
-    }
-
-    Ok((before, chain.iter().copied().map(size).sum()))
-}
-
 /// Saves are usually numbered, so order by that number rather than
 /// lexicographically, which would place "base10" before "base2".
 fn ordering_key(path: &Path) -> (u64, String) {
@@ -414,109 +383,12 @@ fn parse_save_selection(input: &str, saves: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The Lua mod's source. Tried next to this program first (how it travels
-/// once distributed), then the compile-time project root (running straight out
-/// of target/release), then the current folder.
-fn mod_source_dir() -> io::Result<PathBuf> {
-    let exe_sibling = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("mod")));
-    if let Some(dir) = &exe_sibling {
-        if dir.is_dir() {
-            return Ok(dir.clone());
-        }
-    }
-    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mod");
-    if manifest_candidate.is_dir() {
-        return Ok(manifest_candidate);
-    }
-    let cwd_candidate = PathBuf::from("mod");
-    if cwd_candidate.is_dir() {
-        return Ok(cwd_candidate);
-    }
-    Err(io::Error::other(
-        "Could not find the mod/ folder needed to export from saves. It should sit next to \
-         this program (or in the current folder, if running from source).",
-    ))
-}
-
-/// Where a mode writes its output: beside the running exe, so the result is
-/// easy to find wherever Factorio's user data lives. Falls back to the current
-/// directory only if the exe's path cannot be determined.
-fn output_dir_next_to_exe(name: &str) -> PathBuf {
-    std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from(".")).join(name)
-}
-
-/// Where built timelapses are kept, one subfolder each. A single fixed folder
-/// that every run rebuilt meant reopening yesterday's timelapse was
-/// impossible: the only way to see one was to make it again.
-fn timelapses_root() -> PathBuf {
-    output_dir_next_to_exe("timelapses")
-}
-
-/// Turns a playthrough name or save name into something safe to use as a
-/// folder name, since both come from the user and can hold anything.
-fn as_folder_name(raw: &str) -> String {
-    // Dots are kept, a name like "v1.2 run" being ordinary, and trimmed from
-    // the ends, since "." and ".." name directories.
-    let cleaned: String =
-        raw.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
-    let trimmed = cleaned.trim().trim_matches('.').trim();
-    if trimmed.is_empty() {
-        "timelapse".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// One timelapse already built and sitting on disk.
-struct BuiltTimelapse {
-    name: String,
-    path: PathBuf,
-    frames: usize,
-    bytes: u64,
-    modified: SystemTime,
-}
-
-/// Every built timelapse, newest first. Counts frames and weighs the folder,
-/// since which of two somebody wants is usually answered by how big and how
-/// recent it is, neither visible from a name.
-fn list_timelapses() -> Vec<BuiltTimelapse> {
-    list_timelapses_in(&timelapses_root())
-}
-
-/// Split from [`list_timelapses`] only so it can be tested: the real root is
-/// derived from the running executable's own location, which no test can
-/// arrange.
-fn list_timelapses_in(root: &Path) -> Vec<BuiltTimelapse> {
-    let Ok(entries) = std::fs::read_dir(root) else { return Vec::new() };
-
-    let mut found: Vec<BuiltTimelapse> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let files: Vec<_> = std::fs::read_dir(&path).ok()?.filter_map(Result::ok).collect();
-            let frames = files.iter().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("stfr")).count();
-            // A folder with no frames in it is a half-finished or interrupted
-            // build, not something worth offering to open.
-            if frames == 0 {
-                return None;
-            }
-            let bytes = files.iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum();
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some(BuiltTimelapse { name: entry.file_name().to_string_lossy().into_owned(), path, frames, bytes, modified })
-        })
-        .collect();
-
-    found.sort_by_key(|t| std::cmp::Reverse(t.modified));
-    found
-}
-
-fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
+fn ask_timelapse_choice(built: &[build::BuiltTimelapse], question: &str) -> io::Result<Option<usize>> {
     println!("\n  Your timelapses:\n");
     for (i, t) in built.iter().enumerate() {
-        let age = t.modified.elapsed().map(describe_age).unwrap_or_else(|_| "unknown".to_string());
+        let age = t.modified.elapsed().map(describe::describe_age).unwrap_or_else(|_| "unknown".to_string());
         println!("  {}  {}", i + 1, t.name);
-        println!("     {} frames, {}, built {age}\n", with_thousands(t.frames as u64), describe_size(t.bytes));
+        println!("     {} frames, {}, built {age}\n", with_thousands(t.frames as u64), describe::describe_size(t.bytes));
     }
     loop {
         let input = prompt(&format!("  {question} Type a number, or press Enter to go back:"))?;
@@ -530,69 +402,30 @@ fn ask_timelapse_choice(built: &[BuiltTimelapse], question: &str) -> io::Result<
     }
 }
 
-/// `viewer` is a sibling binary rather than a library this crate can call: it
-/// depends on this one, and its `main` is a macroquad event loop. So launching
-/// it means finding the executable cargo built next to this one.
-fn viewer_path() -> io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or_else(|| io::Error::other("could not determine this program's own folder"))?;
-    let candidate = dir.join(format!("viewer{}", std::env::consts::EXE_SUFFIX));
-    if !candidate.exists() {
-        return Err(io::Error::other(format!(
-            "Could not find {} next to this program. Reinstall save-timelapse so both files \
-             end up in the same folder.",
-            candidate.display()
-        )));
-    }
-    Ok(candidate)
-}
-
-/// The surfaces a built timelapse holds, read off its filenames. A
-/// single-surface build writes `frame_0000.stfr` with no name in it, so an
-/// empty result means "one surface, unnamed" rather than "none". Split at the
-/// first underscore after the index, so a name containing one survives.
-fn surfaces_in(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
-        .filter_map(|p| {
-            let stem = p.file_stem()?.to_str()?.to_string();
-            // Terrain files are named per surface too, so counting both would
-            // list a name twice. Terrain alone is not a surface anyone can
-            // export.
-            let rest = stem.strip_prefix("frame_")?;
-            let (_index, surface) = rest.split_once('_')?;
-            (!surface.is_empty()).then(|| surface.to_string())
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
+/// viewer already understands it as every surface.
 /// `None` means "let the viewer pick", which is its busiest surface, and is
 /// what Enter gives. `Some("all")` is passed straight through, since the
 /// viewer already understands it as every surface.
 fn ask_export_surface(surfaces: &[String]) -> io::Result<Option<String>> {
+    println!("\n  This timelapse has more than one world in it.\n");
+    for (i, surface) in surfaces.iter().enumerate() {
+        println!("  {}  {}", i + 1, describe::pretty_place(surface));
+    }
+    // Last and numbered like the rest, rather than a word to type: it is one
+    // more thing this list can produce, not a different kind of answer.
+    let every = surfaces.len() + 1;
+    println!("  {every}  One video for each of them");
+
     loop {
-        let input = prompt(&format!(
-            "\nThis timelapse has more than one world in it.\n\
-             Surfaces: {}\n\
-             Enter a name, \"all\" for one file each, or press Enter for the busiest one:",
-            surfaces.join(", ")
-        ))?;
-        if input.is_empty() {
+        let input = prompt("\n  Type a number, or press Enter for the busiest one:")?;
+        if input.trim().is_empty() {
             return Ok(None);
         }
-        if input.eq_ignore_ascii_case("all") {
-            return Ok(Some("all".to_string()));
+        match parse_session_index(&input, every) {
+            Some(index) if index + 1 == every => return Ok(Some("all".to_string())),
+            Some(index) => return Ok(Some(surfaces[index].clone())),
+            None => println!("\n  Please type a number from 1 to {every}.\n"),
         }
-        if let Some(found) = find_surface(&input, surfaces) {
-            return Ok(Some(found.to_string()));
-        }
-        println!("\"{input}\" doesn't match any surface listed above. Try again.");
     }
 }
 
@@ -662,17 +495,11 @@ fn ask_fps(default: u32) -> io::Result<u32> {
     }
 }
 
-/// Where finished videos and image sequences go: one folder next to the
-/// executable, like `timelapses/`, so "where did it go" has one answer.
-fn videos_root() -> PathBuf {
-    output_dir_next_to_exe("videos")
-}
-
 /// Renders a built timelapse to a video file or an image sequence, by running
 /// the viewer rather than reimplementing it: rendering needs a GPU context and
 /// the whole sprite pipeline.
 fn run_export(settings: &mut Settings) -> io::Result<()> {
-    let built = list_timelapses();
+    let built = build::list_timelapses();
     if built.is_empty() {
         println!("\n  You need a timelapse before you can save one as a video.\n  Try option 2 or 3 first.\n");
         return Ok(());
@@ -683,7 +510,7 @@ fn run_export(settings: &mut Settings) -> io::Result<()> {
     };
     let chosen = &built[index];
 
-    let surfaces = surfaces_in(&chosen.path);
+    let surfaces = build::surfaces_in(&chosen.path);
     let surface = if surfaces.len() > 1 { ask_export_surface(&surfaces)? } else { None };
 
     // Asked as a question about the output rather than as a format choice:
@@ -748,47 +575,29 @@ Show the in-game clock, so the video says how long the factory took?",
     settings.export_fps = Some(fps);
     remember(settings);
 
-    let root = videos_root();
+    let root = build::videos_root();
     std::fs::create_dir_all(&root)?;
     // No extension here: the viewer appends `.avi` or `.mp4` for a video and
     // treats the path as a folder for an image sequence, so the same argument
     // serves both.
-    let target = root.join(as_folder_name(&chosen.name));
-
-    let viewer = viewer_path()?;
-    let mut command = Command::new(&viewer);
-    command
-        .arg(&chosen.path)
-        .arg("--export")
-        .arg(&target)
-        .arg("--width")
-        .arg(size.0.to_string())
-        .arg("--height")
-        .arg(size.1.to_string());
-    if video {
-        command.arg("--video").arg("--fps").arg(fps.to_string());
-        if mp4 {
-            command.arg("--mp4");
-        }
-        if overlay_players {
-            command.arg("--overlay-players");
-        }
-        if overlay_clock {
-            command.arg("--overlay-clock");
-        }
-    }
-    if let Some(name) = &surface {
-        command.arg("--surface").arg(name);
-    }
+    let target = root.join(build::as_folder_name(&chosen.name));
 
     println!("\nRendering. A window opens while this runs; leave it alone until it closes.\n");
-    // `status` rather than `spawn`: every other mode hands off to the viewer
-    // and exits, but an export finishes, and returning to the menu before it
-    // does would leave its progress printing over a fresh prompt.
-    let status = command.status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("the viewer exited with {status} without finishing the export")));
-    }
+    // Blocking: every other mode hands off to the viewer and exits, but an
+    // export finishes, and returning to the menu before it does would leave
+    // its progress printing over a fresh prompt.
+    build::video(&build::VideoRequest {
+        timelapse: chosen.path.clone(),
+        target,
+        width: size.0,
+        height: size.1,
+        surface,
+        video,
+        fps,
+        mp4,
+        overlay_players,
+        overlay_clock,
+    })?;
 
     // Naming the folder, not the file: with "all" there is one file per
     // surface, and with an image sequence there is a folder of them, so the
@@ -837,9 +646,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
 
     step("Finding places");
     let surfaces = replay::discover_surfaces(&chosen.session_dir, &replay_state)?;
-    println!("{}\n", describe_places(&surfaces));
+    println!("{}\n", describe::describe_places(&surfaces));
 
-    let chosen_surface = ask_surface_choice(&surfaces)?;
+    let chosen_surfaces = ask_surface_choice(&surfaces)?;
     let frame_seconds = ask_frame_seconds(settings.frame_seconds.unwrap_or(DEFAULT_FRAME_SECONDS))?;
 
     // Saved before the export, so an answer survives a build that fails.
@@ -855,9 +664,9 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // nothing; the id stays as the last resort against a collision.
     let name = chosen.label().unwrap_or_else(|| match chosen.baseline.surfaces.as_slice() {
         [] => format!("playthrough-{:08x}", chosen.session_id),
-        surfaces => format!("{} ({:08x})", describe_places(surfaces), chosen.session_id),
+        surfaces => format!("{} ({:08x})", describe::describe_places(surfaces), chosen.session_id),
     });
-    let out = timelapses_root().join(as_folder_name(&name));
+    let out = build::timelapses_root().join(build::as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -866,75 +675,39 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
     // recorded before ground moved into its own scan. Kept first because
     // `offer_terrain_for_capture` overwrites it afterwards, which is the right
     // precedence, a scan covering the factory's final extent.
-    match &chosen_surface {
-        None => replay::write_all_terrain(&replay_state.world, replay_state.baseline.tick, &out)?,
-        Some(name) => replay::write_terrain(&replay_state.world, name, replay_state.baseline.tick, &out)?,
+    match chosen_surfaces.as_slice() {
+        [one] => println!("\n  Building your timelapse of {}.\n", describe::pretty_place(one)),
+        many if many.len() == surfaces.len() => println!("\n  Building your timelapse.\n"),
+        many => println!("\n  Building your timelapse of {}.\n", describe::describe_places(many)),
     }
 
-    copy_session_sidecars(&chosen.session_dir, &out)?;
-
-    let options = Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES };
-    let mut written = 0usize;
-    let mut error: Option<io::Error> = None;
-    // Last revision written per surface, carried across the run so
-    // `write_all_surfaces` can skip a surface nothing has touched.
-    let mut surface_revisions: std::collections::HashMap<String, u64> = Default::default();
-
-    let emitted = match &chosen_surface {
-        None => {
-            println!("\n  Building your timelapse.\n");
-            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
-                if error.is_some() {
-                    return;
-                }
-                if let Err(e) = replay::write_all_surfaces(world, tick, &out, written, &mut surface_revisions) {
-                    error = Some(e);
-                    return;
-                }
-                written += 1;
-                if written.is_multiple_of(25) {
-                    print!("\r  {written} frames");
-                    io::stdout().flush().ok();
-                }
-            })?
-        }
-        Some(name) => {
-            println!("\n  Building your timelapse of {}.\n", pretty_place(name));
-            replay::run(&mut replay_state, &chosen.session_dir, &options, |world, tick| {
-                if error.is_some() {
-                    return;
-                }
-                // The first frame is the picture; every one after it is what
-                // changed. A real megabase changed by about 200 items a frame
-                // out of 4.2 million, so a snapshot spent 8.8 MB restating what
-                // the reader already had.
-                let frame = match written == 0 {
-                    true => {
-                        world.clear_changes(name);
-                        world.to_frame(name, tick)
-                    }
-                    false => world.to_frame_delta(name, tick),
-                };
-                let path = out.join(format!("frame_{written:04}.stfr"));
-                if let Err(e) = std::fs::write(&path, frame::write_binary(&frame.as_out())) {
-                    error = Some(e);
-                    return;
-                }
-                written += 1;
-                if written.is_multiple_of(25) {
-                    print!("\r  {written} frames");
-                    io::stdout().flush().ok();
-                }
-            })?
+    let plan = build::Plan {
+        surfaces: chosen_surfaces,
+        options: Options { interval: frame_seconds * TICKS_PER_SECOND, max_frames: MAX_FRAMES },
+    };
+    // A console reports by overwriting one line, and only every twenty-fifth
+    // frame: the work is fast enough that printing each would spend more time
+    // on the terminal than on the timelapse. Nothing here cancels, there being
+    // nothing to press while this blocks.
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let mut on_frame = |written: usize| {
+        if written.is_multiple_of(25) {
+            print!("\r  {written} frames");
+            io::stdout().flush().ok();
         }
     };
-    if let Some(e) = error {
-        return Err(e);
-    }
+    let built = build::timelapse(
+        &mut replay_state,
+        &chosen.session_dir,
+        &out,
+        &plan,
+        &mut build::Watch { on: &mut on_frame, cancel: &never },
+    )?;
+    let emitted = built.emitted;
     println!(
         "\r  Built {} frames covering {}.",
         with_thousands(emitted as u64),
-        describe_span(replay_state.baseline.tick, replay_state.world.tick)
+        describe::describe_span(replay_state.baseline.tick, replay_state.world.tick)
     );
     println!("  Saved in {}", out.display());
 
@@ -1018,7 +791,7 @@ fn add_icons_for_capture(settings: &mut Settings, user_dir: &Path, out: &Path) {
     let Some(factorio) = settings.factorio_exe.clone().or_else(locate_factorio) else {
         return;
     };
-    let Ok(mod_source) = mod_source_dir() else {
+    let Ok(mod_source) = build::mod_source_dir() else {
         return;
     };
     let config = export::ExportConfig {
@@ -1029,7 +802,7 @@ fn add_icons_for_capture(settings: &mut Settings, user_dir: &Path, out: &Path) {
         capture_terrain: false,
         terrain_scan: false,
     };
-    add_icons(out, &config);
+    report_icons(build::add_icons(out, &config, &mut announce_icon_read));
 }
 
 /// Offer to read the ground for a live capture, from a save of the same
@@ -1053,7 +826,7 @@ fn ask_terrain_save(saves: &[PathBuf]) -> io::Result<&Path> {
     println!("  Ground only exists where that save had already been, so pick a recent one.\n");
     for (i, save) in saves.iter().enumerate().take(TERRAIN_SAVE_CHOICES) {
         let age = save.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok());
-        let when = age.map(describe_age).unwrap_or_else(|| "unknown".to_string());
+        let when = age.map(describe::describe_age).unwrap_or_else(|| "unknown".to_string());
         let name = save.file_name().unwrap_or_default().to_string_lossy();
         println!("  {:>2}  {name}  ({when})", i + 1);
     }
@@ -1128,6 +901,10 @@ fn offer_terrain_for_capture(
             cached.iter().filter(|file| file.file_name().is_some_and(|name| std::fs::copy(file, out.join(name)).is_ok())).count();
         if copied > 0 {
             println!("  Reused the ground already read for this playthrough.");
+            // Applied to the reused copy as well as a fresh scan: the cache
+            // holds the scan as it came, and what the recording has to say
+            // about it grows every time somebody plays on.
+            report_dated_nests(out, &user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}")));
             return Ok(());
         }
     }
@@ -1138,13 +915,28 @@ fn offer_terrain_for_capture(
     let config = export::ExportConfig {
         factorio,
         user_mods: user_dir.join("mods"),
-        mod_source: mod_source_dir()?,
+        mod_source: build::mod_source_dir()?,
         include_resources: false,
         capture_terrain: true,
         terrain_scan: true,
     };
     add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
+    report_dated_nests(out, &user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}")));
     Ok(())
+}
+
+/// Hands the ground back to the recording for the one thing a scan cannot
+/// date: a nest the biters built while somebody was playing.
+///
+/// Said out loud when it finds any, because "your nests appeared at the right
+/// time" is not visible in a built timelapse until somebody scrubs to the hour
+/// it happened.
+fn report_dated_nests(out: &Path, session_dir: &Path) {
+    match build::drop_nests_that_arrived_later(out, session_dir) {
+        Ok(0) => {}
+        Ok(n) => println!("  {n} nest(s) the biters built are timed from the recording rather than shown from the start."),
+        Err(e) => eprintln!("warning: could not date the nests against the recording ({e}); they will show from the start"),
+    }
 }
 
 /// Where a scan's ground is kept for next time: this playthrough's own capture
@@ -1191,133 +983,27 @@ fn cached_terrain(user_dir: &Path, session_id: u32) -> Vec<PathBuf> {
 /// from the filenames rather than by reading each one.
 ///
 /// A mod's icons change only when the mod does, so this is what decides
-/// whether the cached dump still answers. Folders as well as zips, a mod being
-/// installable either way.
-fn mod_set_stamp(user_mods: &Path) -> String {
-    let mut names: Vec<String> = std::fs::read_dir(user_mods)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|item| item.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != "mod-settings.dat" && name != "mod-list.json")
-        .collect();
-    names.sort();
-    let mut hash: u64 = 1469598103934665603;
-    for byte in names.join(",").bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    format!("{hash:016x}")
-}
-
 /// Icons already dumped for this exact set of mods, or `None` to dump them.
 ///
 /// Kept next to the timelapses rather than inside one, because the answer
 /// depends on the mods rather than on the playthrough: two timelapses from one
-/// modpack share it, and a timelapse folder is deleted and rebuilt every time.
-fn cached_icons(user_mods: &Path) -> PathBuf {
-    output_dir_next_to_exe("icons").join(mod_set_stamp(user_mods))
+/// Said once, before the read that takes about a minute, and never on a run
+/// that has the icons cached already.
+fn announce_icon_read(missing: usize, names: usize) {
+    step(&format!("Reading this game's icons, once for this set of mods ({missing} of {names} buildings need them)"));
 }
 
-/// Every entity name the built timelapse actually draws.
-///
-/// Read from the frames rather than from `prototypes.json`, which lists every
-/// prototype the game has rather than the few hundred a factory is made of.
-/// Frames are deltas, so a name can first appear in any of them and all are
-/// read; they are small for exactly that reason.
-fn names_in_timelapse(out: &Path) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    let mut frames: Vec<PathBuf> = std::fs::read_dir(out)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|item| item.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
-        .collect();
-    frames.sort();
-    for path in frames {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(frame) = frame::read_binary(&bytes) else { continue };
-        for entity in &frame.entities {
-            if !names.contains(&*entity.n) {
-                names.insert(entity.n.to_string());
-            }
+fn report_icons(added: build::IconsAdded) {
+    if let Some(seconds) = added.read_seconds {
+        println!("read in {seconds:.1}s, kept for next time");
+    }
+    match added.failed {
+        true if added.read_seconds.is_some() => {
+            eprintln!("warning: could not read this game's icons; modded buildings will draw as flat colours")
         }
+        _ if added.copied > 0 => println!("{} icons for this timelapse's buildings", added.copied),
+        _ => {}
     }
-    names
-}
-
-/// Every entity's icon as the recording game draws it, copied into `out`.
-///
-/// Without this a modded prototype has no artwork at all and falls back to a
-/// flat colour, because its icon lives inside its mod zip under a name that
-/// need not match the prototype and is often several layers that the game
-/// composites. Factorio will dump them all if asked, so it is asked.
-///
-/// Asking is the expensive part and is skipped whenever it can be. A vanilla
-/// playthrough draws nothing the install cannot already answer for, so it never
-/// launches Factorio here at all. Beyond that the dump is cached against the
-/// mod set, so a second timelapse from one modpack pays nothing either.
-///
-/// Note what cannot be optimised: 45 of the 60 seconds a dump takes is loading
-/// the mods, not writing the icons, and every icon needs those same prototypes
-/// loaded. Asking for eight instead of thirteen hundred would save about a
-/// second, and `--dump-icon-sprites` takes no filter regardless. Skipping the
-/// run is the only real saving there is.
-///
-/// Best effort throughout: a timelapse without icons is the one everybody had
-/// until now.
-fn add_icons(out: &Path, config: &export::ExportConfig) -> bool {
-    let Some(data_dir) = export::install_data_dir(&config.factorio) else {
-        return false;
-    };
-
-    let names = names_in_timelapse(out);
-    let missing: Vec<&String> =
-        names.iter().filter(|name| save_timelapse::icons::icon_path(None, &data_dir, name).is_none()).collect();
-    if missing.is_empty() {
-        // Every name is one the install can draw, so there is nothing this
-        // game could add. True of any unmodded playthrough.
-        return true;
-    }
-
-    let cache = cached_icons(&config.user_mods);
-    let cached = std::fs::read_dir(&cache).map(|entries| entries.count()).unwrap_or(0);
-
-    if cached == 0 {
-        step(&format!(
-            "Reading this game's icons, once for this set of mods ({} of {} buildings need them)",
-            missing.len(),
-            names.len()
-        ));
-        let staged = std::env::temp_dir().join(format!("save-timelapse-icons-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&staged);
-        let started = std::time::Instant::now();
-        let result = export::dump_entity_icons(&staged, &cache, config);
-        let _ = std::fs::remove_dir_all(&staged);
-        if let Err(e) = result {
-            eprintln!("warning: could not read this game's icons ({e}); modded buildings will draw as flat colours");
-            return false;
-        }
-        println!("read in {:.1}s, kept for next time", started.elapsed().as_secs_f32());
-    }
-
-    // Only what this timelapse draws, not all thirteen hundred: a factory is
-    // made of a few dozen kinds of thing, and the folder travels with the
-    // timelapse.
-    let into = out.join("icons");
-    if std::fs::create_dir_all(&into).is_err() {
-        return false;
-    }
-    let mut copied = 0usize;
-    for name in &names {
-        let file = format!("{name}.png");
-        if std::fs::copy(cache.join(&file), into.join(&file)).is_ok() {
-            copied += 1;
-        }
-    }
-    println!("{copied} icons for this timelapse's buildings");
-    copied > 0
 }
 
 /// Copies the rail shapes a scan sampled into a timelapse's description.
@@ -1487,7 +1173,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "from-saves".to_string());
-    let out = timelapses_root().join(as_folder_name(&name));
+    let out = build::timelapses_root().join(build::as_folder_name(&name));
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out)?;
 
@@ -1495,52 +1181,36 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
     let config = export::ExportConfig {
         factorio,
         user_mods,
-        mod_source: mod_source_dir()?,
+        mod_source: build::mod_source_dir()?,
         include_resources: false,
         capture_terrain,
         terrain_scan: false,
     };
 
-    let mut done = 0usize;
-    let mut milestone_states: Vec<milestone::State> = Vec::new();
-    let mut exported: Vec<PathBuf> = Vec::new();
-    for (index, save) in chosen.iter().enumerate() {
-        let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        print!("[{:>3}/{}] {label} ... ", index + 1, chosen.len());
-        io::stdout().flush().ok();
-
-        let staged = workspace.join(format!("stage_{index}"));
-        match export::export_save(save, &staged, &config) {
-            Ok(outcome) => {
-                let target = out.join(format!("frame_{index:04}.stfr"));
-                let primary = &outcome.frames[0];
-                std::fs::rename(primary, &target).or_else(|_| std::fs::copy(primary, &target).map(drop))?;
-                exported.push(target.clone());
-                // Appended, not overwritten: each save contributes its own
-                // one-shot sample at its own real tick.
-                if let Some(log) = &outcome.players_log {
-                    let mut combined = std::fs::OpenOptions::new().create(true).append(true).open(out.join("players.jsonl"))?;
-                    combined.write_all(&std::fs::read(log)?)?;
-                }
-                if let Some(state) = outcome.milestones {
-                    milestone_states.push(state);
-                }
-                let kib = target.metadata().map(|m| m.len()).unwrap_or(0) / 1024;
-                println!("ok, {kib} KiB in {:.1}s", outcome.seconds);
-                done += 1;
-            }
-            Err(err) => println!("failed: {err}"),
+    // One line per save, written as it starts and completed as it finishes,
+    // which is what makes a long run readable: the name is on screen while
+    // Factorio is loading it rather than only once it is done.
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let mut on_save = |step: build::SaveStep| match step {
+        build::SaveStep::Started { index, total, label } => {
+            print!("[{:>3}/{total}] {label} ... ", index + 1);
+            io::stdout().flush().ok();
         }
-        let _ = std::fs::remove_dir_all(&staged);
-    }
-    let _ = std::fs::remove_dir_all(&workspace);
-    println!("\n{done} of {} exported to {}", chosen.len(), out.display());
+        build::SaveStep::Exported { bytes, seconds, .. } => println!("ok, {} KiB in {seconds:.1}s", bytes / 1024),
+        build::SaveStep::Failed { error, .. } => println!("failed: {error}"),
+    };
+    let exported = build::from_saves(&chosen, &out, &workspace, &config, &mut build::Watch { on: &mut on_save, cancel: &never })?;
 
-    if done == 0 {
+    let _ = std::fs::remove_dir_all(&workspace);
+    println!("\n{} of {} exported to {}", exported.frames.len(), chosen.len(), out.display());
+
+    if exported.frames.is_empty() {
         return Err(io::Error::other("none of the selected saves exported successfully"));
     }
+    let milestone_states = exported.milestones;
+    let exported = exported.frames;
 
-    match write_as_delta_chain(&exported) {
+    match build::write_as_delta_chain(&exported) {
         Ok((before, after)) if after < before => println!(
             "  frames reduced from {} MiB to {} MiB, each one keeping only what changed",
             before / (1024 * 1024),
@@ -1565,7 +1235,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     // Unconditional and unasked, unlike ground: it costs 10 MB and no time
     // at all once cached, where ground is a real size and time decision.
-    add_icons(&out, &config);
+    report_icons(build::add_icons(&out, &config, &mut announce_icon_read));
 
     // Milestones cannot be derived from a single save, which reports only
     // totals. When something first became true needs consecutive ones.
@@ -1596,16 +1266,32 @@ fn remember(settings: &Settings) {
     }
 }
 
+/// Hands over to the window and leaves.
+///
+/// Handed over rather than run alongside: two of this program's faces open at
+/// once is two menus disagreeing about what is on disk. Spawned rather than
+/// called, macroquad allowing one window per process and this process being a
+/// console.
+fn open_window() -> io::Result<()> {
+    println!(
+        "
+  Opening the window. This console can be closed.
+"
+    );
+    // No flag: the window is what this program does when asked for nothing.
+    std::process::Command::new(std::env::current_exe()?).spawn()?;
+    Ok(())
+}
+
 /// Opens the viewer without waiting. `spawn`, not `status`: the viewer is a
 /// window somebody keeps open, so blocking would freeze this program behind it,
 /// and detaching is what lets the menu come straight back.
 fn open_viewer(path: &Path) -> io::Result<()> {
-    let viewer = viewer_path()?;
     println!("\n  Opening the viewer.\n");
     // The viewer narrates its loading on stdout and inherits this console, so
     // it would land on top of the menu. Discarding stdout and keeping stderr
     // silences the narration without silencing a viewer that failed.
-    Command::new(&viewer).arg(path).stdout(Stdio::null()).spawn()?;
+    build::viewer_command()?.arg(path).stdout(Stdio::null()).spawn()?;
     Ok(())
 }
 
@@ -1625,7 +1311,7 @@ fn run() -> io::Result<()> {
     }
 
     loop {
-        let built = list_timelapses();
+        let built = build::list_timelapses();
         let outcome = match ask_mode(built.len())? {
             // Straight to the viewer, building nothing. The whole point: a
             // timelapse that already exists should not have to be made again
@@ -1656,8 +1342,16 @@ fn run() -> io::Result<()> {
                 // asking, and it is worth keeping even though nothing was
                 // built.
                 remember(&settings);
-                manage_captures(&dir.join("script-output").join("save-timelapse"))
+                manage(&dir.join("script-output").join("save-timelapse"))
             }),
+            // Handed over rather than run alongside: two of this program's
+            // faces open at once is two menus disagreeing about what is on
+            // disk. Spawned rather than called, macroquad allowing one window
+            // per process and this one being a console.
+            Mode::OpenWindow => match open_window() {
+                Ok(()) => return Ok(()),
+                Err(e) => Err(e),
+            },
             Mode::Quit => return Ok(()),
         };
 
@@ -1671,101 +1365,123 @@ fn run() -> io::Result<()> {
     }
 }
 
-/// Bytes as something a person can compare at a glance. Captures range from
-/// a few hundred KiB to several GiB, so a single unit would either be
-/// unreadably long or lose the distinction between the small ones.
-fn describe_size(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
-    for (unit, scale) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
-        }
-    }
-    format!("{bytes} B")
-}
-
-/// A raw surface name as a player would say it. Factorio's own names are
-/// lowercase (`nauvis`, `platform-1`), which reads like a database key next to
-/// prose.
-fn pretty_place(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-/// The places in a recording, named rather than listed exhaustively. A Space
-/// Age playthrough reaches five planets and any number of platforms, which ran
-/// to nine names on a real capture. Two and a count says the same thing.
-fn describe_places(surfaces: &[String]) -> String {
-    match surfaces {
-        [] => "nothing yet".to_string(),
-        [one] => pretty_place(one),
-        [one, two] => format!("{} and {}", pretty_place(one), pretty_place(two)),
-        [one, two, rest @ ..] => {
-            format!("{}, {} and {} more", pretty_place(one), pretty_place(two), rest.len())
-        }
-    }
-}
-
-/// How much play time a built timelapse covers, from the snapshot it starts
-/// at to the last thing replayed. Minutes are dropped once there are hours:
-/// at that scale they are noise, and a round number is easier to hold on to.
-fn describe_span(from_tick: u64, to_tick: u64) -> String {
-    let minutes = to_tick.saturating_sub(from_tick) / TICKS_PER_SECOND / 60;
-    match (minutes / 60, minutes) {
-        (0, 0) => "less than a minute of play".to_string(),
-        (0, 1) => "1 minute of play".to_string(),
-        (0, m) => format!("{m} minutes of play"),
-        (1, _) => "1 hour of play".to_string(),
-        (h, _) => format!("{h} hours of play"),
-    }
-}
-
-/// How far into a playthrough a tick is, in hours of play.
-fn describe_play_time(tick: u64) -> String {
-    let hours = tick / TICKS_PER_SECOND / 3600;
-    match hours {
-        0 => "under an hour in".to_string(),
-        1 => "1 hour in".to_string(),
-        n => format!("{n} hours in"),
-    }
-}
-
-/// One line describing a recording, for the picker before a rebuild. Leads with
-/// the name when there is one, the places when there is not: a hex session id
-/// identifies a recording perfectly and tells the person choosing between two
-/// of them nothing. Size belongs in the management screen, where the question
-/// is what to delete.
-fn describe_session(session: &replay::Session, now: SystemTime) -> String {
-    let age = describe_age(now.duration_since(session.last_modified).unwrap_or_default());
-    let places = describe_places(&session.baseline.surfaces);
-    // Older captures wrote only a total, which counts the trees and ore a
-    // capture keeps for context alongside what somebody built.
-    let buildings = session.baseline.buildings.unwrap_or(session.baseline.entities);
-    let scale = format!("{} buildings, {}", with_thousands(buildings as u64), describe_play_time(session.baseline.tick));
-    match session.label() {
-        Some(name) => format!("{name}  ({places})\n     {scale}, last played {age}"),
-        None => format!("{places}\n     {scale}, last played {age}"),
-    }
-}
-
-/// The same recording, plus what it costs on disk, for the management screen.
-fn describe_session_with_size(session: &replay::Session, now: SystemTime) -> String {
-    format!("{}, {}", describe_session(session, now), describe_size(session.size_on_disk()))
-}
-
 /// The capture management screen: name a playthrough, see what each costs on
 /// disk, delete ones finished with. Deleting is offered here because the
 /// in-game reset only removes the playthrough currently loaded.
+/// The three things this tool leaves on disk, split by what losing one costs.
+///
+/// The log data is a playthrough's recorded history and the only copy of it: it
+/// cannot be got back from a save, because Factorio keeps no record of when
+/// anything was built. A timelapse and a video are both made from that log, so
+/// deleting either is giving up disk space and a rebuild, not the history.
+/// Putting all three on one screen with one delete made the recoverable and the
+/// irreversible look alike.
+fn manage(capture_dir: &Path) -> io::Result<()> {
+    loop {
+        let sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
+        let recorded: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
+        let timelapses = build::list_timelapses();
+        let built: u64 = timelapses.iter().map(|t| t.bytes).sum();
+        let videos = build::list_videos();
+        let rendered: u64 = videos.iter().map(|v| v.bytes).sum();
+
+        let input = prompt(&format!(
+            "\n  What would you like to manage?\n\n\
+             \x20   1  Log data            {:>3}, {}\n\
+             \x20   2  Built timelapses    {:>3}, {}\n\
+             \x20   3  Videos              {:>3}, {}\n\
+             \x20   4  Back\n\n\
+             \x20 Type a number:",
+            sessions.len(),
+            describe::describe_size(recorded),
+            timelapses.len(),
+            describe::describe_size(built),
+            videos.len(),
+            describe::describe_size(rendered),
+        ))?;
+
+        match input.trim() {
+            "1" => manage_captures(capture_dir)?,
+            "2" => manage_timelapses()?,
+            "3" => manage_videos()?,
+            "4" | "" => return Ok(()),
+            _ => println!("\n  Please type a number from 1 to 4.\n"),
+        }
+    }
+}
+
+/// Built timelapses. Deleting one costs the time to build it again and nothing
+/// else, which is why this asks once and says so rather than spelling out a
+/// warning the way [`manage_captures`] has to.
+fn manage_timelapses() -> io::Result<()> {
+    loop {
+        let built = build::list_timelapses();
+        if built.is_empty() {
+            println!("\n  No timelapses built yet.\n");
+            return Ok(());
+        }
+
+        let Some(index) = ask_timelapse_choice(&built, "Which would you like to delete?")? else {
+            return Ok(());
+        };
+        let chosen = &built[index];
+        let question = format!("Delete \"{}\"? You can build it again from the log data", chosen.name);
+        if ask_yes_no(&question, false)? {
+            match std::fs::remove_dir_all(&chosen.path) {
+                Ok(()) => println!("Deleted."),
+                Err(e) => println!("Could not delete it: {e}"),
+            }
+        } else {
+            println!("Left alone.");
+        }
+    }
+}
+
+/// Videos and image sequences. Cheapest of the three to lose: the timelapse it
+/// was rendered from is still there.
+fn manage_videos() -> io::Result<()> {
+    loop {
+        let videos = build::list_videos();
+        if videos.is_empty() {
+            println!("\n  No videos saved yet.\n");
+            return Ok(());
+        }
+
+        println!("\n  Your videos:\n");
+        for (i, video) in videos.iter().enumerate() {
+            let age = video.modified.elapsed().map(describe::describe_age).unwrap_or_else(|_| "unknown".to_string());
+            println!("  {}  {}", i + 1, video.name);
+            println!("     {}, saved {age}\n", describe::describe_size(video.bytes));
+        }
+
+        let input = prompt("  Type a number to delete one, or press Enter to go back:")?;
+        if input.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(index) = parse_session_index(&input, videos.len()) else {
+            println!("\n  Please type a number from 1 to {}.\n", videos.len());
+            continue;
+        };
+        let chosen = &videos[index];
+        let question = format!("Delete \"{}\"? You can save it again from the timelapse", chosen.name);
+        if ask_yes_no(&question, false)? {
+            match build::delete_path(&chosen.path) {
+                Ok(()) => println!("Deleted."),
+                Err(e) => println!("Could not delete it: {e}"),
+            }
+        } else {
+            println!("Left alone.");
+        }
+    }
+}
+
 fn manage_captures(capture_dir: &Path) -> io::Result<()> {
     loop {
         let mut sessions = replay::discover_sessions(capture_dir).unwrap_or_default();
         if sessions.is_empty() {
             println!(
                 "
-No captures found in {}.",
+No log data found in {}.",
                 capture_dir.display()
             );
             return Ok(());
@@ -1773,29 +1489,36 @@ No captures found in {}.",
 
         let now = SystemTime::now();
         let total: u64 = sessions.iter().map(replay::Session::size_on_disk).sum();
-        println!("\n  {} recordings, {} in total:\n", sessions.len(), describe_size(total));
+        println!("\n  Log data from {} playthroughs, {} in total:\n", sessions.len(), describe::describe_size(total));
         for (i, session) in sessions.iter().enumerate() {
-            println!("  {}  {}\n", i + 1, describe_session_with_size(session, now));
+            println!("  {}  {}\n", i + 1, describe::describe_session_with_size(session, now));
         }
 
         let action = prompt(
-            "  Type a number to rename one, or \"d\" and a number to delete one.\n\
-             \x20 Press Enter to go back:",
+            "  1  Rename one\n\
+             \x20 2  Delete one permanently\n\n\
+             \x20 Type a number, or press Enter to go back:",
         )?;
         let action = action.trim().to_string();
         if action.is_empty() {
             return Ok(());
         }
+        if action != "1" && action != "2" {
+            println!("\n  Please type 1 or 2, or press Enter to go back.\n");
+            continue;
+        }
 
-        if let Some(rest) = action.strip_prefix('d') {
-            let Some(index) = parse_session_index(rest, sessions.len()) else {
-                println!("Please enter \"d\" followed by a number between 1 and {}.", sessions.len());
-                continue;
-            };
+        let which = prompt(&format!("  Which one? Type a number from 1 to {}:", sessions.len()))?;
+        let Some(index) = parse_session_index(&which, sessions.len()) else {
+            println!("\n  Please type a number from 1 to {}.\n", sessions.len());
+            continue;
+        };
+
+        if action == "2" {
             // Named in the question rather than just numbered: a number is
             // easy to mistype, and this cannot be undone.
             let session = sessions.remove(index);
-            let described = describe_session(&session, now);
+            let described = describe::describe_session(&session, now);
 
             // Spelling out what is lost. "Delete this capture" sounds like
             // discarding a rendered video; it is the only copy of that
@@ -1820,10 +1543,6 @@ No captures found in {}.",
             continue;
         }
 
-        let Some(index) = parse_session_index(&action, sessions.len()) else {
-            println!("Please enter a number between 1 and {}, or \"d <number>\" to delete.", sessions.len());
-            continue;
-        };
         let current = sessions[index].label().unwrap_or_default();
         let hint = if current.is_empty() {
             "Enter a name for this capture (or press Enter to leave it unnamed):".to_string()
@@ -1833,21 +1552,6 @@ No captures found in {}.",
         let name = prompt(&hint)?;
         sessions[index].set_label(&name)?;
     }
-}
-
-/// Copies the plain-JSON sidecar logs a live capture writes into the rendered
-/// output. A straight copy rather than a re-parse, the mod's logs and what the
-/// viewer reads being the same shape by design. Each being absent is normal.
-fn copy_session_sidecars(session_dir: &Path, out: &Path) -> io::Result<Vec<&'static str>> {
-    let mut copied = Vec::new();
-    for name in ["players.jsonl", "milestones.jsonl", "prototypes.json"] {
-        let source = session_dir.join(name);
-        if source.exists() {
-            std::fs::copy(&source, out.join(name))?;
-            copied.push(name);
-        }
-    }
-    Ok(copied)
 }
 
 /// A double-clicked console closes the instant the process exits, so an error
@@ -1860,7 +1564,63 @@ fn wait_for_enter() {
     io::stdin().read_line(&mut discard).ok();
 }
 
+/// Asks for the text menu rather than the window.
+const CONSOLE_FLAG: &str = "--console";
+
+/// Finds a console for the text menu to speak into.
+///
+/// A windows-subsystem binary starts attached to none at all, so the menu
+/// would otherwise run invisibly. The terminal that launched it if there is
+/// one, which is the scripted case, and a fresh one otherwise, which is
+/// somebody arriving from the window. Called before anything prints, so the
+/// standard handles resolve to whichever this leaves in place.
+#[cfg(windows)]
+fn ensure_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+    }
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
+}
+
+/// Every other platform has no such thing: a process inherits whatever
+/// terminal started it, and there is nothing to attach.
+#[cfg(not(windows))]
+fn ensure_console() {}
+
 fn main() {
+    // The window, in its own process, launched by `build::viewer_command`.
+    // Handled before anything else so the menu's console handling, panic hook
+    // and settings loading never run for a process that is only going to draw.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // The text menu, which is now the one that has to be asked for. Also the
+    // only mode that needs a console, this being a windows-subsystem binary.
+    let console = args.first().is_some_and(|first| first == CONSOLE_FLAG);
+    if console {
+        ensure_console();
+    }
+
+    if args.first().is_some_and(|first| first == build::VIEW_FLAG) {
+        let rest: Vec<String> = args[1..].to_vec();
+        macroquad::Window::from_config(save_timelapse::viewer::app::window_conf(), async move {
+            save_timelapse::viewer::app::run(&rest).await
+        });
+        return;
+    }
+
+    // Nothing asked for, so the window: somebody who double-clicked an exe has
+    // no way to pass a flag, and this is what they get.
+    if !console {
+        macroquad::Window::from_config(save_timelapse::gui::window_conf(), save_timelapse::gui::run());
+        return;
+    }
+
     // A panic would otherwise skip the pause below: Rust unwinds straight past
     // the `Err` handling and Windows closes the console either way. The hook
     // makes a bug fail the same way a handled error does.
@@ -1891,15 +1651,15 @@ mod tests {
     /// filename, so both can hold anything a filesystem will not.
     #[test]
     fn folder_names_survive_whatever_the_user_called_it() {
-        assert_eq!(as_folder_name("My Megabase"), "My Megabase");
-        assert_eq!(as_folder_name("Nauvis/Run:2"), "Nauvis_Run_2");
-        assert_eq!(as_folder_name("  spaced  "), "spaced");
+        assert_eq!(build::as_folder_name("My Megabase"), "My Megabase");
+        assert_eq!(build::as_folder_name("Nauvis/Run:2"), "Nauvis_Run_2");
+        assert_eq!(build::as_folder_name("  spaced  "), "spaced");
         // Empty or punctuation-only would otherwise produce a folder named
         // "" or ".", one of which cannot be created and the other of which
         // is the parent directory.
-        assert_eq!(as_folder_name(""), "timelapse");
-        assert_eq!(as_folder_name("..."), "timelapse");
-        assert_eq!(as_folder_name("///"), "___");
+        assert_eq!(build::as_folder_name(""), "timelapse");
+        assert_eq!(build::as_folder_name("..."), "timelapse");
+        assert_eq!(build::as_folder_name("///"), "___");
     }
 
     fn built(root: &Path, name: &str, frames: usize) {
@@ -1916,7 +1676,7 @@ mod tests {
         built(root.path(), "alpha", 3);
         built(root.path(), "beta", 7);
 
-        let found = list_timelapses_in(root.path());
+        let found = build::list_timelapses_in(root.path());
         assert_eq!(found.len(), 2);
         let alpha = found.iter().find(|t| t.name == "alpha").expect("alpha listed");
         assert_eq!(alpha.frames, 3);
@@ -1933,7 +1693,7 @@ mod tests {
         std::fs::write(root.path().join("empty").join("players.jsonl"), b"{}").unwrap();
         built(root.path(), "real", 1);
 
-        let found = list_timelapses_in(root.path());
+        let found = build::list_timelapses_in(root.path());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "real");
     }
@@ -1942,7 +1702,74 @@ mod tests {
     #[test]
     fn a_missing_root_lists_nothing_rather_than_failing() {
         let root = tempfile::tempdir().unwrap();
-        assert!(list_timelapses_in(&root.path().join("never-created")).is_empty());
+        assert!(build::list_timelapses_in(&root.path().join("never-created")).is_empty());
+    }
+
+    #[test]
+    fn a_list_of_numbers_can_be_separated_by_spaces_or_commas() {
+        assert_eq!(parse_index_list("1 3", 4), Some(vec![0, 2]));
+        assert_eq!(parse_index_list("1,3", 4), Some(vec![0, 2]));
+        assert_eq!(parse_index_list("  2 ,3,  1 ", 4), Some(vec![1, 2, 0]));
+    }
+
+    /// One bad entry rejects the line. Selecting the part that parsed would
+    /// mean a typo silently builds a different set of places than was asked
+    /// for, and the build is long enough that nobody would catch it.
+    #[test]
+    fn one_bad_entry_rejects_the_whole_list() {
+        assert_eq!(parse_index_list("1 9", 4), None);
+        assert_eq!(parse_index_list("1 nauvis", 4), None);
+        assert_eq!(parse_index_list("0", 4), None, "the list is 1 based");
+        assert_eq!(parse_index_list("", 4), None, "blank is the caller's business, not a selection");
+    }
+
+    /// Typing the same place twice is a slip, not a request for two copies of
+    /// it, and the writer would key both to one surface anyway.
+    #[test]
+    fn repeats_collapse_and_order_is_kept_as_typed() {
+        assert_eq!(parse_index_list("3 1 3", 3), Some(vec![2, 0]));
+    }
+
+    fn rendered(root: &Path, name: &str, bytes: &[u8]) {
+        std::fs::write(root.join(name), bytes).unwrap();
+    }
+
+    /// The viewer writes one file for a video and a folder of numbered frames
+    /// for an image sequence, so both have to be listed and weighed.
+    #[test]
+    fn videos_and_image_sequences_are_both_listed() {
+        let root = tempfile::tempdir().unwrap();
+        rendered(root.path(), "alpha.mp4", b"pretend video");
+        let sequence = root.path().join("beta");
+        std::fs::create_dir_all(&sequence).unwrap();
+        std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
+        std::fs::write(sequence.join("frame_0001.png"), b"pretend frame").unwrap();
+
+        let found = build::list_videos_in(root.path());
+        assert_eq!(found.len(), 2);
+        let beta = found.iter().find(|v| v.name == "beta").expect("the sequence is listed");
+        assert_eq!(beta.bytes, b"pretend frame".len() as u64 * 2, "a folder weighs what is inside it");
+    }
+
+    #[test]
+    fn no_videos_yet_lists_nothing_rather_than_failing() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(build::list_videos_in(&root.path().join("never-created")).is_empty());
+    }
+
+    /// Deleting a video has to work on both shapes, since which one it is
+    /// depends on an answer given at export time.
+    #[test]
+    fn deleting_covers_a_file_and_a_folder_alike() {
+        let root = tempfile::tempdir().unwrap();
+        rendered(root.path(), "alpha.avi", b"pretend video");
+        let sequence = root.path().join("beta");
+        std::fs::create_dir_all(&sequence).unwrap();
+        std::fs::write(sequence.join("frame_0000.png"), b"pretend frame").unwrap();
+
+        build::delete_path(&root.path().join("alpha.avi")).unwrap();
+        build::delete_path(&sequence).unwrap();
+        assert!(build::list_videos_in(root.path()).is_empty());
     }
 
     /// Both sidecars a live capture writes have to land next to the frames,
@@ -1967,7 +1794,7 @@ mod tests {
         )
         .unwrap();
 
-        let copied = copy_session_sidecars(&session, &out).unwrap();
+        let copied = build::copy_sidecars(&session, &out).unwrap();
         assert_eq!(copied, ["players.jsonl", "milestones.jsonl"]);
 
         // Copied verbatim, not re-encoded: the mod's shape and the reader's
@@ -1987,10 +1814,10 @@ mod tests {
         std::fs::create_dir_all(&session).unwrap();
         std::fs::create_dir_all(&out).unwrap();
 
-        assert!(copy_session_sidecars(&session, &out).unwrap().is_empty());
+        assert!(build::copy_sidecars(&session, &out).unwrap().is_empty());
 
         std::fs::write(session.join("milestones.jsonl"), "").unwrap();
-        assert_eq!(copy_session_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
+        assert_eq!(build::copy_sidecars(&session, &out).unwrap(), ["milestones.jsonl"]);
     }
 
     /// The export menu asks which world to render, and the only record of
@@ -2001,7 +1828,7 @@ mod tests {
         for name in ["frame_0000_nauvis.stfr", "frame_0001_nauvis.stfr", "frame_0000_vulcanus.stfr", "terrain_nauvis.stfr"] {
             std::fs::write(root.path().join(name), b"x").unwrap();
         }
-        assert_eq!(surfaces_in(root.path()), vec!["nauvis", "vulcanus"]);
+        assert_eq!(build::surfaces_in(root.path()), vec!["nauvis", "vulcanus"]);
     }
 
     /// A single-surface build writes untagged filenames, so there is no name
@@ -2011,7 +1838,7 @@ mod tests {
     fn an_untagged_single_surface_build_lists_no_surfaces() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("frame_0000.stfr"), b"x").unwrap();
-        assert!(surfaces_in(root.path()).is_empty());
+        assert!(build::surfaces_in(root.path()).is_empty());
     }
 
     /// Space platforms are named by the player, so a surface name can hold
@@ -2020,7 +1847,7 @@ mod tests {
     fn a_surface_name_containing_an_underscore_survives() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("frame_0003_my_platform.stfr"), b"x").unwrap();
-        assert_eq!(surfaces_in(root.path()), vec!["my_platform"]);
+        assert_eq!(build::surfaces_in(root.path()), vec!["my_platform"]);
     }
 
     #[test]
@@ -2099,52 +1926,11 @@ mod tests {
         assert_eq!(parse_frame_seconds("soon"), None);
     }
 
-    #[test]
-    fn describe_size_picks_a_unit_a_person_can_compare() {
-        assert_eq!(describe_size(0), "0 B");
-        assert_eq!(describe_size(512), "512 B");
-        assert_eq!(describe_size(1024), "1.0 KiB");
-        assert_eq!(describe_size(38 * (1 << 20)), "38.0 MiB");
-        assert_eq!(describe_size(3 * (1 << 30) / 2), "1.5 GiB");
-    }
-
     /// A recording with no name has to stay identifiable. It used to be its
     /// session id, which is unique and completely uninformative.
-    #[test]
-    fn an_unnamed_recording_is_described_by_where_it_happened() {
-        let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("0000002a");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("baseline.json"), r#"{"tick":100,"entities":7,"tiles":3,"surfaces":["nauvis"]}"#)
-            .unwrap();
-
-        let sessions = replay::discover_sessions(dir.path()).unwrap();
-        let line = describe_session(&sessions[0], SystemTime::now());
-        assert!(line.starts_with("Nauvis"), "leads with the place: {line}");
-        assert!(line.contains("7 buildings"), "got: {line}");
-        // The things it deliberately stopped saying, none of which help
-        // anybody choose between two recordings.
-        assert!(!line.contains("0000002a"), "no session id: {line}");
-        assert!(!line.contains("tick"), "no raw tick: {line}");
-
-        sessions[0].set_label("Vulcanus run").unwrap();
-        let named = describe_session(&replay::discover_sessions(dir.path()).unwrap()[0], SystemTime::now());
-        assert!(named.starts_with("Vulcanus run"), "a named recording leads with its name: {named}");
-    }
-
     /// A Space Age playthrough reaches five planets plus any number of space
     /// platforms, and the full comma-separated list ran to nine names on a
     /// real capture. Two and a count is what fits on a line.
-    #[test]
-    fn places_are_named_up_to_two_then_counted() {
-        let of = |names: &[&str]| describe_places(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(of(&[]), "nothing yet");
-        assert_eq!(of(&["nauvis"]), "Nauvis");
-        assert_eq!(of(&["nauvis", "vulcanus"]), "Nauvis and Vulcanus");
-        assert_eq!(of(&["nauvis", "vulcanus", "fulgora"]), "Nauvis, Vulcanus and 1 more");
-        assert_eq!(of(&["nauvis", "platform-1", "a", "b", "c"]), "Nauvis, Platform-1 and 3 more");
-    }
-
     #[test]
     fn counts_are_grouped_so_they_read_as_quantities() {
         assert_eq!(with_thousands(0), "0");
@@ -2155,39 +1941,6 @@ mod tests {
 
     /// Minutes vanish once there are hours: at that scale they are noise, and
     /// the singular cases are the ones that read wrong if left unhandled.
-    #[test]
-    fn a_built_span_is_rounded_to_something_sayable() {
-        let hour = TICKS_PER_SECOND * 3600;
-        assert_eq!(describe_span(0, 0), "less than a minute of play");
-        assert_eq!(describe_span(0, TICKS_PER_SECOND * 60), "1 minute of play");
-        assert_eq!(describe_span(0, TICKS_PER_SECOND * 60 * 19), "19 minutes of play");
-        assert_eq!(describe_span(0, hour), "1 hour of play");
-        assert_eq!(describe_span(hour, hour * 4), "3 hours of play");
-    }
-
-    #[test]
-    fn describe_age_just_now_for_under_a_minute() {
-        assert_eq!(describe_age(Duration::from_secs(30)), "just now");
-    }
-
-    #[test]
-    fn describe_age_minutes() {
-        assert_eq!(describe_age(Duration::from_secs(60)), "1 minute ago");
-        assert_eq!(describe_age(Duration::from_secs(60 * 5)), "5 minutes ago");
-    }
-
-    #[test]
-    fn describe_age_hours() {
-        assert_eq!(describe_age(Duration::from_secs(3600)), "1 hour ago");
-        assert_eq!(describe_age(Duration::from_secs(3600 * 3)), "3 hours ago");
-    }
-
-    #[test]
-    fn describe_age_days() {
-        assert_eq!(describe_age(Duration::from_secs(86400)), "1 day ago");
-        assert_eq!(describe_age(Duration::from_secs(86400 * 2)), "2 days ago");
-    }
-
     #[test]
     fn parse_session_index_accepts_a_one_based_number_in_range() {
         assert_eq!(parse_session_index("1", 3), Some(0));
@@ -2226,7 +1979,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("frame_{i:04}.stfr")), frame::write_binary(&frame.as_out())).unwrap();
         }
 
-        let names = names_in_timelapse(dir.path());
+        let names = build::names_in_timelapse(dir.path());
         assert_eq!(names.len(), 3, "got {names:?}");
         assert!(names.contains("assembler"), "the one that only exists in a later delta");
     }
@@ -2241,7 +1994,7 @@ mod tests {
         std::fs::write(dir.path().join("prototypes.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("frame_0001.stfr"), b"not a frame at all").unwrap();
 
-        let names = names_in_timelapse(dir.path());
+        let names = build::names_in_timelapse(dir.path());
         assert_eq!(names.len(), 1);
         assert!(names.contains("pipe"));
     }
@@ -2317,7 +2070,7 @@ mod tests {
             })
             .collect();
 
-        write_as_delta_chain(&paths).unwrap();
+        build::write_as_delta_chain(&paths).unwrap();
 
         let full: Vec<u64> = paths
             .iter()
@@ -2354,7 +2107,7 @@ mod tests {
             })
             .collect();
 
-        write_as_delta_chain(&paths).unwrap();
+        build::write_as_delta_chain(&paths).unwrap();
 
         let left: Vec<&std::path::PathBuf> = paths.iter().filter(|p| p.exists()).collect();
         assert_eq!(left.len(), 2, "the repeated moment is gone");
@@ -2375,7 +2128,7 @@ mod tests {
             })
             .collect();
 
-        let (before, after) = write_as_delta_chain(&paths).unwrap();
+        let (before, after) = build::write_as_delta_chain(&paths).unwrap();
         assert!(after * 4 < before, "five copies of one factory became one copy and four near-empty frames: {before} to {after}");
     }
 
@@ -2391,18 +2144,6 @@ mod tests {
         let mut saves = vec![PathBuf::from("zzz.zip"), PathBuf::from("aaa.zip")];
         saves.sort_by_key(|p| ordering_key(p));
         assert_eq!(saves, vec![PathBuf::from("aaa.zip"), PathBuf::from("zzz.zip")]);
-    }
-
-    #[test]
-    fn find_surface_matches_case_insensitively() {
-        let surfaces = vec!["nauvis".to_string(), "vulcanus".to_string()];
-        assert_eq!(find_surface("Vulcanus", &surfaces), Some("vulcanus"));
-    }
-
-    #[test]
-    fn find_surface_returns_none_for_no_match() {
-        let surfaces = vec!["nauvis".to_string()];
-        assert_eq!(find_surface("fulgora", &surfaces), None);
     }
 
     fn saves(names: &[&str]) -> Vec<PathBuf> {

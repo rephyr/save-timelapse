@@ -56,20 +56,22 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua check-mod-syntax run viewer drawcalls stress stress-save check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run run-console dist viewer drawcalls stress stress-save check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
 	@echo "  build        cargo build --release --workspace"
 	@echo "  test         cargo test --workspace"
 	@echo "  test-lua     run mod/tests/encode_test.lua (needs Lua 5.2 on PATH, see LUA)"
-	@echo "  run          save-timelapse: interactive, asks what to do and opens the viewer"
+	@echo "  run          save-timelapse: the window"
+	@echo "  run-console  save-timelapse: the console menu"
 	@echo "  viewer       open the interactive viewer on FRAMES"
 	@echo "  drawcalls    headless draw-call report on FRAMES"
 	@echo "  stress       benchmark the whole pipeline against the saved baseline"
 	@echo "  stress-save  run the benchmark and record it as the new baseline"
 	@echo "  install-mod  copy mod/ into MOD_INSTALL (your Factorio mods folder)"
 	@echo "  package      zip mod/ into dist/$(PACKAGE_NAME).zip, ready for the mod portal"
+	@echo "  dist         build the release archive the way CI does, for trying before tagging"
 	@echo "  clean        cargo clean"
 	@echo ""
 	@echo "Variables (current value, override with make VAR=... target):"
@@ -127,11 +129,17 @@ check-mod-syntax:
 run:
 	cargo run --release --bin save-timelapse
 
+# The text menu, which is now the one that has to be asked for. Kept as its own
+# target so a change to one front end can be tried against the other without
+# editing this file.
+run-console:
+	cargo run --release --bin save-timelapse -- --console
+
 viewer:
-	cargo run -p viewer --release --bin viewer -- $(FRAMES)
+	cargo run --release --bin save-timelapse -- --view $(FRAMES)
 
 drawcalls:
-	cargo run -p viewer --release --bin drawcalls -- $(FRAMES)
+	cargo run --release --bin drawcalls -- $(FRAMES)
 
 # Development benchmark: run the whole pipeline at megabase scale and compare
 # every number against a saved baseline, to answer "did the change I just made
@@ -149,10 +157,10 @@ drawcalls:
 #
 #   make stress STRESS_ARGS="--surfaces 1 --entities 2000000"
 stress:
-	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS)
+	cargo run -q --release --bin stress -- $(STRESS_ARGS)
 
 stress-save:
-	cargo run -q -p viewer --release --bin stress -- $(STRESS_ARGS) --save
+	cargo run -q --release --bin stress -- $(STRESS_ARGS) --save
 
 # Fails if mod/ holds a .lua that neither list names, which is exactly how a
 # newly added, required file would otherwise reach a player: control.lua
@@ -194,6 +202,28 @@ package: check-mod-files
 	cd dist && zip -rq "$(PACKAGE_NAME).zip" "$(PACKAGE_NAME)"
 	rm -rf "dist/$(PACKAGE_NAME)"
 	@echo "packaged to dist/$(PACKAGE_NAME).zip"
+
+# The release archive, built the way .github/workflows/release.yml builds it,
+# so what gets tried locally is what ships. One binary plus mod/, because
+# save-timelapse stages the mod itself when exporting from saves and looks for
+# it beside the executable: shipping them apart is the packaging mistake that
+# breaks the from-saves path.
+DIST_NAME := save-timelapse-$(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/mingw.*/windows/;s/msys.*/windows/')
+EXE := $(shell [ "$(OS)" = "Windows_NT" ] && echo .exe)
+
+dist: build
+	rm -rf "dist/$(DIST_NAME)"
+	mkdir -p "dist/$(DIST_NAME)"
+	cp "target/release/save-timelapse$(EXE)" "dist/$(DIST_NAME)/"
+	cp -r mod "dist/$(DIST_NAME)/mod"
+	# tests/ is a development suite, and a stray zip is an old `make package`
+	# left in place. Neither belongs in front of somebody who downloaded this.
+	rm -rf "dist/$(DIST_NAME)/mod/tests"
+	rm -f "dist/$(DIST_NAME)/mod/"*.zip
+	cp README.md LICENSE "dist/$(DIST_NAME)/"
+	cp fonts/OFL.txt "dist/$(DIST_NAME)/OFL-Full-Automation.txt"
+	cd dist && rm -f "$(DIST_NAME).zip" && zip -rq "$(DIST_NAME).zip" "$(DIST_NAME)"
+	@echo "packaged to dist/$(DIST_NAME).zip"
 
 clean:
 	cargo clean

@@ -1,7 +1,7 @@
 //! Mirrors macroquad 0.4's batching rule so the viewer can report the draw
 //! calls it actually costs.
 
-use crate::registry::TypeId;
+use crate::viewer::registry::TypeId;
 
 /// `quad_gl.rs::geometry` merges geometry only into the immediately preceding
 /// draw call, starting a fresh one when the texture differs or the index

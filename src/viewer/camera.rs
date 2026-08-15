@@ -3,7 +3,7 @@
 
 use macroquad::math::Vec2;
 
-use crate::render_frame::RenderFrame;
+use crate::viewer::render_frame::RenderFrame;
 
 pub const BASE_PIXELS_PER_TILE: f32 = 32.0;
 
@@ -44,7 +44,7 @@ impl Camera {
     /// resident: each is materialized into a shared scratch buffer as this
     /// walks, so corners are taken as it goes rather than collected.
     pub fn fit_sequence(
-        frames: &crate::render_frame::FrameSequence,
+        frames: &crate::viewer::render_frame::FrameSequence,
         terrain: Option<&RenderFrame>,
         screen_width: f32,
         screen_height: f32,
@@ -57,7 +57,10 @@ impl Camera {
     /// this walk is O(every entity in every frame): the load path takes the
     /// box once and derives both the opening camera and the smoothed export
     /// path from it, rather than walking twice.
-    pub fn sequence_bounds(frames: &crate::render_frame::FrameSequence, terrain: Option<&RenderFrame>) -> Option<(Vec2, Vec2)> {
+    pub fn sequence_bounds(
+        frames: &crate::viewer::render_frame::FrameSequence,
+        terrain: Option<&RenderFrame>,
+    ) -> Option<(Vec2, Vec2)> {
         let mut bounds: Option<(Vec2, Vec2)> = None;
         let mut take = |point: Vec2| {
             bounds = Some(match bounds {
@@ -386,8 +389,8 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::TypeRegistry;
-    use save_timelapse::frame::{Entity, Frame};
+    use crate::frame::{Entity, Frame};
+    use crate::viewer::registry::TypeRegistry;
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
         Entity { n: n.into(), x, y, d: 0, w: 1, h: 1 }
@@ -465,8 +468,8 @@ mod tests {
             count: 0,
             entities: Vec::new(),
             tiles: vec![
-                save_timelapse::frame::Tile { n: "grass-1".into(), x: -50, y: -50 },
-                save_timelapse::frame::Tile { n: "grass-1".into(), x: 50, y: 50 },
+                crate::frame::Tile { n: "grass-1".into(), x: -50, y: -50 },
+                crate::frame::Tile { n: "grass-1".into(), x: 50, y: 50 },
             ],
             floor_unchanged: false,
             ..Default::default()

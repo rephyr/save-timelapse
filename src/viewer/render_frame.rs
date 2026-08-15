@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 
+use crate::frame::Frame;
 use macroquad::math::Vec2;
-use save_timelapse::frame::Frame;
 
-use crate::registry::{TypeId, TypeRegistry};
-use crate::spans::{Span, SpanBuilder, SpanSet};
+use crate::viewer::registry::{TypeId, TypeRegistry};
+use crate::viewer::spans::{Span, SpanBuilder, SpanSet};
 
 /// A contiguous span of one type within a [`RenderFrame`]'s array. Draws
 /// iterate runs rather than items, so the texture is bound once per type,
@@ -367,29 +367,30 @@ impl RenderFrame {
         // end of a crossing feeds the belt in front of it and can bend it.
         let underground_kinds: Vec<Option<(TypeId, i32)>> =
             entity_ids.iter().map(|&id| registry.underground_reach(id).map(|reach| (id, reach))).collect();
-        crate::belts::infer_underground_ends(&mut entities, &underground_kinds);
+        crate::viewer::belts::infer_underground_ends(&mut entities, &underground_kinds);
 
-        let carriers: Vec<Option<crate::belts::Carrier>> = entity_ids
+        let carriers: Vec<Option<crate::viewer::belts::Carrier>> = entity_ids
             .iter()
             .map(|&id| {
                 if registry.is_belt(id) {
-                    Some(crate::belts::Carrier::Belt)
+                    Some(crate::viewer::belts::Carrier::Belt)
                 } else if registry.is_splitter(id) {
-                    Some(crate::belts::Carrier::Splitter)
+                    Some(crate::viewer::belts::Carrier::Splitter)
                 } else if registry.underground_reach(id).is_some() {
-                    Some(crate::belts::Carrier::Underground)
+                    Some(crate::viewer::belts::Carrier::Underground)
                 } else {
                     None
                 }
             })
             .collect();
-        crate::belts::infer_shapes(&mut entities, &carriers);
+        crate::viewer::belts::infer_shapes(&mut entities, &carriers);
 
         // Pipes reuse the same `shape` byte again, holding a four bit mask of
         // which sides join onto them. Nothing is both a pipe and a belt, so
         // the three meanings never collide on one entity.
         let pipe_flags: Vec<bool> = entity_ids.iter().map(|&id| registry.is_pipe(id)).collect();
-        crate::pipes::infer_connections(&mut entities, &pipe_flags);
+        let to_ground_flags: Vec<bool> = entity_ids.iter().map(|&id| registry.is_pipe_to_ground(id)).collect();
+        crate::viewer::pipes::infer_connections(&mut entities, &pipe_flags, &to_ground_flags);
 
         let tile_ids: Vec<TypeId> = frame.tiles.iter().map(|t| registry.intern(&t.n)).collect();
         let tiles: Vec<RenderTile> = frame.tiles.iter().map(|t| RenderTile { x: t.x, y: t.y }).collect();
@@ -441,7 +442,7 @@ impl RenderFrame {
 }
 
 /// Position key for span identity, matching the tenth-of-a-tile grid
-/// entities are aligned to and `save_timelapse::world::pos_key` keys by.
+/// entities are aligned to and `crate::world::pos_key` keys by.
 fn span_key(x: f32, y: f32) -> u64 {
     let qx = ((x as f64) * 10.0).round() as i32;
     let qy = ((y as f64) * 10.0).round() as i32;
@@ -787,7 +788,7 @@ fn derive_lod<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use save_timelapse::frame::{Entity, Tile};
+    use crate::frame::{Entity, Tile};
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
         Entity { n: n.into(), x, y, d: 0, w: 1, h: 1 }
@@ -815,7 +816,7 @@ mod tests {
     #[test]
     fn a_frame_counts_buildings_apart_from_what_the_map_generated() {
         let mut registry = TypeRegistry::new();
-        registry.set_prototypes(save_timelapse::prototypes::Prototypes {
+        registry.set_prototypes(crate::prototypes::Prototypes {
             types: [
                 ("assembling-machine-2", "assembling-machine"),
                 ("transport-belt", "transport-belt"),
@@ -905,7 +906,7 @@ mod tests {
         let path = std::env::var("SAVE_TIMELAPSE_TERRAIN")
             .expect("set SAVE_TIMELAPSE_TERRAIN to a terrain_<surface>.stfr from a built timelapse");
         let bytes = std::fs::read(&path).expect("reading the terrain layer");
-        let frame = save_timelapse::frame::read_binary(&bytes).expect("parsing the terrain layer");
+        let frame = crate::frame::read_binary(&bytes).expect("parsing the terrain layer");
 
         let tiles = frame.tiles.len();
         let mut registry = TypeRegistry::new();
@@ -933,8 +934,8 @@ mod tests {
     /// builder does with it.
     #[test]
     fn a_timelapse_built_from_deltas_shows_the_same_thing_as_one_built_from_snapshots() {
-        use save_timelapse::event::Event;
-        use save_timelapse::world::World;
+        use crate::event::Event;
+        use crate::world::World;
 
         let add = |name: &str, x: f32, y: f32, id: u64| Event::AddEntity {
             name: name.to_string(),
@@ -961,7 +962,7 @@ mod tests {
 
         let materialise = |deltas: bool| {
             let mut world = World::new();
-            world.load_baseline(&save_timelapse::frame::Frame {
+            world.load_baseline(&crate::frame::Frame {
                 tick: 0,
                 surface: "nauvis".to_string(),
                 count: 1,
@@ -985,8 +986,8 @@ mod tests {
                 };
                 // Through the wire format, so the encoder and reader are in the
                 // loop rather than assumed.
-                let bytes = save_timelapse::frame::write_binary(&frame.as_out());
-                let read = save_timelapse::frame::read_binary(&bytes).expect("a frame must read back");
+                let bytes = crate::frame::write_binary(&frame.as_out());
+                let read = crate::frame::read_binary(&bytes).expect("a frame must read back");
                 builder.push(&RenderFrame::from_frame(read, &mut registry));
             }
             let mut sequence = builder.finish(&registry).expect("frames");

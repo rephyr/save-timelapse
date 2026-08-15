@@ -34,8 +34,8 @@
 
 use macroquad::math::Vec2;
 
-use crate::registry::TypeRegistry;
-use crate::render_frame::{FrameSequence, RenderEntity, RenderFrame};
+use crate::viewer::registry::TypeRegistry;
+use crate::viewer::render_frame::{FrameSequence, RenderEntity, RenderFrame};
 
 /// Side of one histogram bin, in tiles. A Factorio chunk, which the rest of
 /// the viewer already thinks in and is comfortably larger than any single
@@ -193,8 +193,8 @@ pub fn growing_bounds_per_frame(frames: &FrameSequence, registry: &TypeRegistry)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::TypeRegistry;
-    use save_timelapse::frame::{Entity, Frame, Tile};
+    use crate::frame::{Entity, Frame, Tile};
+    use crate::viewer::registry::TypeRegistry;
 
     fn entity(n: &str, x: f32, y: f32) -> Entity {
         Entity { n: n.into(), x, y, d: 0, w: 1, h: 1 }

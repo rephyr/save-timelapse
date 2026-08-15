@@ -154,8 +154,8 @@ fn report(metrics: &[Metric], saving: bool) {
 use save_timelapse::event::Event;
 use save_timelapse::frame::{Entity, Frame, Tile};
 use save_timelapse::replay::write_all_surfaces;
+use save_timelapse::viewer::{analyze_activity, growing_bounds_per_frame, FrameSequence, RenderFrame, TypeRegistry};
 use save_timelapse::world::World;
-use viewer::{analyze_activity, growing_bounds_per_frame, FrameSequence, RenderFrame, TypeRegistry};
 
 struct Config {
     surfaces: usize,
@@ -325,9 +325,9 @@ fn main() {
     // cost: if that loop changes, this measures something the viewer no
     // longer does.
     let start = Instant::now();
-    let paths = viewer::frame_paths(&out).expect("enumerate");
-    let grouped = viewer::group_paths_by_surface(paths);
-    let timeline = viewer::timeline_ticks(&grouped);
+    let paths = save_timelapse::viewer::frame_paths(&out).expect("enumerate");
+    let grouped = save_timelapse::viewer::group_paths_by_surface(paths);
+    let timeline = save_timelapse::viewer::timeline_ticks(&grouped);
 
     let mut registry = TypeRegistry::new();
     let mut sequences: Vec<(String, FrameSequence)> = Vec::new();
@@ -336,7 +336,7 @@ fn main() {
         let mut builder = FrameSequence::builder();
         let mut filled = 0usize;
         for (_, path) in &entries {
-            let Some(frame) = viewer::load_frame(path) else { continue };
+            let Some(frame) = save_timelapse::viewer::load_frame(path) else { continue };
             if let Some(offset) = timeline[filled..].iter().position(|&t| t == frame.tick) {
                 builder.push_repeats(&timeline[filled..filled + offset]);
                 filled += offset + 1;

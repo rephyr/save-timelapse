@@ -5,11 +5,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use macroquad::prelude::*;
-use save_timelapse::export::install_data_dir;
-use save_timelapse::locate::locate_factorio;
-use save_timelapse::milestone::{Kind, Milestone};
-use viewer::{
+use crate::export::install_data_dir;
+use crate::locate::locate_factorio;
+use crate::milestone::{Kind, Milestone};
+use crate::viewer::{
     activity_heights, analyze_activity, belt_source_rect, color_for, downsample, draw_key_panel, entity_cull_half_extents,
     entity_footprint_size, entity_rotation_radians, entity_sheet_path, format_game_time, growing_bounds_per_frame, icon_path,
     icon_source_rect, pipe_piece_path, pipe_to_ground_paths, recent_heat, sheet_row, splitter_offsets, splitter_patch_path,
@@ -19,6 +18,7 @@ use viewer::{
     ProgressBar, RailSegment, RenderEntity, RenderFrame, RenderTile, Run, Timeline, TypeId, TypeRegistry, Ui, UndergroundEnd,
     HEAT_CELL_TILES, LOD_CELL_TILES, PIECES, RAIL_WIDTH_TILES, SHEET_ROWS, SPRITE_TILE_PIXELS,
 };
+use macroquad::prelude::*;
 
 const ZOOM_STEP: f32 = 1.1;
 const PLAY_INTERVAL_SECS: f32 = 0.25; // ~4 frames/sec auto-play
@@ -77,7 +77,7 @@ const LOAD_BATCH_FRAMES: usize = 16;
 /// while leaving loading effectively at full speed.
 const PROGRESS_REDRAW: std::time::Duration = std::time::Duration::from_millis(33);
 
-fn window_conf() -> macroquad::conf::Conf {
+pub fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
             window_title: "save-timelapse viewer".to_owned(),
@@ -98,7 +98,7 @@ struct WorldView {
     sequence: FrameSequence,
     camera: Camera,
     /// The whole base's bounding box as of each frame, monotonically
-    /// growing, precomputed once at load. See `viewer::growing_bounds_per_frame`.
+    /// growing, precomputed once at load. See `crate::viewer::growing_bounds_per_frame`.
     growing_bounds: Vec<Option<GrowingBounds>>,
     /// Everything this surface ever contains, terrain included: the box the
     /// opening camera is fitted to. Kept because an export smooths its way out
@@ -126,7 +126,7 @@ struct WorldView {
     /// `jump_targets` rather than derived from it, because that list has
     /// milestones mixed in and they are already drawn their own way.
     bookmark_frames: Vec<usize>,
-    /// Bookmarked *ticks*, not frames. See `viewer::marks`: a rebuild at a
+    /// Bookmarked *ticks*, not frames. See `crate::viewer::marks`: a rebuild at a
     /// different seconds-per-frame renumbers every index, so a bookmark that
     /// meant an index would silently come back pointing somewhere else.
     bookmarks: Vec<u64>,
@@ -201,7 +201,7 @@ struct ExportRequest {
     supersample: u32,
     /// Roughly how long the camera takes to complete a move, in seconds of
     /// finished video. Zero fits every frame's own bounds exactly, which is
-    /// what this used to do and what snapped. See `viewer::camera_path`.
+    /// what this used to do and what snapped. See `crate::viewer::camera_path`.
     smooth_secs: f32,
 }
 
@@ -213,8 +213,7 @@ struct Args {
     export: Option<ExportRequest>,
 }
 
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn parse_args(args: &[String]) -> Args {
     let mut result = Args { path: None, synthetic_entities: None, synthetic_tile_count: None, factorio: None, export: None };
     let (mut export_dir, mut width, mut height) = (None, 1920u32, 1080u32);
     let mut supersample = DEFAULT_SUPERSAMPLE;
@@ -330,6 +329,15 @@ fn draw_loading(progress: &LoadProgress) {
     }
 }
 
+/// The export's own progress, in the window that would otherwise stay black.
+///
+/// Drawn after `set_default_camera`, which is what hands painting back from
+/// the render target every frame is composed into.
+fn draw_export_progress(done: usize, total: usize, destination: &str) {
+    let progress = LoadProgress { phase: "rendering", detail: destination.to_string(), done, total };
+    draw_loading(&progress);
+}
+
 /// Draw the bar and yield to the window, but only if enough time has passed
 /// since the last redraw, so a fast load doesn't pay a vsync wait per item.
 async fn redraw_progress(progress: &LoadProgress, last: &mut Instant, force: bool) {
@@ -358,12 +366,12 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         redraw_progress(&progress, &mut last, true).await;
         Some(synthetic_frame(n))
     } else if args.path.is_none() {
-        let default = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/frames/frame_0004.stfr");
+        let default = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/frames/frame_0004.stfr");
         println!("no frame given, defaulting to {default}");
         progress.detail = "default fixture".to_string();
         redraw_progress(&progress, &mut last, true).await;
         let bytes = std::fs::read(default).expect("failed to read default fixture");
-        Some(save_timelapse::frame::read_binary(&bytes).expect("failed to parse frame"))
+        Some(crate::frame::read_binary(&bytes).expect("failed to parse frame"))
     } else {
         None
     };
@@ -386,29 +394,29 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
         let path = args.path.as_ref().expect("checked above");
         println!("loading {path}");
         let path = std::path::Path::new(path);
-        let paths = viewer::frame_paths(path).expect("failed to enumerate frames");
+        let paths = crate::viewer::frame_paths(path).expect("failed to enumerate frames");
 
         // A single frame file's terrain (if it even has one) would sit beside
         // it in its parent directory, same as a real capture's.
         let terrain_dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        let terrain_file_paths = viewer::terrain_paths(terrain_dir).unwrap_or_default();
+        let terrain_file_paths = crate::viewer::terrain_paths(terrain_dir).unwrap_or_default();
 
         // Terrain starts loading before the frames: two waits back to back
         // cost their sum, started together they cost the slower.
         progress.total = paths.len() + terrain_file_paths.len();
         progress.detail = format!("{} core(s)", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-        let terrain_load = viewer::ParallelFrameLoad::start(terrain_file_paths);
+        let terrain_load = crate::viewer::ParallelFrameLoad::start(terrain_file_paths);
 
         // Grouped from headers rather than parsed frames, which is what makes
         // the streaming below possible: surface and tick fix the order, at a
         // bounded read per file.
         progress.phase = "reading frame headers";
         redraw_progress(&progress, &mut last, true).await;
-        let grouped = viewer::group_paths_by_surface(paths);
+        let grouped = crate::viewer::group_paths_by_surface(paths);
         // Every moment the export covers. A surface's file is omitted at a
         // moment nothing on it changed, so no single surface describes the
-        // whole timeline. See `viewer::timeline_ticks`.
-        let timeline = viewer::timeline_ticks(&grouped);
+        // whole timeline. See `crate::viewer::timeline_ticks`.
+        let timeline = crate::viewer::timeline_ticks(&grouped);
 
         // Painted before the first batch rather than after it. Setting a phase
         // and not redrawing until the end of the work leaves the previous
@@ -427,7 +435,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                 // One batch is parsed across every core, folded into spans,
                 // and dropped before the next is read, so peak memory is a
                 // batch plus the spans rather than the whole capture.
-                for mut frame in viewer::load_batch(chunk) {
+                for mut frame in crate::viewer::load_batch(chunk) {
                     if let Some(n) = args.synthetic_tile_count {
                         frame.tiles = synthetic_tiles(n);
                     }
@@ -461,7 +469,7 @@ async fn load_frames(args: &Args, registry: &mut TypeRegistry) -> Vec<(String, F
                 break loaded;
             }
         };
-        let mut terrain_by_surface: std::collections::HashMap<String, save_timelapse::frame::Frame> =
+        let mut terrain_by_surface: std::collections::HashMap<String, crate::frame::Frame> =
             loaded_terrain.into_iter().map(|frame| (frame.surface.clone(), frame)).collect();
         for (name, _, terrain) in &mut result {
             *terrain = terrain_by_surface.remove(name).map(|frame| RenderFrame::from_frame(frame, registry));
@@ -1076,8 +1084,11 @@ fn handle_input(
     // one that should stay put. A jump with nowhere to go does nothing rather
     // than wrapping, which would look like the key jumped at random.
     let jump = |targets: &[usize], sequence: &mut FrameSequence, forward: bool| -> bool {
-        let found =
-            if forward { viewer::next_mark(targets, sequence.index()) } else { viewer::previous_mark(targets, sequence.index()) };
+        let found = if forward {
+            crate::viewer::next_mark(targets, sequence.index())
+        } else {
+            crate::viewer::previous_mark(targets, sequence.index())
+        };
         match found {
             Some(frame) => {
                 sequence.goto(frame);
@@ -1316,10 +1327,10 @@ async fn export_frames(
     // The whole camera path at once, before a single frame is drawn. An
     // export knows every frame's bounds up front, so the move to a newly
     // reached corner of the map can begin before that corner is built rather
-    // than snapping to it after; see `viewer::camera_path`. `fps` is used even
+    // than snapping to it after; see `crate::viewer::camera_path`. `fps` is used even
     // for an image sequence, which has no rate of its own: whatever the frames
     // are later assembled at is the rate the pacing was meant for.
-    let radius = viewer::smoothing_radius(request.smooth_secs, request.fps);
+    let radius = crate::viewer::smoothing_radius(request.smooth_secs, request.fps);
     let path = CameraPath::smooth(&world.growing_bounds, world.opening_bounds, radius);
 
     let total = world.sequence.len();
@@ -1399,6 +1410,11 @@ async fn export_frames(
             print!("\r  {}/{total}", index + 1);
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
+        // Every frame is drawn into the render target and read straight back
+        // out, so nothing was ever painted into the window itself: an export
+        // sat there black for however long it took. The bar is the same one a
+        // load draws, because it is the same question being asked.
+        draw_export_progress(index + 1, total, &destination);
         // Hands the frame to the driver. Without it the whole export happens
         // inside one displayed frame and the window sits unresponsive until
         // it finishes.
@@ -1871,7 +1887,7 @@ const HEAT_WINDOW_FRAMES: usize = 10;
 const HEAT_MAX_ALPHA: f32 = 0.85;
 /// How far heat bleeds outward from where something was built, in cells. This
 /// is what turns scattered lit machines into one glow. See
-/// `viewer::recent_heat`.
+/// `crate::viewer::recent_heat`.
 const HEAT_SPREAD_CELLS: i32 = 3;
 
 // Vertical layout above the scrub bar, stacked upward: graph on the track,
@@ -2064,9 +2080,9 @@ fn milestone_color(milestone: &Milestone) -> Color {
 /// Resolved from ticks here, the same tick landing on a different frame
 /// depending on how coarsely the timelapse was built.
 fn marks_for(milestones: &[Milestone], bookmarks: &[u64], frame_ticks: &[u64]) -> (Vec<usize>, Vec<usize>) {
-    let bookmark_frames = viewer::frames_for_ticks(bookmarks, frame_ticks);
+    let bookmark_frames = crate::viewer::frames_for_ticks(bookmarks, frame_ticks);
     let ticks: Vec<u64> = milestones.iter().map(|m| m.tick).chain(bookmarks.iter().copied()).collect();
-    (viewer::frames_for_ticks(&ticks, frame_ticks), bookmark_frames)
+    (crate::viewer::frames_for_ticks(&ticks, frame_ticks), bookmark_frames)
 }
 
 /// Milestone markers: a small diamond under the bar at each notable moment,
@@ -2214,7 +2230,7 @@ fn draw_timeline_hover(ui: &Ui, timeline: &Timeline, sequence: &FrameSequence, m
 /// remember it costs one keypress next time, which is no reason to interrupt
 /// somebody watching a timelapse.
 fn remember_players(enabled: bool) {
-    let mut settings = save_timelapse::settings::Settings::load();
+    let mut settings = crate::settings::Settings::load();
     settings.show_players = Some(enabled);
     let _ = settings.save();
 }
@@ -2254,7 +2270,7 @@ struct Loaded {
     worlds: Vec<WorldView>,
     sprites: Vec<Option<Sprite>>,
     player_track: PlayerTrack,
-    milestones: Vec<save_timelapse::milestone::Milestone>,
+    milestones: Vec<crate::milestone::Milestone>,
     /// Where bookmarks are written back to, or `None` for a synthetic load
     /// with no directory to keep them in.
     frames_dir: Option<std::path::PathBuf>,
@@ -2271,7 +2287,7 @@ async fn load_everything(args: &Args) -> Loaded {
     // Before loading anything: colours resolve when a name is first interned.
     // Missing is the normal state of any capture older than the feature.
     if let Some(dir) = args.path.as_deref().map(std::path::Path::new) {
-        if let Some(prototypes) = save_timelapse::prototypes::read(dir) {
+        if let Some(prototypes) = crate::prototypes::read(dir) {
             println!(
                 "using this game's own description of {} tiles and {} entities, {} of them typed",
                 prototypes.tiles.len(),
@@ -2291,7 +2307,7 @@ async fn load_everything(args: &Args) -> Loaded {
         .as_deref()
         .map(|p| std::path::Path::new(p).join("players.jsonl"))
         .filter(|p| p.exists())
-        .and_then(|p| save_timelapse::player_log::read_jsonl(&p).ok())
+        .and_then(|p| crate::player_log::read_jsonl(&p).ok())
         .unwrap_or_default();
     let player_track = PlayerTrack::new(players);
 
@@ -2302,7 +2318,7 @@ async fn load_everything(args: &Args) -> Loaded {
         .path
         .as_deref()
         .map(|p| std::path::Path::new(p).join("milestones.jsonl"))
-        .and_then(|p| save_timelapse::milestone::read(&p).ok())
+        .and_then(|p| crate::milestone::read(&p).ok())
         .unwrap_or_default();
     if !milestones.is_empty() {
         println!("{} milestone(s) loaded", milestones.len());
@@ -2348,12 +2364,12 @@ async fn load_everything(args: &Args) -> Loaded {
             // to pull it in to how small the base actually starts.
             let follow = FollowState { enabled: true, ..Default::default() };
 
-            let busy = viewer::busy_stretches(&measured.counts);
+            let busy = crate::viewer::busy_stretches(&measured.counts);
             // Milestones and bookmarks share one list, being one gesture.
             // Busy stretches stay separate: derived rather than chosen, and
             // numerous enough to bury the moments somebody marked.
             let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
-            let bookmarks = frames_dir.as_deref().map(viewer::read_bookmarks).unwrap_or_default();
+            let bookmarks = frames_dir.as_deref().map(crate::viewer::read_bookmarks).unwrap_or_default();
             let (jump_targets, bookmark_frames) = marks_for(&milestones, &bookmarks, &frame_ticks);
 
             WorldView {
@@ -2433,9 +2449,14 @@ async fn run_export(
     Ok(())
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
-    let args = parse_args();
+/// The viewer, as a screen rather than a program: this used to be `main` in a
+/// separate binary, and the two merged so there is one executable to ship.
+///
+/// Still reached by this program launching itself (see `open_viewer` in
+/// `main.rs`), because macroquad allows one window per process and the menu
+/// has to stay usable while a timelapse is open.
+pub async fn run(args: &[String]) {
+    let args = parse_args(args);
     let Loaded { registry, mut worlds, sprites, player_track, milestones, frames_dir } = load_everything(&args).await;
     let mut current = 0usize;
 
@@ -2451,7 +2472,7 @@ async fn main() {
         heatmap_enabled: false,
         // Shown unless the viewer has been told otherwise: a capture that has
         // player positions recorded them on purpose.
-        players_enabled: save_timelapse::settings::Settings::load().show_players.unwrap_or(true),
+        players_enabled: crate::settings::Settings::load().show_players.unwrap_or(true),
         surfaces_expanded: false,
     };
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
@@ -2491,7 +2512,7 @@ async fn main() {
     // Opened once so a first-time viewer is told what the window does, then
     // never again. A `?` in the corner only helps somebody who already
     // suspects there is something to find.
-    ui.show_keys = viewer::first_run();
+    ui.show_keys = crate::viewer::first_run();
 
     // A click on a surface chip lands while `worlds[current]` is still
     // mutably borrowed, so it is recorded here and applied at the top of the
@@ -2605,7 +2626,7 @@ async fn main() {
                     None => bookmarks.push(tick),
                 }
                 bookmarks.sort_unstable();
-                viewer::write_bookmarks(dir, bookmarks);
+                crate::viewer::write_bookmarks(dir, bookmarks);
                 let frame_ticks: Vec<u64> = (0..sequence.len()).filter_map(|i| sequence.tick_at(i)).collect();
                 (*jump_targets, *bookmark_frames) = marks_for(&milestones, bookmarks, &frame_ticks);
             }

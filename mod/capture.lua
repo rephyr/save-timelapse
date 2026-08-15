@@ -66,7 +66,7 @@ local loaded_mods_stamp = nil
 --- this a capture kept whatever its first write produced: the rail section
 --- added in 0.8.0 never reached a playthrough already under way, and would
 --- have looked exactly like the sampling failing.
-local PROTOTYPES_FORMAT = 5
+local PROTOTYPES_FORMAT = 6
 
 --- What the prototype description was written for: every loaded mod and its
 --- version, plus the shape this mod writes. Cached, `script.active_mods`
@@ -505,11 +505,16 @@ local function log_entity(op, entity)
   local pos = entity.position
 
   if op ~= "+" then
-    -- Named only when it is a deposit, which is the one thing that can be
-    -- buried under something else and so the one case a position alone cannot
-    -- resolve (see `encode.event_remove_name`). The type was read above
-    -- already, so every other removal still reads exactly what it writes.
-    local buried = entity.type == "resource" and entity.name or nil
+    -- Named for two kinds and no others, both of which need it and neither of
+    -- which is common enough to cost anything. A deposit is the one thing that
+    -- can be buried under something else, so a position alone cannot resolve
+    -- it (see `encode.event_remove_name`). A nest is the one thing the ground
+    -- scan cannot supply, because a nest somebody cleared is not in the
+    -- finished save it reads: naming it is what lets the reading side put it
+    -- back and take it away again at the tick this fired. The type was read
+    -- above already, so every other removal still reads exactly what it writes.
+    local named = entity.type == "resource" or entity.type == "unit-spawner"
+    local buried = named and entity.name or nil
     log_event(op, "e", buried, pos.x, pos.y, nil, entity.unit_number, nil, nil, entity.surface.name)
     return
   end
@@ -610,6 +615,25 @@ capture_handler("on_space_platform_mined_tile", function(e) log_tile_change("-",
 -- A ghost revived by a script rather than by a bot: the path mods use.
 -- Without it a modded construction aid places entities capture never sees.
 capture_handler("script_raised_revive", function(e) log_entity("+", e.entity) end)
+
+-- Biters expanding, which is the only thing in the game that builds without a
+-- player or a bot doing it. Nothing above fires for it: it is neither built
+-- nor revived nor raised by a script, so a nest that appeared during a
+-- playthrough was recorded only if some later baseline happened to catch it,
+-- while a nest cleared was recorded the moment it died. The two halves of the
+-- same war belong in the log together.
+capture_handler("on_biter_base_built", function(e) log_entity("+", e.entity) end)
+
+-- An ore patch is not mined away a removal at a time. The resource entity
+-- stays put while its amount falls and the game destroys it on reaching zero,
+-- raising none of the removal events above, so without this every patch a
+-- factory ever ate sits there full for the rest of the timelapse.
+--
+-- `log_entity` reads the entity, so this relies on the event arriving before
+-- the game destroys it. Its validity check is what makes the other reading
+-- cost the one removal rather than raise. Infinite resources never deplete and
+-- so never reach here, which is correct: they are still there.
+capture_handler("on_resource_depleted", function(e) log_entity("-", e.entity) end)
 
 --- The periodic flush body, run from control.lua's timer multiplexer. Calls
 --- `ensure_capture_segment` directly because a save that starts with capture

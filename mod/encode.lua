@@ -730,6 +730,11 @@ function M.prototypes_json(rails)
       -- The prototype's own type, verbatim. Filtering here would only move
       -- the curated list to the other side of the file.
       kind = proto.type,
+      -- How many tiles it covers. Every record that carries a position carries
+      -- this too, except a removal, which is exactly where something has to be
+      -- rebuilt from nothing but its name.
+      w = proto.tile_width,
+      h = proto.tile_height,
       reach = REACH_TYPES[proto.type] and proto.max_underground_distance or nil,
     }
   end
@@ -758,6 +763,16 @@ function M.prototypes_json(rails)
   section('},"reach":{', entities, function(e)
     if e.reach then
       add(string.format('%q:%d', e.name, e.reach))
+    end
+  end)
+
+  -- How many tiles each prototype covers, as "WxH". Every record carrying a
+  -- position carries this too, except a removal, and a removal is exactly
+  -- where the reading side has to rebuild something from nothing but its name.
+  -- Only where both are known and neither is the 1x1 that assuming would give.
+  section('},"size":{', entities, function(e)
+    if e.w and e.h and (e.w ~= 1 or e.h ~= 1) then
+      add(string.format('%q:"%dx%d"', e.name, e.w, e.h))
     end
   end)
 

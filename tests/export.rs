@@ -247,3 +247,109 @@ fn a_clean_run_that_writes_nothing_is_an_error() {
     let err = export::export_save(&save, &tmp.path().join("staged"), &config).expect_err("no frame written must be an error");
     assert!(err.to_string().contains("startup setting"), "the error should explain the startup-setting requirement, got: {err}");
 }
+
+/// Exporting a set of saves, which is the long half of the from-saves flow and
+/// the one a window has to run without freezing. The job reports per save and
+/// takes a cancel flag; these cover both, against the fake game rather than a
+/// mock of the job, so the reporting is checked where the work actually is.
+mod from_saves {
+    use super::*;
+    use save_timelapse::build::{self, SaveStep, Watch};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `count` saves, named so their order is obvious in a failure.
+    fn saves(root: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .map(|i| {
+                let save = root.join(format!("save{i}.zip"));
+                fs::write(&save, b"pretend save").unwrap();
+                save
+            })
+            .collect()
+    }
+
+    /// Runs the job, collecting every step it reported.
+    fn run(root: &Path, saves: &[PathBuf], stop_after: Option<usize>) -> (build::Exported, Vec<String>) {
+        let config = config_for(root);
+        let out = root.join("out");
+        fs::create_dir_all(&out).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<String> = Vec::new();
+        let mut started = 0usize;
+        let mut on = |step: SaveStep| match step {
+            SaveStep::Started { index, total, label } => {
+                started += 1;
+                seen.push(format!("start {index}/{total} {label}"));
+                if stop_after.is_some_and(|at| started >= at) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            SaveStep::Exported { index, label, .. } => seen.push(format!("ok {index} {label}")),
+            SaveStep::Failed { index, label, .. } => seen.push(format!("failed {index} {label}")),
+        };
+
+        let result = build::from_saves(saves, &out, &root.join("work"), &config, &mut Watch { on: &mut on, cancel: &cancel })
+            .expect("the job itself should not fail");
+        (result, seen)
+    }
+
+    #[test]
+    fn each_save_becomes_one_frame_and_is_reported_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = saves(tmp.path(), 3);
+        let (result, seen) = run(tmp.path(), &saves, None);
+
+        assert_eq!(result.frames.len(), 3);
+        assert!(!result.cancelled);
+        assert_eq!(
+            seen,
+            vec![
+                "start 0/3 save0.zip",
+                "ok 0 save0.zip",
+                "start 1/3 save1.zip",
+                "ok 1 save1.zip",
+                "start 2/3 save2.zip",
+                "ok 2 save2.zip",
+            ]
+        );
+        for i in 0..3 {
+            assert!(tmp.path().join("out").join(format!("frame_{i:04}.stfr")).is_file());
+        }
+    }
+
+    /// One unreadable save out of many should cost that save. Ending the run
+    /// would throw away every save already exported, which on a set of forty
+    /// is most of an hour.
+    #[test]
+    fn a_save_that_fails_is_reported_and_the_rest_still_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut list = saves(tmp.path(), 2);
+        // The fake exits cleanly having written nothing for this name, which
+        // is the shape of a real save the game loads and the mod cannot read.
+        let refused = tmp.path().join("broken-silent.zip");
+        fs::write(&refused, b"pretend save").unwrap();
+        list.insert(1, refused);
+
+        let (result, seen) = run(tmp.path(), &list, None);
+        assert_eq!(result.frames.len(), 2, "the two real saves still exported: {seen:?}");
+        assert!(seen.iter().any(|line| line.starts_with("failed 1 broken-silent.zip")), "{seen:?}");
+        assert!(seen.iter().any(|line| line.starts_with("ok 2 ")), "the save after the failure still ran: {seen:?}");
+    }
+
+    /// Checked between saves, never during one: a running Factorio is minutes
+    /// into loading, and stopping before the next one starts is both
+    /// achievable and what somebody means by "stop".
+    #[test]
+    fn cancelling_stops_before_the_next_save_and_keeps_what_is_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = saves(tmp.path(), 4);
+        let (result, seen) = run(tmp.path(), &saves, Some(2));
+
+        assert!(result.cancelled);
+        assert_eq!(result.frames.len(), 2, "the save already running finished: {seen:?}");
+        assert!(!seen.iter().any(|line| line.contains("save2.zip")), "nothing started after the flag: {seen:?}");
+        assert!(tmp.path().join("out").join("frame_0001.stfr").is_file());
+        assert!(!tmp.path().join("out").join("frame_0002.stfr").exists());
+    }
+}

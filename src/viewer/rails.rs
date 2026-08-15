@@ -184,7 +184,7 @@ const SAME_JOINT: f32 = 0.05;
 /// A piece that never gathers two distinct joints is left out rather than
 /// guessed at, which is what a rail with only one thing attached looks like.
 /// The caller keeps drawing those the old way.
-pub fn solve(samples: &[save_timelapse::prototypes::RailSample]) -> HashMap<(String, u8), RailSegment> {
+pub fn solve(samples: &[crate::prototypes::RailSample]) -> HashMap<(String, u8), RailSegment> {
     let mut known: HashMap<(String, u8), RailSegment> = HashMap::new();
     // Seeded with everything already measured, including the neighbours,
     // which is what the first round has to push out from.
@@ -237,7 +237,7 @@ pub fn solve(samples: &[save_timelapse::prototypes::RailSample]) -> HashMap<(Str
 /// multiples of four directions: measured against solved pairs, those agree to
 /// 0.0 degrees, while 45 degree steps do not, so they are a different shape and
 /// not this function's to guess.
-fn complete_by_quarter_turns(samples: &[save_timelapse::prototypes::RailSample], known: &mut HashMap<(String, u8), RailSegment>) {
+fn complete_by_quarter_turns(samples: &[crate::prototypes::RailSample], known: &mut HashMap<(String, u8), RailSegment>) {
     // A solved run of no length draws as nothing, so it is not a solution.
     known.retain(|_, segment| segment.length > SAME_JOINT);
 
@@ -261,7 +261,7 @@ fn complete_by_quarter_turns(samples: &[save_timelapse::prototypes::RailSample],
 }
 
 /// The joints a piece can work out from neighbours already known.
-fn joints_from_known(sample: &save_timelapse::prototypes::RailSample, known: &HashMap<(String, u8), RailSegment>) -> Vec<Joint> {
+fn joints_from_known(sample: &crate::prototypes::RailSample, known: &HashMap<(String, u8), RailSegment>) -> Vec<Joint> {
     let mut joints: Vec<Joint> = Vec::new();
     for link in &sample.links {
         let Some(neighbour) = known.get(&(link.name.clone(), link.direction)) else {
@@ -291,7 +291,7 @@ fn joints_from_known(sample: &save_timelapse::prototypes::RailSample, known: &Ha
 /// the two ends that are known. The pair then draws as two segments across the
 /// turn, which is closer to the real arc than one chord would be and much
 /// closer than the two squares it replaces.
-fn pair_up_the_rest(samples: &[save_timelapse::prototypes::RailSample], known: &mut HashMap<(String, u8), RailSegment>) {
+fn pair_up_the_rest(samples: &[crate::prototypes::RailSample], known: &mut HashMap<(String, u8), RailSegment>) {
     // Worked out against the same `known` for every pair, so the order samples
     // arrive in cannot change the answer.
     let anchors: HashMap<(String, u8), Joint> = samples
@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    use save_timelapse::prototypes::{RailLink, RailSample};
+    use crate::prototypes::{RailLink, RailSample};
 
     fn sample(name: &str, direction: u8, links: &[(&str, u8, f32, f32)]) -> RailSample {
         RailSample {

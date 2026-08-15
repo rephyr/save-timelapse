@@ -113,7 +113,7 @@ Seeking stays cheap despite materialising on demand: 425µs per seek, and a
 full walk of all 150 frames in 67ms.
 
 ```bash
-cargo test --release -p viewer --lib gains -- --ignored --nocapture
+cargo test --release --lib gains -- --ignored --nocapture
 ```
 
 ### Load time
@@ -141,7 +141,7 @@ almost entirely sequentially and allocates nothing per frame once the buffers
 have grown.
 
 ```bash
-cargo test --release -p viewer --lib measure_cost -- --ignored --nocapture
+cargo test --release --lib measure_cost -- --ignored --nocapture
 ```
 
 ### Export: aggregating the ground
@@ -170,7 +170,7 @@ protected are untouched. Total drawing falls about 4.4x, which should take that
 export from 22 minutes to roughly 5.
 
 ```bash
-SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release -p viewer --lib measure_terrain_lod -- --ignored --nocapture
+SAVE_TIMELAPSE_TERRAIN='<...>/timelapses/<name>/terrain_nauvis.stfr'   cargo test --release --lib measure_terrain_lod -- --ignored --nocapture
 ```
 
 ### Folding a frame that changes most of the factory
@@ -224,6 +224,46 @@ and then disagreed wildly on a nine-surface one: it asks whether anything
 changed *anywhere*, which is near always true, and reported almost no
 duplication where 86% of files were duplicates. It was removed rather than
 kept as a misleading number.
+
+### Reading the ground faster
+
+The ground scan is the slowest part of building a timelapse. On a 10 hour
+Krastorio save it was 30s of a 38s Factorio run, the save load being 5.7s of
+that. `encode.terrain_margin` gives the box a floor of `TERRAIN_MAX_TILES` per
+surface, so the factory's own size barely enters into it: a small base and a
+megabase both read about four million tiles, at roughly 3.8 us each.
+
+Two changes were measured against that, both reverted.
+
+**Asking for the box a block at a time, and a numeric loop instead of `pairs`.**
+The whole box in one `find_tiles_filtered` builds a Lua table of four million
+entries before the first tile is written; 256 tile blocks hold 65k. Together
+these bought **7%**, 3.82 us a tile down to 3.56.
+
+**Reading one tile per 8x8 square outside the fitted view**, written out as the
+whole square, which removes three quarters of the reads. It bought a further
+**9%**, 3.56 down to 3.24.
+
+Nine percent for three quarters of the reads is the entire finding: the two
+Lua/C++ crossings per tile are about a tenth of what a tile costs. The rest is
+the per-tile *write* path, all of it Lua, being `record`'s table stores,
+`frame_tile_run`'s position encoding, and `checksum_update` folding ten
+megabytes a byte at a time.
+
+The sampling worked and was not lost ground: every generated chunk in the
+result held exactly 1024 tiles, so coverage was complete. It was still reverted,
+because 9% is a poor price for a blocky shoreline beyond the fitted view. It is
+worth revisiting only together with a frame format that can say "this 8x8
+square is grass" in one record rather than 64, which would cut the writes, the
+checksum and the file by the same factor. That is a change to a frozen format,
+not an optimisation.
+
+**Measuring this again.** Nothing outside Factorio can separate the scan from
+the save load, and the tool's own stopwatch covers both. Factorio's log
+timestamps every line from process start, so two `log()` calls bracketing the
+scan in `M.export_terrain` give the split exactly. The log lives in the staging
+directory `add_terrain` builds, which is removed on the way out whether the
+scan succeeded or failed, so keep it or read it before then.
 
 ## Deliberately not optimized
 

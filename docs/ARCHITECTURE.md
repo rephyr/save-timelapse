@@ -493,10 +493,58 @@ standing on nothing beyond that first box. Topping it up as the base grows
 would need the covered area tracked in `storage`, a threshold to batch on, ring
 geometry so each top-up writes only what is new, and a stall when one fires.
 
-**What it gives up is ground since built over.** The query asks for everything
-that is not placed floor, so water landfilled at hour three reads as landfill
-at hour ten and its water is never recorded: replayed from the beginning, that
-lake is a hole until the tick the landfill was laid.
+**Ground under placed floor is recovered rather than skipped.** The scan reads
+the finished save, where concrete laid at hour three is already concrete, and
+writing only what is not floor left every paved position with nothing under it:
+replayed from the beginning a paved area was a hole until the tick the concrete
+went down, rather than the grass it was laid on. Factorio keeps the covered tile
+so that mining floor gives the ground back, and keeps a second layer for floor
+over landfill, so `ground_under` asks for the deeper of the two and writes that.
+The floor itself still stays out, the frames carrying when each piece went down.
+
+Both reads are probed once rather than per tile: an API build without the
+property raises rather than answering nil, and a `pcall` per tile would cost
+more than the read it guards. A build that cannot answer, or paving the game
+kept nothing under, leaves that position as it was before, which is the hole.
+
+Cheap because it runs nowhere near anybody's game, and it repairs recordings
+already made: ground is offered against a finished capture, so re-scanning fills
+in paving that was already a hole.
+
+**Nests come from the scan and from nowhere else**, and the scan cannot say
+when one arrived. Biters expand, so a nest built at hour ten is in the scanned
+save and gets laid down from the first frame, contradicting the
+`on_biter_base_built` event that says when it really turned up.
+
+Leaving them out was tried and was worse. A live baseline only sees chunks the
+game had generated when recording started, and Factorio keeps nests out of the
+starting area, so a capture begun at the beginning has none at all: measured on
+a real one, 2,109 entities and not a single spawner. Without the scan the
+timelapse had no nests until biters expanded into view.
+
+So the scan keeps every nest, and `build::drop_nests_that_arrived_later` takes
+back the ones it has no business dating: any whose position the log names in an
+`AddEntity`, which for a nest can only be `on_biter_base_built`. Those are left
+to the event, which knows the tick. Applied to reused ground as well as a fresh
+scan, since the cache holds the scan as it came and what the recording has to
+say about it grows every time somebody plays on.
+
+Only nests. Everything else in that layer is trees, ore and cliffs, none of
+which a playthrough builds, and matching a factory's own adds against the ground
+would be millions of positions to no purpose.
+
+What is still wrong is a nest nobody built and nobody cleared, standing in a
+part of the map that was not generated when recording started. Nothing knows
+when it came into view, because revealing a chunk raises no event this records.
+Watching `on_chunk_generated` would close it, at the cost of a query per chunk
+during play and only for recordings made afterwards.
+
+Scenery cleared before the scan ran is not its job and never was. A patch mined
+out or a forest felled is carried by the baseline that recorded it standing and
+the removal that took it away, which is why depletion needs an event of its own:
+ore is not mined a removal at a time, so `on_resource_depleted` is the only
+thing that fires when a patch finally empties. What no record anywhere holds is
+scenery already gone before recording began.
 
 The scan writes into the session folder named for the map seed, which is what
 verifies it: a save from a different playthrough lands under a different
@@ -1155,7 +1203,7 @@ preceding* draw call and starts a new one whenever the bound texture changes
 costs close to one draw call per entity. Untextured rects count as their own
 texture state, so mixing shapes and sprites breaks the batch the same way.
 
-Measured on `tests/fixtures/frames` with `cargo run -p viewer bin drawcalls`,
+Measured on `tests/fixtures/frames` with `cargo run --bin drawcalls`,
 for fully-visible frames:
 
     items    types    export order    grouped    grouped, raised capacity

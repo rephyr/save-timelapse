@@ -199,6 +199,119 @@ check(
   false
 )
 
+-- An exhausted ore patch ----------------------------------------------------
+--
+-- The bug this exists for: ore is not mined away a removal at a time. The
+-- resource entity stays while its amount falls, and the game destroys it on
+-- reaching zero without raising any of the removal events the capture listens
+-- for, so every patch a factory ever ate stood there full for the whole
+-- timelapse while the drills on top of it kept working.
+
+--- Everything written to a segment file, joined: a segment is appended in
+--- pieces, and a record's name lives in whichever piece first mentioned it.
+local function segment_bytes()
+  local parts = {}
+  for _, write in ipairs(fake.written) do
+    if write.path:match("%.stev$") then
+      parts[#parts + 1] = write.data
+    end
+  end
+  return table.concat(parts)
+end
+
+fake.reset(20000)
+_G.settings.startup["save-timelapse-include-resources"] = { value = true }
+local depleting = load_mod()
+local patch = fake.entity({ name = "iron-ore", type = "resource", x = 12, y = -34 })
+depleting.CAPTURE_HANDLERS[_G.defines.events.on_resource_depleted]({ entity = patch })
+depleting.periodic_flush(20000)
+
+check_true("a depleted patch is recorded as removed", segment_bytes():find("iron%-ore") ~= nil)
+
+-- The `RemoveName` record: tag 128, a one byte payload, naming dictionary
+-- entry 0. Asserted exactly, because a removal carrying only a position
+-- resolves to whatever stands on the ore, which on an exhausted patch is the
+-- drill that exhausted it.
+check_true(
+  "and named, so the removal reaches the ore rather than the drill on top of it",
+  segment_bytes():find("\128\1\0", 1, true) ~= nil
+)
+
+-- Turning resources off is a statement that this capture has no ore in it, so
+-- there is nothing to deplete either. The removal would otherwise be logged
+-- against a patch no frame ever showed.
+fake.reset(20000)
+_G.settings.startup["save-timelapse-include-resources"] = { value = false }
+local uninterested = load_mod()
+uninterested.CAPTURE_HANDLERS[_G.defines.events.on_resource_depleted]({ entity = patch })
+uninterested.periodic_flush(20000)
+
+check("with resources not captured, depletion is not recorded either", segment_bytes():find("iron%-ore"), nil)
+
+-- An entity the game destroyed before the event reached the mod. Costs that
+-- one removal rather than raising, which would take the whole capture down.
+fake.reset(20000)
+_G.settings.startup["save-timelapse-include-resources"] = { value = true }
+local gone = load_mod()
+local invalid = fake.entity({ name = "copper-ore", type = "resource", x = 1, y = 2 })
+invalid.valid = false
+gone.CAPTURE_HANDLERS[_G.defines.events.on_resource_depleted]({ entity = invalid })
+gone.periodic_flush(20000)
+
+check("an already destroyed patch is skipped rather than raising", segment_bytes():find("copper%-ore"), nil)
+
+-- Nests cleared ---------------------------------------------------------------
+--
+-- A nest is stationary and worth watching get cleared, unlike the biters that
+-- come out of it, so it is recorded and its death is an event like any other.
+-- These pin that down: it is one absence from `EXCLUDED_TYPES` away from being
+-- silently dropped, and nothing else would say so.
+
+fake.reset(30000)
+local clearing = load_mod()
+local nest = fake.entity({ name = "biter-spawner", type = "unit-spawner", x = 400, y = -120, unit_number = 77 })
+clearing.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = nest })
+clearing.periodic_flush(30000)
+
+check_true("a nest destroyed is recorded as removed", segment_bytes():find(string.char(4), 1, true) ~= nil)
+
+-- The biters themselves are not. They move, and this format cannot say
+-- anything moved, so a captured one sits frozen wherever it was first logged
+-- while their combat deaths flood the log with removals of things replay never
+-- had.
+fake.reset(30000)
+local swarm = load_mod()
+local biter = fake.entity({ name = "small-biter", type = "unit", x = 401, y = -121, unit_number = 78 })
+swarm.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = biter })
+swarm.periodic_flush(30000)
+
+check("a biter dying is not", segment_bytes():find(string.char(4), 1, true), nil)
+
+-- The other half of the same war. Biters expanding is the only thing in the
+-- game that builds without a player or a bot doing it, so none of the ordinary
+-- build events fire for it: a nest that appeared mid playthrough was recorded
+-- only if a later baseline happened to catch it, while a nest cleared was
+-- recorded the moment it died.
+fake.reset(30000)
+local expanding = load_mod()
+local built = fake.entity({ name = "biter-spawner", type = "unit-spawner", x = 900, y = 40, unit_number = 80 })
+expanding.CAPTURE_HANDLERS[_G.defines.events.on_biter_base_built]({ entity = built })
+expanding.periodic_flush(30000)
+
+check_true("a nest built by expansion is recorded", segment_bytes():find("biter%-spawner") ~= nil)
+check_true("as something arriving rather than leaving", segment_bytes():find(string.char(3), 1, true) ~= nil)
+
+-- A worm is stationary too, and shares the "turret" type with the player's
+-- own, which is why it cannot be named in the scenery list and has to be
+-- recorded the same way anything built is.
+fake.reset(30000)
+local worms = load_mod()
+local worm = fake.entity({ name = "small-worm-turret", type = "turret", x = 402, y = -122, unit_number = 79 })
+worms.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = worm })
+worms.periodic_flush(30000)
+
+check_true("and neither is a worm dropped", segment_bytes():find(string.char(4), 1, true) ~= nil)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

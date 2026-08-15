@@ -313,10 +313,18 @@ local function export_surface(surface, tick, session_id)
   return written, tiles_written, built
 end
 
---- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
 --- Fixed rather than read from the settings gating the in-game pass: those
 --- exist to keep a live baseline cheap, and the tool sets them off for its own
 --- runs, so reading them here would scan nothing.
+---
+--- Nests are in here despite expanding during a playthrough, which this pass
+--- cannot represent: it reads one save and its result is drawn for the whole
+--- replay, so a nest built at hour ten is laid down from the first frame.
+--- Leaving them out was tried and was worse. A live baseline only sees chunks
+--- the game had generated when recording started, and Factorio keeps nests out
+--- of the starting area, so on a capture begun at the beginning the baseline
+--- holds none at all: measured on a real one, 2,109 entities and not a single
+--- spawner. Without this the timelapse has no nests until biters expand.
 local SCAN_SCENERY_TYPES = { "resource", "tree", "cliff", "plant", "unit-spawner" }
 
 --- Scenery over `area`, as entity runs.
@@ -368,9 +376,65 @@ local function write_scenery(path, dict, surface, area, checksum)
   return { checksum = checksum, written = written }
 end
 
+--- Placed floor as a set. Memoized: `encode.placed_floor_tiles` walks every
+--- tile prototype and sorts, where the scan asks once per tile.
+local placed_floor_set = nil
+local function is_placed_floor(name)
+  if not placed_floor_set then
+    placed_floor_set = {}
+    for _, n in pairs(encode.placed_floor_tiles()) do
+      placed_floor_set[n] = true
+    end
+  end
+  return placed_floor_set[name] == true
+end
+
+--- Reads `key` off a tile, or nil where this build of Factorio has no such
+--- property. Probed once per property rather than per tile: an unknown property
+--- raises rather than answering nil, so the read needs guarding, and a `pcall`
+--- per tile would cost more than the read it guards.
+local property_readable = {}
+local function tile_property(tile, key)
+  local known = property_readable[key]
+  if known == true then
+    return tile[key]
+  elseif known == false then
+    return nil
+  end
+  local ok, value = pcall(function() return tile[key] end)
+  property_readable[key] = ok
+  if not ok then
+    return nil
+  end
+  return value
+end
+
+--- What a paved position covered up, or nil where the game did not keep it.
+---
+--- The scan reads the finished save, where floor laid at hour three is already
+--- floor, so writing only what is not floor left those positions with no ground
+--- under them at all: replayed from the start they were holes until the tick the
+--- concrete went down. Factorio keeps the covered tile so that mining floor
+--- gives the ground back, and the double is the layer below that, concrete over
+--- landfill over water, so the deeper answer wins.
+---
+--- A recovered name can itself be floor, where only the single layer is known.
+--- Written anyway: it is what that position held before the recording, and the
+--- event laying it again over the top changes nothing on screen.
+local function ground_under(tile)
+  local found = tile_property(tile, "double_hidden_tile") or tile_property(tile, "hidden_tile")
+  -- A name on current builds, the prototype on older ones.
+  if type(found) == "table" then
+    return found.name
+  end
+  return found
+end
+
+--- Natural ground over `area` as a `terrain_<surface>.stfr`: a frame file
 --- with the scenery of `SCAN_SCENERY_TYPES` in its entity section and natural
---- ground after it. Placed floor is excluded, the frames already carrying it
---- with the history of when each piece went down.
+--- ground after it. Placed floor is not written as itself, the frames already
+--- carrying it with the history of when each piece went down, but the ground it
+--- covers is.
 local function export_terrain_to(tick, session_id, surface, area)
   local path = M.EXPORT_DIR .. encode.terrain_name(session_id, surface.name)
   local dict = encode.new_dictionary()
@@ -397,25 +461,30 @@ local function export_terrain_to(tick, session_id, surface, area)
     order, groups, pending_count = {}, {}, 0
   end
 
-  for _, tile in pairs(surface.find_tiles_filtered({
-    area = area,
-    name = encode.placed_floor_tiles(),
-    invert = true,
-  })) do
-    local pos = tile.position
-    local group = groups[tile.name]
-    if not group then
-      group = { n = 0, xs = {}, ys = {} }
-      groups[tile.name] = group
-      order[#order + 1] = tile.name
+  -- The whole box in one pass, rather than a query with placed floor filtered
+  -- out: a paved position still owes the ground beneath it, and asking for that
+  -- means holding the tile.
+  for _, tile in pairs(surface.find_tiles_filtered({ area = area })) do
+    local name = tile.name
+    if is_placed_floor(name) then
+      name = ground_under(tile)
     end
-    local k = group.n + 1
-    group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
-    written = written + 1
-    pending_count = pending_count + 1
+    if name then
+      local pos = tile.position
+      local group = groups[name]
+      if not group then
+        group = { n = 0, xs = {}, ys = {} }
+        groups[name] = group
+        order[#order + 1] = name
+      end
+      local k = group.n + 1
+      group.n, group.xs[k], group.ys[k] = k, pos.x, pos.y
+      written = written + 1
+      pending_count = pending_count + 1
 
-    if pending_count >= FLUSH_EVERY then
-      flush()
+      if pending_count >= FLUSH_EVERY then
+        flush()
+      end
     end
   end
 
@@ -453,9 +522,10 @@ end
 --- buys three things: no ground cost inside anybody's game, no ground repeated
 --- per frame, and an area chosen knowing how far the factory reached.
 ---
---- What it gives up is ground since built over: the query asks for everything
---- that is not placed floor, so water landfilled at hour three reads as
---- landfill at hour ten.
+--- Ground under placed floor comes with it (see `ground_under`), so paving laid
+--- mid playthrough uncovers rather than leaving a hole. Scenery already cleared
+--- by the time this runs is not here and cannot be: it is the baseline and its
+--- removals that carry a patch mined out or a forest felled, not the scan.
 function M.export_terrain(tick, session_id)
   local written, scenery, surfaces = 0, 0, 0
   for _, surface in pairs(game.surfaces) do

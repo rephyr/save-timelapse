@@ -6,7 +6,7 @@ use macroquad::math::Rect;
 
 /// Icon resolution is shared with the CLI, which needs the same answer to
 /// decide whether this game has to be asked to draw its icons at all.
-pub use save_timelapse::icons::{icon_candidates, icon_path};
+pub use crate::icons::{icon_candidates, icon_path};
 
 /// Factorio's in-world sheet for an entity, holding every facing and corner
 /// drawn separately. Same guess and same failure mode as `icon_candidates`.

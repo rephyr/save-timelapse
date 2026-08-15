@@ -717,6 +717,11 @@ do
         type = "unit-spawner",
         friendly_map_color = { r = 0, g = 93, b = 147 },
         enemy_map_color = { r = 255, g = 25, b = 25 },
+        -- The one thing a removal cannot say. A nest cleared before any save
+        -- was scanned is rebuilt from its name alone, and without this it
+        -- would be rebuilt one tile across.
+        tile_width = 3,
+        tile_height = 3,
       },
       ["small-worm-turret"] = {
         type = "turret",
@@ -736,7 +741,7 @@ do
   }
 
   check(
-    "prototypes_json: colours, types and reach, each sorted",
+    "prototypes_json: colours, types, reach and footprints, each sorted",
     encode.prototypes_json(),
     '{"tiles":{"cerys-refined-concrete":[100,100,100],"grass-1":[55,53,11],"water":[51,83,95]},'
       .. '"entities":{"biter-spawner":[255,25,25],"kr-advanced-underground-belt":[0,93,147],'
@@ -745,6 +750,11 @@ do
       .. '"kr-advanced-underground-belt":"underground-belt","radar":"radar",'
       .. '"small-worm-turret":"turret","transport-belt":"transport-belt"},'
       .. '"reach":{"kr-advanced-underground-belt":30},'
+      -- Only what is not one tile across, so absent means 1x1 and the common
+      -- case costs nothing. The nest is here because a removal carries no
+      -- footprint, and a nest cleared before any save was scanned is rebuilt
+      -- from its name alone.
+      .. '"size":{"biter-spawner":"3x3"},'
       -- Empty for a game with no rails down, and for one whose rail API this
       -- mod could not read. The desktop side falls back to its own geometry
       -- for both, so they need not be told apart.
