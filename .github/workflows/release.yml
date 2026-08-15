@@ -77,6 +77,9 @@ jobs:
           cp -r mod "$staged/mod"
           rm -rf "$staged/mod/tests"
           cp README.md LICENSE "$staged/"
+          # The display face is compiled into the binary, so only its licence
+          # has to travel beside it.
+          cp fonts/OFL.txt "$staged/OFL-Full-Automation.txt"
           echo "STAGED=$staged" >> "$GITHUB_ENV"
 
       - name: Archive

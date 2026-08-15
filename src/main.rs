@@ -785,7 +785,7 @@ fn add_icons_for_capture(settings: &mut Settings, user_dir: &Path, out: &Path) {
         capture_terrain: false,
         terrain_scan: false,
     };
-    add_icons(out, &config);
+    report_icons(build::add_icons(out, &config, &mut announce_icon_read));
 }
 
 /// Offer to read the ground for a live capture, from a save of the same
@@ -966,133 +966,27 @@ fn cached_terrain(user_dir: &Path, session_id: u32) -> Vec<PathBuf> {
 /// from the filenames rather than by reading each one.
 ///
 /// A mod's icons change only when the mod does, so this is what decides
-/// whether the cached dump still answers. Folders as well as zips, a mod being
-/// installable either way.
-fn mod_set_stamp(user_mods: &Path) -> String {
-    let mut names: Vec<String> = std::fs::read_dir(user_mods)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|item| item.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != "mod-settings.dat" && name != "mod-list.json")
-        .collect();
-    names.sort();
-    let mut hash: u64 = 1469598103934665603;
-    for byte in names.join(",").bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    format!("{hash:016x}")
-}
-
 /// Icons already dumped for this exact set of mods, or `None` to dump them.
 ///
 /// Kept next to the timelapses rather than inside one, because the answer
 /// depends on the mods rather than on the playthrough: two timelapses from one
-/// modpack share it, and a timelapse folder is deleted and rebuilt every time.
-fn cached_icons(user_mods: &Path) -> PathBuf {
-    build::output_dir_next_to_exe("icons").join(mod_set_stamp(user_mods))
+/// Said once, before the read that takes about a minute, and never on a run
+/// that has the icons cached already.
+fn announce_icon_read(missing: usize, names: usize) {
+    step(&format!("Reading this game's icons, once for this set of mods ({missing} of {names} buildings need them)"));
 }
 
-/// Every entity name the built timelapse actually draws.
-///
-/// Read from the frames rather than from `prototypes.json`, which lists every
-/// prototype the game has rather than the few hundred a factory is made of.
-/// Frames are deltas, so a name can first appear in any of them and all are
-/// read; they are small for exactly that reason.
-fn names_in_timelapse(out: &Path) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    let mut frames: Vec<PathBuf> = std::fs::read_dir(out)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|item| item.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
-        .collect();
-    frames.sort();
-    for path in frames {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Ok(frame) = frame::read_binary(&bytes) else { continue };
-        for entity in &frame.entities {
-            if !names.contains(&*entity.n) {
-                names.insert(entity.n.to_string());
-            }
+fn report_icons(added: build::IconsAdded) {
+    if let Some(seconds) = added.read_seconds {
+        println!("read in {seconds:.1}s, kept for next time");
+    }
+    match added.failed {
+        true if added.read_seconds.is_some() => {
+            eprintln!("warning: could not read this game's icons; modded buildings will draw as flat colours")
         }
+        _ if added.copied > 0 => println!("{} icons for this timelapse's buildings", added.copied),
+        _ => {}
     }
-    names
-}
-
-/// Every entity's icon as the recording game draws it, copied into `out`.
-///
-/// Without this a modded prototype has no artwork at all and falls back to a
-/// flat colour, because its icon lives inside its mod zip under a name that
-/// need not match the prototype and is often several layers that the game
-/// composites. Factorio will dump them all if asked, so it is asked.
-///
-/// Asking is the expensive part and is skipped whenever it can be. A vanilla
-/// playthrough draws nothing the install cannot already answer for, so it never
-/// launches Factorio here at all. Beyond that the dump is cached against the
-/// mod set, so a second timelapse from one modpack pays nothing either.
-///
-/// Note what cannot be optimised: 45 of the 60 seconds a dump takes is loading
-/// the mods, not writing the icons, and every icon needs those same prototypes
-/// loaded. Asking for eight instead of thirteen hundred would save about a
-/// second, and `--dump-icon-sprites` takes no filter regardless. Skipping the
-/// run is the only real saving there is.
-///
-/// Best effort throughout: a timelapse without icons is the one everybody had
-/// until now.
-fn add_icons(out: &Path, config: &export::ExportConfig) -> bool {
-    let Some(data_dir) = export::install_data_dir(&config.factorio) else {
-        return false;
-    };
-
-    let names = names_in_timelapse(out);
-    let missing: Vec<&String> =
-        names.iter().filter(|name| save_timelapse::icons::icon_path(None, &data_dir, name).is_none()).collect();
-    if missing.is_empty() {
-        // Every name is one the install can draw, so there is nothing this
-        // game could add. True of any unmodded playthrough.
-        return true;
-    }
-
-    let cache = cached_icons(&config.user_mods);
-    let cached = std::fs::read_dir(&cache).map(|entries| entries.count()).unwrap_or(0);
-
-    if cached == 0 {
-        step(&format!(
-            "Reading this game's icons, once for this set of mods ({} of {} buildings need them)",
-            missing.len(),
-            names.len()
-        ));
-        let staged = std::env::temp_dir().join(format!("save-timelapse-icons-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&staged);
-        let started = std::time::Instant::now();
-        let result = export::dump_entity_icons(&staged, &cache, config);
-        let _ = std::fs::remove_dir_all(&staged);
-        if let Err(e) = result {
-            eprintln!("warning: could not read this game's icons ({e}); modded buildings will draw as flat colours");
-            return false;
-        }
-        println!("read in {:.1}s, kept for next time", started.elapsed().as_secs_f32());
-    }
-
-    // Only what this timelapse draws, not all thirteen hundred: a factory is
-    // made of a few dozen kinds of thing, and the folder travels with the
-    // timelapse.
-    let into = out.join("icons");
-    if std::fs::create_dir_all(&into).is_err() {
-        return false;
-    }
-    let mut copied = 0usize;
-    for name in &names {
-        let file = format!("{name}.png");
-        if std::fs::copy(cache.join(&file), into.join(&file)).is_ok() {
-            copied += 1;
-        }
-    }
-    println!("{copied} icons for this timelapse's buildings");
-    copied > 0
 }
 
 /// Copies the rail shapes a scan sampled into a timelapse's description.
@@ -1324,7 +1218,7 @@ fn run_from_saves(settings: &mut Settings) -> io::Result<PathBuf> {
 
     // Unconditional and unasked, unlike ground: it costs 10 MB and no time
     // at all once cached, where ground is a real size and time decision.
-    add_icons(&out, &config);
+    report_icons(build::add_icons(&out, &config, &mut announce_icon_read));
 
     // Milestones cannot be derived from a single save, which reports only
     // totals. When something first became true needs consecutive ones.
@@ -2008,7 +1902,7 @@ mod tests {
             std::fs::write(dir.path().join(format!("frame_{i:04}.stfr")), frame::write_binary(&frame.as_out())).unwrap();
         }
 
-        let names = names_in_timelapse(dir.path());
+        let names = build::names_in_timelapse(dir.path());
         assert_eq!(names.len(), 3, "got {names:?}");
         assert!(names.contains("assembler"), "the one that only exists in a later delta");
     }
@@ -2023,7 +1917,7 @@ mod tests {
         std::fs::write(dir.path().join("prototypes.json"), b"{}").unwrap();
         std::fs::write(dir.path().join("frame_0001.stfr"), b"not a frame at all").unwrap();
 
-        let names = names_in_timelapse(dir.path());
+        let names = build::names_in_timelapse(dir.path());
         assert_eq!(names.len(), 1);
         assert!(names.contains("pipe"));
     }

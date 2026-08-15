@@ -1073,3 +1073,139 @@ mod ground_tests {
         assert_eq!(nests_left(out.path()).len(), 1);
     }
 }
+
+/// modpack share it, and a timelapse folder is deleted and rebuilt every time.
+pub fn cached_icons(user_mods: &Path) -> PathBuf {
+    output_dir_next_to_exe("icons").join(mod_set_stamp(user_mods))
+}
+
+/// Every entity name the built timelapse actually draws.
+///
+/// Read from the frames rather than from `prototypes.json`, which lists every
+/// prototype the game has rather than the few hundred a factory is made of.
+/// Frames are deltas, so a name can first appear in any of them and all are
+/// read; they are small for exactly that reason.
+pub fn names_in_timelapse(out: &Path) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut frames: Vec<PathBuf> = std::fs::read_dir(out)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|item| item.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("stfr"))
+        .collect();
+    frames.sort();
+    for path in frames {
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(frame) = frame::read_binary(&bytes) else { continue };
+        for entity in &frame.entities {
+            if !names.contains(&*entity.n) {
+                names.insert(entity.n.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Every entity's icon as the recording game draws it, copied into `out`.
+///
+/// Without this a modded prototype has no artwork at all and falls back to a
+/// flat colour, because its icon lives inside its mod zip under a name that
+/// need not match the prototype and is often several layers that the game
+/// composites. Factorio will dump them all if asked, so it is asked.
+///
+/// Asking is the expensive part and is skipped whenever it can be. A vanilla
+/// playthrough draws nothing the install cannot already answer for, so it never
+/// launches Factorio here at all. Beyond that the dump is cached against the
+/// mod set, so a second timelapse from one modpack pays nothing either.
+///
+/// Note what cannot be optimised: 45 of the 60 seconds a dump takes is loading
+/// the mods, not writing the icons, and every icon needs those same prototypes
+/// loaded. Asking for eight instead of thirteen hundred would save about a
+/// second, and `--dump-icon-sprites` takes no filter regardless. Skipping the
+/// run is the only real saving there is.
+///
+/// Best effort throughout: a timelapse without icons is the one everybody had
+/// What adding a timelapse's icons did.
+pub struct IconsAdded {
+    pub copied: usize,
+    /// How long the game took to draw them, when it had to be asked. `None`
+    /// means the answer was already cached, which is every run but the first
+    /// with a given set of mods.
+    pub read_seconds: Option<f32>,
+    pub failed: bool,
+}
+
+/// Copies the icons this timelapse's buildings need into it, asking Factorio
+/// to draw them first if nothing has yet.
+///
+/// `starting` is called once, with how many names need icons out of how many
+/// there are, immediately before the read that takes about a minute. Not
+/// called at all when the cache already has them, which is what makes it the
+/// right place to say something: a front end that says "this will take a
+/// while" every time is a front end nobody believes.
+pub fn add_icons(out: &Path, config: &ExportConfig, starting: &mut dyn FnMut(usize, usize)) -> IconsAdded {
+    let none = IconsAdded { copied: 0, read_seconds: None, failed: true };
+    let Some(data_dir) = crate::export::install_data_dir(&config.factorio) else {
+        return none;
+    };
+
+    let names = names_in_timelapse(out);
+    let missing: Vec<&String> = names.iter().filter(|name| crate::icons::icon_path(None, &data_dir, name).is_none()).collect();
+    if missing.is_empty() {
+        // Every name is one the install can draw, so there is nothing this
+        // game could add. True of any unmodded playthrough.
+        return IconsAdded { copied: 0, read_seconds: None, failed: false };
+    }
+
+    let cache = cached_icons(&config.user_mods);
+    let cached = std::fs::read_dir(&cache).map(|entries| entries.count()).unwrap_or(0);
+
+    let mut read_seconds = None;
+    if cached == 0 {
+        starting(missing.len(), names.len());
+        let staged = std::env::temp_dir().join(format!("{MOD_NAME}-icons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staged);
+        let started = std::time::Instant::now();
+        let result = crate::export::dump_entity_icons(&staged, &cache, config);
+        let _ = std::fs::remove_dir_all(&staged);
+        if result.is_err() {
+            return none;
+        }
+        read_seconds = Some(started.elapsed().as_secs_f32());
+    }
+
+    // Only what this timelapse draws, not all thirteen hundred: a factory is
+    // made of a few dozen kinds of thing, and the folder travels with the
+    // timelapse.
+    let into = out.join("icons");
+    if std::fs::create_dir_all(&into).is_err() {
+        return none;
+    }
+    let copied = names
+        .iter()
+        .filter(|name| {
+            let file = format!("{name}.png");
+            std::fs::copy(cache.join(&file), into.join(&file)).is_ok()
+        })
+        .count();
+    IconsAdded { copied, read_seconds, failed: copied == 0 }
+}
+
+/// installable either way.
+pub fn mod_set_stamp(user_mods: &Path) -> String {
+    let mut names: Vec<String> = std::fs::read_dir(user_mods)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|item| item.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "mod-settings.dat" && name != "mod-list.json")
+        .collect();
+    names.sort();
+    let mut hash: u64 = 1469598103934665603;
+    for byte in names.join(",").bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    format!("{hash:016x}")
+}

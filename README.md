@@ -240,3 +240,5 @@ Issues, bug reports, performance reports, and feature suggestions are welcome.
 ## License
 
 MIT
+
+The window sets its name in [Full Automation](https://fonts.google.com/) by Sharkshock, used under the SIL Open Font License. The face is compiled into the binary; its licence ships beside it and lives in `fonts/OFL.txt`.

@@ -51,6 +51,13 @@ const NAME_MIN_SIZE: f32 = 16.0;
 const NAME: Color = Color::new(1.0, 0.72, 0.86, 1.0);
 const NAME_GLOW: Color = Color::new(1.0, 0.60, 0.82, 0.10);
 
+/// The face the name is set in, carried inside the binary rather than beside
+/// it: the point of one executable is that there is nothing to lose on the way
+/// to somebody's machine, and this is 24 KB.
+///
+/// Licensed under the OFL, whose text ships in `fonts/`.
+const NAME_FONT: &[u8] = include_bytes!("../../fonts/Full Automation.otf");
+
 /// One choice in a column: what it says, and the quieter thing it says on the
 /// right. The note is where a count goes, so a row can carry "3 ready" without
 /// a second column to align.
@@ -419,6 +426,10 @@ impl Running {
 
 pub struct App {
     ui: Ui,
+    /// The name's own face. `None` if this build of macroquad cannot read it,
+    /// in which case the name is set in the same font as everything else,
+    /// which is a duller title rather than a broken window.
+    name_font: Option<Font>,
     screen: Screen,
     /// Rebuilt when a screen opens rather than every frame: it reads the disk.
     timelapses: Vec<crate::gui::Built>,
@@ -438,7 +449,23 @@ pub struct Built {
 
 impl Default for App {
     fn default() -> App {
-        App { ui: Ui::new(), screen: Screen::Menu, timelapses: Vec::new(), scroll: 0.0, quit: false }
+        App {
+            ui: Ui::new(),
+            // Said out loud rather than swallowed. A name silently set in the
+            // interface font looks like the face never loaded, which is
+            // exactly how the last hour went.
+            name_font: match load_ttf_font_from_bytes(NAME_FONT) {
+                Ok(font) => Some(font),
+                Err(e) => {
+                    eprintln!("the name's own font could not be read ({e}); using the interface font");
+                    None
+                }
+            },
+            screen: Screen::Menu,
+            timelapses: Vec::new(),
+            scroll: 0.0,
+            quit: false,
+        }
     }
 }
 
@@ -938,14 +965,29 @@ impl App {
     /// both are the same trick as the halo without its excuse of being faint.
     fn draw_name(&self, center_x: f32, baseline: f32, room: f32) {
         let name = "Save Timelapse";
-        let natural = self.ui.width(name, NAME_SIZE);
+
+        // Measuring and drawing both go through the name's own face, or they
+        // disagree: sized by one font and painted in another, the name comes
+        // out off centre and scaled by the width of a string nobody sees.
+        let width_at = |size: f32| match &self.name_font {
+            Some(font) => measure_text(name, Some(font), size as u16, 1.0).width,
+            None => self.ui.width(name, size),
+        };
+        let write = |x: f32, y: f32, size: f32, color: Color| match &self.name_font {
+            Some(font) => {
+                let params = TextParams { font: Some(font), font_size: size as u16, color, ..Default::default() };
+                draw_text_ex(name, x, y, params);
+            }
+            None => self.ui.text(name, x, y, size, color),
+        };
+
+        let natural = width_at(NAME_SIZE);
         let size = match natural > room && room > 0.0 {
             true => (NAME_SIZE * room / natural).max(NAME_MIN_SIZE),
             false => NAME_SIZE,
         };
 
-        let width = self.ui.width(name, size);
-        let left = (center_x - width / 2.0).round();
+        let left = (center_x - width_at(size) / 2.0).round();
         let baseline = baseline.round();
 
         let scale = size / NAME_SIZE;
@@ -962,10 +1004,10 @@ impl App {
                 (-diagonal, diagonal),
                 (diagonal, diagonal),
             ] {
-                self.ui.text(name, left + dx, baseline + dy, size, NAME_GLOW);
+                write(left + dx, baseline + dy, size, NAME_GLOW);
             }
         }
-        self.ui.text(name, left, baseline, size, NAME);
+        write(left, baseline, size, NAME);
     }
 
     fn draw(&self, column: &Column, choices: &[Choice], hovered: Option<usize>) {
@@ -1110,6 +1152,38 @@ impl App {
             }
         }
     }
+}
+
+/// What a Factorio run needs, or a sentence saying which part is missing.
+fn factorio_config(capture_terrain: bool, terrain_scan: bool) -> Result<crate::export::ExportConfig, String> {
+    let Some(factorio) = crate::locate::locate_factorio() else {
+        return Err("Could not find factorio.exe.".to_string());
+    };
+    let Some(user_dir) = crate::locate::factorio_user_dir() else {
+        return Err("Could not find your Factorio folder.".to_string());
+    };
+    let Ok(mod_source) = build::mod_source_dir() else {
+        return Err("Could not find the mod folder that has to sit beside this program.".to_string());
+    };
+    Ok(crate::export::ExportConfig {
+        factorio,
+        user_mods: user_dir.join("mods"),
+        mod_source,
+        include_resources: false,
+        capture_terrain,
+        terrain_scan,
+    })
+}
+
+/// Copies in the icons this timelapse's buildings need, saying so first when
+/// the game has to be asked to draw them, which takes about a minute and only
+/// ever happens once per set of mods.
+fn add_icons(out: &std::path::Path, send: &std::sync::mpsc::Sender<Update>) {
+    let Ok(config) = factorio_config(false, false) else { return };
+    let mut starting = |_missing: usize, _names: usize| {
+        let _ = send.send(Update::Stage("Reading this game's icons, once for this set of mods..."));
+    };
+    build::add_icons(out, &config, &mut starting);
 }
 
 /// Ground already read for this playthrough, if any.
@@ -1304,23 +1378,9 @@ fn from_saves_on_thread(
     cancel: &AtomicBool,
     send: &std::sync::mpsc::Sender<Update>,
 ) -> (String, Option<std::path::PathBuf>) {
-    let Some(factorio) = crate::locate::locate_factorio() else {
-        return ("Could not find factorio.exe. Build from a recording instead, or start the console menu once to point it at your install.".to_string(), None);
-    };
-    let Some(user_dir) = crate::locate::factorio_user_dir() else {
-        return ("Could not find your Factorio folder.".to_string(), None);
-    };
-    let Ok(mod_source) = build::mod_source_dir() else {
-        return ("Could not find the mod folder that has to sit beside this program.".to_string(), None);
-    };
-
-    let config = crate::export::ExportConfig {
-        factorio,
-        user_mods: user_dir.join("mods"),
-        mod_source,
-        include_resources: false,
-        capture_terrain: ground,
-        terrain_scan: false,
+    let config = match factorio_config(ground, false) {
+        Ok(config) => config,
+        Err(missing) => return (format!("{missing} Build from a recording instead."), None),
     };
 
     let name = saves.last().and_then(|s| s.file_stem()).map(|s| s.to_string_lossy().into_owned());
@@ -1357,8 +1417,27 @@ fn from_saves_on_thread(
         let _ = crate::milestone::write_jsonl(&out.join("milestones.jsonl"), &milestones);
     }
 
+    // Ground is a second Factorio run over one save, read once for the whole
+    // timelapse. The last one chosen, its map being generated furthest out.
+    let mut note = String::new();
+    if ground {
+        if let (Ok(scan), Some(save)) = (factorio_config(true, true), saves.last()) {
+            let _ = send.send(Update::Stage("Reading the ground. Factorio is opening again..."));
+            // No session to check against: on this path the saves are the
+            // playthrough, so there is nothing a stranger's ground could be
+            // confused with.
+            if let Err(e) = build::scan_ground(save, &out, &scan, None) {
+                note = format!(
+                    "
+{e}"
+                );
+            }
+        }
+    }
+    add_icons(&out, send);
+
     let stopped = if exported.cancelled { "Stopped. " } else { "" };
-    (format!("{stopped}Built {} frames in {}", exported.frames.len(), out.display()), Some(out))
+    (format!("{stopped}Built {} frames in {}{note}", exported.frames.len(), out.display()), Some(out))
 }
 
 /// How much of one kind there is, for the row that opens it.
@@ -1487,6 +1566,9 @@ fn start_build(choosing: Choosing) -> Running {
         let worked = !built.starts_with("The build failed") && !built.starts_with("Could not");
         // Ground last, and only if the frames worked: it is the slow half, and
         // there is nothing to lay it under otherwise.
+        if worked {
+            add_icons(&out, &send);
+        }
         let ended = match ground {
             Some(from) if worked => {
                 // A whole Factorio launch that says nothing until it is done,
@@ -1908,6 +1990,22 @@ mod tests {
         let (label_room, note_room) = share_row(400.0, 0.0);
         assert_eq!(note_room, 0.0);
         assert_eq!(label_room, 400.0 - ROW_PAD * 2.0);
+    }
+
+    /// The name is set in an OpenType face, and macroquad rasterises through
+    /// fontdue, which reads TrueType outlines. If it cannot read this one the
+    /// name silently falls back to the interface font, which is a duller
+    /// title nobody would report as a bug.
+    #[test]
+    fn the_name_font_is_one_the_renderer_can_read() {
+        let font = fontdue::Font::from_bytes(NAME_FONT, fontdue::FontSettings::default());
+        assert!(font.is_ok(), "the embedded face cannot be rasterised: {:?}", font.err());
+
+        let font = font.unwrap();
+        for letter in "Save Timelapse".chars().filter(|c| !c.is_whitespace()) {
+            let (metrics, _) = font.rasterize(letter, 44.0);
+            assert!(metrics.width > 0 && metrics.height > 0, "{letter} came out empty");
+        }
     }
 
     /// Every screen has a way out and it has to be the one that stands out,
