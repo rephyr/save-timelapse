@@ -91,7 +91,12 @@ pub fn analyze_activity(frames: &FrameSequence, registry: &TypeRegistry) -> Acti
         }
         current.clear();
         for run in &frame.entity_runs {
-            if registry.is_terrain_scatter(run.type_id) || registry.is_resource(run.type_id) {
+            // Enemies join trees and ore in not being construction. Biters
+            // expanding is recorded now, and a nest arriving is the game
+            // building something at you rather than you building anything, so
+            // counting it would put a spike on the graph and a glow on the
+            // heatmap for a moment you had no hand in.
+            if registry.is_terrain_scatter(run.type_id) || registry.is_resource(run.type_id) || registry.is_enemy(run.type_id) {
                 continue;
             }
             current.extend(frame.entities[run.range()].iter().map(|e| pos_key(e.x, e.y)));
@@ -342,6 +347,20 @@ mod tests {
             frame_of(&mut registry, "transport-belt", &[(0.5, 0.5)]),
         ];
         assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 0, 1]);
+    }
+
+    /// Biters expanding is the game building something at you. Counting it
+    /// would spike the graph and glow the heatmap for a moment nobody had a
+    /// hand in, and it is recorded now, so it has to be skipped like the rest
+    /// of what the map does on its own.
+    #[test]
+    fn a_nest_appearing_is_not_construction() {
+        let mut registry = TypeRegistry::new();
+        let frames = vec![
+            frame_of(&mut registry, "transport-belt", &[(0.5, 0.5)]),
+            frame_of(&mut registry, "biter-spawner", &[(80.5, 80.5), (84.5, 80.5)]),
+        ];
+        assert_eq!(analyze_activity(&seq(frames), &registry).counts, vec![0, 0]);
     }
 
     /// The bug this guards: with terrain capture on, a frame that merely

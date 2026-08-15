@@ -260,6 +260,58 @@ gone.periodic_flush(20000)
 
 check("an already destroyed patch is skipped rather than raising", segment_bytes():find("copper%-ore"), nil)
 
+-- Nests cleared ---------------------------------------------------------------
+--
+-- A nest is stationary and worth watching get cleared, unlike the biters that
+-- come out of it, so it is recorded and its death is an event like any other.
+-- These pin that down: it is one absence from `EXCLUDED_TYPES` away from being
+-- silently dropped, and nothing else would say so.
+
+fake.reset(30000)
+local clearing = load_mod()
+local nest = fake.entity({ name = "biter-spawner", type = "unit-spawner", x = 400, y = -120, unit_number = 77 })
+clearing.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = nest })
+clearing.periodic_flush(30000)
+
+check_true("a nest destroyed is recorded as removed", segment_bytes():find(string.char(4), 1, true) ~= nil)
+
+-- The biters themselves are not. They move, and this format cannot say
+-- anything moved, so a captured one sits frozen wherever it was first logged
+-- while their combat deaths flood the log with removals of things replay never
+-- had.
+fake.reset(30000)
+local swarm = load_mod()
+local biter = fake.entity({ name = "small-biter", type = "unit", x = 401, y = -121, unit_number = 78 })
+swarm.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = biter })
+swarm.periodic_flush(30000)
+
+check("a biter dying is not", segment_bytes():find(string.char(4), 1, true), nil)
+
+-- The other half of the same war. Biters expanding is the only thing in the
+-- game that builds without a player or a bot doing it, so none of the ordinary
+-- build events fire for it: a nest that appeared mid playthrough was recorded
+-- only if a later baseline happened to catch it, while a nest cleared was
+-- recorded the moment it died.
+fake.reset(30000)
+local expanding = load_mod()
+local built = fake.entity({ name = "biter-spawner", type = "unit-spawner", x = 900, y = 40, unit_number = 80 })
+expanding.CAPTURE_HANDLERS[_G.defines.events.on_biter_base_built]({ entity = built })
+expanding.periodic_flush(30000)
+
+check_true("a nest built by expansion is recorded", segment_bytes():find("biter%-spawner") ~= nil)
+check_true("as something arriving rather than leaving", segment_bytes():find(string.char(3), 1, true) ~= nil)
+
+-- A worm is stationary too, and shares the "turret" type with the player's
+-- own, which is why it cannot be named in the scenery list and has to be
+-- recorded the same way anything built is.
+fake.reset(30000)
+local worms = load_mod()
+local worm = fake.entity({ name = "small-worm-turret", type = "turret", x = 402, y = -122, unit_number = 79 })
+worms.CAPTURE_HANDLERS[_G.defines.events.on_entity_died]({ entity = worm })
+worms.periodic_flush(30000)
+
+check_true("and neither is a worm dropped", segment_bytes():find(string.char(4), 1, true) ~= nil)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

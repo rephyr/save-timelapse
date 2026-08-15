@@ -42,12 +42,13 @@ const TITLE_SIZE: f32 = 34.0;
 /// The name, bigger than a screen's own title: it is the one piece of the
 /// window that is the same on every screen, so it carries the identity.
 const NAME_SIZE: f32 = 44.0;
+/// How small the name may shrink before it stops. Past this it is unreadable
+/// anyway, and a window that narrow has bigger problems.
+const NAME_MIN_SIZE: f32 = 16.0;
 
-/// A cool light pink for the name, with a deeper one under it for depth and a
-/// wide faint one for the glow. Three shades of one colour rather than three
-/// colours, so it reads as lit rather than as decorated.
+/// A cool light pink for the name, with a faint wider one behind it for the
+/// glow. Two shades of one colour, so it reads as lit rather than decorated.
 const NAME: Color = Color::new(1.0, 0.72, 0.86, 1.0);
-const NAME_DEEP: Color = Color::new(0.72, 0.36, 0.58, 0.85);
 const NAME_GLOW: Color = Color::new(1.0, 0.60, 0.82, 0.10);
 
 /// One choice in a column: what it says, and the quieter thing it says on the
@@ -276,6 +277,59 @@ impl Choosing {
     fn chosen_surfaces(&self) -> Vec<String> {
         chosen_of(&self.loaded.surfaces, &self.picked)
     }
+}
+
+/// Space kept clear at each end of a row, and between a label and its note.
+const ROW_PAD: f32 = 18.0;
+const ROW_GAP: f32 = 16.0;
+
+/// The most of a row a note may take, leaving the rest to the label.
+///
+/// The label is what a row is; the note is what it is like. So when they will
+/// not both fit the note gives way first, but it is never dropped outright,
+/// because "13 hours in, last played just now" cut short still says more than
+/// nothing does.
+const NOTE_SHARE: f32 = 0.5;
+
+/// `text` cut to fit `max`, ending in dots when something was taken off.
+///
+/// Takes its measuring as an argument rather than reaching for the font, which
+/// is what lets it be tested: the real measure needs a window, and the rule
+/// being tested is about widths rather than about glyphs.
+///
+/// Trimmed by character rather than by byte, so a cut lands between letters
+/// instead of inside one.
+fn elide(text: &str, max: f32, width_of: &dyn Fn(&str) -> f32) -> String {
+    if width_of(text) <= max {
+        return text.to_string();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        // Back up to a character boundary, then try that much plus the dots.
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}...", &text[..end]);
+        if width_of(&candidate) <= max {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+/// How wide a row's label and note may each be drawn.
+///
+/// Split rather than clipped: two strings drawn from opposite edges of a box
+/// have nothing stopping them meeting in the middle, and on a narrow window
+/// they did.
+fn share_row(width: f32, note_width: f32) -> (f32, f32) {
+    let available = (width - ROW_PAD * 2.0).max(0.0);
+    if note_width <= 0.0 {
+        return (available, 0.0);
+    }
+    let for_note = note_width.min(available * NOTE_SHARE);
+    ((available - for_note - ROW_GAP).max(0.0), for_note)
 }
 
 /// The ticked names, in the order they were offered.
@@ -842,38 +896,49 @@ impl App {
 
     /// The program's name, drawn as the one thing here that is not a list.
     ///
-    /// Weight comes from redrawing rather than from a bold font, because the
-    /// font is whatever the system had and there is no promise of a bold cut
-    /// of it. Three passes: a wide faint glow, a deeper shade offset down for
-    /// depth, then the face thickened horizontally, which is what a real bold
-    /// mostly is.
-    fn draw_name(&self, center_x: f32, baseline: f32) {
+    /// A faint wider copy of the glyphs behind the face, in eight directions
+    /// at two radii. Offset copies are not a blur, so this is a halo rather
+    /// than a real glow: eight directions rather than four, because the axes
+    /// alone come out as a cross rather than as light around the letters.
+    ///
+    /// The radii scale with the size actually drawn, so a name shrunk to fit a
+    /// narrow window keeps the same halo in proportion instead of one three
+    /// times too wide for it. That, and its origin being rounded to a whole
+    /// pixel, is what keeps the copies overlapping: where they stop
+    /// overlapping the seams read as the text drawn twice.
+    ///
+    /// No outline and no sideways smear. Both were attempts at weight, and
+    /// both are the same trick as the halo without its excuse of being faint.
+    fn draw_name(&self, center_x: f32, baseline: f32, room: f32) {
         let name = "Save Timelapse";
-        let width = self.ui.width(name, NAME_SIZE);
-        let left = center_x - width / 2.0;
+        let natural = self.ui.width(name, NAME_SIZE);
+        let size = match natural > room && room > 0.0 {
+            true => (NAME_SIZE * room / natural).max(NAME_MIN_SIZE),
+            false => NAME_SIZE,
+        };
 
-        // Eight directions rather than four, because offset copies of a glyph
-        // are not a blur: with only the axes the halo comes out as a cross
-        // rather than as light around the letters.
+        let width = self.ui.width(name, size);
+        let left = (center_x - width / 2.0).round();
+        let baseline = baseline.round();
+
+        let scale = size / NAME_SIZE;
         for ring in [3.0f32, 6.0] {
-            let diagonal = ring * std::f32::consts::FRAC_1_SQRT_2;
+            let spread = ring * scale;
+            let diagonal = spread * std::f32::consts::FRAC_1_SQRT_2;
             for (dx, dy) in [
-                (-ring, 0.0),
-                (ring, 0.0),
-                (0.0, -ring),
-                (0.0, ring),
+                (-spread, 0.0),
+                (spread, 0.0),
+                (0.0, -spread),
+                (0.0, spread),
                 (-diagonal, -diagonal),
                 (diagonal, -diagonal),
                 (-diagonal, diagonal),
                 (diagonal, diagonal),
             ] {
-                self.ui.text(name, left + dx, baseline + dy, NAME_SIZE, NAME_GLOW);
+                self.ui.text(name, left + dx, baseline + dy, size, NAME_GLOW);
             }
         }
-        self.ui.text(name, left, baseline + 2.0, NAME_SIZE, NAME_DEEP);
-        for weight in [0.0, 0.6, 1.2] {
-            self.ui.text(name, left + weight, baseline, NAME_SIZE, NAME);
-        }
+        self.ui.text(name, left, baseline, size, NAME);
     }
 
     fn draw(&self, column: &Column, choices: &[Choice], hovered: Option<usize>) {
@@ -884,7 +949,7 @@ impl App {
         // on its own rather than a placeholder box standing in for artwork
         // nobody has drawn yet.
         match self.screen {
-            Screen::Menu => self.draw_name(center_x, center_y + NAME_SIZE / 2.0),
+            Screen::Menu => self.draw_name(center_x, center_y + NAME_SIZE / 2.0, screen_width() - 32.0),
             _ => {
                 let title = self.title();
                 let width = self.ui.width(title, TITLE_SIZE);
@@ -908,22 +973,27 @@ impl App {
             draw_rectangle_lines(row.x, row.y, row.width, row.height, 1.0, ROW_EDGE);
 
             let baseline = row.text_baseline(LABEL_SIZE);
-            let label = match (choice.leave, lit) {
+            let colour = match (choice.leave, lit) {
                 (true, _) => LEAVE,
                 (false, true) => ACCENT,
                 (false, false) => TEXT,
             };
-            self.ui.text(&choice.label, row.x + 18.0, baseline, LABEL_SIZE, label);
+
+            let measure_note = |text: &str| self.ui.width(text, NOTE_SIZE);
+            let (label_room, note_room) = share_row(row.width, measure_note(&choice.note));
+            let label = elide(&choice.label, label_room, &|text| self.ui.width(text, LABEL_SIZE));
+            self.ui.text(&label, row.x + ROW_PAD, baseline, LABEL_SIZE, colour);
+
+            if note_room > 0.0 {
+                let note = elide(&choice.note, note_room, &measure_note);
+                let width = measure_note(&note);
+                self.ui.text(&note, row.x + row.width - ROW_PAD - width, baseline, NOTE_SIZE, TEXT_DIM);
+            }
 
             // A ticked place gets an edge as well as a word, so which rows are
             // in is readable at a glance rather than by reading every note.
             if choice.note == "included" {
                 draw_rectangle(row.x, row.y, 3.0, row.height, ACCENT);
-            }
-
-            if !choice.note.is_empty() {
-                let note_width = self.ui.width(&choice.note, NOTE_SIZE);
-                self.ui.text(&choice.note, row.x + row.width - 18.0 - note_width, baseline, NOTE_SIZE, TEXT_DIM);
             }
         }
 
@@ -1705,6 +1775,73 @@ mod tests {
         frames.players = true;
         assert!(!(frames.video && frames.clock));
         assert!(!(frames.video && frames.players));
+    }
+
+    /// Ten pixels a character, so a width in this test is a character count.
+    fn ten_per_char(text: &str) -> f32 {
+        text.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn text_that_fits_is_left_alone() {
+        assert_eq!(elide("nauvis", 200.0, &ten_per_char), "nauvis");
+        assert_eq!(elide("nauvis", 60.0, &ten_per_char), "nauvis", "exactly filling is still fitting");
+    }
+
+    /// The point of the dots: a cut that says nothing was cut reads as a
+    /// shorter name rather than as a longer one that did not fit.
+    #[test]
+    fn text_too_long_is_cut_and_says_so() {
+        let cut = elide("a very long timelapse name", 100.0, &ten_per_char);
+        assert!(cut.ends_with("..."), "{cut}");
+        assert!(ten_per_char(&cut) <= 100.0, "{cut} is {} wide", ten_per_char(&cut));
+        assert!(cut.starts_with("a very"), "what is left has to be the start: {cut}");
+    }
+
+    /// A box too small even for the dots gets nothing rather than something
+    /// wider than the box it is in.
+    #[test]
+    fn a_box_too_small_for_even_the_dots_draws_nothing() {
+        assert_eq!(elide("nauvis", 10.0, &ten_per_char), "");
+        assert_eq!(elide("nauvis", 0.0, &ten_per_char), "");
+    }
+
+    /// Cut between letters, never inside one: trimming by byte would split a
+    /// multi-byte character and produce something unprintable.
+    #[test]
+    fn a_cut_lands_between_characters() {
+        let cut = elide("vegetation-turquoise-grass", 90.0, &|text| text.chars().count() as f32 * 10.0);
+        assert!(cut.is_char_boundary(cut.len()));
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    /// The bug this exists for: a label and a note drawn from opposite edges
+    /// have nothing stopping them meeting, and on a narrow window they did.
+    #[test]
+    fn a_label_and_its_note_never_overlap() {
+        for width in [120.0f32, 200.0, 320.0, 620.0] {
+            for note in [10.0f32, 80.0, 400.0] {
+                let (label_room, note_room) = share_row(width, note);
+                let used = label_room + note_room + ROW_PAD * 2.0 + if note_room > 0.0 { ROW_GAP } else { 0.0 };
+                assert!(used <= width + 0.01, "row {width} overflows at note {note}: {label_room} + {note_room}");
+            }
+        }
+    }
+
+    /// A note gives way before the label does: the label is what a row is.
+    #[test]
+    fn the_note_gives_up_room_before_the_label() {
+        let (label_room, note_room) = share_row(400.0, 900.0);
+        assert!(note_room <= (400.0 - ROW_PAD * 2.0) * NOTE_SHARE + 0.01, "{note_room}");
+        assert!(label_room > 0.0, "the label must keep something: {label_room}");
+    }
+
+    /// No note means the label gets everything, which is the common row.
+    #[test]
+    fn a_row_with_no_note_gives_the_label_the_whole_width() {
+        let (label_room, note_room) = share_row(400.0, 0.0);
+        assert_eq!(note_room, 0.0);
+        assert_eq!(label_room, 400.0 - ROW_PAD * 2.0);
     }
 
     /// Every screen has a way out and it has to be the one that stands out,

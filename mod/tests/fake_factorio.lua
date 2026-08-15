@@ -116,7 +116,7 @@ function M.reset(tick)
     "on_built_entity", "on_robot_built_entity", "script_raised_built", "script_raised_revive", "on_entity_cloned",
     "on_player_rotated_entity", "on_player_mined_entity", "on_robot_mined_entity", "on_entity_died", "script_raised_destroy",
     "on_player_built_tile", "on_robot_built_tile", "on_player_mined_tile", "on_robot_mined_tile",
-    "on_resource_depleted",
+    "on_resource_depleted", "on_biter_base_built",
     "on_tick", "on_rocket_launched", "on_research_finished", "on_player_created", "on_gui_click",
     "on_gui_checked_state_changed", "on_gui_closed", "on_lua_shortcut", "on_runtime_mod_setting_changed",
     "on_surface_created", "on_surface_deleted", "on_pre_surface_deleted", "on_player_changed_surface",

@@ -611,6 +611,14 @@ capture_handler("on_space_platform_mined_tile", function(e) log_tile_change("-",
 -- Without it a modded construction aid places entities capture never sees.
 capture_handler("script_raised_revive", function(e) log_entity("+", e.entity) end)
 
+-- Biters expanding, which is the only thing in the game that builds without a
+-- player or a bot doing it. Nothing above fires for it: it is neither built
+-- nor revived nor raised by a script, so a nest that appeared during a
+-- playthrough was recorded only if some later baseline happened to catch it,
+-- while a nest cleared was recorded the moment it died. The two halves of the
+-- same war belong in the log together.
+capture_handler("on_biter_base_built", function(e) log_entity("+", e.entity) end)
+
 -- An ore patch is not mined away a removal at a time. The resource entity
 -- stays put while its amount falls and the game destroys it on reaching zero,
 -- raising none of the removal events above, so without this every patch a
