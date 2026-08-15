@@ -353,8 +353,21 @@ const INTERVALS: [(u64, &str); 4] =
 /// What a build says to the window while it runs.
 enum Update {
     Frames(usize),
-    /// The sentence to show when it is over, whether it worked or not.
-    Ended(String),
+    /// What it has moved on to, for the stretches with nothing to count. The
+    /// ground scan is a whole Factorio launch and says nothing at all until it
+    /// is over, so without this the screen keeps showing the frame count from
+    /// the phase before and reads as stuck.
+    Stage(&'static str),
+    Ended(Finish),
+}
+
+/// How a job ended, and what to open now it has.
+struct Finish {
+    message: String,
+    /// The timelapse to open, when there is one worth looking at. Opened
+    /// rather than announced: somebody who just waited through a build wants
+    /// to see it, not to be sent back to a menu to ask for it.
+    open: Option<std::path::PathBuf>,
 }
 
 /// A build on its own thread, and the two things the window needs to reach it.
@@ -363,6 +376,9 @@ struct Running {
     cancel: Arc<AtomicBool>,
     what: String,
     frames: Option<usize>,
+    /// The phase it has moved on to, which replaces the count once counting
+    /// stops meaning anything.
+    stage: Option<&'static str>,
     /// Whether this job counts anything. A render does not: the window it
     /// opens shows its own progress, and a second count here would be a
     /// number nobody can check.
@@ -378,14 +394,17 @@ impl Running {
     /// Drained rather than read once, because a build reports far more often
     /// than the window redraws and a queue losing one entry a frame would fall
     /// behind and never catch up.
-    fn drain(&mut self) -> Option<String> {
+    fn drain(&mut self) -> Option<Finish> {
         loop {
             match self.updates.try_recv() {
                 Ok(Update::Frames(count)) => self.frames = Some(count),
-                Ok(Update::Ended(message)) => return Some(message),
+                Ok(Update::Stage(stage)) => self.stage = Some(stage),
+                Ok(Update::Ended(finish)) => return Some(finish),
                 // Disconnected without a word means the thread died. Saying so
                 // beats a count that never moves again and no way to leave.
-                Err(TryRecvError::Disconnected) => return Some("The build stopped unexpectedly.".to_string()),
+                Err(TryRecvError::Disconnected) => {
+                    return Some(Finish { message: "The build stopped unexpectedly.".to_string(), open: None })
+                }
                 Err(TryRecvError::Empty) => return None,
             }
         }
@@ -866,8 +885,16 @@ impl App {
     /// job's own business.
     fn poll(&mut self) {
         if let Screen::Building(running) = &mut self.screen {
-            if let Some(message) = running.drain() {
-                self.screen = Screen::Done(message);
+            if let Some(finish) = running.drain() {
+                // Straight into the viewer, in its own process as always. The
+                // Done screen is still behind it, so a build worth rebuilding
+                // or a failure worth reading is not skipped past.
+                if let Some(path) = &finish.open {
+                    if let Ok(mut command) = build::viewer_command() {
+                        let _ = command.arg(path).stdout(std::process::Stdio::null()).spawn();
+                    }
+                }
+                self.screen = Screen::Done(finish.message);
             }
             return;
         }
@@ -1042,10 +1069,11 @@ impl App {
         }
 
         if let Screen::Building(running) = &self.screen {
-            let line = match (running.counts, running.frames) {
-                (false, _) => running.waiting.clone(),
-                (true, None) => "Starting...".to_string(),
-                (true, Some(count)) => format!("{} frames", crate::with_thousands(count as u64)),
+            let line = match (running.stage, running.counts, running.frames) {
+                (Some(stage), _, _) => stage.to_string(),
+                (None, false, _) => running.waiting.clone(),
+                (None, true, None) => "Starting...".to_string(),
+                (None, true, Some(count)) => format!("{} frames", crate::with_thousands(count as u64)),
             };
             let width = self.ui.width(&line, LABEL_SIZE);
             self.ui.text(&line, (screen_width() - width) / 2.0, under_title, LABEL_SIZE, ACCENT);
@@ -1199,12 +1227,22 @@ fn start_render(render: Render) -> Running {
             Ok(()) => format!("Saved to {}", request.target.display()),
             Err(e) => format!("The render failed: {e}"),
         };
-        let _ = send.send(Update::Ended(ended));
+        // Nothing to open: what a render produces is a video file, and the
+        // viewer shows timelapses.
+        let _ = send.send(Update::Ended(Finish { message: ended, open: None }));
     });
 
     // A render counts nothing here: the window it opens shows its own frames,
     // and a second count would be a number nobody can check against it.
-    Running { updates, cancel, what, frames: None, counts: false, waiting: "Rendering in its own window...".to_string() }
+    Running {
+        updates,
+        cancel,
+        what,
+        frames: None,
+        stage: None,
+        counts: false,
+        waiting: "Rendering in its own window...".to_string(),
+    }
 }
 
 /// The saves this machine has, newest first, with nothing ticked.
@@ -1252,11 +1290,11 @@ fn start_from_saves(pick: SavePick) -> Running {
     let what = format!("Building from {} saves", saves.len());
 
     std::thread::spawn(move || {
-        let ended = from_saves_on_thread(&saves, ground, &flag, &send);
-        let _ = send.send(Update::Ended(ended));
+        let (ended, built) = from_saves_on_thread(&saves, ground, &flag, &send);
+        let _ = send.send(Update::Ended(Finish { message: ended, open: built }));
     });
 
-    Running { updates, cancel, what, frames: None, counts: true, waiting: "Starting Factorio...".to_string() }
+    Running { updates, cancel, what, frames: None, stage: None, counts: true, waiting: "Starting Factorio...".to_string() }
 }
 
 /// The from-saves build, as one function returning the sentence to show.
@@ -1265,15 +1303,15 @@ fn from_saves_on_thread(
     ground: bool,
     cancel: &AtomicBool,
     send: &std::sync::mpsc::Sender<Update>,
-) -> String {
+) -> (String, Option<std::path::PathBuf>) {
     let Some(factorio) = crate::locate::locate_factorio() else {
-        return "Could not find factorio.exe. Build from a recording instead, or start the console menu once to point it at your install.".to_string();
+        return ("Could not find factorio.exe. Build from a recording instead, or start the console menu once to point it at your install.".to_string(), None);
     };
     let Some(user_dir) = crate::locate::factorio_user_dir() else {
-        return "Could not find your Factorio folder.".to_string();
+        return ("Could not find your Factorio folder.".to_string(), None);
     };
     let Ok(mod_source) = build::mod_source_dir() else {
-        return "Could not find the mod folder that has to sit beside this program.".to_string();
+        return ("Could not find the mod folder that has to sit beside this program.".to_string(), None);
     };
 
     let config = crate::export::ExportConfig {
@@ -1289,7 +1327,7 @@ fn from_saves_on_thread(
     let out = build::timelapses_root().join(build::as_folder_name(&name.unwrap_or_else(|| "timelapse".to_string())));
     let _ = std::fs::remove_dir_all(&out);
     if let Err(e) = std::fs::create_dir_all(&out) {
-        return format!("Could not make a folder for it: {e}");
+        return (format!("Could not make a folder for it: {e}"), None);
     }
     let workspace = std::env::temp_dir().join(format!("save-timelapse-gui-{}", std::process::id()));
 
@@ -1304,12 +1342,12 @@ fn from_saves_on_thread(
     };
     let exported = match build::from_saves(saves, &out, &workspace, &config, &mut build::Watch { on: &mut on_save, cancel }) {
         Ok(exported) => exported,
-        Err(e) => return format!("The build failed: {e}"),
+        Err(e) => return (format!("The build failed: {e}"), None),
     };
     let _ = std::fs::remove_dir_all(&workspace);
 
     if exported.frames.is_empty() {
-        return "None of those saves could be exported.".to_string();
+        return ("None of those saves could be exported.".to_string(), None);
     }
     // Best effort from here: a timelapse that exists beats one abandoned for a
     // step that only makes it smaller or prettier.
@@ -1320,7 +1358,7 @@ fn from_saves_on_thread(
     }
 
     let stopped = if exported.cancelled { "Stopped. " } else { "" };
-    format!("{stopped}Built {} frames in {}", exported.frames.len(), out.display())
+    (format!("{stopped}Built {} frames in {}", exported.frames.len(), out.display()), Some(out))
 }
 
 /// How much of one kind there is, for the row that opens it.
@@ -1446,10 +1484,14 @@ fn start_build(choosing: Choosing) -> Running {
 
     std::thread::spawn(move || {
         let built = build_on_thread(&mut replay, &session_dir, &out, surfaces, seconds, &flag, &send);
+        let worked = !built.starts_with("The build failed") && !built.starts_with("Could not");
         // Ground last, and only if the frames worked: it is the slow half, and
         // there is nothing to lay it under otherwise.
         let ended = match ground {
-            Some(from) if !built.starts_with("The build failed") && !built.starts_with("Could not") => {
+            Some(from) if worked => {
+                // A whole Factorio launch that says nothing until it is done,
+                // so the screen has to say what it is waiting for.
+                let _ = send.send(Update::Stage("Reading the ground. Factorio is opening..."));
                 format!(
                     "{built}
 {}",
@@ -1458,10 +1500,10 @@ fn start_build(choosing: Choosing) -> Running {
             }
             _ => built,
         };
-        let _ = send.send(Update::Ended(ended));
+        let _ = send.send(Update::Ended(Finish { message: ended, open: worked.then_some(out) }));
     });
 
-    Running { updates, cancel, what, frames: None, counts: true, waiting: "Reading the recording...".to_string() }
+    Running { updates, cancel, what, frames: None, stage: None, counts: true, waiting: "Reading the recording...".to_string() }
 }
 
 /// The build itself, as one function returning the sentence to show. Split out
@@ -1598,6 +1640,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             what: "Building nauvis".to_string(),
             frames: None,
+            stage: None,
             counts: true,
             waiting: "Reading the recording...".to_string(),
         };
@@ -1613,7 +1656,7 @@ mod tests {
         for count in 1..=500 {
             send.send(Update::Frames(count)).unwrap();
         }
-        assert_eq!(job.drain(), None, "not over yet");
+        assert!(job.drain().is_none(), "not over yet");
         assert_eq!(job.frames, Some(500));
     }
 
@@ -1623,7 +1666,7 @@ mod tests {
     #[test]
     fn nothing_is_counted_until_the_first_frame_lands() {
         let (mut job, send) = running();
-        assert_eq!(job.drain(), None);
+        assert!(job.drain().is_none());
         assert_eq!(job.frames, None);
 
         send.send(Update::Frames(1)).unwrap();
@@ -1635,8 +1678,8 @@ mod tests {
     fn the_closing_sentence_comes_back_once() {
         let (mut job, send) = running();
         send.send(Update::Frames(9)).unwrap();
-        send.send(Update::Ended("Built 9 frames".to_string())).unwrap();
-        assert_eq!(job.drain().as_deref(), Some("Built 9 frames"));
+        send.send(Update::Ended(Finish { message: "Built 9 frames".to_string(), open: None })).unwrap();
+        assert_eq!(job.drain().expect("finished").message, "Built 9 frames");
         assert_eq!(job.frames, Some(9), "what it reported before finishing still stands");
     }
 
@@ -1647,7 +1690,8 @@ mod tests {
         let (mut job, send) = running();
         drop(send);
         let ended = job.drain().expect("a disconnected build must not sit there forever");
-        assert!(ended.contains("unexpectedly"), "{ended}");
+        assert!(ended.message.contains("unexpectedly"), "{}", ended.message);
+        assert!(ended.open.is_none(), "a build that died has nothing worth opening");
     }
 
     fn places(names: &[&str]) -> Vec<String> {
@@ -1903,6 +1947,34 @@ mod tests {
     fn a_word_longer_than_the_line_still_terminates() {
         let lines = wrapped("short verylongwordthatcannotfit end", 10);
         assert_eq!(lines, ["short", "verylongwordthatcannotfit", "end"]);
+    }
+
+    /// The ground scan is a whole Factorio launch that says nothing until it
+    /// is done. Without a stage the screen keeps showing the frame count from
+    /// the phase before, which reads as a build that has stopped moving.
+    #[test]
+    fn a_stage_replaces_the_count_once_counting_stops_meaning_anything() {
+        let (mut job, send) = running();
+        send.send(Update::Frames(340)).unwrap();
+        job.drain();
+        assert_eq!((job.stage, job.frames), (None, Some(340)));
+
+        send.send(Update::Stage("Reading the ground. Factorio is opening...")).unwrap();
+        job.drain();
+        assert_eq!(job.stage, Some("Reading the ground. Factorio is opening..."));
+        assert_eq!(job.frames, Some(340), "what it counted still stands, it just is not what is happening now");
+    }
+
+    /// Somebody who just waited through a build wants to see it, not to be
+    /// sent back to a menu to ask for it.
+    #[test]
+    fn a_finished_build_says_what_to_open() {
+        let (mut job, send) = running();
+        let out = std::path::PathBuf::from("timelapses/nauvis");
+        send.send(Update::Ended(Finish { message: "Built 9 frames".to_string(), open: Some(out.clone()) })).unwrap();
+
+        let finish = job.drain().expect("finished");
+        assert_eq!(finish.open, Some(out));
     }
 
     /// Stopping raises the flag and nothing else: the thread notices within a
