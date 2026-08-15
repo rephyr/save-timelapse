@@ -220,9 +220,9 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.8.2:** Scenery scanned from the save rather than bounded to the starting factory, rail corners drawn as curves
 - **v0.9:** One binary instead of two, a window alongside the text menu, biter expansion and nest clearing recorded, ground under paving recovered, exhausted ore emptied out, pipes joined to underground runs
 
-### v1.0
-- [ ] Smarter camera auto-follow
-- [ ] The window as the default, rather than behind `--gui`
+### Upcomming
+
+- **v1.0:** Currently gated behind testing and finding edge-cases/missed bugs
 
 ---
 
