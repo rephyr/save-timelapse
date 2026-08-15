@@ -1,18 +1,22 @@
 ---------------------------------------------------------------------------------------------------
 Version: 0.9.0
 Date: 2026-08-15
+  Major Features:
+    - One program instead of two. The viewer is part of it now, so there is a single file to download and nothing to keep together
+    - A window, if you would rather not use the text menu. Run it with --gui and it does everything the menu does. Opt in for this release while it gets some use
   Features:
-    - One program instead of two. The viewer used to be a second executable that had to sit beside the first, and shipping them apart was the one packaging mistake that broke building from saves. There is now a single file to download and nothing to keep together
-    - A window, if you would rather not use the text menu. Run it with --gui and everything the menu does is there: watching, building from a recording or from saves, saving a video, and managing what is on disk. It is opt in for this release while it gets some use
-    - Biters expanding is recorded, so a nest they build appears when they built it rather than whenever a later snapshot happened to notice it
-    - Clearing a nest can be watched. A nest you destroy is not in the save the ground is read from, so it never appeared at all and the fight was invisible; the recording now says one was there and takes it away at the moment you cleared it. Recordings already under way pick this up for nests cleared from here on, earlier ones having nothing written down to work from
+    - Build several places at once, rather than one or all of them
+    - Every menu is picked by number, with nothing left to spell
+    - What is on disk is managed in three parts: your recorded log data, the timelapses built from it, and the videos saved from those. Deleting a recording cannot be undone and says so first
+    - Biters expanding is recorded, so a nest appears when they built it
+    - Clearing a nest can be watched. One you destroy is not in the save the ground is read from, so it never appeared at all; the recording now puts it back and takes it away when you cleared it. Recordings already under way gain this for nests cleared from here on
   Graphics:
-    - Pipe runs that dive underground join up on screen instead of stopping dead. A pipe meeting an underground pipe is drawn connected to it, the same as one meeting another pipe. On the test capture this joined up a quarter again as many pipe ends as before
+    - Pipe runs that dive underground join up on screen instead of stopping dead
   Bugfixes:
-    - Ore patches your factory has eaten now empty out as they are mined instead of sitting there full for the whole timelapse. Ore is not mined away a piece at a time, so nothing the recording listened for ever fired: a patch stayed exactly as it started while the drills on top of it kept working
-    - Your recordings said how far you had played when you started recording rather than how far you have played. A capture turned on at the beginning read as "under an hour in" no matter how long the playthrough ran
-    - Saving a video no longer opens a black window. Every frame was drawn into an off-screen buffer and read straight back out, so nothing was ever painted into the window you were looking at; it now shows the frames going by and how far along it is
-    - The ground under paving you laid partway through a playthrough is no longer missing. Concrete placed at hour three used to leave a hole where it would later go, because ground is read from a finished save that already has concrete there. Factorio remembers what paving covered up, so that is read too and the grass is there from the first frame. Rebuild an existing timelapse's ground to fix one already made
+    - Ore patches your factory has eaten empty out as they are mined, instead of sitting there full for the whole timelapse
+    - Recordings said how far you had played when recording started, rather than how far you have played
+    - Saving a video no longer shows a black window while it renders
+    - The ground under paving you laid partway through a playthrough is no longer a hole. Rebuild an existing timelapse's ground to fix one already made
 
 ---------------------------------------------------------------------------------------------------
 Version: 0.8.2

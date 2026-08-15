@@ -75,7 +75,11 @@ jobs:
             cp target/release/save-timelapse "$staged/"
           fi
           cp -r mod "$staged/mod"
+          # tests/ is a development suite, and a stray zip is an old
+          # `make package` left in place. A clean checkout has neither, but
+          # this copies a folder rather than a list, so it says so.
           rm -rf "$staged/mod/tests"
+          rm -f "$staged/mod/"*.zip
           cp README.md LICENSE "$staged/"
           # The display face is compiled into the binary, so only its licence
           # has to travel beside it.

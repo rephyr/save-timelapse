@@ -483,6 +483,7 @@ impl App {
                     Choice::new("Build one from save files", ""),
                     Choice::new("Save one as a video", ""),
                     Choice::new("Manage", ""),
+                    Choice::new("Use the text menu instead", ""),
                     Choice::leaving("Quit"),
                 ]
             }
@@ -689,6 +690,16 @@ impl App {
                     }
                 }
                 4 => self.screen = Screen::Manage,
+                // Handed over rather than opened alongside: two of this
+                // program's faces at once is two menus disagreeing about what
+                // is on disk. It finds its own console, this being a
+                // windows-subsystem binary with none to inherit.
+                5 => {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(exe).arg("--console").spawn();
+                    }
+                    self.quit = true;
+                }
                 _ => self.quit = true,
             },
             Screen::Watch => match self.timelapses.get(index) {
@@ -1654,11 +1665,12 @@ pub fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: miniquad::conf::Conf {
             window_title: "Save Timelapse".to_string(),
-            // The same size the viewer opens at, so clicking a timelapse does
-            // not resize the world. Comfortably inside a 1440p or 1080p
-            // screen, and the lists scroll on anything smaller.
-            window_width: 1280,
-            window_height: 800,
+            // Bigger than the viewer's own, because this one has a name across
+            // the top and the header is the first thing a smaller window
+            // crowds. Fits a 1080p screen with room for a taskbar, and the
+            // lists scroll on anything smaller.
+            window_width: 1680,
+            window_height: 1050,
             high_dpi: true,
             ..Default::default()
         },

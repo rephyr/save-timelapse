@@ -56,7 +56,7 @@ MOD_META := info.json settings.lua changelog.txt
 VERSION      := $(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' mod/info.json)
 PACKAGE_NAME := save-timelapse_$(VERSION)
 
-.PHONY: help build test test-lua check-mod-syntax run run-console viewer drawcalls stress stress-save check-mod-files install-mod package clean
+.PHONY: help build test test-lua check-mod-syntax run run-console dist viewer drawcalls stress stress-save check-mod-files install-mod package clean
 
 help:
 	@echo "Targets:"
@@ -71,6 +71,7 @@ help:
 	@echo "  stress-save  run the benchmark and record it as the new baseline"
 	@echo "  install-mod  copy mod/ into MOD_INSTALL (your Factorio mods folder)"
 	@echo "  package      zip mod/ into dist/$(PACKAGE_NAME).zip, ready for the mod portal"
+	@echo "  dist         build the release archive the way CI does, for trying before tagging"
 	@echo "  clean        cargo clean"
 	@echo ""
 	@echo "Variables (current value, override with make VAR=... target):"
@@ -126,13 +127,13 @@ check-mod-syntax:
 	done
 
 run:
-	cargo run --release --bin save-timelapse -- --gui
-
-# The console menu, which is still what a release runs by default and still
-# the only one that offers every option. Kept as its own target so a change to
-# one front end can be tried against the other without editing this file.
-run-console:
 	cargo run --release --bin save-timelapse
+
+# The text menu, which is now the one that has to be asked for. Kept as its own
+# target so a change to one front end can be tried against the other without
+# editing this file.
+run-console:
+	cargo run --release --bin save-timelapse -- --console
 
 viewer:
 	cargo run --release --bin save-timelapse -- --view $(FRAMES)
@@ -201,6 +202,28 @@ package: check-mod-files
 	cd dist && zip -rq "$(PACKAGE_NAME).zip" "$(PACKAGE_NAME)"
 	rm -rf "dist/$(PACKAGE_NAME)"
 	@echo "packaged to dist/$(PACKAGE_NAME).zip"
+
+# The release archive, built the way .github/workflows/release.yml builds it,
+# so what gets tried locally is what ships. One binary plus mod/, because
+# save-timelapse stages the mod itself when exporting from saves and looks for
+# it beside the executable: shipping them apart is the packaging mistake that
+# breaks the from-saves path.
+DIST_NAME := save-timelapse-$(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/mingw.*/windows/;s/msys.*/windows/')
+EXE := $(shell [ "$(OS)" = "Windows_NT" ] && echo .exe)
+
+dist: build
+	rm -rf "dist/$(DIST_NAME)"
+	mkdir -p "dist/$(DIST_NAME)"
+	cp "target/release/save-timelapse$(EXE)" "dist/$(DIST_NAME)/"
+	cp -r mod "dist/$(DIST_NAME)/mod"
+	# tests/ is a development suite, and a stray zip is an old `make package`
+	# left in place. Neither belongs in front of somebody who downloaded this.
+	rm -rf "dist/$(DIST_NAME)/mod/tests"
+	rm -f "dist/$(DIST_NAME)/mod/"*.zip
+	cp README.md LICENSE "dist/$(DIST_NAME)/"
+	cp fonts/OFL.txt "dist/$(DIST_NAME)/OFL-Full-Automation.txt"
+	cd dist && rm -f "$(DIST_NAME).zip" && zip -rq "$(DIST_NAME).zip" "$(DIST_NAME)"
+	@echo "packaged to dist/$(DIST_NAME).zip"
 
 clean:
 	cargo clean

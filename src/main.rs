@@ -1,6 +1,16 @@
 //! save-timelapse: one interactive tool, no flags to learn. Asks what you want
 //! to do, asks whatever it could not auto-detect, then opens the viewer on the
 //! result.
+//!
+//! A window by default, and a text menu behind `--console` for anyone who
+//! prefers one or is driving it from a terminal. Each offers the other, so
+//! neither is reachable only by knowing a flag.
+
+// Windows only, and ignored everywhere else. Without it a console-subsystem
+// binary opens a black console box behind the window on every double-click,
+// which is most of what makes an app feel unfinished. The cost is that the
+// text menu has to find a console for itself; see `ensure_console`.
+#![windows_subsystem = "windows"]
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -47,6 +57,7 @@ enum Mode {
     FromSaves,
     ExportVideo,
     ManageCaptures,
+    OpenWindow,
     Quit,
 }
 
@@ -113,7 +124,8 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
              \x20   3  Build one from your save files\n\
              \x20   4  Save one as a video file\n\
              \x20   5  Manage log data, timelapses and videos\n\
-             \x20   6  Quit\n\n\
+             \x20   6  Use the window instead\n\
+             \x20   7  Quit\n\n\
              \x20 Type a number:"
         ))?;
         match input.as_str() {
@@ -122,11 +134,16 @@ fn ask_mode(already_built: usize) -> io::Result<Mode> {
             "3" => return Ok(Mode::FromSaves),
             "4" => return Ok(Mode::ExportVideo),
             "5" => return Ok(Mode::ManageCaptures),
+            // The only way anybody finds the window. It takes a flag to open,
+            // and a flag has to come from a terminal or a shortcut, neither of
+            // which somebody who double-clicked an exe has. This menu is what
+            // they do have.
+            "6" => return Ok(Mode::OpenWindow),
             // Bare Enter still leaves, both because it is what long-time users
             // already press and because it is what leaves every screen below
             // this one, so it should keep meaning "back" one level up.
-            "6" | "q" | "Q" | "" => return Ok(Mode::Quit),
-            _ => println!("\n  Please type a number from 1 to 6.\n"),
+            "7" | "q" | "Q" | "" => return Ok(Mode::Quit),
+            _ => println!("\n  Please type a number from 1 to 7.\n"),
         }
     }
 }
@@ -1249,6 +1266,23 @@ fn remember(settings: &Settings) {
     }
 }
 
+/// Hands over to the window and leaves.
+///
+/// Handed over rather than run alongside: two of this program's faces open at
+/// once is two menus disagreeing about what is on disk. Spawned rather than
+/// called, macroquad allowing one window per process and this process being a
+/// console.
+fn open_window() -> io::Result<()> {
+    println!(
+        "
+  Opening the window. This console can be closed.
+"
+    );
+    // No flag: the window is what this program does when asked for nothing.
+    std::process::Command::new(std::env::current_exe()?).spawn()?;
+    Ok(())
+}
+
 /// Opens the viewer without waiting. `spawn`, not `status`: the viewer is a
 /// window somebody keeps open, so blocking would freeze this program behind it,
 /// and detaching is what lets the menu come straight back.
@@ -1310,6 +1344,14 @@ fn run() -> io::Result<()> {
                 remember(&settings);
                 manage(&dir.join("script-output").join("save-timelapse"))
             }),
+            // Handed over rather than run alongside: two of this program's
+            // faces open at once is two menus disagreeing about what is on
+            // disk. Spawned rather than called, macroquad allowing one window
+            // per process and this one being a console.
+            Mode::OpenWindow => match open_window() {
+                Ok(()) => return Ok(()),
+                Err(e) => Err(e),
+            },
             Mode::Quit => return Ok(()),
         };
 
@@ -1522,18 +1564,46 @@ fn wait_for_enter() {
     io::stdin().read_line(&mut discard).ok();
 }
 
+/// Asks for the text menu rather than the window.
+const CONSOLE_FLAG: &str = "--console";
+
+/// Finds a console for the text menu to speak into.
+///
+/// A windows-subsystem binary starts attached to none at all, so the menu
+/// would otherwise run invisibly. The terminal that launched it if there is
+/// one, which is the scripted case, and a fresh one otherwise, which is
+/// somebody arriving from the window. Called before anything prints, so the
+/// standard handles resolve to whichever this leaves in place.
+#[cfg(windows)]
+fn ensure_console() {
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+    }
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
+}
+
+/// Every other platform has no such thing: a process inherits whatever
+/// terminal started it, and there is nothing to attach.
+#[cfg(not(windows))]
+fn ensure_console() {}
+
 fn main() {
     // The window, in its own process, launched by `build::viewer_command`.
     // Handled before anything else so the menu's console handling, panic hook
     // and settings loading never run for a process that is only going to draw.
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // The window that replaces this menu, still opt in while it is being
-    // built: every flow it does not have yet is one the console still does,
-    // so both have to work at once until the last screen lands.
-    if args.first().is_some_and(|first| first == "--gui") {
-        macroquad::Window::from_config(save_timelapse::gui::window_conf(), save_timelapse::gui::run());
-        return;
+    // The text menu, which is now the one that has to be asked for. Also the
+    // only mode that needs a console, this being a windows-subsystem binary.
+    let console = args.first().is_some_and(|first| first == CONSOLE_FLAG);
+    if console {
+        ensure_console();
     }
 
     if args.first().is_some_and(|first| first == build::VIEW_FLAG) {
@@ -1541,6 +1611,13 @@ fn main() {
         macroquad::Window::from_config(save_timelapse::viewer::app::window_conf(), async move {
             save_timelapse::viewer::app::run(&rest).await
         });
+        return;
+    }
+
+    // Nothing asked for, so the window: somebody who double-clicked an exe has
+    // no way to pass a flag, and this is what they get.
+    if !console {
+        macroquad::Window::from_config(save_timelapse::gui::window_conf(), save_timelapse::gui::run());
         return;
     }
 
