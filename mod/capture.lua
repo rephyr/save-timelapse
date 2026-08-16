@@ -157,17 +157,6 @@ local function capture_segment_path(session_id, start_tick, parent)
   return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, parent)
 end
 
---- The map's terrain seed. Stable across save and reload and readable without
---- any in-game UI, unlike a save name, which mods cannot read. Falls back to 0
---- rather than crashing.
-local function map_seed()
-  local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
-  if ok and seed then
-    return seed
-  end
-  return 0
-end
-
 --- A fresh identity for a capture that is starting now.
 ---
 --- The seed alone used to be the identity, and it is a map's rather than a
@@ -190,7 +179,7 @@ end
 --- can write to the output folder but not list it, so one collision in four
 --- billion is the trade being made here.
 local function mint_session_id()
-  return (map_seed() + (game.tick % 0x10000) * 0x10000 + math.random(0, 0xffff)) % 0x100000000
+  return (export.map_seed() + (game.tick % 0x10000) * 0x10000 + math.random(0, 0xffff)) % 0x100000000
 end
 
 --- Which playthrough this save's output belongs to.
@@ -206,7 +195,7 @@ function M.compute_session_id()
   if state and state.session_id then
     return state.session_id
   end
-  return map_seed()
+  return export.map_seed()
 end
 
 --- A player can load an older save than one already recorded past, which an

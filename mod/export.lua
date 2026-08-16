@@ -121,6 +121,21 @@ function M.checksummed_write(path, data, append, checksum)
   return encode.checksum_update(checksum, data)
 end
 
+--- The map's terrain seed. Stable across save and reload and readable without
+--- any in-game UI, unlike a save name, which mods cannot read. Falls back to 0
+--- rather than crashing.
+---
+--- Lives here rather than in capture.lua, which is where it is actually used
+--- to mint a session id: capture requires this module, so the dependency only
+--- runs one way.
+function M.map_seed()
+  local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
+  if ok and seed then
+    return seed
+  end
+  return 0
+end
+
 --- Whether somebody built `entity`, as opposed to the map generating it.
 --- `"player"` is the same force name `M.is_inhabited` and
 --- `M.milestone_state` treat as the player's.
@@ -876,8 +891,13 @@ function M.export_all_to(tick, manifest_path, session_id, is_excluded)
     -- `buildings` counts only the unbounded pass, `entities` everything
     -- written. A reader older than this field falls back to `entities`, which
     -- is what it always showed.
-    string.format('{"tick":%d,"entities":%d,"buildings":%d,"tiles":%d,"surfaces":[%s],"milestones":%s}',
-      tick, total, built_total, tile_total, table.concat(names, ","),
+    -- The map seed is recorded even though the session id is no longer derived
+    -- from it. It is what lets a save made before capture was ever turned on
+    -- still be recognised as this playthrough's: such a save has no stored id
+    -- and reports its seed in place of one, so the seed is the only thing the
+    -- two have in common. See `scan_ground`.
+    string.format('{"tick":%d,"entities":%d,"buildings":%d,"tiles":%d,"seed":%d,"surfaces":[%s],"milestones":%s}',
+      tick, total, built_total, tile_total, M.map_seed(), table.concat(names, ","),
       encode.milestone_state(science, planets, rockets)),
     false)
 

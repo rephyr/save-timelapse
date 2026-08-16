@@ -623,6 +623,7 @@ impl App {
                     let mut rows: Vec<Choice> =
                         render.surfaces.iter().map(|name| Choice::new(&describe::pretty_place(name), "")).collect();
                     rows.push(Choice::new("One video for each", ""));
+                    rows.push(Choice::new("Follow me between them", "one video"));
                     rows.push(Choice::leaving("Back"));
                     rows
                 }
@@ -847,12 +848,14 @@ impl App {
                         false => RenderStep::Size,
                     };
                 }
-                RenderStep::Place if index <= render.surfaces.len() => {
+                RenderStep::Place if index <= render.surfaces.len() + 1 => {
                     render.surface = match render.surfaces.get(index) {
                         Some(name) => Some(name.clone()),
-                        // The row past the places is "one video for each",
-                        // which the renderer already understands by name.
-                        None => Some("all".to_string()),
+                        // The two rows past the places are "one video for
+                        // each" and "follow me", both of which the renderer
+                        // already understands by name.
+                        None if index == render.surfaces.len() => Some("all".to_string()),
+                        None => Some("follow".to_string()),
                     };
                     render.step = RenderStep::Size;
                 }
@@ -1319,7 +1322,14 @@ fn saves_newest_first() -> Vec<(String, String, std::path::PathBuf)> {
 }
 
 /// Puts the ground beside the frames, however it was chosen.
-fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32, session_dir: &std::path::Path) -> String {
+fn add_ground(
+    from: GroundFrom,
+    out: &std::path::Path,
+    session_id: u32,
+    seed: Option<u32>,
+    session_dir: &std::path::Path,
+    cancel: &AtomicBool,
+) -> String {
     let cached = match from {
         GroundFrom::Cache(cached) => {
             return match build::reuse_ground(&cached, out) {
@@ -1354,7 +1364,7 @@ fn add_ground(from: GroundFrom, out: &std::path::Path, session_id: u32, session_
         capture_terrain: true,
         terrain_scan: true,
     };
-    match build::scan_ground(&cached, out, &config, Some(session_id)) {
+    match build::scan_ground(&cached, out, &config, Some(build::Belongs { session_id, seed }), cancel) {
         Ok(surfaces) => {
             // The scan cannot date what it found, and the recording can. Only
             // nests need it: nothing else in there is built during a
@@ -1392,11 +1402,17 @@ fn start_render(render: Render) -> Running {
         overlay_clock: render.video && render.clock,
     };
 
+    let flag = Arc::clone(&cancel);
     std::thread::spawn(move || {
         let ended = match std::fs::create_dir_all(request.target.parent().unwrap_or(&request.target))
-            .and_then(|()| build::video(&request))
+            .and_then(|()| build::video_until(&request, &flag))
         {
-            Ok(()) => format!("Saved to {}", request.target.display()),
+            Ok(true) => format!("Saved to {}", request.target.display()),
+            // A video is written as one file that is only finished at the end,
+            // so a killed render leaves something no player will open. Frames
+            // are the opposite: each one was complete when it was written.
+            Ok(false) if request.video => "Stopped. The part-written video will not play.".to_string(),
+            Ok(false) => format!("Stopped. The frames written so far are in {}", request.target.display()),
             Err(e) => format!("The render failed: {e}"),
         };
         // Nothing to open: what a render produces is a video file, and the
@@ -1524,7 +1540,7 @@ fn from_saves_on_thread(
             // No session to check against: on this path the saves are the
             // playthrough, so there is nothing a stranger's ground could be
             // confused with.
-            if let Err(e) = build::scan_ground(save, &out, &scan, None) {
+            if let Err(e) = build::scan_ground(save, &out, &scan, None, cancel) {
                 note = format!(
                     "
 {e}"
@@ -1657,6 +1673,9 @@ fn start_build(choosing: Choosing) -> Running {
     let ground = choosing.ground.clone();
     let session_id = choosing.recording.session_id;
     let mut replay = choosing.loaded.replay;
+    // Read before the replay moves into the thread. Lets a save from before
+    // capture was turned on still be recognised as this playthrough's.
+    let seed = replay.baseline.seed;
     let flag = Arc::clone(&cancel);
 
     std::thread::spawn(move || {
@@ -1675,7 +1694,7 @@ fn start_build(choosing: Choosing) -> Running {
                 format!(
                     "{built}
 {}",
-                    add_ground(from, &out, session_id, &session_dir)
+                    add_ground(from, &out, session_id, seed, &session_dir, &flag)
                 )
             }
             _ => built,

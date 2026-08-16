@@ -134,6 +134,7 @@ The replay is designed to be explored rather than simply watched.
 - 🔖 Add bookmarks
 - 🌍 Switch between planets and space platforms
 - 👤 Track player position, in timelapses recorded with live capture
+- 🚀 Export one video that follows you between planets, cutting to each one as you arrive
 
 ### Viewer controls
 

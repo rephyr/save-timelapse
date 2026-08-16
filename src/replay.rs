@@ -34,6 +34,13 @@ pub struct Baseline {
     #[serde(default)]
     pub tiles: usize,
     pub surfaces: Vec<String>,
+    /// The map this playthrough was rolled from, which the session id is no
+    /// longer derived from. Kept because a save made before capture was ever
+    /// turned on carries no session id and reports its seed instead, so this
+    /// is the only thing the two have in common. `None` for a recording
+    /// written before the field existed, whose session id is its seed anyway.
+    #[serde(default)]
+    pub seed: Option<u32>,
     /// Not part of the JSON body: derived from the filename by `read_at`,
     /// since that's also where the mod's writer gets it from.
     #[serde(skip)]

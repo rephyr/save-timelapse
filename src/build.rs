@@ -307,6 +307,29 @@ mod tests {
         assert!(whole.written > stopped.written, "{whole:?} against {stopped:?}");
     }
 
+    /// Which saves count as this playthrough's. Every line here is a save
+    /// somebody would plausibly point at a ground scan, and getting one wrong
+    /// either refuses their own save or lays a stranger's landscape under
+    /// their factory.
+    #[test]
+    fn a_saves_ground_is_accepted_only_when_it_is_this_playthroughs() {
+        let recording = Belongs { session_id: 0xAAAA, seed: Some(0x1234) };
+
+        assert!(recording.accepts(0xAAAA), "another save of this playthrough carries the same minted id");
+        assert!(!recording.accepts(0xBBBB), "a different playthrough minted its own id, even on this same map");
+
+        // No capture state to hold an id, so the mod reports the map seed. The
+        // save predates capture being turned on but is genuinely this game's.
+        assert!(recording.accepts(0x1234), "a save from before capture started still belongs here");
+        assert!(!recording.accepts(0x9999), "a save from another map does not");
+
+        // A recording written before the seed was recorded. Its own id is its
+        // seed, so the first rule already covers what the second would have.
+        let older = Belongs { session_id: 0x1234, seed: None };
+        assert!(older.accepts(0x1234));
+        assert!(!older.accepts(0xBBBB));
+    }
+
     /// What a cancelled build leaves is a shorter timelapse, not nothing: the
     /// frames already written are correct and somebody may well have wanted
     /// exactly that.
@@ -373,7 +396,7 @@ pub fn from_saves(
         (watch.on)(SaveStep::Started { index, total: saves.len(), label: label.clone() });
 
         let staged = workspace.join(format!("stage_{index}"));
-        match export::export_save(save, &staged, config) {
+        match export::export_save(save, &staged, config, watch.cancel) {
             Ok(outcome) => {
                 let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];
@@ -485,12 +508,36 @@ fn video_args(request: &VideoRequest) -> Vec<std::ffi::OsString> {
 /// front of whoever asked. What a caller with a window of its own needs is to
 /// run this off the thread doing the painting, which is what makes it a job
 /// rather than something the menu does inline.
-pub fn video(request: &VideoRequest) -> io::Result<()> {
-    let status = viewer_command()?.args(video_args(request)).status()?;
-    if status.success() {
-        return Ok(());
+/// `false` when it was asked to stop rather than finishing, mirroring
+/// `Built::cancelled`.
+///
+/// The renderer is a child process, so stopping means killing it: an atomic
+/// flag has nothing to reach inside another program. Polled rather than waited
+/// on, `Child::wait` having no timeout, at an interval fine enough to feel
+/// immediate and coarse enough to cost nothing over a render measured in
+/// minutes.
+pub fn video_until(request: &VideoRequest, cancel: &AtomicBool) -> io::Result<bool> {
+    let mut child = viewer_command()?.args(video_args(request)).spawn()?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            child.kill()?;
+            child.wait()?;
+            return Ok(false);
+        }
+        match child.try_wait()? {
+            Some(status) if status.success() => return Ok(true),
+            Some(status) => {
+                return Err(io::Error::other(format!("the renderer exited with {status} without finishing the export")))
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
     }
-    Err(io::Error::other(format!("the renderer exited with {status} without finishing the export")))
+}
+
+/// The same, for a caller with nothing to stop it: the text menu is
+/// interrupted with Ctrl+C, which kills the child along with everything else.
+pub fn video(request: &VideoRequest) -> io::Result<()> {
+    video_until(request, &AtomicBool::new(false)).map(|_| ())
 }
 
 /// Where a mode writes its output: beside the running exe, so the result is
@@ -732,15 +779,49 @@ pub fn reuse_ground(cached: &[PathBuf], out: &Path) -> usize {
 /// than laying an unrelated landscape under somebody's factory; `None` skips
 /// that check, which is right for the from-saves path where the saves *are*
 /// the playthrough.
-pub fn scan_ground(save: &Path, out: &Path, config: &ExportConfig, expect_session: Option<u32>) -> Result<usize, String> {
+/// Which playthrough a scanned save has to belong to.
+pub struct Belongs {
+    pub session_id: u32,
+    /// The map this playthrough was rolled from, when the recording knows it.
+    pub seed: Option<u32>,
+}
+
+impl Belongs {
+    /// Whether a scan reporting `scanned` is this playthrough's.
+    ///
+    /// Two ways in, and the second is the one that needs explaining. A save
+    /// made before capture was ever turned on has no session id stored in it,
+    /// so the mod falls back to reporting its map seed. Matching that against
+    /// the recording's own seed accepts a save that genuinely belongs here and
+    /// would otherwise be refused for having been made too early.
+    ///
+    /// What it lets through is a different playthrough on the same seed that
+    /// never captured, which is exactly what every version before minted ids
+    /// let through, so this is no worse than it was. A save that *did* capture
+    /// still has to match outright.
+    pub fn accepts(&self, scanned: u32) -> bool {
+        scanned == self.session_id || Some(scanned) == self.seed
+    }
+}
+
+pub fn scan_ground(
+    save: &Path,
+    out: &Path,
+    config: &ExportConfig,
+    expect_session: Option<Belongs>,
+    cancel: &AtomicBool,
+) -> Result<usize, String> {
     let staged = std::env::temp_dir().join(format!("{MOD_NAME}-ground-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
 
-    let scanned = crate::export::scan_terrain(save, &staged, config);
+    let scanned = crate::export::scan_terrain(save, &staged, config, cancel);
     let copied = match scanned {
+        // A stop is not a failure and must not be reported as one: somebody who
+        // pressed the button already knows why it ended.
+        Err(e) if crate::export::was_stopped(&e) => Err("Stopped.".to_string()),
         Err(e) => Err(format!("Could not read the ground: {e}")),
-        Ok(scan) => match expect_session {
-            Some(want) if want != scan.session_id => {
+        Ok(scan) => match &expect_session {
+            Some(want) if !want.accepts(scan.session_id) => {
                 Err("That save is from a different playthrough, so its ground would not match.".to_string())
             }
             _ => {

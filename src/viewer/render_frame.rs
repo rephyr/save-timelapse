@@ -560,6 +560,13 @@ impl FrameSequence {
         self.ticks.len()
     }
 
+    /// When each frame is, ascending. Needed by a following export, which runs
+    /// off a clock shared by every surface and has to find each one's frame at
+    /// or before a given moment.
+    pub fn ticks(&self) -> &[u64] {
+        &self.ticks
+    }
+
     pub fn is_empty(&self) -> bool {
         false
     }

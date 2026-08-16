@@ -128,7 +128,8 @@ fn exporting_produces_a_frame() {
     let save = tmp.path().join("MyBase.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    let outcome = export::export_save(&save, &tmp.path().join("staged"), &config).expect("export should produce a frame");
+    let outcome =
+        export::export_save(&save, &tmp.path().join("staged"), &config, export::never()).expect("export should produce a frame");
 
     assert_eq!(outcome.frames.len(), 1);
     let frame = save_timelapse::frame::read_binary(&fs::read(&outcome.frames[0]).unwrap()).unwrap();
@@ -147,7 +148,8 @@ fn exporting_reads_the_saves_milestone_state_from_its_manifest() {
     let save = tmp.path().join("MyBase.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    let outcome = export::export_save(&save, &tmp.path().join("staged"), &config).expect("export should produce a frame");
+    let outcome =
+        export::export_save(&save, &tmp.path().join("staged"), &config, export::never()).expect("export should produce a frame");
 
     let state = outcome.milestones.expect("the manifest carries milestone state");
     assert_eq!(state.tick, 216_000);
@@ -164,7 +166,7 @@ fn staging_preserves_other_mods_settings() {
     fs::write(&save, b"pretend save").unwrap();
 
     let staged = tmp.path().join("staged");
-    export::export_save(&save, &staged, &config).expect("export");
+    export::export_save(&save, &staged, &config, export::never()).expect("export");
 
     let listing = settings_dat::decode(&fs::read(staged.join("mods").join("mod-settings.dat")).unwrap()).unwrap().listing();
 
@@ -195,7 +197,7 @@ fn the_users_mods_folder_is_never_modified() {
     let list_before = fs::read(&list_path).unwrap();
     let settings_before = fs::read(&settings_path).unwrap();
 
-    export::export_save(&save, &tmp.path().join("staged"), &config).expect("export");
+    export::export_save(&save, &tmp.path().join("staged"), &config, export::never()).expect("export");
 
     assert_eq!(fs::read(&list_path).unwrap(), list_before, "mod-list.json was modified");
     assert_eq!(fs::read(&settings_path).unwrap(), settings_before, "the user's mod-settings.dat was modified");
@@ -209,7 +211,7 @@ fn our_mod_is_enabled_in_the_staged_list() {
     fs::write(&save, b"pretend save").unwrap();
 
     let staged = tmp.path().join("staged");
-    export::export_save(&save, &staged, &config).expect("export");
+    export::export_save(&save, &staged, &config, export::never()).expect("export");
 
     let list: serde_json::Value = serde_json::from_slice(&fs::read(staged.join("mods").join("mod-list.json")).unwrap()).unwrap();
     let entry =
@@ -229,7 +231,8 @@ fn a_missing_executable_fails_rather_than_reporting_success() {
     let save = tmp.path().join("MyBase.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    export::export_save(&save, &tmp.path().join("staged"), &config).expect_err("a missing executable must be an error");
+    export::export_save(&save, &tmp.path().join("staged"), &config, export::never())
+        .expect_err("a missing executable must be an error");
 }
 
 /// The failure this project exists to prevent: the game runs, exits cleanly,
@@ -244,7 +247,8 @@ fn a_clean_run_that_writes_nothing_is_an_error() {
     let save = tmp.path().join("MyBase-silent.zip");
     fs::write(&save, b"pretend save").unwrap();
 
-    let err = export::export_save(&save, &tmp.path().join("staged"), &config).expect_err("no frame written must be an error");
+    let err = export::export_save(&save, &tmp.path().join("staged"), &config, export::never())
+        .expect_err("no frame written must be an error");
     assert!(err.to_string().contains("startup setting"), "the error should explain the startup-setting requirement, got: {err}");
 }
 
