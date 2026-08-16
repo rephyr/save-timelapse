@@ -176,6 +176,10 @@ function M.surface(name, entities, tiles)
     name = name,
     valid = true,
     index = 1,
+    -- What a session id used to be derived from wholesale, and still falls
+    -- back to. A test that wants two playthroughs on one map assigns the same
+    -- seed to both.
+    map_gen_settings = { seed = 0 },
     find_entities_filtered = function(filter)
       local all = entities or {}
       local wanted = filter and filter.type
