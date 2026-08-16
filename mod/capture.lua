@@ -134,8 +134,15 @@ end
 --- function serve the first baseline, a reset, and any catch-up. Nested inside
 --- `storage.timelapse_capture`, this being capture progress a reset throws
 --- away.
+--- The empty answer before capture has ever run is the true one: nothing has
+--- a baseline yet. Only `perform_baseline` writes through this, and it runs
+--- after `ensure_capture_segment`, so the throwaway table is never the one a
+--- write lands in.
 local function baselined_surfaces()
   local capture = storage.timelapse_capture
+  if not capture then
+    return {}
+  end
   capture.baselined_surfaces = capture.baselined_surfaces or {}
   return capture.baselined_surfaces
 end
@@ -271,6 +278,26 @@ local function surfaces_needing_baseline()
   end
   table.sort(names)
   return names
+end
+
+--- Everything the panel puts on screen, gathered in one call so it never has
+--- to reach into `storage` itself.
+---
+--- `since_tick` is when this save was loaded rather than when recording began:
+--- every load starts a fresh segment, so the span before it is on disk and no
+--- longer anything the mod can count.
+---
+--- Costs one limit-1 entity query per surface, through
+--- `surfaces_needing_baseline`, which is why the panel asks about once a
+--- second instead of every tick.
+function M.panel_status()
+  local state = storage.timelapse_capture
+  return {
+    on = settings.global["save-timelapse-live-capture"].value,
+    since_tick = state and state.segment_start_tick or nil,
+    baselined = baselined_surfaces(),
+    pending = surfaces_needing_baseline(),
+  }
 end
 
 --- Warns that a freeze is coming, with a real entity count:

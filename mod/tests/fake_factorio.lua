@@ -253,6 +253,24 @@ function M.entity(fields)
   }
 end
 
+--- Names Factorio refuses for a child element, because `LuaGuiElement` already
+--- has a property or method of that name. Modelled here because the game only
+--- rejects them at `add` time, in a player's game, with a non-recoverable
+--- error: `text` and `state` are the natural names for a label and a status
+--- row, and both are taken.
+---
+--- Not the full list, which is long and version-specific. These are the ones a
+--- panel like this one would plausibly reach for.
+local RESERVED_NAMES = {}
+for _, name in ipairs({
+  "add", "anchor", "auto_center", "badge_text", "caption", "children", "clear", "destroy", "direction",
+  "drag_target", "elem_value", "enabled", "entity", "focus", "force", "gui", "index", "items", "location",
+  "name", "number", "parent", "position", "read_only", "selected_index", "sprite", "state", "style", "tags",
+  "text", "tooltip", "type", "valid", "value", "visible", "word_wrap", "zoom",
+}) do
+  RESERVED_NAMES[name] = true
+end
+
 --- One GUI element, as much of `LuaGuiElement` as the panel uses.
 ---
 --- Children are reachable both by name (`screen["save-timelapse-panel"]`,
@@ -274,6 +292,10 @@ function M.element(spec)
   }
 
   element.add = function(child_spec)
+    if child_spec.name and RESERVED_NAMES[child_spec.name] then
+      error(string.format("Invalid name \"%s\": LuaGuiElement contains a property or method with the same name",
+        child_spec.name))
+    end
     local child = M.element(child_spec)
     child.parent = element
     element.children[#element.children + 1] = child

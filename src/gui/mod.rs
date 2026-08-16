@@ -26,6 +26,9 @@ const BACKGROUND: Color = Color::new(0.09, 0.09, 0.11, 1.0);
 const ROW: Color = Color::new(1.0, 1.0, 1.0, 0.06);
 const ROW_HOVER: Color = Color::new(1.0, 1.0, 1.0, 0.13);
 const ROW_EDGE: Color = Color::new(1.0, 1.0, 1.0, 0.10);
+/// Darker than the row it sits on, so the entry box reads as a well cut into
+/// the row rather than as another row stacked on top of it.
+const FIELD: Color = Color::new(0.0, 0.0, 0.0, 0.28);
 const TEXT: Color = Color::new(0.94, 0.94, 0.96, 1.0);
 const TEXT_DIM: Color = Color::new(0.94, 0.94, 0.96, 0.55);
 const ACCENT: Color = Color::new(0.45, 0.75, 1.0, 1.0);
@@ -268,6 +271,10 @@ struct Choosing {
     /// One per surface, in the same order.
     picked: Vec<bool>,
     seconds: u64,
+    /// Digits typed into the custom interval row, before they are a number.
+    /// Kept as text so a half finished entry survives a redraw and can be
+    /// backspaced, which an integer that has to be valid at all times cannot.
+    typed: String,
     /// Where the ground comes from, or `None` for a build without it.
     ground: Option<GroundFrom>,
 }
@@ -287,6 +294,11 @@ impl Choosing {
 }
 
 /// Space kept clear at each end of a row, and between a label and its note.
+/// How wide the custom interval's entry box is, before a narrow window makes
+/// it give way. Room for the five digits `INTERVAL_MAX` allows, and no more:
+/// a field the width of the row would look like it wanted a sentence.
+const FIELD_WIDTH: f32 = 120.0;
+
 const ROW_PAD: f32 = 18.0;
 const ROW_GAP: f32 = 16.0;
 
@@ -356,6 +368,24 @@ fn chosen_of(surfaces: &[String], picked: &[bool]) -> Vec<String> {
 /// points cover, and a free number invites answers nobody wants to sit through.
 const INTERVALS: [(u64, &str); 4] =
     [(10, "Every 10 seconds"), (30, "Every 30 seconds"), (60, "Every minute"), (300, "Every 5 minutes")];
+
+/// The longest custom interval worth offering, in seconds of game time.
+///
+/// A day of game time per frame turns even a thousand hour save into forty
+/// odd frames, so nothing past it produces a timelapse rather than a slideshow.
+const INTERVAL_MAX: u64 = 86_400;
+
+/// What has been typed into the custom row, once it is a number worth using.
+///
+/// Rejects rather than clamps: somebody who typed 0 by mistake gets the screen
+/// back and can see it, where a silent bump to 1 would start a build they did
+/// not ask for. A free function so the range can be tested without a window.
+fn custom_seconds(typed: &str) -> Option<u64> {
+    match typed.parse::<u64>() {
+        Ok(seconds) if (1..=INTERVAL_MAX).contains(&seconds) => Some(seconds),
+        _ => None,
+    }
+}
 
 /// What a build says to the window while it runs.
 enum Update {
@@ -515,6 +545,12 @@ impl App {
             }
             Screen::Interval(_) => {
                 let mut rows: Vec<Choice> = INTERVALS.iter().map(|(_, label)| Choice::new(label, "")).collect();
+                // Reads like the presets above it as soon as there are digits
+                // in it, so the row about to be picked says what picking it
+                // does instead of showing a number out of context.
+                // No note: the right of this row belongs to the entry box,
+                // and a note would be drawn straight through it.
+                rows.push(Choice::new("Custom, in seconds", ""));
                 rows.push(Choice::leaving("Back"));
                 rows
             }
@@ -747,6 +783,17 @@ impl App {
                         choosing.seconds = seconds;
                         Screen::CaptureGround(choosing)
                     }
+                    // Clicking the custom row commits what is in it, the same
+                    // as Enter does. An empty or out of range entry leaves the
+                    // screen up rather than starting a build on a number
+                    // nobody meant.
+                    None if index == INTERVALS.len() => match custom_seconds(&choosing.typed) {
+                        Some(seconds) => {
+                            choosing.seconds = seconds;
+                            Screen::CaptureGround(choosing)
+                        }
+                        None => Screen::Interval(choosing),
+                    },
                     None => Screen::Menu,
                 };
             }
@@ -953,6 +1000,7 @@ impl App {
                 loaded,
                 recording: opening.recording,
                 seconds: 60,
+                typed: String::new(),
                 ground: None,
             }),
             Err(message) => Screen::Done(message),
@@ -1021,6 +1069,37 @@ impl App {
         write(left, baseline, size, NAME);
     }
 
+    /// The custom interval's entry box, cut into the right of its own row.
+    ///
+    /// A caret rather than a cursor that can be moved: entry here is digits
+    /// and backspace, so there is nowhere else for one to be, and the blink is
+    /// the whole of what tells somebody the keyboard is going in here. An
+    /// empty box on its own says nothing.
+    fn draw_field(&self, row: &layout::Rect, typed: &str) {
+        let height = (row.height - 14.0).max(20.0);
+        let width = FIELD_WIDTH.min(row.width / 2.0);
+        let x = row.x + row.width - ROW_PAD - width;
+        let y = row.y + (row.height - height) / 2.0;
+
+        draw_rectangle(x, y, width, height, FIELD);
+        // Lit only once what is in it could actually be used, which turns the
+        // border into the answer to "is this number allowed" without a line of
+        // text saying so.
+        let edge = match custom_seconds(typed) {
+            Some(_) => ACCENT,
+            None => ROW_EDGE,
+        };
+        draw_rectangle_lines(x, y, width, height, 1.0, edge);
+
+        let baseline = y + (height + LABEL_SIZE * 0.7) / 2.0;
+        let text_x = x + 10.0;
+        self.ui.text(typed, text_x, baseline, LABEL_SIZE, TEXT);
+        if (get_time() * 2.0) as i64 % 2 == 0 {
+            let caret = text_x + self.ui.width(typed, LABEL_SIZE) + 2.0;
+            draw_rectangle(caret, y + 5.0, 2.0, height - 10.0, ACCENT);
+        }
+    }
+
     fn draw(&self, column: &Column, choices: &[Choice], hovered: Option<usize>) {
         clear_background(BACKGROUND);
 
@@ -1081,6 +1160,14 @@ impl App {
             // in is readable at a glance rather than by reading every note.
             if choice.note == "included" {
                 draw_rectangle(row.x, row.y, 3.0, row.height, ACCENT);
+            }
+
+            // The custom interval is the one row that is a field rather than a
+            // choice, so it is drawn as one.
+            if let Screen::Interval(choosing) = &self.screen {
+                if index == INTERVALS.len() {
+                    self.draw_field(&row, &choosing.typed);
+                }
             }
         }
 
@@ -1706,6 +1793,38 @@ pub async fn run() {
                 }
             }
         }
+        // Drained every frame rather than only on the screen that wants it:
+        // macroquad queues characters, so anything typed elsewhere would be
+        // sitting in the buffer waiting to appear the moment the custom
+        // interval row opened.
+        let mut digits = String::new();
+        while let Some(key) = get_char_pressed() {
+            if key.is_ascii_digit() {
+                digits.push(key);
+            }
+        }
+        if matches!(app.screen, Screen::Interval(_)) {
+            let commit = is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::KpEnter);
+            let back = is_key_pressed(KeyCode::Backspace);
+            if let Screen::Interval(choosing) = &mut app.screen {
+                // A cap on length, not on value: it keeps the row from growing
+                // without bound mid-entry, and `custom_seconds` still has the
+                // final say on whether the number is usable.
+                for digit in digits.chars().take(6_usize.saturating_sub(choosing.typed.len())) {
+                    choosing.typed.push(digit);
+                }
+                if back {
+                    choosing.typed.pop();
+                }
+            }
+            if commit {
+                let was = std::mem::discriminant(&app.screen);
+                app.choose(INTERVALS.len());
+                if was != std::mem::discriminant(&app.screen) {
+                    app.scroll = 0.0;
+                }
+            }
+        }
         // Escape goes back one level, and out of the menu entirely, so the
         // keyboard reaches every exit the mouse does.
         if is_key_pressed(KeyCode::Escape) {
@@ -1824,6 +1943,24 @@ mod tests {
         let seconds: Vec<u64> = INTERVALS.iter().map(|(s, _)| *s).collect();
         assert!(seconds.windows(2).all(|w| w[0] < w[1]), "{seconds:?}");
         assert!(INTERVALS.iter().all(|(_, label)| !label.is_empty()));
+    }
+
+    /// A typed interval is only worth using if it is a number in range, and
+    /// the rejections matter more than the acceptances: each one is a build
+    /// that would otherwise have started on something nobody meant.
+    #[test]
+    fn a_custom_interval_is_taken_only_when_it_is_a_usable_number() {
+        assert_eq!(custom_seconds("1"), Some(1));
+        assert_eq!(custom_seconds("45"), Some(45));
+        assert_eq!(custom_seconds(&INTERVAL_MAX.to_string()), Some(INTERVAL_MAX));
+
+        // Nothing typed yet, so there is nothing to commit.
+        assert_eq!(custom_seconds(""), None);
+        // Zero would mean a frame every no time at all.
+        assert_eq!(custom_seconds("0"), None);
+        assert_eq!(custom_seconds(&(INTERVAL_MAX + 1).to_string()), None);
+        // Past u64, which parse rejects rather than wrapping.
+        assert_eq!(custom_seconds("99999999999999999999999"), None);
     }
 
     fn save_pick_of(saves: &[&str], picked: &[bool]) -> SavePick {

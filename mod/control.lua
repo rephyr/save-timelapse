@@ -91,6 +91,7 @@ local function on_tick(event)
   export.run_pending_tick_work(event.tick, capture.compute_session_id)
   capture.run_pending_tick_work(event.tick)
   snapshot.run_pending_tick_work(event.tick)
+  gui.run_pending_tick_work(event.tick)
 end
 script.on_event(defines.events.on_tick, on_tick)
 
