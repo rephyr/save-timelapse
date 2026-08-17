@@ -31,6 +31,10 @@ end
 local PANEL = "save-timelapse-panel"
 local LIVE_CAPTURE_CHECKBOX = "save-timelapse-toggle-live-capture"
 local CLOSE_BUTTON = "save-timelapse-panel-close"
+local GENERATE_BUTTON = "save-timelapse-generate-baseline"
+local GENERATE_NOTE = "save-timelapse-generate-note"
+local STATUS_TEXT = "save-timelapse-status-text"
+local ROW_STATE = "save-timelapse-row-state"
 
 local function load_gui()
   for _, name in ipairs({ "gui", "capture", "export", "encode", "milestones" }) do
@@ -135,6 +139,47 @@ gui.on_gui_checked_state_changed({
   element = { valid = true, name = "surface-row", tags = { surface = "vulcanus" }, state = true },
 })
 check("and include it again", capture.is_surface_excluded("vulcanus"), false)
+
+-- What the panel says ----------------------------------------------------------
+
+-- The button used to read "Generate", which named nothing it made and did
+-- nothing at all in two of its three states. Each state is asserted on here
+-- because each one used to be an identical, silent button.
+
+fake.reset(1000)
+gui = load_gui()
+player = with_player()
+_G.settings.global["save-timelapse-live-capture"] = { value = false }
+gui.open(1)
+check("with recording off there is nothing to snapshot", fake.find(player.gui.screen, GENERATE_BUTTON).enabled, false)
+check("and the panel says why", fake.find(player.gui.screen, GENERATE_NOTE).caption, "Turn recording on first.")
+check("the status line leads with it", fake.find(player.gui.screen, STATUS_TEXT).caption, "Not recording")
+
+-- A place that has never been snapshotted is what the button is for, and
+-- naming it on the button is the whole difference from "Generate".
+gui.close(1)
+_G.settings.global["save-timelapse-live-capture"] = { value = true }
+gui.open(1)
+check("a place waiting for one names itself", fake.find(player.gui.screen, GENERATE_BUTTON).caption, "Snapshot Nauvis")
+check_true("and the button can be pressed", fake.find(player.gui.screen, GENERATE_BUTTON).enabled)
+check("the row agrees with the button", fake.find(player.gui.screen, ROW_STATE).caption, "needs a snapshot")
+check("and the status line has flipped", fake.find(player.gui.screen, STATUS_TEXT).caption, "Recording")
+
+-- Once it has a baseline the button has nothing left to do, and says that
+-- rather than staying pressable and doing nothing.
+gui.close(1)
+_G.storage.timelapse_capture = { segment_start_tick = 0, session_id = "s", baselined_surfaces = { nauvis = 1 } }
+gui.open(1)
+check("nothing left to snapshot", fake.find(player.gui.screen, GENERATE_BUTTON).enabled, false)
+check("and the row says so", fake.find(player.gui.screen, ROW_STATE).caption, "recording")
+
+-- Unticking a place updates the row without waiting for the next refresh,
+-- which is what makes the click look like it landed.
+gui.on_gui_checked_state_changed({
+  player_index = 1,
+  element = { valid = true, name = "check", tags = { surface = "nauvis" }, state = false },
+})
+check("an unticked place stops claiming to record", fake.find(player.gui.screen, ROW_STATE).caption, "not recorded")
 
 -- Events about elements that are gone ----------------------------------------------
 

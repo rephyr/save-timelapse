@@ -34,6 +34,30 @@ impl PlayerTrack {
         }
         latest.into_values().filter(|s| s.surface == surface).map(|s| (s.name.as_str(), s.x, s.y)).collect()
     }
+
+    /// Who a following camera is following: whoever was sampled first.
+    ///
+    /// A camera can only be in one place, so in multiplayer the answer has to
+    /// be somebody, and picking once means it does not change allegiance every
+    /// time a different player travels. In single player, which is nearly all
+    /// of them, there is only ever one candidate.
+    pub fn followed(&self) -> Option<&str> {
+        self.samples.first().map(|s| s.name.as_str())
+    }
+
+    /// Which surface the followed player was on as of `tick`, by the same
+    /// nearest-preceding rule as `positions_at`. `None` before their first
+    /// sample, which is the stretch where nothing is known rather than the
+    /// stretch where they were nowhere.
+    pub fn surface_at(&self, tick: u64) -> Option<&str> {
+        let followed = self.followed()?;
+        self.samples
+            .iter()
+            .take_while(|sample| sample.tick <= tick)
+            .filter(|sample| sample.name == followed)
+            .last()
+            .map(|sample| sample.surface.as_str())
+    }
 }
 
 #[cfg(test)]

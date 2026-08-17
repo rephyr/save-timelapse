@@ -5,7 +5,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::settings_dat::{self, Version};
@@ -245,7 +246,7 @@ pub fn install_data_dir(exe: &Path) -> Option<PathBuf> {
 /// Export one save. `staged` is a directory this call owns and may delete.
 /// Shared by the frame export and the ground scan, which differ only in which
 /// startup flag `stage_mods` sets.
-fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<PathBuf> {
+fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig, cancel: &AtomicBool) -> io::Result<PathBuf> {
     let written_to = staged.join("script-output").join(MOD_NAME);
     std::fs::create_dir_all(&written_to)?;
 
@@ -257,7 +258,16 @@ fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result
     let config_file = staged.join("config.ini");
     std::fs::write(&config_file, format!("[path]\nread-data={}\nwrite-data={}\n", data.display(), staged.display()))?;
 
-    let run = Command::new(&config.factorio)
+    // Into a file rather than a pipe. Nothing reads this while the run is
+    // being polled below, and a pipe whose buffer fills stops the process
+    // writing into it, which would hang Factorio somewhere no timeout would
+    // ever fire. A file has no such limit. Both streams share it, so the tail
+    // reported on failure is in the order it was printed.
+    let log_path = staged.join("factorio-run.log");
+    let log = std::fs::File::create(&log_path)?;
+    let errors = log.try_clone()?;
+
+    let mut child = Command::new(&config.factorio)
         .arg("--benchmark")
         .arg(save)
         .arg("--benchmark-ticks")
@@ -267,25 +277,57 @@ fn run_factorio(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result
         .arg("--mod-directory")
         .arg(&mods)
         .arg("--disable-audio")
-        .output()?;
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(errors))
+        .spawn()?;
 
-    if !run.status.success() {
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        let tail: Vec<&str> = stdout.lines().rev().take(3).collect();
-        return Err(io::Error::other(format!(
-            "factorio exited with {}: {} {}",
-            run.status,
-            tail.join(" | "),
-            String::from_utf8_lossy(&run.stderr).trim()
-        )));
+    // Polled rather than waited on, so somebody who asked to stop is not held
+    // until Factorio finishes: on a big save this is the longest single thing
+    // the program does, and it used to ignore the stop button entirely.
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            child.kill()?;
+            child.wait()?;
+            return Err(stopped());
+        }
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+
+    if !status.success() {
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let tail: Vec<&str> = text.lines().rev().take(3).collect();
+        return Err(io::Error::other(format!("factorio exited with {status}: {}", tail.join(" | "))));
     }
 
     Ok(written_to)
 }
 
-pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<ExportOutcome> {
+/// What a run that was asked to stop returns. `Interrupted` rather than a
+/// message anybody has to match on: a caller needs to tell "the user stopped
+/// this" apart from "this failed" to report it honestly, and the kind is the
+/// part of `io::Error` meant for that.
+pub fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "stopped")
+}
+
+/// Whether an error is that stop rather than a failure.
+pub fn was_stopped(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Interrupted
+}
+
+/// A stop signal for a caller that has nothing to stop it with. The text menu
+/// is interrupted with Ctrl+C, which takes the child down with it.
+pub fn never() -> &'static AtomicBool {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    &NEVER
+}
+
+pub fn export_save(save: &Path, staged: &Path, config: &ExportConfig, cancel: &AtomicBool) -> io::Result<ExportOutcome> {
     let started = Instant::now();
-    let written_to = run_factorio(save, staged, config)?;
+    let written_to = run_factorio(save, staged, config, cancel)?;
 
     let mut frames: Vec<PathBuf> = std::fs::read_dir(&written_to)?
         .filter_map(Result::ok)
@@ -365,10 +407,10 @@ pub struct TerrainScan {
 /// covered, so the scan reads that rather than leaving the position empty until
 /// the tick the concrete went down. What the scan alone cannot see is scenery
 /// already gone by then, which the baseline and its removals carry instead.
-pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig) -> io::Result<TerrainScan> {
+pub fn scan_terrain(save: &Path, staged: &Path, config: &ExportConfig, cancel: &AtomicBool) -> io::Result<TerrainScan> {
     let started = Instant::now();
     let scan = ExportConfig { terrain_scan: true, ..config.clone() };
-    let written_to = run_factorio(save, staged, &scan)?;
+    let written_to = run_factorio(save, staged, &scan, cancel)?;
 
     // One session folder per playthrough, and a scan only ever loads one
     // save, so anything else here would mean a stale staging directory.

@@ -134,6 +134,7 @@ The replay is designed to be explored rather than simply watched.
 - 🔖 Add bookmarks
 - 🌍 Switch between planets and space platforms
 - 👤 Track player position, in timelapses recorded with live capture
+- 🚀 Export one video that follows you between planets, cutting to each one as you arrive
 
 ### Viewer controls
 
@@ -198,7 +199,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 
 - **A nest you walked up to is shown from the start.** Where the nests are comes from the same one-off scan the ground does, and that scan reads a finished save, so it cannot say when any of them appeared. Nests the biters built are timed correctly, because your recording says when, and the scan hands those back to it. What is left is a nest that was always sitting there in a part of the map you had not explored yet: nothing anywhere knows when it came into view, so it is drawn from the beginning.
 
-- **Two playthroughs on the same map seed are one recording.** A recording is filed under your map's terrain seed, which is what lets the tool recognise your playthrough across saves and refuse ground scanned from somebody else's game. It also means a second game started from the same seed is indistinguishable from carrying on with the first: both write into the same recording, and one of them is treated as a branch you left behind and dropped. Rolling a new seed, which is what generating a new map normally does, keeps them apart.
+- **A save copied and taken two ways is one recording.** A recording is filed under an id minted when capture first starts and carried in the save from then on, which is what lets the tool follow your playthrough across saves and refuse ground scanned from somebody else's game. Two separate games are separate recordings even on the same map seed. What it cannot tell apart is a single save copied and played in two directions: both copies carry the id they were saved with, so the tool reads them as one playthrough that branched, and keeps whichever branch you played most recently.
 
 - **The landscape from before your recording is the finished one.** Ground, ore, trees and cliffs are scanned once from a single save after the fact, which is what keeps them out of your game entirely. A forest you cleared before that recording began is in no save it can read and was never written down anywhere else, so it was never there to find. Cleared while recording, it replays as it happened, and so does a patch your drills have mined out. With terrain capture switched off there is deliberately nothing to uncover at all.
 
@@ -219,6 +220,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
 - **v0.8.2:** Scenery scanned from the save rather than bounded to the starting factory, rail corners drawn as curves
 - **v0.9:** One binary instead of two, a window alongside the text menu, biter expansion and nest clearing recorded, ground under paving recovered, exhausted ore emptied out, pipes joined to underground runs
+- **v0.10:** One video that follows you between planets, playthroughs on a shared map seed kept apart, a rebuilt in-game panel that says what it is doing, a working Stop button, custom frame intervals
 
 ### Upcomming
 

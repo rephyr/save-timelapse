@@ -1275,7 +1275,8 @@ fn update_auto_follow(
 /// otherwise the ordinary draw path, so an export looks like browsing rather
 /// than like a second renderer.
 async fn export_frames(
-    world: &mut WorldView,
+    worlds: &mut [WorldView],
+    plan: &[(usize, usize)],
     registry: &TypeRegistry,
     sprites: &[Option<Sprite>],
     player_track: &PlayerTrack,
@@ -1331,16 +1332,27 @@ async fn export_frames(
     // for an image sequence, which has no rate of its own: whatever the frames
     // are later assembled at is the rate the pacing was meant for.
     let radius = crate::viewer::smoothing_radius(request.smooth_secs, request.fps);
-    let path = CameraPath::smooth(&world.growing_bounds, world.opening_bounds, radius);
+    // Only for the surfaces this plan actually visits. Smoothing walks every
+    // frame of a surface, and a single-surface export of a four planet
+    // timelapse would otherwise pay for three it never draws.
+    let visited: std::collections::HashSet<usize> = plan.iter().map(|(world, _)| *world).collect();
+    let paths: Vec<Option<CameraPath>> = worlds
+        .iter()
+        .enumerate()
+        .map(|(index, world)| {
+            visited.contains(&index).then(|| CameraPath::smooth(&world.growing_bounds, world.opening_bounds, radius))
+        })
+        .collect();
 
-    let total = world.sequence.len();
+    let total = plan.len();
     let mut counter = DrawCallCounter::new(BATCH_INDEX_CAPACITY);
     let destination = if request.video { video_path.display().to_string() } else { request.dir.display().to_string() };
     let rate = if request.video { format!(" at {} fps", request.fps) } else { String::new() };
     let sampling = if ss > 1 { format!(" ({ss}x supersampled from {rw}x{rh})") } else { String::new() };
     println!("exporting {total} frames at {}x{}{rate}{sampling} to {destination}", request.width, request.height);
 
-    for index in 0..total {
+    for (step, &(which, index)) in plan.iter().enumerate() {
+        let world = &mut worlds[which];
         world.sequence.goto(index);
 
         // Read off the precomputed path rather than glided through
@@ -1351,7 +1363,7 @@ async fn export_frames(
         // and this is where the output size is known. `None` only when there
         // is nothing on this surface at all, and then the opening camera is
         // as good an answer as any.
-        if let Some(camera) = path.camera_at(index, w, h, export_framing(h)) {
+        if let Some(camera) = paths[which].as_ref().and_then(|path| path.camera_at(index, w, h, export_framing(h))) {
             world.camera = camera;
         }
 
@@ -1401,20 +1413,23 @@ async fn export_frames(
         match &mut video {
             Some(writer) => writer.add(&image)?,
             None => {
-                let path = request.dir.join(format!("frame_{index:05}.png"));
+                // Numbered by output position, not by the frame's place in its
+                // own surface: a following export visits two surfaces and both
+                // would otherwise start again at zero and overwrite.
+                let path = request.dir.join(format!("frame_{step:05}.png"));
                 image.export_png(&path.to_string_lossy());
             }
         }
 
-        if index % 25 == 0 || index + 1 == total {
-            print!("\r  {}/{total}", index + 1);
+        if step % 25 == 0 || step + 1 == total {
+            print!("\r  {}/{total}", step + 1);
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
         // Every frame is drawn into the render target and read straight back
         // out, so nothing was ever painted into the window itself: an export
         // sat there black for however long it took. The bar is the same one a
         // load draws, because it is the same question being asked.
-        draw_export_progress(index + 1, total, &destination);
+        draw_export_progress(step + 1, total, &destination);
         // Hands the frame to the driver. Without it the whole export happens
         // inside one displayed frame and the window sits unresponsive until
         // it finishes.
@@ -2408,6 +2423,14 @@ async fn run_export(
     request: &ExportRequest,
 ) -> Result<(), String> {
     let available: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
+
+    // One video that goes where the player went, rather than one video per
+    // planet each running the full length with nothing on it for the hours
+    // nobody was there.
+    if request.surface.as_deref().is_some_and(|name| name.eq_ignore_ascii_case("follow")) {
+        return run_follow_export(worlds, registry, sprites, player_track, ui, request).await;
+    }
+
     let chosen: Vec<usize> = match request.surface.as_deref() {
         // The default is the busiest surface, which `group_by_surface` already
         // orders first, so the common single-surface case needs no flag.
@@ -2417,7 +2440,12 @@ async fn run_export(
             Some(index) => vec![index],
             // Naming what is there rather than only what is not: the answer is
             // always in the timelapse the user just pointed at.
-            None => return Err(format!("no surface called \"{name}\". This timelapse has: {}", available.join(", "))),
+            None => {
+                return Err(format!(
+                    "no surface called \"{name}\". This timelapse has: {}, or \"all\", or \"follow\"",
+                    available.join(", ")
+                ))
+            }
         },
     };
 
@@ -2442,11 +2470,59 @@ async fn run_export(
             supersample: request.supersample,
             smooth_secs: request.smooth_secs,
         };
-        if let Err(e) = export_frames(&mut worlds[index], registry, sprites, player_track, ui, &this).await {
+        let plan: Vec<(usize, usize)> = (0..worlds[index].sequence.len()).map(|frame| (index, frame)).collect();
+        if let Err(e) = export_frames(worlds, &plan, registry, sprites, player_track, ui, &this).await {
             eprintln!("export of {name} failed: {e}");
         }
     }
     Ok(())
+}
+
+/// One video following the player between surfaces.
+///
+/// The plan is built before anything is drawn, which is what lets the move
+/// list be printed up front: an export is long, and being told it will spend
+/// its middle third on Vulcanus beforehand beats discovering it afterwards.
+async fn run_follow_export(
+    worlds: &mut [WorldView],
+    registry: &TypeRegistry,
+    sprites: &[Option<Sprite>],
+    player_track: &PlayerTrack,
+    ui: &Ui,
+    request: &ExportRequest,
+) -> Result<(), String> {
+    let names: Vec<String> = worlds.iter().map(|w| w.name.clone()).collect();
+    let per_surface: Vec<&[u64]> = worlds.iter().map(|w| w.sequence.ticks()).collect();
+    let ticks = crate::viewer::follow::shared_ticks(&per_surface);
+
+    // Index 0 is the busiest surface, which is where a recording that has not
+    // said otherwise should open.
+    let schedule = crate::viewer::follow::schedule(&ticks, &names, player_track, 0);
+
+    // Each moment paired with that surface's own frame for it. A surface is
+    // only written when something changed on it, so the shared clock asks for
+    // moments most of them have no frame of their own at.
+    let plan: Vec<(usize, usize)> = ticks
+        .iter()
+        .zip(&schedule)
+        .map(|(&tick, &which)| (which, crate::viewer::follow::frame_at(worlds[which].sequence.ticks(), tick)))
+        .collect();
+
+    match player_track.followed() {
+        Some(name) => println!("\nfollowing {name} across {} surfaces", names.len()),
+        // Worth saying plainly rather than quietly producing one surface: a
+        // recording with no player log cannot be followed, and the result is
+        // indistinguishable from a normal export unless somebody says so.
+        None => println!("\nno player was recorded, so there is nobody to follow: exporting {} throughout", names[0]),
+    }
+    for (at, which) in crate::viewer::follow::moves(&schedule) {
+        println!("  {} from frame {at}", names[which]);
+    }
+
+    export_frames(worlds, &plan, registry, sprites, player_track, ui, request)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("follow export failed: {e}"))
 }
 
 /// The viewer, as a screen rather than a program: this used to be `main` in a

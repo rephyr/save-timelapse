@@ -14,6 +14,7 @@ mod camera_path;
 mod chrome;
 mod construction;
 mod draw_calls;
+mod follow;
 mod loading;
 mod marks;
 mod mp4;

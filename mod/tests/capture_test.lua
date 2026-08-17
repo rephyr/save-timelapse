@@ -312,6 +312,64 @@ worms.periodic_flush(30000)
 
 check_true("and neither is a worm dropped", segment_bytes():find(string.char(4), 1, true) ~= nil)
 
+-- Which playthrough a recording belongs to -------------------------------------
+
+-- The id was the map seed, which identifies a map and not a playthrough: two
+-- games rolled from one seed wrote into one folder, and the second one's
+-- baseline manifest overwrote the first's. The tests that matter most here are
+-- the two at the bottom, which are the recordings that already exist.
+
+local function with_seed(tick, seed)
+  fake.reset(tick)
+  _G.game.surfaces.nauvis = fake.surface("nauvis")
+  _G.game.surfaces.nauvis.map_gen_settings.seed = seed
+  return load_mod()
+end
+
+local first = with_seed(1000, 12345)
+first.periodic_flush(1000)
+local first_id = _G.storage.timelapse_capture.session_id
+
+-- A new game on the same map: identical seed, empty `storage`, and that second
+-- part is the whole of what the old id could not see.
+local second = with_seed(4000, 12345)
+second.periodic_flush(4000)
+local second_id = _G.storage.timelapse_capture.session_id
+
+check_true("two playthroughs on one seed no longer share an id", first_id ~= second_id)
+check_true(
+  "and both fit the eight hex digits the folder name is",
+  first_id >= 0 and first_id < 0x100000000 and second_id >= 0 and second_id < 0x100000000
+)
+
+-- Minted once, not per load: a reload that re-minted would start a new
+-- recording every time the player came back to the game.
+local saved = save_game()
+fake.reset(6000)
+_G.game.surfaces.nauvis = fake.surface("nauvis")
+_G.game.surfaces.nauvis.map_gen_settings.seed = 12345
+local again = load_save(saved, 6000)
+again.periodic_flush(6000)
+check("a reload keeps the id its capture was minted with", _G.storage.timelapse_capture.session_id, second_id)
+
+-- An older save, whose id is its seed because that is what the mod stored back
+-- then. It has to go on writing exactly where it always did.
+fake.reset(8000)
+_G.game.surfaces.nauvis = fake.surface("nauvis")
+_G.game.surfaces.nauvis.map_gen_settings.seed = 777
+_G.storage.timelapse_capture =
+  { segment_start_tick = 100, last_tick = 100, segment_initialized = true, session_id = 777 }
+local older = load_mod()
+check("an older recording keeps the id it already had", older.compute_session_id(), 777)
+
+-- A save that never captured, which is every build-from-saves run. There is
+-- nothing to have stored an id on, so the seed still answers.
+fake.reset(9000)
+_G.game.surfaces.nauvis = fake.surface("nauvis")
+_G.game.surfaces.nauvis.map_gen_settings.seed = 4242
+local never_captured = load_mod()
+check("a save that never captured still resolves to its seed", never_captured.compute_session_id(), 4242)
+
 if failures > 0 then
   print(string.format("\n%d check(s) failed", failures))
   os.exit(1)

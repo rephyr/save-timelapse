@@ -134,8 +134,15 @@ end
 --- function serve the first baseline, a reset, and any catch-up. Nested inside
 --- `storage.timelapse_capture`, this being capture progress a reset throws
 --- away.
+--- The empty answer before capture has ever run is the true one: nothing has
+--- a baseline yet. Only `perform_baseline` writes through this, and it runs
+--- after `ensure_capture_segment`, so the throwaway table is never the one a
+--- write lands in.
 local function baselined_surfaces()
   local capture = storage.timelapse_capture
+  if not capture then
+    return {}
+  end
   capture.baselined_surfaces = capture.baselined_surfaces or {}
   return capture.baselined_surfaces
 end
@@ -150,16 +157,45 @@ local function capture_segment_path(session_id, start_tick, parent)
   return export.EXPORT_DIR .. encode.capture_segment_name(session_id, start_tick, parent)
 end
 
---- A playthrough's identity, for tagging files in the shared script-output
---- folder. The map's terrain seed is stable across save/reload and differs
---- across playthroughs, and needs no in-game UI to collect, unlike a save name
---- which mods cannot read. Falls back to 0 rather than crashing.
+--- A fresh identity for a capture that is starting now.
+---
+--- The seed alone used to be the identity, and it is a map's rather than a
+--- playthrough's: two games rolled from one seed shared a folder, and the
+--- second one's `baseline.json` overwrote the first's. Minting instead, and
+--- keeping it in `storage`, gets the property the seed was chosen for and the
+--- one it lacked. `storage` survives save and reload, rewinds with the save so
+--- a rollback keeps writing to the same place, and is empty in a new game,
+--- which is precisely where a new identity is wanted.
+---
+--- Mixed from three sources because no one of them is enough. The seed differs
+--- between maps. The tick differs between two games that turned capture on at
+--- different moments, which is every pair of them in practice, capture being
+--- off until somebody asks for it. `math.random` is deterministic and synced
+--- in Factorio, so it is safe in multiplayer, and its state depends on
+--- everything the game did before this call.
+---
+--- Held inside a u32 because the folder is named with eight hex digits and the
+--- reading side parses it back. Nothing checks the number is unused: the mod
+--- can write to the output folder but not list it, so one collision in four
+--- billion is the trade being made here.
+local function mint_session_id()
+  return (export.map_seed() + (game.tick % 0x10000) * 0x10000 + math.random(0, 0xffff)) % 0x100000000
+end
+
+--- Which playthrough this save's output belongs to.
+---
+--- The stored id when there is one, which is every save that has ever
+--- captured, and the bare seed otherwise. That fallback is what keeps older
+--- recordings working: a save already mid-capture carries a `session_id` equal
+--- to its seed and goes on writing exactly where it always did, and a save
+--- that never captured at all, which is every build-from-saves run, still
+--- resolves to the same folder it used to.
 function M.compute_session_id()
-  local ok, seed = pcall(function() return game.surfaces["nauvis"].map_gen_settings.seed end)
-  if ok and seed then
-    return seed
+  local state = storage.timelapse_capture
+  if state and state.session_id then
+    return state.session_id
   end
-  return 0
+  return export.map_seed()
 end
 
 --- A player can load an older save than one already recorded past, which an
@@ -183,7 +219,9 @@ local function ensure_capture_segment()
       segment_start_tick = game.tick,
       last_tick = game.tick,
       segment_initialized = false,
-      session_id = M.compute_session_id(),
+      -- Minted, not computed: this branch is a capture that did not exist a
+      -- moment ago, which is the one moment a new identity is correct.
+      session_id = mint_session_id(),
     }
     storage.timelapse_capture = state
   end
@@ -271,6 +309,26 @@ local function surfaces_needing_baseline()
   end
   table.sort(names)
   return names
+end
+
+--- Everything the panel puts on screen, gathered in one call so it never has
+--- to reach into `storage` itself.
+---
+--- `since_tick` is when this save was loaded rather than when recording began:
+--- every load starts a fresh segment, so the span before it is on disk and no
+--- longer anything the mod can count.
+---
+--- Costs one limit-1 entity query per surface, through
+--- `surfaces_needing_baseline`, which is why the panel asks about once a
+--- second instead of every tick.
+function M.panel_status()
+  local state = storage.timelapse_capture
+  return {
+    on = settings.global["save-timelapse-live-capture"].value,
+    since_tick = state and state.segment_start_tick or nil,
+    baselined = baselined_surfaces(),
+    pending = surfaces_needing_baseline(),
+  }
 end
 
 --- Warns that a freeze is coming, with a real entity count:

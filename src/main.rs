@@ -415,16 +415,21 @@ fn ask_export_surface(surfaces: &[String]) -> io::Result<Option<String>> {
     // more thing this list can produce, not a different kind of answer.
     let every = surfaces.len() + 1;
     println!("  {every}  One video for each of them");
+    // Offered last because it is the answer that needs the most explaining,
+    // and named for what it does rather than for the surfaces it visits.
+    let follow = surfaces.len() + 2;
+    println!("  {follow}  One video that follows you between them");
 
     loop {
         let input = prompt("\n  Type a number, or press Enter for the busiest one:")?;
         if input.trim().is_empty() {
             return Ok(None);
         }
-        match parse_session_index(&input, every) {
+        match parse_session_index(&input, follow) {
+            Some(index) if index + 1 == follow => return Ok(Some("follow".to_string())),
             Some(index) if index + 1 == every => return Ok(Some("all".to_string())),
             Some(index) => return Ok(Some(surfaces[index].clone())),
-            None => println!("\n  Please type a number from 1 to {every}.\n"),
+            None => println!("\n  Please type a number from 1 to {follow}.\n"),
         }
     }
 }
@@ -774,7 +779,7 @@ fn run_live_capture(settings: &mut Settings) -> io::Result<PathBuf> {
         wait_for_enter();
     }
 
-    offer_terrain_for_capture(settings, &user_dir, &out, chosen.session_id, replay_state.world.tick)?;
+    offer_terrain_for_capture(settings, &user_dir, &out, chosen.session_id, chosen.baseline.seed, replay_state.world.tick)?;
     add_icons_for_capture(settings, &user_dir, &out);
 
     Ok(out)
@@ -852,6 +857,7 @@ fn offer_terrain_for_capture(
     user_dir: &Path,
     out: &Path,
     session_id: u32,
+    seed: Option<u32>,
     capture_tick: u64,
 ) -> io::Result<()> {
     let mut saves: Vec<PathBuf> = std::fs::read_dir(user_dir.join("saves"))
@@ -920,7 +926,7 @@ fn offer_terrain_for_capture(
         capture_terrain: true,
         terrain_scan: true,
     };
-    add_terrain(chosen, out, &config, Some(session_id), Some(capture_tick));
+    add_terrain(chosen, out, &config, Some(build::Belongs { session_id, seed }), Some(capture_tick));
     report_dated_nests(out, &user_dir.join("script-output").join("save-timelapse").join(format!("{session_id:08x}")));
     Ok(())
 }
@@ -1034,7 +1040,7 @@ fn add_terrain(
     save: &Path,
     out: &Path,
     config: &export::ExportConfig,
-    expect_session: Option<u32>,
+    expect_session: Option<build::Belongs>,
     capture_tick: Option<u64>,
 ) -> bool {
     let label = save.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -1043,14 +1049,14 @@ fn add_terrain(
     let staged = std::env::temp_dir().join(format!("save-timelapse-terrain-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
 
-    let result = export::scan_terrain(save, &staged, config);
+    let result = export::scan_terrain(save, &staged, config, export::never());
     let copied = match result {
-        Ok(scan) => match expect_session {
-            Some(want) if want != scan.session_id => {
+        Ok(scan) => match &expect_session {
+            Some(want) if !want.accepts(scan.session_id) => {
                 eprintln!(
-                    "warning: {label} is from a different playthrough ({:08x}, not {want:08x}), \
+                    "warning: {label} is from a different playthrough ({:08x}, not {:08x}), \
                      so its ground would not match this timelapse. Skipped.",
-                    scan.session_id
+                    scan.session_id, want.session_id
                 );
                 0
             }
@@ -1059,7 +1065,7 @@ fn add_terrain(
                 // rebuild reuses it instead of launching Factorio to read the
                 // same unchanging ground again. Best effort: failing to keep a
                 // copy costs a scan next time, not this timelapse.
-                let keep = keep_terrain_beside_capture(expect_session);
+                let keep = keep_terrain_beside_capture(expect_session.as_ref().map(|w| w.session_id));
                 let mut copied = 0usize;
                 for file in &scan.files {
                     let Some(name) = file.file_name() else { continue };
