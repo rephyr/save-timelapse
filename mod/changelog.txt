@@ -1,4 +1,19 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.10.0
+Date: 2026-08-17
+  Major Features:
+    - One video that follows you between planets. It cuts to each one as you arrive, instead of a separate video per planet each running the whole playthrough with nothing on it for the hours nobody was there. A planet you left out of the timelapse holds the camera where it was rather than cutting away
+  Features:
+    - The in-game panel says whether it is recording, for how long, and what each place is doing. It updates while it is open
+    - The panel's Generate button now names the places it will snapshot, and greys out with a reason when there is nothing to do
+    - Type your own seconds-per-frame in the window, instead of picking one of four presets
+  Bugfixes:
+    - Two playthroughs rolled from the same map seed no longer share one recording, where the second overwrote the first's baseline. Recordings already under way keep the identity they have and are unaffected
+    - The Stop button now stops a video render. It set a flag nothing was reading, so a render ran to the end whatever you pressed
+    - Stop also works during a ground scan, which used to ignore it for as long as Factorio took to open the save
+    - Stopping is reported as stopping rather than as a failure
+
+---------------------------------------------------------------------------------------------------
 Version: 0.9.0
 Date: 2026-08-15
   Major Features:

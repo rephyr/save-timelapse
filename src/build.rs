@@ -396,7 +396,12 @@ pub fn from_saves(
         (watch.on)(SaveStep::Started { index, total: saves.len(), label: label.clone() });
 
         let staged = workspace.join(format!("stage_{index}"));
-        match export::export_save(save, &staged, config, watch.cancel) {
+        // Deliberately not `watch.cancel`, unlike the ground scan and the video
+        // render, which do kill their child. Stopping is checked between saves
+        // and never during one: killing the run in flight throws away the whole
+        // save's export to save the tail of a single load, and the loop above
+        // already stops before the next one starts. See the test that pins this.
+        match export::export_save(save, &staged, config, export::never()) {
             Ok(outcome) => {
                 let target = out.join(format!("frame_{index:04}.stfr"));
                 let primary = &outcome.frames[0];

@@ -73,15 +73,23 @@ struct Choice {
     /// something else can still be the exit and a row that happens to say
     /// "Back" cannot become one by accident.
     leave: bool,
+    /// A label over the rows beneath it rather than something to pick. Drawn
+    /// without a box and ignored by clicks, so a list that offers two kinds of
+    /// answer can say which is which instead of running them together.
+    heading: bool,
 }
 
 impl Choice {
     fn new(label: &str, note: impl Into<String>) -> Choice {
-        Choice { label: label.to_string(), note: note.into(), leave: false }
+        Choice { label: label.to_string(), note: note.into(), leave: false, heading: false }
     }
 
     fn leaving(label: &str) -> Choice {
         Choice { leave: true, ..Choice::new(label, "") }
+    }
+
+    fn heading(label: &str) -> Choice {
+        Choice { heading: true, ..Choice::new(label, "") }
     }
 }
 
@@ -361,6 +369,34 @@ fn chosen_of(surfaces: &[String], picked: &[bool]) -> Vec<String> {
     surfaces.iter().zip(picked).filter(|(_, picked)| **picked).map(|(name, _)| name.clone()).collect()
 }
 
+/// What a row on the render screen's place list means.
+#[derive(Debug, PartialEq, Eq)]
+enum PlaceChoice {
+    /// The place at this index in the list of surfaces.
+    One(usize),
+    /// Every place, as a video each.
+    All,
+    /// Every place, as one video that follows the player between them.
+    Follow,
+}
+
+/// Which answer a click at `index` means, on a list holding `places` places.
+///
+/// A free function because the arithmetic is the entire risk here. Two heading
+/// rows sit in that list, so a row's position is not its answer's, and adding
+/// a place moves both of the rows below it. `None` covers the headings and the
+/// Back row, which answer nothing.
+fn place_at(index: usize, places: usize) -> Option<PlaceChoice> {
+    match index {
+        // Row 0 is the "one place" heading.
+        at if (1..=places).contains(&at) => Some(PlaceChoice::One(at - 1)),
+        // Then the "every place" heading, which is `places + 1`.
+        at if at == places + 2 => Some(PlaceChoice::All),
+        at if at == places + 3 => Some(PlaceChoice::Follow),
+        _ => None,
+    }
+}
+
 /// The intervals offered, in seconds of game time per frame.
 ///
 /// Presets rather than a number to type, for the same reason every list here
@@ -620,10 +656,13 @@ impl App {
                     Choice::leaving("Back"),
                 ],
                 RenderStep::Place => {
-                    let mut rows: Vec<Choice> =
-                        render.surfaces.iter().map(|name| Choice::new(&describe::pretty_place(name), "")).collect();
-                    rows.push(Choice::new("One video for each", ""));
-                    rows.push(Choice::new("Follow me between them", "one video"));
+                    // Two genuinely different answers, so they are asked as two
+                    // groups: one place on its own, or every place together.
+                    let mut rows = vec![Choice::heading("ONE PLACE")];
+                    rows.extend(render.surfaces.iter().map(|name| Choice::new(&describe::pretty_place(name), "")));
+                    rows.push(Choice::heading("EVERY PLACE"));
+                    rows.push(Choice::new("One video for each", "separate files"));
+                    rows.push(Choice::new("Build all and follow player between them", "one video"));
                     rows.push(Choice::leaving("Back"));
                     rows
                 }
@@ -848,14 +887,16 @@ impl App {
                         false => RenderStep::Size,
                     };
                 }
-                RenderStep::Place if index <= render.surfaces.len() + 1 => {
-                    render.surface = match render.surfaces.get(index) {
-                        Some(name) => Some(name.clone()),
-                        // The two rows past the places are "one video for
-                        // each" and "follow me", both of which the renderer
-                        // already understands by name.
-                        None if index == render.surfaces.len() => Some("all".to_string()),
-                        None => Some("follow".to_string()),
+                // Row 0 is the "one place" heading and the row after the places
+                // is the "every place" one, so a click's index is two ahead of
+                // the answer it means by the time it reaches the last two rows.
+                RenderStep::Place if place_at(index, render.surfaces.len()).is_some() => {
+                    render.surface = match place_at(index, render.surfaces.len()) {
+                        Some(PlaceChoice::One(at)) => Some(render.surfaces[at].clone()),
+                        // Both of these the renderer already understands by
+                        // name, so nothing here has to know what they do.
+                        Some(PlaceChoice::All) => Some("all".to_string()),
+                        _ => Some("follow".to_string()),
                     };
                     render.step = RenderStep::Size;
                 }
@@ -1131,6 +1172,16 @@ impl App {
                 continue;
             }
             let row = column.row(index);
+
+            // A heading is text over a group, not a row: no box, no hover, and
+            // dimmer than the choices so the eye reads it as a label for them
+            // rather than as one more thing on the list.
+            if choice.heading {
+                let baseline = row.text_baseline(NOTE_SIZE) + row.height / 4.0;
+                self.ui.text(&choice.label, row.x + ROW_PAD, baseline, NOTE_SIZE, TEXT_DIM);
+                continue;
+            }
+
             let lit = hovered == Some(index);
             let fill = match (choice.leave, lit) {
                 (true, true) => LEAVE_ROW_HOVER,
@@ -1804,7 +1855,9 @@ pub async fn run() {
         let hovered = column.hit(mouse_x, mouse_y);
 
         if is_mouse_button_pressed(MouseButton::Left) {
-            if let Some(index) = hovered {
+            // A heading occupies a row and answers nothing, so a click that
+            // lands on one does nothing rather than picking its neighbour.
+            if let Some(index) = hovered.filter(|&at| !choices[at].heading) {
                 let was = std::mem::discriminant(&app.screen);
                 app.choose(index);
                 if was != std::mem::discriminant(&app.screen) {
@@ -1962,6 +2015,31 @@ mod tests {
         let seconds: Vec<u64> = INTERVALS.iter().map(|(s, _)| *s).collect();
         assert!(seconds.windows(2).all(|w| w[0] < w[1]), "{seconds:?}");
         assert!(INTERVALS.iter().all(|(_, label)| !label.is_empty()));
+    }
+
+    /// The place list is the one screen whose rows are not its answers: two
+    /// headings sit in it, so every row below one is offset. Asserted against
+    /// the list as drawn, because an off-by-one here silently renders the
+    /// wrong planet after somebody waited for it.
+    #[test]
+    fn a_click_on_the_place_list_means_the_row_it_landed_on() {
+        // As drawn for two places: heading, Nauvis, Vulcanus, heading, each,
+        // follow, Back.
+        assert_eq!(place_at(0, 2), None, "the ONE PLACE heading answers nothing");
+        assert_eq!(place_at(1, 2), Some(PlaceChoice::One(0)));
+        assert_eq!(place_at(2, 2), Some(PlaceChoice::One(1)));
+        assert_eq!(place_at(3, 2), None, "the EVERY PLACE heading answers nothing");
+        assert_eq!(place_at(4, 2), Some(PlaceChoice::All));
+        assert_eq!(place_at(5, 2), Some(PlaceChoice::Follow));
+        assert_eq!(place_at(6, 2), None, "Back is not a place");
+
+        // Every row below the places moves when the list grows, which is the
+        // whole reason this is worth pinning: with three places, row 4 is the
+        // second heading rather than the third planet.
+        assert_eq!(place_at(3, 3), Some(PlaceChoice::One(2)), "the last place on a longer list");
+        assert_eq!(place_at(4, 3), None);
+        assert_eq!(place_at(5, 3), Some(PlaceChoice::All));
+        assert_eq!(place_at(6, 3), Some(PlaceChoice::Follow));
     }
 
     /// A typed interval is only worth using if it is a number in range, and

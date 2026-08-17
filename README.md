@@ -220,6 +220,7 @@ The included capture grows from 240 to 22,971 entities, allowing the renderer to
 - **v0.8.1:** Smoothed export camera, framing clear of the scrub bar, modded building artwork
 - **v0.8.2:** Scenery scanned from the save rather than bounded to the starting factory, rail corners drawn as curves
 - **v0.9:** One binary instead of two, a window alongside the text menu, biter expansion and nest clearing recorded, ground under paving recovered, exhausted ore emptied out, pipes joined to underground runs
+- **v0.10:** One video that follows you between planets, playthroughs on a shared map seed kept apart, a rebuilt in-game panel that says what it is doing, a working Stop button, custom frame intervals
 
 ### Upcomming
 
